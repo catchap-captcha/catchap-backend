@@ -1,0 +1,606 @@
+import secrets
+from datetime import datetime, timedelta, timezone
+
+from fastapi import HTTPException, status
+from sqlalchemy.orm import Session
+
+from app.core.security import (
+    create_access_token,
+    create_refresh_token,
+    generate_email_code,
+    hash_password,
+    sha256_hash,
+    verify_password,
+)
+from app.email.smtp import render_template, send_email
+from app.models import (
+    ClassRoom,
+    EmailVerificationCode,
+    Membership,
+    Organization,
+    OrgRegistrationRequest,
+    RefreshToken,
+    StudentProfile,
+    Subscription,
+    User,
+)
+from app.schemas import auth as s
+
+EMAIL_CODE_TTL_MINUTES = 5
+CAPTCHA_FAIL_THRESHOLD = 5  # 이 횟수 이상 연속 실패하면 캡차 요구
+
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+# --- 로그인 실패 카운터 (5회 이상 실패 → 캡차, 성공 → 리셋) ---
+def _throttle_row(db: Session, identifier: str):
+    from app.models import LoginThrottle
+
+    row = db.query(LoginThrottle).filter(LoginThrottle.identifier == identifier).first()
+    if row is None:
+        row = LoginThrottle(identifier=identifier, fail_count=0)
+        db.add(row)
+        db.flush()
+    return row
+
+
+def _record_fail(db: Session, identifier: str) -> int:
+    row = _throttle_row(db, identifier)
+    row.fail_count += 1
+    db.commit()
+    return row.fail_count
+
+
+def _reset_fails(db: Session, identifier: str) -> None:
+    row = _throttle_row(db, identifier)
+    if row.fail_count:
+        row.fail_count = 0
+    db.commit()
+
+
+def captcha_required(db: Session, identifier: str) -> bool:
+    from app.models import LoginThrottle
+
+    row = db.query(LoginThrottle).filter(LoginThrottle.identifier == identifier).first()
+    return bool(row and row.fail_count >= CAPTCHA_FAIL_THRESHOLD)
+
+
+def _login_failed(db: Session, identifier: str, message: str) -> HTTPException:
+    """실패 기록 + 5회 이상이면 captcha_required 플래그를 포함한 401 반환.
+
+    NOTE: 실제 캡차 토큰 검증은 메인 CAPTCHA API 단계에서 추가 (현재 프론트 데모 팝업).
+    """
+    count = _record_fail(db, identifier)
+    return HTTPException(
+        status.HTTP_401_UNAUTHORIZED,
+        detail={
+            "message": message,
+            "captcha_required": count >= CAPTCHA_FAIL_THRESHOLD,
+            "fail_count": count,
+        },
+    )
+
+
+HARD_LOCK_THRESHOLD = 10  # 이 횟수 이상 실패 시 실제 잠금(플래그가 아니라 차단)
+LOCK_WINDOW_SECONDS = 900  # 15분 — 이 시간 지나면 자동 해제
+
+
+def _check_locked(db: Session, identifier: str) -> None:
+    """H1: 무제한 시도 방지 — HARD_LOCK_THRESHOLD 도달 시 창(window) 동안 실제 차단(429).
+
+    창이 지나면 카운터를 리셋해 자동 해제(정당 사용자가 영구 잠기지 않도록).
+    """
+    from app.models import LoginThrottle
+
+    row = db.query(LoginThrottle).filter(LoginThrottle.identifier == identifier).first()
+    if row is None or row.fail_count < HARD_LOCK_THRESHOLD:
+        return
+    # updated_at은 로컬 시각(Timestamps)으로 저장되므로 창 비교도 로컬(datetime.now)로 맞춘다
+    last = row.updated_at or row.created_at
+    if last and (datetime.now() - last).total_seconds() < LOCK_WINDOW_SECONDS:
+        raise HTTPException(
+            status.HTTP_429_TOO_MANY_REQUESTS,
+            detail={
+                "message": "로그인 시도가 너무 많아요. 잠시 후(약 15분) 다시 시도해 주세요.",
+                "locked": True,
+            },
+        )
+    row.fail_count = 0  # 창 경과 → 자동 해제
+    db.commit()
+
+
+def issue_tokens(db: Session, subject_id: str, role: str, subject_type: str) -> s.TokenPair:
+    access = create_access_token(subject_id, role)
+    refresh, expires_at = create_refresh_token(subject_id)
+    db.add(
+        RefreshToken(
+            user_id=subject_id,
+            subject_type=subject_type,
+            token_hash=sha256_hash(refresh),
+            expires_at=expires_at.replace(tzinfo=None),
+        )
+    )
+    db.commit()
+    return s.TokenPair(access_token=access, refresh_token=refresh)
+
+
+def login(db: Session, req: s.LoginRequest) -> s.TokenPair:
+    identifier = f"user:{req.email.strip().lower()}"
+    _check_locked(db, identifier)  # H1: 과도한 실패 시 실제 차단
+    user = db.query(User).filter(User.email == req.email.strip().lower()).first()
+    if user is None or not verify_password(req.password, user.password_hash):
+        raise _login_failed(db, identifier, "이메일 또는 비밀번호가 올바르지 않습니다.")
+    # 역할은 계정(이메일 유일)에서 판별한다 — 클라이언트가 보낸 req.role은 무시.
+    # 운영자(ops)는 일반 로그인 폼으로 인증할 수 없다 — 전용 경로(/auth/ops-login)만 허용.
+    # 존재 여부를 흘리지 않도록 자격 오류와 동일한 메시지로 거부하되, 실패 카운트는
+    # 올리지 않는다 — 그렇지 않으면 알려진 ops 이메일로 이 엔드포인트를 두드려
+    # ops 계정을 잠그는 교차 락아웃(DoS)이 가능하다.
+    if user.role == "ops":
+        raise HTTPException(
+            status.HTTP_401_UNAUTHORIZED,
+            detail={"message": "이메일 또는 비밀번호가 올바르지 않습니다.", "captcha_required": False},
+        )
+    if user.status == "disabled":
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail="비활성화된 계정입니다.")
+    if user.email_verified_at is None:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail="이메일 인증이 완료되지 않았습니다.")
+    _reset_fails(db, identifier)
+    user.last_login_at = _now()
+    db.commit()
+    return issue_tokens(db, user.id, user.role, "user")
+
+
+def ops_login(db: Session, req: s.LoginRequest) -> s.TokenPair:
+    """운영자 전용 로그인 — 숨겨진 경로(/ops/login → /auth/ops-login)에서만 호출.
+
+    일반 사용자 계정으로는 여기서 토큰을 받을 수 없고(존재 여부도 흘리지 않음),
+    운영자 계정은 일반 로그인 폼(/auth/login)으로는 인증되지 않는다.
+    """
+    identifier = f"user:{req.email.strip().lower()}"
+    _check_locked(db, identifier)  # H1: 과도한 실패 시 실제 차단
+    user = db.query(User).filter(User.email == req.email.strip().lower()).first()
+    if (
+        user is None
+        or user.role != "ops"
+        or not verify_password(req.password, user.password_hash)
+    ):
+        raise _login_failed(db, identifier, "이메일 또는 비밀번호가 올바르지 않습니다.")
+    if user.status == "disabled":
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail="비활성화된 계정입니다.")
+    _reset_fails(db, identifier)
+    user.last_login_at = _now()
+    db.commit()
+    return issue_tokens(db, user.id, user.role, "user")
+
+
+def student_login(db: Session, req: s.StudentLoginRequest) -> s.TokenPair:
+    _check_locked(db, f"student:{req.student_login_id.strip()}")  # H1: 과도한 실패 시 차단
+    # 탈퇴/비활성 학생은 로그인 차단 (B2) — 성인 로그인과 동일 정책
+    query = db.query(StudentProfile).filter(
+        StudentProfile.student_login_id == req.student_login_id.strip(),
+        StudentProfile.status != "disabled",
+    )
+    if req.organization_id:
+        query = query.filter(StudentProfile.organization_id == req.organization_id)
+
+    # 아이디+비밀번호가 함께 일치하는 계정으로 판별 — 아이디가 여러 기관에 있어도
+    # 비밀번호가 하나에만 맞으면 바로 로그인 (기관 선택 불필요)
+    matched = [
+        st for st in query.limit(5).all() if verify_password(req.password, st.password_hash)
+    ]
+
+    identifier = f"student:{req.student_login_id.strip()}"
+    if not matched:
+        raise _login_failed(db, identifier, "아이디 또는 비밀번호가 올바르지 않습니다.")
+
+    if len(matched) > 1:
+        # 아이디+비밀번호까지 동일한 계정이 여러 기관에 존재 — 비밀번호를 증명한
+        # 사용자에게만 후보 기관을 보여주고 원클릭 선택하게 한다.
+        orgs = {o.id: o.name for o in db.query(Organization).filter(
+            Organization.id.in_([st.organization_id for st in matched])
+        )}
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail={
+                "message": "여러 기관에 같은 계정이 있어요. 소속 기관을 눌러 주세요.",
+                "candidates": [
+                    {
+                        "organization_id": st.organization_id,
+                        "organization_name": orgs.get(st.organization_id, ""),
+                    }
+                    for st in matched
+                ],
+            },
+        )
+
+    student = matched[0]
+    _reset_fails(db, identifier)
+    student.last_login_at = _now()
+    db.commit()
+    return issue_tokens(db, student.id, "student", "student")
+
+
+def refresh_tokens(db: Session, refresh_token: str) -> s.TokenPair:
+    from jwt import PyJWTError
+
+    from app.core.security import decode_token
+
+    try:
+        payload = decode_token(refresh_token)
+    except PyJWTError:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail="refresh token이 유효하지 않습니다.")
+    if payload.get("type") != "refresh":
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail="refresh token이 아닙니다.")
+
+    token_hash = sha256_hash(refresh_token)
+    row = db.query(RefreshToken).filter(RefreshToken.token_hash == token_hash).first()
+    if row is None or row.revoked_at is not None or row.expires_at < _now():
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail="만료되었거나 사용할 수 없는 토큰입니다.")
+
+    # 회전: 기존 토큰 폐기 후 새로 발급
+    row.revoked_at = _now()
+    db.commit()
+
+    subject_id = payload["sub"]
+    if row.subject_type == "student":
+        # 탈퇴/비활성 학생은 refresh 토큰으로도 재발급 불가 (B3)
+        student = db.get(StudentProfile, subject_id)
+        if student is None or student.status == "disabled":
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail="학생 계정을 사용할 수 없습니다.")
+        return issue_tokens(db, subject_id, "student", "student")
+    user = db.get(User, subject_id)
+    if user is None or user.status == "disabled":
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail="사용자를 찾을 수 없습니다.")
+    return issue_tokens(db, subject_id, user.role, "user")
+
+
+def logout(db: Session, subject_id: str) -> None:
+    db.query(RefreshToken).filter(
+        RefreshToken.user_id == subject_id, RefreshToken.revoked_at.is_(None)
+    ).update({"revoked_at": _now()})
+    db.commit()
+
+
+# --- 이메일 인증 (6자리 코드) ---
+def send_email_code(db: Session, email: str, purpose: str, for_account: bool = False) -> None:
+    # 계정용 이메일(학부모/교사/기관 가입)은 발송 전에 중복을 먼저 알려준다
+    if purpose == "signup" and for_account:
+        if db.query(User).filter(User.email == email.strip().lower()).first():
+            raise HTTPException(status.HTTP_409_CONFLICT, detail="이미 가입된 이메일입니다.")
+    code = generate_email_code()
+    db.add(
+        EmailVerificationCode(
+            email=email.strip().lower(),
+            purpose=purpose,
+            code_hash=sha256_hash(code),
+            expires_at=_now() + timedelta(minutes=EMAIL_CODE_TTL_MINUTES),
+        )
+    )
+    db.commit()
+    template = "password_reset.html" if purpose == "reset" else "verify_email.html"
+    subject = (
+        "[CatChap] 비밀번호 재설정 인증 코드" if purpose == "reset" else "[CatChap] 이메일 인증 코드"
+    )
+    html = render_template(template, code=code, name=email.split("@")[0])
+    send_email(db, email, subject, html)
+
+
+def _find_valid_code(db: Session, email: str, code: str, purpose: str) -> EmailVerificationCode:
+    row = (
+        db.query(EmailVerificationCode)
+        .filter(
+            EmailVerificationCode.email == email.strip().lower(),
+            EmailVerificationCode.purpose == purpose,
+            EmailVerificationCode.code_hash == sha256_hash(code),
+            EmailVerificationCode.used_at.is_(None),
+        )
+        .order_by(EmailVerificationCode.created_at.desc())
+        .first()
+    )
+    if row is None:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="인증 코드가 올바르지 않습니다.")
+    if row.expires_at < _now():
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="인증 코드가 만료되었어요. 다시 받아주세요.")
+    return row
+
+
+def verify_email_code(db: Session, email: str, code: str, purpose: str) -> None:
+    # B2: 6자리 코드 무제한 대입 차단 (이메일+목적 기준 잠금)
+    ident = f"emailcode:{email.strip().lower()}:{purpose}"
+    _check_locked(db, ident)
+    try:
+        row = _find_valid_code(db, email, code, purpose)
+    except HTTPException:
+        _record_fail(db, ident)
+        raise
+    _reset_fails(db, ident)
+    row.verified_at = _now()
+    db.commit()
+
+
+def _consume_verified_code(db: Session, email: str, code: str, purpose: str) -> None:
+    """가입/재설정 확정 시 1회 사용 처리 (재사용 방지)"""
+    row = _find_valid_code(db, email, code, purpose)
+    row.used_at = _now()
+    db.commit()
+
+
+def _ensure_email_unused(db: Session, email: str) -> None:
+    if db.query(User).filter(User.email == email).first():
+        raise HTTPException(status.HTTP_409_CONFLICT, detail="이미 가입된 이메일입니다.")
+
+
+# --- 회원가입 4종 ---
+def register_parent(db: Session, req: s.RegisterParentRequest) -> User:
+    email = req.email.strip().lower()
+    _ensure_email_unused(db, email)
+    _consume_verified_code(db, email, req.email_code, "signup")
+    user = User(
+        email=email,
+        password_hash=hash_password(req.password),
+        name=req.name,
+        phone=req.phone,
+        role="parent",
+        email_verified_at=_now(),
+    )
+    db.add(user)
+    db.commit()
+    return user
+
+
+def register_teacher(db: Session, req: s.RegisterTeacherRequest) -> User:
+    email = req.email.strip().lower()
+    _ensure_email_unused(db, email)
+
+    membership = (
+        db.query(Membership)
+        .filter(
+            Membership.organization_id == req.organization_id,
+            Membership.teacher_code == req.teacher_code.strip().upper(),
+        )
+        .first()
+    )
+    if membership is None:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="교사 개별 코드가 올바르지 않습니다.")
+    if membership.user_id is not None:
+        raise HTTPException(status.HTTP_409_CONFLICT, detail="이미 사용된 교사 코드입니다.")
+
+    _consume_verified_code(db, email, req.email_code, "signup")
+    user = User(
+        email=email,
+        password_hash=hash_password(req.password),
+        name=req.name,
+        role="teacher",
+        organization_id=req.organization_id,
+        email_verified_at=_now(),
+    )
+    db.add(user)
+    db.flush()
+    membership.user_id = user.id
+    membership.status = "active"
+    membership.joined_at = _now()
+    db.commit()
+    return user
+
+
+def student_id_available(db: Session, login_id: str) -> bool:
+    """학생 아이디 전역 중복 확인 (전 기관 대상)"""
+    login_id = login_id.strip()
+    if len(login_id) < 3:
+        return False
+    return (
+        db.query(StudentProfile)
+        .filter(StudentProfile.student_login_id == login_id)
+        .first()
+        is None
+    )
+
+
+def register_student(db: Session, req: s.RegisterStudentRequest) -> StudentProfile:
+    org = db.get(Organization, req.organization_id)
+    if org is None or org.code != req.org_code.strip().upper():
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="기관 코드가 올바르지 않습니다.")
+
+    # 학생 아이디는 전역 유일 (기관 무관) — 가입 화면의 '중복 확인'과 동일 기준
+    if not student_id_available(db, req.student_login_id):
+        raise HTTPException(status.HTTP_409_CONFLICT, detail="이미 사용 중인 아이디예요. 다른 아이디를 골라 주세요.")
+
+    _consume_verified_code(db, req.email.strip().lower(), req.email_code, "signup")
+
+    student = StudentProfile(
+        organization_id=org.id,
+        student_login_id=req.student_login_id.strip(),
+        student_code=_generate_student_code(db),
+        password_hash=hash_password(req.password),
+        nickname=req.name,
+        coins=0,
+        level=1,
+    )
+    db.add(student)
+    db.commit()
+    return student
+
+
+def _generate_student_code(db: Session) -> str:
+    while True:
+        code = f"CAT-{secrets.randbelow(9000) + 1000}"
+        if not db.query(StudentProfile).filter(StudentProfile.student_code == code).first():
+            return code
+
+
+def _generate_org_code(db: Session, name: str) -> str:
+    prefix = "".join(c for c in name if c.isascii() and c.isalnum())[:2].upper() or "CC"
+    while True:
+        code = f"{prefix}-EDU-{secrets.randbelow(9000) + 1000}"
+        if not db.query(Organization).filter(Organization.code == code).first():
+            return code
+
+
+def register_org(db: Session, req: s.RegisterOrgRequest) -> Organization:
+    email = req.contact_email.strip().lower()
+    _ensure_email_unused(db, email)
+    if req.business_number:
+        if (
+            db.query(Organization)
+            .filter(Organization.business_number == req.business_number)
+            .first()
+        ):
+            raise HTTPException(status.HTTP_409_CONFLICT, detail="이미 등록된 고유번호입니다.")
+
+    _consume_verified_code(db, email, req.email_code, "signup")
+
+    request = OrgRegistrationRequest(
+        org_name=req.org_name,
+        org_type=req.org_type,
+        business_number=req.business_number,
+        address=req.address,
+        contact_name=req.contact_name,
+        contact_email=email,
+        contact_phone=req.contact_phone,
+        expected_students=req.expected_students,
+        plan_interest=req.plan_interest,
+    )
+    db.add(request)
+
+    # 운영진 승인 대기: 기관·관리자 계정은 만들되 status=pending으로 두고,
+    # ops가 승인(approve)해야 active가 되어 로그인·이용 가능. (승인 흐름: ops.py)
+    org = Organization(
+        name=req.org_name,
+        code=_generate_org_code(db, req.org_name),
+        org_type=req.org_type,
+        status="pending",
+        contact_email=email,
+        contact_phone=req.contact_phone,
+        address=req.address,
+        business_number=req.business_number,
+        code_expires_at=_now() + timedelta(days=365),
+    )
+    db.add(org)
+    db.flush()
+
+    # 신청서는 pending 유지 — 승인 시 approved로 전환
+    request.organization_id = org.id
+
+    admin = User(
+        email=email,
+        password_hash=hash_password(req.password),
+        name=req.contact_name,
+        phone=req.contact_phone,
+        role="org_admin",
+        organization_id=org.id,
+        email_verified_at=_now(),
+    )
+    db.add(admin)
+    db.flush()
+    db.add(
+        Membership(
+            user_id=admin.id,
+            organization_id=org.id,
+            role="org_admin",
+            status="pending",
+            joined_at=_now(),
+        )
+    )
+
+    # 요금제 연결 (관심 요금제 → 구독, 기본 Basic)
+    from app.models import Plan
+
+    plan_key = (req.plan_interest or "basic").lower()
+    plan = db.query(Plan).filter(Plan.key == plan_key).first() or (
+        db.query(Plan).filter(Plan.key == "basic").first()
+    )
+    if plan:
+        db.add(Subscription(organization_id=org.id, plan_id=plan.id))
+
+    db.commit()
+    return org
+
+
+# --- 비밀번호 재설정 ---
+def password_reset_request(db: Session, email: str) -> None:
+    user = db.query(User).filter(User.email == email.strip().lower()).first()
+    # 계정 존재 여부를 노출하지 않기 위해 항상 성공 응답, 존재할 때만 발송
+    if user:
+        send_email_code(db, email, "reset")
+
+
+def password_reset_confirm(db: Session, req: s.PasswordResetConfirm) -> None:
+    email = req.email.strip().lower()
+    # B2: 6자리 재설정 코드 무제한 대입 → 계정 탈취 차단 (이메일 기준 잠금)
+    ident = f"reset:{email}"
+    _check_locked(db, ident)
+    user = db.query(User).filter(User.email == email).first()
+    if user is None:
+        _record_fail(db, ident)
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="인증 코드가 올바르지 않습니다.")
+    try:
+        _consume_verified_code(db, email, req.code, "reset")
+    except HTTPException:
+        _record_fail(db, ident)
+        raise
+    _reset_fails(db, ident)
+    user.password_hash = hash_password(req.new_password)
+    db.commit()
+    logout(db, user.id)  # 모든 기기 로그아웃
+
+
+# --- 코드 확인 ---
+def verify_org_code(db: Session, organization_id: str, code: str) -> Organization | None:
+    org = db.get(Organization, organization_id)
+    if org and org.code == code.strip().upper():
+        return org
+    return None
+
+
+def verify_teacher_code(db: Session, organization_id: str, code: str) -> bool:
+    membership = (
+        db.query(Membership)
+        .filter(
+            Membership.organization_id == organization_id,
+            Membership.teacher_code == code.strip().upper(),
+            Membership.user_id.is_(None),
+        )
+        .first()
+    )
+    return membership is not None
+
+
+def get_me(db: Session, principal) -> s.MeResponse:
+    if principal.kind == "student":
+        st: StudentProfile = principal.student
+        org = db.get(Organization, st.organization_id)
+        cls = db.get(ClassRoom, st.class_id) if st.class_id else None
+        return s.MeResponse(
+            id=st.id,
+            role="student",
+            name=st.nickname,
+            email=None,
+            organization_id=st.organization_id,
+            organization_name=org.name if org else None,
+            must_change_password=bool(getattr(st, "must_change_password", False)),
+            student=s.MeStudent(
+                student_login_id=st.student_login_id,
+                student_code=st.student_code,
+                nickname=st.nickname,
+                class_id=st.class_id,
+                class_name=cls.name if cls else None,
+                grade_band=st.grade_band,
+                avatar=st.avatar or {},
+                coins=st.coins,
+                level=st.level,
+                age=st.age,
+            ),
+        )
+    user: User = principal.user
+    org = db.get(Organization, user.organization_id) if user.organization_id else None
+    return s.MeResponse(
+        id=user.id,
+        role=user.role,
+        name=user.name,
+        email=user.email,
+        phone=user.phone,
+        organization_id=user.organization_id,
+        organization_name=org.name if org else None,
+    )

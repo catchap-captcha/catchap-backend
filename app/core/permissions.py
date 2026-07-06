@@ -1,0 +1,107 @@
+"""RBAC — API 단계 권한 검사.
+
+- 기관 관리자: 자기 기관 전체
+- 교사: 담당 학급 범위
+- 학부모: 승인된 연결 자녀만
+- 학생: 본인 데이터만
+- 운영자(ops): 운영 API만
+principal 은 (kind, id) — kind: 'user' | 'student'
+"""
+
+from dataclasses import dataclass
+
+from fastapi import Depends, HTTPException, status
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from jwt import PyJWTError
+from sqlalchemy.orm import Session
+
+from app.core.security import decode_token
+from app.db.session import get_db
+from app.models import ParentStudentLink, StudentProfile, User
+
+bearer = HTTPBearer(auto_error=False)
+
+
+@dataclass
+class Principal:
+    kind: str  # user | student
+    id: str
+    role: str  # student | parent | teacher | org_admin | ops
+    user: User | None = None
+    student: StudentProfile | None = None
+
+    @property
+    def organization_id(self) -> str | None:
+        if self.student:
+            return self.student.organization_id
+        if self.user:
+            return self.user.organization_id
+        return None
+
+
+def get_current_principal(
+    credentials: HTTPAuthorizationCredentials | None = Depends(bearer),
+    db: Session = Depends(get_db),
+) -> Principal:
+    if credentials is None:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail="인증이 필요합니다.")
+    try:
+        payload = decode_token(credentials.credentials)
+    except PyJWTError:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail="토큰이 유효하지 않습니다.")
+    if payload.get("type") != "access":
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail="access token이 아닙니다.")
+
+    subject_id: str = payload["sub"]
+    role: str = payload.get("role", "")
+
+    if role == "student":
+        student = db.get(StudentProfile, subject_id)
+        # 탈퇴/비활성(status=disabled) 학생은 기존 토큰이 남아 있어도 접근 차단 (B3)
+        if student is None or student.status == "disabled":
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail="학생을 찾을 수 없습니다.")
+        return Principal(kind="student", id=subject_id, role="student", student=student)
+
+    user = db.get(User, subject_id)
+    if user is None or user.status == "disabled":
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail="사용자를 찾을 수 없습니다.")
+    return Principal(kind="user", id=subject_id, role=user.role, user=user)
+
+
+def require_roles(*roles: str):
+    def dep(principal: Principal = Depends(get_current_principal)) -> Principal:
+        if principal.role not in roles:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, detail="접근 권한이 없습니다.")
+        return principal
+
+    return dep
+
+
+require_student = require_roles("student")
+require_parent = require_roles("parent")
+require_teacher = require_roles("teacher", "org_admin")
+require_org_admin = require_roles("org_admin", "ops")
+require_ops = require_roles("ops")
+
+
+def check_org_scope(principal: Principal, organization_id: str) -> None:
+    """운영자는 전체, 그 외에는 자기 기관만."""
+    if principal.role == "ops":
+        return
+    if principal.organization_id != organization_id:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail="기관 접근 권한이 없습니다.")
+
+
+def check_parent_child(db: Session, parent_user_id: str, student_id: str) -> ParentStudentLink:
+    link = (
+        db.query(ParentStudentLink)
+        .filter(
+            ParentStudentLink.parent_user_id == parent_user_id,
+            ParentStudentLink.student_id == student_id,
+            ParentStudentLink.status == "approved",
+        )
+        .first()
+    )
+    if link is None:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail="연결된 자녀가 아닙니다.")
+    return link
