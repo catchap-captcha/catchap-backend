@@ -4,6 +4,7 @@ import re
 from datetime import date, datetime, time, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from pydantic import BaseModel as _GBaseModel
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
@@ -986,6 +987,74 @@ def save_attempt(
         quiz.status = "done" if req.completed else ("progress" if quiz.status != "done" else "done")
     db.commit()
     return {"ok": True, "attempt_id": attempt.id, "coins_earned": coins_earned, "coins": me.coins}
+
+
+# ---------------------------------------------------------------- 실전 게임 세션 (생활 — ms 문제은행)
+class _GameAnswerReq(_GBaseModel):
+    question_id: str
+    option_id: str
+    last: bool = False  # 세션의 마지막 문항 → 오늘의퀴즈 완료 처리
+    replay: bool = False  # 복습 모드 — 상태·코인 반영 없음
+
+
+@router.get("/students/me/game-session")
+def game_session(
+    subject: str = Query(default="생활"),
+    count: int = Query(default=5, ge=1, le=10),
+    principal: Principal = Depends(require_student),
+):
+    """실제 플레이 가능한 문항 세트 발급 (정답 미포함 — 채점은 서버).
+
+    현재 '생활' 과목만 실문항 지원(capcha_service ms 문제은행 이식분).
+    다른 과목은 available=false → 프론트가 기존 데모 슬롯 유지.
+    """
+    _me(principal)
+    if subject != "생활":
+        return {"available": False, "subject": subject, "questions": []}
+    import random as _random
+
+    from app.services import life_bank
+
+    picked = _random.sample(life_bank.LIFE_QUESTIONS, min(count, len(life_bank.LIFE_QUESTIONS)))
+    return {
+        "available": True,
+        "subject": subject,
+        "questions": [life_bank.public_question(q) for q in picked],
+    }
+
+
+@router.post("/students/me/game-answer")
+def game_answer(
+    req: _GameAnswerReq,
+    principal: Principal = Depends(require_student),
+    db: Session = Depends(get_db),
+):
+    """문항 1개 서버 채점 + 학습기록 저장 — 자기신고가 아닌 서버 판정 결과를 기록한다."""
+    me = _me(principal)
+    from app.services import life_bank
+
+    q = life_bank.get_question(req.question_id)
+    if q is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="문항을 찾을 수 없습니다.")
+    correct = str(req.option_id) == str(q["answer"])
+    answer_opt = next((o for o in q["options"] if o["id"] == q["answer"]), None)
+
+    # 서버 판정 결과를 학습기록으로 저장 (기존 save_attempt와 동일 부수효과: 코인 상한·진도·퀴즈 상태)
+    attempt_req = AttemptCreate(
+        subject="생활",
+        result="correct" if correct else "incorrect",
+        score=20 if correct else 0,  # 5문 기준 100점 만점
+        completed=req.last and not req.replay,
+        replay=req.replay,
+    )
+    saved = save_attempt(attempt_req, principal, db)
+    return {
+        "correct": correct,
+        "answer_id": q["answer"],
+        "answer_text": answer_opt["text"] if answer_opt else "",
+        "hint": q["hint"],
+        "coins_earned": saved.get("coins_earned", 0),
+    }
 
 
 # ---------------------------------------------------------------- 학습결과 / 게임화면

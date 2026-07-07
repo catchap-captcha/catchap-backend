@@ -224,3 +224,50 @@ def test_replay_attempt_no_status_no_coins(client, db, seed_org):
         .first()
     )
     assert quiz2 is not None and quiz2.status == "done"
+
+
+def test_game_session_server_graded(client, db, seed_org):
+    """생활 실문항: 정답 미노출 발급 + 서버 채점 + 학습기록(서버판정) 저장."""
+    from app.models import LearningAttempt
+
+    token = _student_token(client, seed_org)
+    res = client.get("/api/v1/students/me/game-session?subject=생활&count=3", headers=auth(token))
+    assert res.status_code == 200
+    body = res.json()
+    assert body["available"] is True and len(body["questions"]) == 3
+    q = body["questions"][0]
+    assert "answer" not in q and "answer_id" not in q  # 정답 미노출
+
+    # 일부러 오답 제출 → 서버가 incorrect 판정
+    from app.services.life_bank import get_question
+
+    real = get_question(q["id"])
+    wrong = next(o["id"] for o in real["options"] if o["id"] != real["answer"])
+    r1 = client.post(
+        "/api/v1/students/me/game-answer",
+        json={"question_id": q["id"], "option_id": wrong},
+        headers=auth(token),
+    )
+    assert r1.status_code == 200
+    assert r1.json()["correct"] is False
+    assert r1.json()["answer_id"] == real["answer"]  # 정답 공개는 채점 후에만
+
+    # 정답 제출 → correct + 기록 확인
+    r2 = client.post(
+        "/api/v1/students/me/game-answer",
+        json={"question_id": q["id"], "option_id": real["answer"], "last": True},
+        headers=auth(token),
+    )
+    assert r2.json()["correct"] is True
+
+    rows = (
+        db.query(LearningAttempt)
+        .filter(LearningAttempt.student_id == seed_org["student"].id, LearningAttempt.subject == "생활")
+        .all()
+    )
+    results = sorted(r.result for r in rows)
+    assert results == ["correct", "incorrect"]  # 서버 판정 그대로 기록됨
+
+    # 다른 과목은 아직 미지원 → available=False (프론트 데모 유지)
+    other = client.get("/api/v1/students/me/game-session?subject=수학", headers=auth(token)).json()
+    assert other["available"] is False
