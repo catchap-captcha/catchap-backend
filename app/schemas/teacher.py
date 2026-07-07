@@ -7,6 +7,7 @@ class AddStudentByCode(BaseModel):
 
 class ClassStudentUpdate(BaseModel):
     nickname: str | None = Field(default=None, max_length=50)
+    real_name: str | None = Field(default=None, max_length=100)  # 학교용 실명 (교사가 관리)
     age: int | None = Field(default=None, ge=3, le=13)
     status: str | None = Field(default=None, pattern="^(좋음|학습 뜸함|도움 필요|good|inactive|needs_help)$")
 

@@ -402,6 +402,7 @@ def register_student(db: Session, req: s.RegisterStudentRequest) -> StudentProfi
     org = db.get(Organization, req.organization_id)
     if org is None or org.code != req.org_code.strip().upper():
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="기관 코드가 올바르지 않습니다.")
+    _assert_org_code_not_expired(org)  # 만료된 코드로는 가입 불가
 
     # 학생 아이디는 전역 유일 (기관 무관) — 가입 화면의 '중복 확인'과 동일 기준
     if not student_id_available(db, req.student_login_id):
@@ -547,9 +548,19 @@ def password_reset_confirm(db: Session, req: s.PasswordResetConfirm) -> None:
 
 
 # --- 코드 확인 ---
+def _assert_org_code_not_expired(org: Organization) -> None:
+    """기관 코드가 만료됐으면 가입 차단 (연 1회 갱신 정책)."""
+    if org.code_expires_at is not None and org.code_expires_at < datetime.utcnow():
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            detail="기관 코드가 만료되었어요. 기관 담당자에게 새 코드를 요청해 주세요.",
+        )
+
+
 def verify_org_code(db: Session, organization_id: str, code: str) -> Organization | None:
     org = db.get(Organization, organization_id)
     if org and org.code == code.strip().upper():
+        _assert_org_code_not_expired(org)
         return org
     return None
 
@@ -595,6 +606,21 @@ def get_me(db: Session, principal) -> s.MeResponse:
         )
     user: User = principal.user
     org = db.get(Organization, user.organization_id) if user.organization_id else None
+    # 학년부장이면 담당 학년을 함께 내려 화면 범위 표기("N학년 담당")에 사용
+    managed_grade = None
+    if user.role == "grade_head" and user.organization_id:
+        from app.models import Membership
+
+        m = (
+            db.query(Membership)
+            .filter(
+                Membership.user_id == user.id,
+                Membership.organization_id == user.organization_id,
+                Membership.status != "disabled",
+            )
+            .first()
+        )
+        managed_grade = m.managed_grade if m else None
     return s.MeResponse(
         id=user.id,
         role=user.role,
@@ -603,4 +629,5 @@ def get_me(db: Session, principal) -> s.MeResponse:
         phone=user.phone,
         organization_id=user.organization_id,
         organization_name=org.name if org else None,
+        managed_grade=managed_grade,
     )

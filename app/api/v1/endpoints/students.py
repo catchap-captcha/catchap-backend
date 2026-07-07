@@ -12,6 +12,7 @@ from app.db.session import get_db
 from app.models import (
     Badge,
     Chapter,
+    ClassRoom,
     CoinTransaction,
     ConceptRead,
     Content,
@@ -74,38 +75,70 @@ def _today_quiz_rows(db: Session, student_id: str) -> list[DailyQuizStatus]:
     return rows
 
 
-def _class_board(db: Session, me: StudentProfile) -> list[dict]:
-    """같은 반 학생들의 실데이터 랭킹 — 점수는 코인 + 학습 시도 점수 합.
+def _my_grade(db: Session, me: StudentProfile) -> int | None:
+    """학생의 학년 — 소속 반(classes.grade) 기준. 무반이면 None."""
+    if not me.class_id:
+        return None
+    cls = db.get(ClassRoom, me.class_id)
+    return cls.grade if cls else None
 
-    개인정보 보호: 타 학생은 닉네임만 노출한다.
+
+# 랭킹 점수 산식(사용자 결정 2026-07-07): "일일 과제 완료" 기반 · 학년별로만 합산 · 학기 누적(리셋 없음).
+# - 과목 완료 1개당 10점, 하루 전 과목(6과목) 완료 보너스 +40 → 하루 최대 100점
+# - 문제 수·속도 경쟁이 아니라 꾸준함이 점수가 된다 (개근과 자연 연동)
+RANK_SUBJECT_POINT = 10
+RANK_FULLDAY_BONUS = 40
+
+
+def _grade_scores(db: Session, student_ids: list[str]) -> dict[str, int]:
+    """학생별 랭킹 점수 = 완료 과목 수 × 10 + 전과목 완료일 수 × 40 (daily_quiz_status 실집계)."""
+    rows = (
+        db.query(
+            DailyQuizStatus.student_id,
+            DailyQuizStatus.quiz_date,
+            func.count(DailyQuizStatus.id),
+        )
+        .filter(
+            DailyQuizStatus.student_id.in_(student_ids),
+            DailyQuizStatus.status == "done",
+        )
+        .group_by(DailyQuizStatus.student_id, DailyQuizStatus.quiz_date)
+        .all()
+    )
+    full = len(D.SUBJECT_ORDER)  # 전 과목 수 (6)
+    scores: dict[str, int] = {}
+    for sid, _day, done_cnt in rows:
+        pts = int(done_cnt) * RANK_SUBJECT_POINT + (RANK_FULLDAY_BONUS if int(done_cnt) >= full else 0)
+        scores[sid] = scores.get(sid, 0) + pts
+    return scores
+
+
+def _class_board(db: Session, me: StudentProfile) -> list[dict]:
+    """같은 학년 학생들의 랭킹 (학년별로만 합산 — 반이 달라도 같은 학년이면 함께 경쟁).
+
+    개인정보 보호: 타 학생은 닉네임만 노출한다 (실명 절대 금지).
     """
-    if me.class_id:
-        classmates = (
+    grade = _my_grade(db, me)
+    if grade is not None:
+        peers = (
             db.query(StudentProfile)
+            .join(ClassRoom, StudentProfile.class_id == ClassRoom.id)
             .filter(
-                StudentProfile.class_id == me.class_id,
+                StudentProfile.organization_id == me.organization_id,
                 StudentProfile.status != "disabled",
+                ClassRoom.grade == grade,
             )
             .all()
         )
     else:
-        classmates = [me]
-    if all(s.id != me.id for s in classmates):
-        classmates.append(me)
-    attempt_scores = dict(
-        db.query(LearningAttempt.student_id, func.coalesce(func.sum(LearningAttempt.score), 0))
-        .filter(LearningAttempt.student_id.in_([s.id for s in classmates]))
-        .group_by(LearningAttempt.student_id)
-        .all()
-    )
+        peers = [me]  # 무반 학생은 학년 풀 없음 — 본인만
+    if all(s.id != me.id for s in peers):
+        peers.append(me)
+    scores = _grade_scores(db, [s.id for s in peers])
     ranked = sorted(
         (
-            {
-                "name": s.nickname,
-                "score": int(s.coins or 0) + int(attempt_scores.get(s.id, 0)),
-                "me": s.id == me.id,
-            }
-            for s in classmates
+            {"name": s.nickname, "score": scores.get(s.id, 0), "me": s.id == me.id}
+            for s in peers
         ),
         key=lambda r: (-r["score"], r["name"]),
     )
@@ -152,7 +185,7 @@ def dashboard(
         subjects.append(
             {**card, "done": done, "state": state, "meta": D.SUBJECT_META[sub]}
         )
-    # 반 랭킹 밴드: 같은 반 실데이터 기준
+    # 학년 랭킹 밴드: 같은 학년 실데이터 기준 (일일 과제 완료 점수, 학기 누적)
     board = _class_board(db, me)
     my_rank = next(r["rank"] for r in board if r["me"])
     band = f"상위 {max(1, round(my_rank / len(board) * 100))}%"
@@ -717,7 +750,11 @@ def update_profile(
     return {"ok": True, "nickname": me.nickname, "age": me.age}
 
 
-# ---------------------------------------------------------------- 반 랭킹
+# ---------------------------------------------------------------- 학년 랭킹
+# 상위 3위 보너스 코인 (하루 1회, 랭킹 확인 시 지급 — 순위 유지 동기)
+RANK_TOP3_COINS = {1: 30, 2: 20, 3: 10}
+
+
 @router.get("/students/me/class-ranking")
 def class_ranking(
     principal: Principal = Depends(require_student), db: Session = Depends(get_db)
@@ -726,12 +763,125 @@ def class_ranking(
     rows = _class_board(db, me)
     mine = next(r for r in rows if r["me"])
     top_score = rows[0]["score"] or 1
+    grade = _my_grade(db, me)
+
+    # 상위 3위 추가 코인: 오늘 아직 안 받았으면 지급 (학기 누적 랭킹이라 '매일 유지' 보상)
+    bonus = 0
+    if mine["rank"] in RANK_TOP3_COINS and mine["score"] > 0:
+        already = (
+            db.query(CoinTransaction)
+            .filter(
+                CoinTransaction.student_id == me.id,
+                CoinTransaction.reason.like("%랭킹 보상"),
+                func.date(CoinTransaction.created_at) == date.today(),
+            )
+            .first()
+        )
+        if already is None:
+            bonus = RANK_TOP3_COINS[mine["rank"]]
+            me.coins += bonus
+            db.add(
+                CoinTransaction(
+                    student_id=me.id, amount=bonus, reason=f"{mine['rank']}위 랭킹 보상"
+                )
+            )
+            db.commit()
+
     return {
         "rank": mine["rank"],
         "score": mine["score"],
-        "class_size": len(rows),
-        "board": rows,
+        "grade": grade,
+        "class_size": len(rows),  # (호환) 랭킹 풀 크기 = 같은 학년 인원
+        "board": rows[:20],  # 상위 20명까지만 노출
         "top_pct": round(mine["score"] / top_score * 100),
+        "bonus_coins": bonus,  # 방금 지급된 상위 3위 보너스 (0이면 없음)
+    }
+
+
+# ---------------------------------------------------------------- 상장 · 개근 뱃지
+ATTENDANCE_BADGE_NAME = "개근왕"
+ATTENDANCE_STREAK_DAYS = 30  # 30일 연속 학습 = 개근상
+
+
+def _semester_label(d: date) -> str:
+    # 한국 학기: 3~8월 = 1학기, 9~2월 = 2학기(연도는 학기 시작 연도)
+    if 3 <= d.month <= 8:
+        return f"{d.year}년 1학기"
+    year = d.year if d.month >= 9 else d.year - 1
+    return f"{year}년 2학기"
+
+
+@router.get("/students/me/awards")
+def my_awards(
+    principal: Principal = Depends(require_student), db: Session = Depends(get_db)
+):
+    """상장(다운로드용) 목록 — 학년 랭킹 상위 3위 + 개근상. 개근 뱃지는 여기서 자동 지급."""
+    me = _me(principal)
+    awards: list[dict] = []
+    today = date.today()
+    semester = _semester_label(today)
+
+    # 학년 랭킹 상장 (학기 누적 상위 3위)
+    board = _class_board(db, me)
+    mine = next(r for r in board if r["me"])
+    grade = _my_grade(db, me)
+    if grade is not None and mine["rank"] in (1, 2, 3) and mine["score"] > 0:
+        awards.append(
+            {
+                "type": "rank",
+                "title": f"{grade}학년 랭킹 {mine['rank']}위",
+                "detail": f"{semester} · {grade}학년 {len(board)}명 중 {mine['rank']}위 · {mine['score']}점",
+                "rank": mine["rank"],
+                "grade": grade,
+                "semester": semester,
+            }
+        )
+
+    # 개근상 — 연속 학습 30일 이상이면 상장 + '개근왕' 뱃지 자동 지급
+    growth = aggregate.student_growth(db, me) or {}
+    streak = int(growth.get("streak_days") or 0)
+    if streak >= ATTENDANCE_STREAK_DAYS:
+        awards.append(
+            {
+                "type": "attendance",
+                "title": "개근상",
+                "detail": f"{semester} · {streak}일 연속으로 하루도 빠짐없이 학습했어요",
+                "streak_days": streak,
+                "semester": semester,
+            }
+        )
+        badge = db.query(Badge).filter(Badge.name == ATTENDANCE_BADGE_NAME).first()
+        if badge is None:
+            badge = Badge(
+                name=ATTENDANCE_BADGE_NAME,
+                description=f"{ATTENDANCE_STREAK_DAYS}일 연속 학습 개근",
+                icon="ph-fill ph-calendar-check",
+                color="#17B08C",
+                condition_text=f"{ATTENDANCE_STREAK_DAYS}일 연속 학습하기",
+                order_no=99,
+            )
+            db.add(badge)
+            db.flush()
+        earned = (
+            db.query(StudentBadge)
+            .filter(StudentBadge.student_id == me.id, StudentBadge.badge_id == badge.id)
+            .first()
+        )
+        if earned is None:
+            db.add(StudentBadge(student_id=me.id, badge_id=badge.id, earned_at=datetime.now(), progress=1))
+            db.commit()
+        elif earned.earned_at is None:
+            earned.earned_at = datetime.now()
+            earned.progress = 1
+            db.commit()
+
+    return {
+        "nickname": me.nickname,
+        "grade": grade,
+        "semester": semester,
+        "streak_days": streak,
+        "attendance_target": ATTENDANCE_STREAK_DAYS,
+        "awards": awards,
     }
 
 
@@ -760,7 +910,8 @@ def save_attempt(
     db.add(attempt)
 
     coins_earned = 0
-    if req.result == "correct":
+    # 복습(replay: 전날 다시풀기·오늘 재도전)은 보상 없음 — 반복 파밍 차단
+    if req.result == "correct" and not req.replay:
         # 파밍 방지: 하루 학습 보상 코인 총량 상한(자기신고 반복으로 무한 적립 차단).
         # 정식 서버 채점(정답 검증)은 교육 API 단계에서 대체.
         earned_today = (
@@ -815,21 +966,24 @@ def save_attempt(
     correct = prev_correct + (1 if req.result == "correct" else 0)
     prog.accuracy = round(correct / total * 100, 1)
 
-    quiz = (
-        db.query(DailyQuizStatus)
-        .filter(
-            DailyQuizStatus.student_id == me.id,
-            DailyQuizStatus.quiz_date == date.today(),
-            DailyQuizStatus.subject == req.subject,
+    # 일일 잠금 규칙: 오늘의퀴즈 상태는 '오늘' 것만 갱신 가능(미래 날짜 미리 완료 불가 —
+    # quiz_date는 항상 서버의 오늘). 복습(replay)은 상태를 건드리지 않는다(전날 다시풀기는 기록만).
+    if not req.replay:
+        quiz = (
+            db.query(DailyQuizStatus)
+            .filter(
+                DailyQuizStatus.student_id == me.id,
+                DailyQuizStatus.quiz_date == date.today(),
+                DailyQuizStatus.subject == req.subject,
+            )
+            .first()
         )
-        .first()
-    )
-    if quiz is None:
-        quiz = DailyQuizStatus(
-            student_id=me.id, quiz_date=date.today(), subject=req.subject, status="progress"
-        )
-        db.add(quiz)
-    quiz.status = "done" if req.completed else ("progress" if quiz.status != "done" else "done")
+        if quiz is None:
+            quiz = DailyQuizStatus(
+                student_id=me.id, quiz_date=date.today(), subject=req.subject, status="progress"
+            )
+            db.add(quiz)
+        quiz.status = "done" if req.completed else ("progress" if quiz.status != "done" else "done")
     db.commit()
     return {"ok": True, "attempt_id": attempt.id, "coins_earned": coins_earned, "coins": me.coins}
 

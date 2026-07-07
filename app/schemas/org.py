@@ -25,6 +25,12 @@ class TeacherUpdate(BaseModel):
     role: str | None = Field(default=None, pattern="^(담임|교과|보조)$")
 
 
+class AppointGradeHead(BaseModel):
+    """교사를 학년부장으로 임명 (담당 학년 지정)."""
+
+    grade: int = Field(ge=1, le=12)
+
+
 class CaptchaSettingsUpdate(BaseModel):
     active_types: dict  # {image_select, word_select, drag, arithmetic}
     round_count: int = Field(default=2, ge=1, le=4)

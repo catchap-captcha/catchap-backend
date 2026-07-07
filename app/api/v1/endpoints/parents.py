@@ -15,7 +15,7 @@ from app.models import (
     ReportDownloadLog,
     StudentProfile,
 )
-from app.schemas.parent import ChildSettingsUpdate, LinkRequest, ParentProfileUpdate
+from app.schemas.parent import ChildSettingsUpdate, ParentProfileUpdate
 from app.services import aggregate, onboarding_service
 from app.services.aggregate import fb
 from pydantic import BaseModel as _BaseModel
@@ -214,60 +214,8 @@ def child_report(
     }
 
 
-@router.post("/parents/me/children/link-request")
-def link_request(
-    req: LinkRequest,
-    request: Request,
-    principal: Principal = Depends(require_parent),
-    db: Session = Depends(get_db),
-):
-    # B1 완화: 학생코드(CAT-####, 저엔트로피)를 대입 열거해 임의 아동을 연결·열람하는
-    # 대량 하베스팅을 차단. 정식 해소는 학교 발급 초대코드(link-invite) 흐름.
-    from app.services import auth_service as _as
-
-    ip = request.client.host if request.client else "unknown"
-    for ident in (f"linkreq:{principal.id}", f"linkreq-ip:{ip}"):
-        _as._check_locked(db, ident)
-    code = req.student_code.strip().upper()
-    student = db.query(StudentProfile).filter(StudentProfile.student_code == code).first()
-    if student is None:
-        for ident in (f"linkreq:{principal.id}", f"linkreq-ip:{ip}"):
-            _as._record_fail(db, ident)
-        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="학생 코드를 찾을 수 없습니다.")
-    for ident in (f"linkreq:{principal.id}", f"linkreq-ip:{ip}"):
-        _as._reset_fails(db, ident)
-    existing = (
-        db.query(ParentStudentLink)
-        .filter(
-            ParentStudentLink.parent_user_id == principal.id,
-            ParentStudentLink.student_id == student.id,
-            ParentStudentLink.status == "approved",
-        )
-        .first()
-    )
-    if existing:
-        raise HTTPException(status.HTTP_409_CONFLICT, detail="이미 연결된 자녀입니다.")
-    now = datetime.utcnow()
-    link = ParentStudentLink(
-        parent_user_id=principal.id,
-        student_id=student.id,
-        organization_id=student.organization_id,
-        status="approved",  # 1차 정책: 자동 승인
-        requested_at=now,
-        approved_at=now,
-    )
-    db.add(link)
-    audit(
-        db,
-        action="parent.child_link",
-        actor_user_id=principal.id,
-        organization_id=student.organization_id,
-        target_type="parent_student_link",
-        target_id=student.id,
-        after={"student_code": code, "status": "approved"},
-    )
-    db.commit()
-    return {"ok": True, "child": _child_row(db, link)}
+# NOTE: 학생코드(CAT-####) 자동승인 연결(구 link-request)은 제거됨 (B1 완전 해소).
+# 자녀 연결은 학교 발급 초대코드(link-invite)로만 — 아래 link_invite 참고.
 
 
 @router.delete("/parents/me/children/{child_id}/link")
@@ -411,4 +359,23 @@ def link_invite(
             _as._record_fail(db, ident)
         raise
     _as._reset_fails(db, ident)
+    # 학생 화면 연동 알림 팝업용 — 학교 발급 초대코드로 연결됐음을 아이에게 알림
+    from app.models import Notification
+
+    parent_name = principal.user.name if principal.user else "보호자"
+    db.add(
+        Notification(
+            student_id=link.student_id,
+            organization_id=link.organization_id,
+            type="parent_link",
+            category="연결",
+            title=f"{parent_name} 보호자님과 연결됐어요",
+            message=(
+                f"{parent_name} 보호자님이 학교에서 발급한 초대코드로 내 계정과 연결됐어요. "
+                "이제 보호자님이 나의 학습 현황을 함께 볼 수 있어요. "
+                "내가 모르는 연결이라면 선생님께 알려주세요."
+            ),
+        )
+    )
+    db.commit()
     return {"ok": True, "student_id": link.student_id}

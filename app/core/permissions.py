@@ -1,7 +1,8 @@
 """RBAC — API 단계 권한 검사.
 
-- 기관 관리자: 자기 기관 전체
-- 교사: 담당 학급 범위
+- 기관 관리자(org_admin, 교장 격): 자기 기관 전체
+- 학년부장(grade_head): 담당 학년 범위 (교사 권한 + 그 학년 반/교사 관리)
+- 교사(teacher): 담당 학급 범위
 - 학부모: 승인된 연결 자녀만
 - 학생: 본인 데이터만
 - 운영자(ops): 운영 API만
@@ -17,7 +18,7 @@ from sqlalchemy.orm import Session
 
 from app.core.security import decode_token
 from app.db.session import get_db
-from app.models import ParentStudentLink, StudentProfile, User
+from app.models import Membership, ParentStudentLink, StudentProfile, User
 
 bearer = HTTPBearer(auto_error=False)
 
@@ -79,7 +80,11 @@ def require_roles(*roles: str):
 
 require_student = require_roles("student")
 require_parent = require_roles("parent")
-require_teacher = require_roles("teacher", "org_admin")
+# 학년부장은 교사 권한도 포함(자기 학급 조회 등)
+require_teacher = require_roles("teacher", "grade_head", "org_admin")
+# 학년/반/교사 관리: 학년부장(자기 학년) + 교장 + 운영자
+require_grade_head = require_roles("grade_head", "org_admin", "ops")
+# 기관 전체 관리(교장 전용): 학년부장은 제외
 require_org_admin = require_roles("org_admin", "ops")
 require_ops = require_roles("ops")
 
@@ -90,6 +95,39 @@ def check_org_scope(principal: Principal, organization_id: str) -> None:
         return
     if principal.organization_id != organization_id:
         raise HTTPException(status.HTTP_403_FORBIDDEN, detail="기관 접근 권한이 없습니다.")
+
+
+def managed_grade(db: Session, principal: Principal) -> int | None:
+    """학년부장이 담당하는 학년(정수). 학년부장이 아니거나 미지정이면 None."""
+    if principal.role != "grade_head" or principal.organization_id is None:
+        return None
+    m = (
+        db.query(Membership)
+        .filter(
+            Membership.user_id == principal.id,
+            Membership.organization_id == principal.organization_id,
+            Membership.status != "disabled",
+        )
+        .first()
+    )
+    return m.managed_grade if m else None
+
+
+def check_grade_scope(db: Session, principal: Principal, organization_id: str, grade: int | None) -> None:
+    """학년 단위 접근 검사.
+
+    - ops/org_admin: 기관 범위만 맞으면 전체 학년 허용 (교장은 전 학년)
+    - grade_head: 자기 담당 학년(grade)일 때만 허용
+    - 그 외: 거부
+    """
+    check_org_scope(principal, organization_id)
+    if principal.role in ("ops", "org_admin"):
+        return
+    if principal.role == "grade_head":
+        mg = managed_grade(db, principal)
+        if mg is not None and grade is not None and mg == grade:
+            return
+    raise HTTPException(status.HTTP_403_FORBIDDEN, detail="담당 학년이 아닙니다.")
 
 
 def check_parent_child(db: Session, parent_user_id: str, student_id: str) -> ParentStudentLink:

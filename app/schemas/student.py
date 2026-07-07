@@ -25,6 +25,7 @@ class AttemptCreate(BaseModel):
     retry_count: int = Field(default=0, ge=0, le=100)
     estimated_reason: str | None = Field(default=None, max_length=200)
     completed: bool = False  # true면 오늘의퀴즈 해당 과목 완료 처리
+    replay: bool = False  # 전날 복습/다시풀기 — 오늘 완료 처리·코인 지급 없음
 
 
 class ConceptReadRequest(BaseModel):

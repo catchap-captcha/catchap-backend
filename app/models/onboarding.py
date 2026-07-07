@@ -21,6 +21,8 @@ class StudentJoinCode(Base, UUIDPk, Timestamps):
     login_id: Mapped[str] = mapped_column(String(60), unique=True, index=True)
     code_hash: Mapped[str] = mapped_column(String(64), index=True)
     class_label: Mapped[str | None] = mapped_column(String(60), nullable=True)
+    # 기관이 등록 시 입력한 실명 — 활성화되면 StudentProfile.real_name 으로 복사
+    real_name: Mapped[str | None] = mapped_column(String(100), nullable=True)
     expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     used_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     student_id: Mapped[str | None] = mapped_column(CHAR(36), nullable=True)  # 활성화 후 연결

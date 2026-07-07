@@ -16,4 +16,8 @@ class ClassRoom(Base, UUIDPk, Timestamps):
     teacher_id: Mapped[str | None] = mapped_column(
         CHAR(36), ForeignKey("users.id"), nullable=True, index=True
     )
+    # 보조/대체 담임 — 담임 결원 시 이 반을 대신 볼 수 있는 교사(선택)
+    assistant_teacher_id: Mapped[str | None] = mapped_column(
+        CHAR(36), ForeignKey("users.id"), nullable=True, index=True
+    )
     status: Mapped[str] = mapped_column(String(20), default="active")

@@ -5,7 +5,8 @@
 - 개인정보 없음: 디자인 속 가명/가짜 도메인만 사용.
 
 개발용 계정:
-  admin@catchap.dev   / Password123!  (org_admin, 햇살초 김서연)
+  admin@catchap.dev   / Password123!  (org_admin=교장, 햇살초 김서연)
+  gradehead@catchap.dev / Password123!  (grade_head=학년부장, 1학년 담당 한지원)
   teacher@catchap.dev / Password123!  (교사 이수진, 1-2반 담임, 코드 T-4821)
   parent@catchap.dev  / Password123!  (학부모 김서연, 자녀 하은·도윤 연결)
   ops@catchap.dev     / Password123!  (운영자)
@@ -357,6 +358,23 @@ def _seed(db: Session) -> None:  # noqa: PLR0915
         classes[c["name"]] = cls
     db.flush()
 
+    # ---------------- 학년부장 데모 (1학년 담당) ----------------
+    # 교장(admin) 아래 중간 관리자: 1학년 반/교사 배정·수정 권한만 (전 학년 아님)
+    grade_head = User(
+        email="gradehead@catchap.dev", password_hash=dev_hash, name="한지원",
+        role="grade_head", status="active", email_verified_at=now, organization_id=org.id,
+    )
+    db.add(grade_head)
+    db.flush()
+    db.add(
+        Membership(
+            user_id=grade_head.id, organization_id=org.id, role="grade_head",
+            status="active", teacher_code="T-1001", position="담임",
+            managed_grade=1, career_years=10, joined_at=now,
+        )
+    )
+    db.flush()
+
     # ---------------- 학생: 우리반 8명 ----------------
     students: dict[str, StudentProfile] = {}  # code -> profile
     week_start = today - timedelta(days=today.weekday())
@@ -369,6 +387,7 @@ def _seed(db: Session) -> None:  # noqa: PLR0915
             student_code=s["code"],
             password_hash=student_hash,
             nickname=s["name"][1:] if s["code"] in ("CAT-4823", "CAT-5119") else s["name"],
+            real_name=s["name"],  # 학교용 실명 (교사·기관 화면 전용)
             age=s["age"],
             grade_band="elementary_low",
             coins=340 if s["code"] == "CAT-4823" else 120,

@@ -122,3 +122,4 @@ class MeResponse(BaseModel):
     organization_name: str | None
     student: MeStudent | None = None
     must_change_password: bool = False  # 학생 비번 초기화 후 True → 강제 변경
+    managed_grade: int | None = None  # 학년부장(grade_head)의 담당 학년 (그 외 None)

@@ -63,16 +63,21 @@ def generate_join_codes(
     class_id: str | None = None,
     created_by: str | None = None,
     expires_days: int = 30,
+    names: list[str] | None = None,
 ) -> list[dict]:
-    """학생 슬롯 N개에 대한 1회용 가입 코드 발급. 코드 원문은 이 응답에서만 노출."""
+    """학생 슬롯 N개에 대한 1회용 가입 코드 발급. 코드 원문은 이 응답에서만 노출.
+
+    names: 기관이 입력한 학생 실명(슬롯 순서대로). 활성화 시 real_name 으로 복사됨.
+    """
     org = db.query(Organization).filter(Organization.id == organization_id).first()
     if org is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="기관을 찾을 수 없습니다.")
     count = max(1, min(50, count))
     out: list[dict] = []
-    for _ in range(count):
+    for i in range(count):
         login_id = _unique_login_id(db, org)
         raw = f"JOIN-{_seg(4)}-{_seg(4)}"
+        real_name = (names[i].strip()[:100] if names and i < len(names) and names[i] and names[i].strip() else None)
         db.add(
             StudentJoinCode(
                 organization_id=organization_id,
@@ -80,11 +85,12 @@ def generate_join_codes(
                 login_id=login_id,
                 code_hash=sha256_hash(raw),
                 class_label=class_label,
+                real_name=real_name,
                 expires_at=_now() + timedelta(days=expires_days),
                 created_by=created_by,
             )
         )
-        out.append({"login_id": login_id, "join_code": raw, "class_label": class_label})
+        out.append({"login_id": login_id, "join_code": raw, "class_label": class_label, "real_name": real_name})
     db.commit()
     return out
 
@@ -114,6 +120,7 @@ def activate_student(db: Session, code: str, nickname: str, password: str) -> tu
         student_code=_unique_student_code(db),
         password_hash=hash_password(password),
         nickname=nickname,  # 자유 중복 허용
+        real_name=row.real_name,  # 기관 입력 실명 (교사·기관 화면 전용)
         status="good",
     )
     db.add(profile)

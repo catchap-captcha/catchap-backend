@@ -32,12 +32,23 @@ router = APIRouter(prefix="/teacher", tags=["teacher"])
 
 
 def _my_class(db: Session, principal: Principal) -> ClassRoom:
+    # 담임(teacher_id) 우선, 없으면 보조 담임(assistant_teacher_id)으로 배정된 반 — 담임 결원 대체
     cls = (
         db.query(ClassRoom)
         .filter(ClassRoom.teacher_id == principal.id, ClassRoom.status == "active")
         .order_by(ClassRoom.name)
         .first()
     )
+    if cls is None:
+        cls = (
+            db.query(ClassRoom)
+            .filter(
+                ClassRoom.assistant_teacher_id == principal.id,
+                ClassRoom.status == "active",
+            )
+            .order_by(ClassRoom.name)
+            .first()
+        )
     if cls is None and principal.role == "org_admin":
         cls = (
             db.query(ClassRoom)
@@ -77,6 +88,9 @@ def _display_name(s: StudentProfile) -> str:
     실명 컬럼이 없어 디자인의 '성 포함 표기' 매핑을 쓰되, 닉네임이 바뀌면
     (매핑과 어긋나면) DB 닉네임을 우선한다 → 이름 변경이 화면에 반영된다.
     """
+    # 학교 입력 실명 최우선 — 학생이 닉네임을 바꿔도 교사는 실명으로 식별/검색 가능
+    if s.real_name:
+        return s.real_name
     full = D.CODE_FULL_NAME.get(s.student_code)
     if full and s.nickname and s.nickname in full:
         return full
@@ -240,9 +254,11 @@ def update_class_student(
     db: Session = Depends(get_db),
 ):
     cls, student = _get_class_student(db, principal, student_id)
-    before = {"nickname": student.nickname, "age": student.age, "status": student.status}
+    before = {"nickname": student.nickname, "real_name": student.real_name, "age": student.age, "status": student.status}
     if req.nickname is not None and req.nickname.strip():
         student.nickname = req.nickname.strip()[:10]
+    if req.real_name is not None and req.real_name.strip():
+        student.real_name = req.real_name.strip()[:100]
     if req.age is not None:
         student.age = req.age
     if req.status is not None:
@@ -325,6 +341,7 @@ def all_students(
             {
                 "id": s.id,
                 "name": s.nickname,
+                "code": s.student_code,  # 반배정용 학생코드 (전체 학생 조회 표시)
                 "acc": _acc(summaries.get(s.id)),
                 "sessions": meta.get("sessions", ""),
                 "weak": meta.get("weak", ""),

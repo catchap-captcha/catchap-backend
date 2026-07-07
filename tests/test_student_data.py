@@ -130,30 +130,97 @@ def test_daily_quiz_reflects_daily_quiz_status(client, db, seed_org):
     assert dash.json()["today"] == {"done": 1, "total": len(rows)}
 
 
-def test_class_ranking_uses_real_classmates(client, db, seed_org):
+def test_grade_ranking_daily_completion(client, db, seed_org):
+    """랭킹: 학년별 풀 + 일일 과제 완료 점수(과목당 10, 전과목 보너스 40) + 상위3 보너스 코인."""
     from app.core.security import hash_password
-    from app.models import StudentProfile
+    from app.models import ClassRoom, DailyQuizStatus, StudentProfile
 
+    # 같은 학년 다른 반 친구 (grade=1인 1-9반) — 학년 풀에 포함돼야 함
+    other_cls = ClassRoom(organization_id=seed_org["org"].id, name="1-9반", grade=1, status="active")
+    db.add(other_cls)
+    db.flush()
     mate = StudentProfile(
         organization_id=seed_org["org"].id,
-        class_id=seed_org["class"].id,
+        class_id=other_cls.id,
         student_login_id="stu02",
         student_code="CAT-2222",
         password_hash=hash_password("1234"),
         nickname="친구닉",
-        coins=999,
+        coins=999,  # 코인은 더 많지만 — 랭킹은 이제 코인이 아니라 일일 완료 점수
     )
     db.add(mate)
+    db.flush()
+    # 내(테스트학생)가 이틀 완료: 어제 2과목, 오늘 전과목(6과목)
+    me_id = seed_org["student"].id
+    yesterday = date.today() - __import__("datetime").timedelta(days=1)
+    for subj in ["국어", "수학"]:
+        db.add(DailyQuizStatus(student_id=me_id, quiz_date=yesterday, subject=subj, status="done"))
+    for subj in ["국어", "영어", "수학", "과학", "역사", "생활"]:
+        db.add(DailyQuizStatus(student_id=me_id, quiz_date=date.today(), subject=subj, status="done"))
     db.commit()
 
     token = _student_token(client, seed_org)
     res = client.get("/api/v1/students/me/class-ranking", headers=auth(token))
     assert res.status_code == 200
     body = res.json()
-    assert body["class_size"] == 2
+    assert body["class_size"] == 2  # 다른 반이어도 같은 학년이면 풀에 포함
+    assert body["grade"] == 1
     names = [r["name"] for r in body["board"]]
-    assert "친구닉" in names  # 같은 반 실데이터 (닉네임만 노출)
+    assert "친구닉" in names  # 닉네임만 노출
     me_row = next(r for r in body["board"] if r["me"])
-    assert me_row["name"] == "테스트학생"
-    assert me_row["rank"] == 2  # 코인 100 < 999
-    assert body["rank"] == 2
+    # 점수 = 어제 2과목×10 + 오늘 6과목×10 + 전과목 보너스 40 = 120
+    assert me_row["score"] == 120
+    assert me_row["rank"] == 1  # 코인 999인 친구보다 위 (완료 기반 점수)
+    # 1위 보너스 코인 30 지급 (하루 1회)
+    assert body["bonus_coins"] == 30
+    res2 = client.get("/api/v1/students/me/class-ranking", headers=auth(token))
+    assert res2.json()["bonus_coins"] == 0  # 같은 날 중복 지급 없음
+
+
+def test_replay_attempt_no_status_no_coins(client, db, seed_org):
+    """복습(replay=True): 학습 기록은 남지만 오늘의퀴즈 완료 처리·코인 지급이 없다."""
+    from app.models import DailyQuizStatus, StudentProfile
+
+    token = _student_token(client, seed_org)
+    before_coins = db.get(StudentProfile, seed_org["student"].id).coins
+
+    r = client.post(
+        "/api/v1/learning/attempts",
+        json={"subject": "국어", "result": "correct", "score": 100, "completed": False, "replay": True},
+        headers=auth(token),
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["coins_earned"] == 0  # 복습 보상 없음
+
+    db.expire_all()
+    assert db.get(StudentProfile, seed_org["student"].id).coins == before_coins
+    quiz = (
+        db.query(DailyQuizStatus)
+        .filter(
+            DailyQuizStatus.student_id == seed_org["student"].id,
+            DailyQuizStatus.quiz_date == date.today(),
+            DailyQuizStatus.subject == "국어",
+        )
+        .first()
+    )
+    assert quiz is None or quiz.status != "done"  # 복습으로 오늘 완료 처리되지 않음
+
+    # 일반 완료는 여전히 동작 (코인 + done)
+    r2 = client.post(
+        "/api/v1/learning/attempts",
+        json={"subject": "국어", "result": "correct", "score": 100, "completed": True},
+        headers=auth(token),
+    )
+    assert r2.status_code == 200
+    assert r2.json()["coins_earned"] > 0
+    db.expire_all()
+    quiz2 = (
+        db.query(DailyQuizStatus)
+        .filter(
+            DailyQuizStatus.student_id == seed_org["student"].id,
+            DailyQuizStatus.quiz_date == date.today(),
+            DailyQuizStatus.subject == "국어",
+        )
+        .first()
+    )
+    assert quiz2 is not None and quiz2.status == "done"

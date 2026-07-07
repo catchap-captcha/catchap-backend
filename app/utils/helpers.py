@@ -1,10 +1,22 @@
 """엔드포인트 공용 헬퍼 (감사 로그, 상태 라벨, 날짜 라벨)."""
 
+import re
 from datetime import date, datetime
 
 from sqlalchemy.orm import Session
 
 from app.models import AuditLog
+
+# 반 이름 맨 앞의 학년 숫자 ("1-2반", "1학년 2반", "3반" → 1/1/3)
+_GRADE_RE = re.compile(r"^\s*(\d+)")
+
+
+def parse_grade(name: str | None) -> int | None:
+    """반 이름에서 학년(정수)을 파싱. 못 찾으면 None."""
+    if not name:
+        return None
+    m = _GRADE_RE.match(name)
+    return int(m.group(1)) if m else None
 
 # StudentProfile.status <-> 화면 한글 라벨
 STATUS_LABEL = {"good": "좋음", "inactive": "학습 뜸함", "needs_help": "도움 필요"}

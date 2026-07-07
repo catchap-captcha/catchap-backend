@@ -26,6 +26,9 @@ class StudentProfile(Base, UUIDPk, Timestamps):
     student_code: Mapped[str] = mapped_column(String(20), unique=True, index=True)  # CAT-4823
     password_hash: Mapped[str] = mapped_column(String(255))
     nickname: Mapped[str] = mapped_column(String(50))  # 하은
+    # 학교(기관)가 입력하는 실명 — 교사·기관 화면 표시/검색 전용.
+    # 학생·학부모·랭킹 화면에는 절대 노출하지 않는다 (아이들 사이 가명 유지).
+    real_name: Mapped[str | None] = mapped_column(String(100), nullable=True)
     age: Mapped[int | None] = mapped_column(nullable=True)
     grade_band: Mapped[str] = mapped_column(String(30), default="kindergarten")
     avatar: Mapped[dict] = mapped_column(JSON, default=dict)  # {hat, background, sticker}

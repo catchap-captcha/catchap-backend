@@ -108,31 +108,40 @@ def test_parent_only_linked_children(client, db, seed_org):
         == 403
     )
 
-    # 학생 코드로 연결(자동 승인) 후 접근 가능
+    # 학교 발급 초대코드로만 연결 (학생코드 자동승인은 폐지됨 — B1)
+    from app.services import onboarding_service
+
+    invite = onboarding_service.issue_parent_invite(
+        db, student_id=sid, organization_id=seed_org["org"].id
+    )
     link = client.post(
-        "/api/v1/parents/me/children/link-request",
-        json={"student_code": "CAT-1111"},
+        "/api/v1/parents/me/children/link-invite",
+        json={"invite_code": invite},
         headers=auth(token),
     )
-    assert link.status_code == 200
+    assert link.status_code == 200, link.text
     assert (
         client.get(f"/api/v1/parents/me/children/{sid}/summary", headers=auth(token)).status_code
         == 200
     )
 
-    # 잘못된 코드 404, 중복 연결 409
+    # 잘못된 초대코드 404
     assert (
         client.post(
-            "/api/v1/parents/me/children/link-request",
-            json={"student_code": "CAT-0000"},
+            "/api/v1/parents/me/children/link-invite",
+            json={"invite_code": "LINK-ZZZZ-ZZZZ"},
             headers=auth(token),
         ).status_code
         == 404
     )
+    # 새 초대코드로 다시 연결 시도 → 이미 연결된 자녀 409
+    invite2 = onboarding_service.issue_parent_invite(
+        db, student_id=sid, organization_id=seed_org["org"].id
+    )
     assert (
         client.post(
-            "/api/v1/parents/me/children/link-request",
-            json={"student_code": "CAT-1111"},
+            "/api/v1/parents/me/children/link-invite",
+            json={"invite_code": invite2},
             headers=auth(token),
         ).status_code
         == 409

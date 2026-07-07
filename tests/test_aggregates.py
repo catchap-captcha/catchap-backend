@@ -207,13 +207,18 @@ def test_parent_summary_kpis_reflect_attempts(client, db, seed_org):
         json={"role": "parent", "email": "p1@test.dev", "password": "Password123!"},
     )
     token = res.json()["access_token"]
+    sid = seed_org["student"].id
+    from app.services import onboarding_service
+
+    invite = onboarding_service.issue_parent_invite(
+        db, student_id=sid, organization_id=seed_org["org"].id
+    )
     client.post(
-        "/api/v1/parents/me/children/link-request",
-        json={"student_code": "CAT-1111"},
+        "/api/v1/parents/me/children/link-invite",
+        json={"invite_code": invite},
         headers=auth(token),
     )
 
-    sid = seed_org["student"].id
     summary = client.get(f"/api/v1/parents/me/children/{sid}/summary", headers=auth(token)).json()
     kpis = {k["label"]: k for k in summary["kpis"]}
     assert kpis["이번 주 학습 횟수"]["value"] == "6회"

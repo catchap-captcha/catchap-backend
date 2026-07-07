@@ -18,10 +18,13 @@ class Membership(Base, UUIDPk, Timestamps):
     organization_id: Mapped[str] = mapped_column(
         CHAR(36), ForeignKey("organizations.id"), index=True
     )
-    role: Mapped[str] = mapped_column(String(20))  # teacher | org_admin
+    role: Mapped[str] = mapped_column(String(20))  # teacher | grade_head | org_admin
     status: Mapped[str] = mapped_column(String(20), default="active")  # active|pending|disabled
     teacher_code: Mapped[str | None] = mapped_column(String(20), unique=True, nullable=True)
     position: Mapped[str | None] = mapped_column(String(50), nullable=True)  # 담임 | 수학 전담 등
+    # 학년부장(grade_head)이 담당하는 학년(정수). teacher/org_admin은 NULL.
+    # role=grade_head 인데 managed_grade 가 있으면 그 학년 범위만 관리 가능.
+    managed_grade: Mapped[int | None] = mapped_column(nullable=True)
     career_years: Mapped[int | None] = mapped_column(nullable=True)
     invited_by: Mapped[str | None] = mapped_column(CHAR(36), nullable=True)
     joined_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)

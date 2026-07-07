@@ -1,12 +1,19 @@
 """기관 관리자 API — 자기 기관만 (require_org_admin + check_org_scope)."""
 
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from app.core.permissions import Principal, check_org_scope, require_org_admin
+from app.core.permissions import (
+    Principal,
+    check_grade_scope,
+    check_org_scope,
+    managed_grade,
+    require_grade_head,
+    require_org_admin,
+)
 from app.db.session import get_db
 from app.models import (
     ApiKey,
@@ -28,7 +35,13 @@ from app.models import (
 import secrets as _secrets
 
 from app.core.security import hash_password as _hash_password
-from app.schemas.org import CaptchaSettingsUpdate, OrgUpdate, TeacherCreate, TeacherUpdate
+from app.schemas.org import (
+    AppointGradeHead,
+    CaptchaSettingsUpdate,
+    OrgUpdate,
+    TeacherCreate,
+    TeacherUpdate,
+)
 from app.services import aggregate, onboarding_service
 from app.services import auth_service as _auth_service
 from app.services.aggregate import fb
@@ -39,10 +52,31 @@ class _RegisterStudentsReq(_BaseModel):
     count: int = 1
     class_label: str | None = None
     class_id: str | None = None
+    names: list[str] | None = None  # 학생 실명(슬롯 순서대로, 교사·기관 화면 전용)
 from app.services.stats import D  # DB(stat_blobs) 우선, design_data fallback
-from app.utils.helpers import audit
+from app.utils.helpers import audit, parse_grade
 
 router = APIRouter(prefix="/orgs", tags=["orgs"])
+
+
+def _scope_grade(db: Session, principal: Principal) -> int | None:
+    """이 요청의 학년 범위. None=전 학년(교장/운영), 정수=해당 학년만(학년부장).
+
+    학년부장인데 담당 학년이 지정 안 됐으면 403 (관리 대상 없음).
+    """
+    if principal.role == "grade_head":
+        mg = managed_grade(db, principal)
+        if mg is None:
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN, detail="담당 학년이 지정되지 않았습니다."
+            )
+        return mg
+    return None
+
+
+def _class_grade(cls: ClassRoom) -> int | None:
+    """학급의 학년 — 컬럼 우선, 없으면 이름에서 파싱."""
+    return cls.grade if cls.grade is not None else parse_grade(cls.name)
 
 
 def _org(db: Session, org_id: str) -> Organization:
@@ -128,6 +162,43 @@ def update_org(
     return _org_row(db, org)
 
 
+# ---------------------------------------------------------------- 기관 코드 재발급 (연 1회 갱신)
+@router.post("/{org_id}/rotate-code")
+def rotate_org_code(
+    org_id: str,
+    principal: Principal = Depends(require_org_admin),
+    db: Session = Depends(get_db),
+):
+    """기관 가입 코드 재발급 — 새 코드 발급 + 만료일 1년 연장. 교장(org_admin) 전용.
+
+    유출·학년 교체 시 기존 코드를 무효화하고 새 코드를 배부한다.
+    """
+    check_org_scope(principal, org_id)
+    org = _org(db, org_id)
+    from app.services.auth_service import _generate_org_code
+
+    old = org.code
+    org.code = _generate_org_code(db, org.name)  # 유일 보장(기존 코드와 다름)
+    org.code_expires_at = datetime.utcnow() + timedelta(days=365)
+    audit(
+        db,
+        action="org.code_rotate",
+        actor_user_id=principal.id,
+        organization_id=org_id,
+        target_type="organization",
+        target_id=org_id,
+        before={"code": old},
+        after={"code": org.code, "code_expires_at": org.code_expires_at.isoformat()},
+    )
+    db.commit()
+    return {
+        "ok": True,
+        "code": org.code,
+        "code_expires_at": org.code_expires_at.isoformat(),
+        "code_remain_days": 365,
+    }
+
+
 # ---------------------------------------------------------------- 대시보드/분석
 @router.get("/{org_id}/dashboard")
 def dashboard(
@@ -136,6 +207,7 @@ def dashboard(
     principal: Principal = Depends(require_org_admin),
     db: Session = Depends(get_db),
 ):
+    # 전교 집계라 교장 전용 (학년부장은 담당 학년 밖 데이터 열람 불가 — 학급·학생 화면으로 스코프)
     check_org_scope(principal, org_id)
     p = period if period in D.ORG_DASHBOARD else "week"
     # 실집계 덮어쓰기: kStudents/kApi/kPass/kFail/kAvg/dLow·dReview·dElevated/grades
@@ -161,7 +233,7 @@ def analytics(
     org_id: str,
     period: str = Query(default="week"),
     subject: str | None = Query(default=None),
-    principal: Principal = Depends(require_org_admin),
+    principal: Principal = Depends(require_org_admin),  # 전교 집계 — 교장 전용
     db: Session = Depends(get_db),
 ):
     check_org_scope(principal, org_id)
@@ -212,16 +284,19 @@ def analytics(
 @router.get("/{org_id}/classes")
 def classes(
     org_id: str,
-    principal: Principal = Depends(require_org_admin),
+    principal: Principal = Depends(require_grade_head),
     db: Session = Depends(get_db),
 ):
     check_org_scope(principal, org_id)
+    scope_grade = _scope_grade(db, principal)  # 학년부장이면 자기 학년만
     rows = (
         db.query(ClassRoom)
         .filter(ClassRoom.organization_id == org_id, ClassRoom.status == "active")
         .order_by(ClassRoom.name)
         .all()
     )
+    if scope_grade is not None:
+        rows = [c for c in rows if _class_grade(c) == scope_grade]
     design = {c["name"]: c for c in D.ORG_CLASSES}
     # 학급별 실제 학생 수 (student_profiles.class_id 기준)
     counts = dict(
@@ -238,6 +313,7 @@ def classes(
     for c in rows:
         d = design.get(c.name, {})
         teacher_user = db.get(User, c.teacher_id) if c.teacher_id else None
+        assistant_user = db.get(User, c.assistant_teacher_id) if c.assistant_teacher_id else None
         real_count = int(counts.get(c.id, 0))
         out.append(
             {
@@ -247,6 +323,8 @@ def classes(
                 "grade": c.grade,
                 # 담당 교사: 실테이블(classes.teacher_id → users) 우선
                 "teacher": teacher_user.name if teacher_user else d.get("teacher", "미배정"),
+                # 보조 담임(결원 대체) — 없으면 null
+                "assistant": assistant_user.name if assistant_user else None,
                 # 학생 수: 실테이블 우선 (배정 학생이 없으면 디자인 수치 유지)
                 "count": real_count or d.get("count", 0),
                 "acc": d.get("acc", 0),
@@ -256,6 +334,113 @@ def classes(
     return out
 
 
+class _CreateClassReq(_BaseModel):
+    name: str  # "1-2반" 등 — 맨 앞 숫자가 학년
+
+
+@router.post("/{org_id}/classes")
+def create_class(
+    org_id: str,
+    req: _CreateClassReq,
+    principal: Principal = Depends(require_grade_head),
+    db: Session = Depends(get_db),
+):
+    """새 학급 생성 (교장=전 학년, 학년부장=담당 학년만). 반 이름 맨 앞 숫자가 학년.
+
+    이미 있는 활성 반이면 409. 예전에 해체(archived)된 같은 이름 반은 되살린다.
+    """
+    check_org_scope(principal, org_id)
+    scope_grade = _scope_grade(db, principal)
+    name = (req.name or "").strip()
+    if not name:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="반 이름이 필요합니다.")
+    grade = parse_grade(name)
+    # 학년부장: 담당 학년 반만 (파싱 불가/불일치 fail-closed)
+    if scope_grade is not None and grade != scope_grade:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            detail=f"{scope_grade}학년 담당이라 담당 학년 반(예: {scope_grade}-1반)만 만들 수 있어요.",
+        )
+    existing = (
+        db.query(ClassRoom)
+        .filter(ClassRoom.organization_id == org_id, ClassRoom.name == name)
+        .first()
+    )
+    if existing is not None:
+        if existing.status == "active":
+            raise HTTPException(status.HTTP_409_CONFLICT, detail="이미 있는 반 이름이에요.")
+        existing.status = "active"  # 해체됐던 반 재사용
+        existing.grade = grade
+        # 해체 전 담임/보조 연결은 되살리지 않는다 (예전 교사가 부활한 반에 다시 붙는 것 방지)
+        existing.teacher_id = None
+        existing.assistant_teacher_id = None
+        cls = existing
+    else:
+        cls = ClassRoom(organization_id=org_id, name=name, grade=grade, status="active")
+        db.add(cls)
+        db.flush()
+    audit(
+        db,
+        action="org.class_create",
+        actor_user_id=principal.id,
+        organization_id=org_id,
+        target_type="class",
+        target_id=cls.id,
+        after={"name": name, "grade": grade},
+    )
+    db.commit()
+    return {"ok": True, "class": {"id": cls.id, "name": cls.name, "grade": cls.grade}}
+
+
+@router.delete("/{org_id}/classes/{class_id}")
+def dissolve_class(
+    org_id: str,
+    class_id: str,
+    principal: Principal = Depends(require_grade_head),
+    db: Session = Depends(get_db),
+):
+    """학급 해체 (학년말). 교장=전 학년, 학년부장=담당 학년만.
+
+    배정된 학생이 있으면 409 — 먼저 담임이 학생을 다른 반으로 옮기거나 빼야 한다.
+    소프트 해체(status=archived) + 담임 연결 해제. 같은 이름으로 다시 만들면 되살아난다.
+    """
+    check_org_scope(principal, org_id)
+    cls = db.get(ClassRoom, class_id)
+    if cls is None or cls.organization_id != org_id or cls.status != "active":
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="학급을 찾을 수 없습니다.")
+    check_grade_scope(db, principal, org_id, _class_grade(cls))  # 학년 범위(파싱불가면 거부)
+    count = (
+        db.query(StudentProfile)
+        .filter(StudentProfile.class_id == cls.id, StudentProfile.status != "disabled")
+        .count()
+    )
+    if count > 0:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail={
+                "message": f"{cls.name}에 학생 {count}명이 남아 있어 해체할 수 없어요. 먼저 학생을 다른 반으로 옮겨 주세요.",
+                "count": count,
+                "cls": cls.name,
+            },
+        )
+    before = {"name": cls.name, "grade": cls.grade, "teacher_id": cls.teacher_id, "status": "active"}
+    cls.status = "archived"
+    cls.teacher_id = None  # 학년말 담임·보조 연결 모두 해제 (다음 학년 재배정 준비)
+    cls.assistant_teacher_id = None
+    audit(
+        db,
+        action="org.class_dissolve",
+        actor_user_id=principal.id,
+        organization_id=org_id,
+        target_type="class",
+        target_id=cls.id,
+        before=before,
+        after={"status": "archived"},
+    )
+    db.commit()
+    return {"ok": True}
+
+
 def _acc_pct(summary) -> int:
     if summary is None or not summary.total_count:
         return 0
@@ -263,7 +448,9 @@ def _acc_pct(summary) -> int:
 
 
 def _roster_display_name(s: StudentProfile) -> str:
-    """닉네임이 디자인 매핑과 일치할 때만 '성 포함 표기', 아니면 DB 닉네임."""
+    """기관 화면 표시 이름: 실명 최우선(닉네임 변경 무관), 없으면 디자인 매핑/닉네임."""
+    if s.real_name:
+        return s.real_name
     full = D.CODE_FULL_NAME.get(s.student_code)
     if full and s.nickname and s.nickname in full:
         return full
@@ -274,10 +461,11 @@ def _roster_display_name(s: StudentProfile) -> str:
 def roster(
     org_id: str,
     cls: str | None = Query(default=None),
-    principal: Principal = Depends(require_org_admin),
+    principal: Principal = Depends(require_grade_head),
     db: Session = Depends(get_db),
 ):
     check_org_scope(principal, org_id)
+    scope_grade = _scope_grade(db, principal)  # 학년부장이면 자기 학년 학생만
     # 학급 배정된 기관 학생 전체 — 실테이블(student_profiles/classes) 기준
     students = (
         db.query(StudentProfile)
@@ -289,10 +477,9 @@ def roster(
         .order_by(StudentProfile.student_code)
         .all()
     )
-    class_names = {
-        c.id: c.name
-        for c in db.query(ClassRoom).filter(ClassRoom.organization_id == org_id).all()
-    }
+    all_classes = db.query(ClassRoom).filter(ClassRoom.organization_id == org_id).all()
+    class_names = {c.id: c.name for c in all_classes}
+    grade_by_class = {c.id: _class_grade(c) for c in all_classes}
     summaries = {
         r.student_id: r
         for r in db.query(LearningSummary)
@@ -315,6 +502,9 @@ def roster(
     for s in students:
         meta = D.ORG_ROSTER_META.get(s.student_code, {})
         cls_name = class_names.get(s.class_id) or meta.get("cls")
+        # 학년부장: 담당 학년 학생만
+        if scope_grade is not None and grade_by_class.get(s.class_id) != scope_grade:
+            continue
         if cls and cls_name != cls:
             continue
         acc = _acc_pct(summaries.get(s.id)) or meta.get("acc", 0)
@@ -330,27 +520,38 @@ def roster(
                 "risk": meta.get("risk") or ("주의" if acc < 75 else "낮음"),
             }
         )
-    total = (
-        db.query(StudentProfile)
-        .filter(StudentProfile.organization_id == org_id, StudentProfile.status != "disabled")
-        .count()
-    )
-    org = _org(db, org_id)
-    # 헤더 요약용 실카운트 (classes/memberships 실테이블)
-    class_count = (
-        db.query(ClassRoom)
-        .filter(ClassRoom.organization_id == org_id, ClassRoom.status == "active")
-        .count()
-    )
-    teacher_count = (
-        db.query(Membership)
-        .filter(
-            Membership.organization_id == org_id,
-            Membership.role == "teacher",
-            Membership.status != "disabled",
+    if scope_grade is None:
+        total = (
+            db.query(StudentProfile)
+            .filter(StudentProfile.organization_id == org_id, StudentProfile.status != "disabled")
+            .count()
         )
-        .count()
-    )
+    else:
+        # 학년부장: 담당 학년 학급에 배정된 학생 수만 (전교 수치 노출 안 함)
+        grade_ids = {c.id for c in all_classes if _class_grade(c) == scope_grade}
+        total = sum(1 for s in students if s.class_id in grade_ids)
+    org = _org(db, org_id)
+    # 헤더 요약용 실카운트 (classes/memberships 실테이블) — 학년부장은 담당 학년만
+    grade_class_ids = {c.id for c in all_classes if c.status == "active"
+                       and (scope_grade is None or _class_grade(c) == scope_grade)}
+    class_count = len(grade_class_ids)
+    if scope_grade is None:
+        teacher_count = (
+            db.query(Membership)
+            .filter(
+                Membership.organization_id == org_id,
+                Membership.role.in_(("teacher", "grade_head")),
+                Membership.status != "disabled",
+            )
+            .count()
+        )
+    else:
+        # 담당 학년 학급의 담임 교사 수 (그 학년 반을 맡은 교사)
+        teacher_ids = {
+            c.teacher_id for c in all_classes
+            if c.teacher_id and _class_grade(c) == scope_grade
+        }
+        teacher_count = len(teacher_ids)
     return {
         "total": total,
         "shown": len(out),
@@ -362,11 +563,69 @@ def roster(
 
 
 # ---------------------------------------------------------------- 선생님 관리
-def _teacher_row(db: Session, m: Membership) -> dict:
-    user = db.get(User, m.user_id) if m.user_id else None
+def _link_homeroom(
+    db: Session, org_id: str, class_name: str, user_id: str, scope_grade: int | None
+) -> None:
+    """'담임' 교사를 해당 반의 담당 교사(classes.teacher_id)로 연결.
+
+    반이 없으면 학년 정보와 함께 생성. 역할(담임) → 실제 학급 소유 권한 반영.
+    """
+    if not class_name:
+        return
     cls = (
         db.query(ClassRoom)
-        .filter(ClassRoom.teacher_id == m.user_id, ClassRoom.status == "active")
+        .filter(ClassRoom.organization_id == org_id, ClassRoom.name == class_name)
+        .first()
+    )
+    grade = scope_grade if scope_grade is not None else parse_grade(class_name)
+    if cls is None:
+        cls = ClassRoom(
+            organization_id=org_id, name=class_name, grade=grade, status="active"
+        )
+        db.add(cls)
+        db.flush()
+    elif scope_grade is not None and _class_grade(cls) != scope_grade:
+        # 이름은 담당 학년으로 보여도 실제 학년(컬럼)이 다르면 거부 (이름/학년 불일치 방어)
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail="담당 학년 반이 아닙니다.")
+    cls.teacher_id = user_id
+
+
+def _link_assistant(
+    db: Session, org_id: str, class_name: str, user_id: str, scope_grade: int | None
+) -> None:
+    """'보조'/'대체' 교사를 해당 반의 보조 담임(classes.assistant_teacher_id)으로 연결.
+
+    담임 결원 시 이 교사가 반을 대신 볼 수 있다. 반이 없으면 생성.
+    """
+    if not class_name:
+        return
+    cls = (
+        db.query(ClassRoom)
+        .filter(ClassRoom.organization_id == org_id, ClassRoom.name == class_name)
+        .first()
+    )
+    grade = scope_grade if scope_grade is not None else parse_grade(class_name)
+    if cls is None:
+        cls = ClassRoom(
+            organization_id=org_id, name=class_name, grade=grade, status="active"
+        )
+        db.add(cls)
+        db.flush()
+    elif scope_grade is not None and _class_grade(cls) != scope_grade:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail="담당 학년 반이 아닙니다.")
+    cls.assistant_teacher_id = user_id
+
+
+def _teacher_row(db: Session, m: Membership) -> dict:
+    user = db.get(User, m.user_id) if m.user_id else None
+    # 담당 학급: 담임(teacher_id) 또는 보조(assistant_teacher_id) 어느 쪽으로든 연결된 반
+    cls = (
+        db.query(ClassRoom)
+        .filter(
+            ClassRoom.status == "active",
+            (ClassRoom.teacher_id == m.user_id)
+            | (ClassRoom.assistant_teacher_id == m.user_id),
+        )
         .order_by(ClassRoom.name)
         .first()
         if m.user_id
@@ -383,37 +642,59 @@ def _teacher_row(db: Session, m: Membership) -> dict:
         "code": m.teacher_code,
         "years": m.career_years or 0,
         "status": "active" if m.status == "active" else "pending",
+        # 학년부장 여부 + 담당 학년 (교장 화면 배지/관리용)
+        "is_grade_head": m.role == "grade_head",
+        "managed_grade": m.managed_grade,
+        # 담당 학급의 학년 (그 교사가 속한 학년 — 학년부장 범위 판단용)
+        "grade": _class_grade(cls) if cls else None,
     }
 
 
 @router.get("/{org_id}/teachers")
 def teachers(
     org_id: str,
-    principal: Principal = Depends(require_org_admin),
+    principal: Principal = Depends(require_grade_head),
     db: Session = Depends(get_db),
 ):
     check_org_scope(principal, org_id)
+    scope_grade = _scope_grade(db, principal)  # 학년부장이면 자기 학년 교사만
     rows = (
         db.query(Membership)
         .filter(
             Membership.organization_id == org_id,
-            Membership.role == "teacher",
+            Membership.role.in_(("teacher", "grade_head")),
             Membership.status != "disabled",
         )
         .order_by(Membership.created_at)
         .all()
     )
-    return [_teacher_row(db, m) for m in rows]
+    out = [_teacher_row(db, m) for m in rows]
+    if scope_grade is not None:
+        # 담당 학년 학급을 맡은 교사 + 담당 학년으로 지정된 학년부장만
+        out = [
+            t for t in out
+            if t["grade"] == scope_grade or t["managed_grade"] == scope_grade
+        ]
+    return out
 
 
 @router.post("/{org_id}/teachers")
 def add_teacher(
     org_id: str,
     req: TeacherCreate,
-    principal: Principal = Depends(require_org_admin),
+    principal: Principal = Depends(require_grade_head),
     db: Session = Depends(get_db),
 ):
     check_org_scope(principal, org_id)
+    scope_grade = _scope_grade(db, principal)
+    # 학년부장은 자기 학년 반의 교사만 추가 가능 (파싱 불가한 반 이름도 fail-closed로 거부)
+    if scope_grade is not None and req.class_name:
+        cg = parse_grade(req.class_name)
+        if cg != scope_grade:
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                detail=f"{scope_grade}학년 담당이라 담당 학년 반(예: {scope_grade}-1반)의 교사만 추가할 수 있어요.",
+            )
     code = req.teacher_code.strip().upper()
     if db.query(Membership).filter(Membership.teacher_code == code).first():
         raise HTTPException(status.HTTP_409_CONFLICT, detail="이미 사용 중인 교사 코드입니다.")
@@ -446,6 +727,12 @@ def add_teacher(
             db.add(placeholder)
             db.flush()
             membership.user_id = placeholder.id
+    # 역할→권한 실제 반영: 담임은 담당 교사, 보조는 보조 담임(결원 대체)으로 반에 연결
+    if req.class_name and membership.user_id:
+        if req.role == "담임":
+            _link_homeroom(db, org_id, req.class_name.strip(), membership.user_id, scope_grade)
+        elif req.role == "보조":
+            _link_assistant(db, org_id, req.class_name.strip(), membership.user_id, scope_grade)
     audit(
         db,
         action="org.teacher_add",
@@ -464,16 +751,36 @@ def update_teacher(
     org_id: str,
     teacher_id: str,
     req: TeacherUpdate,
-    principal: Principal = Depends(require_org_admin),
+    principal: Principal = Depends(require_grade_head),
     db: Session = Depends(get_db),
 ):
     check_org_scope(principal, org_id)
+    scope_grade = _scope_grade(db, principal)
     m = db.get(Membership, teacher_id)
-    if m is None or m.organization_id != org_id or m.role != "teacher":
+    if m is None or m.organization_id != org_id or m.role not in ("teacher", "grade_head"):
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="선생님을 찾을 수 없습니다.")
     before = _teacher_row(db, m)
+    # 학년부장은 자기 학년 교사만 수정. 학급 미배정(grade=None) 교사는 학년을 알 수 없으므로
+    # 학년부장에게는 fail-closed(거부) — 미배정 교사 관리는 교장 몫. (학년부장 본인은 managed_grade로 판정)
+    if scope_grade is not None:
+        target_grade = before["grade"] if before["grade"] is not None else before["managed_grade"]
+        if target_grade != scope_grade:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, detail="담당 학년 교사가 아닙니다.")
+    if req.class_name and scope_grade is not None:
+        cg = parse_grade(req.class_name)
+        if cg != scope_grade:  # 파싱 불가한 반 이름도 거부(fail-closed)
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN, detail="담당 학년 반으로만 지정할 수 있습니다."
+            )
     if req.role is not None:
         m.position = req.role
+    # 담임/보조 + 반 지정 시 담당 학급 연결 (역할→권한 실제 반영)
+    effective_role = req.role or m.position
+    if req.class_name and m.user_id:
+        if effective_role == "담임":
+            _link_homeroom(db, org_id, req.class_name.strip(), m.user_id, scope_grade)
+        elif effective_role == "보조":
+            _link_assistant(db, org_id, req.class_name.strip(), m.user_id, scope_grade)
     user = db.get(User, m.user_id) if m.user_id else None
     if user:
         if req.name is not None and req.name.strip():
@@ -509,13 +816,20 @@ def update_teacher(
 def delete_teacher(
     org_id: str,
     teacher_id: str,
-    principal: Principal = Depends(require_org_admin),
+    principal: Principal = Depends(require_grade_head),
     db: Session = Depends(get_db),
 ):
     check_org_scope(principal, org_id)
+    scope_grade = _scope_grade(db, principal)
     m = db.get(Membership, teacher_id)
-    if m is None or m.organization_id != org_id or m.role != "teacher":
+    if m is None or m.organization_id != org_id or m.role not in ("teacher", "grade_head"):
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="선생님을 찾을 수 없습니다.")
+    # 학년부장은 자기 학년 교사만 삭제 (미배정 grade=None 교사는 fail-closed로 거부)
+    if scope_grade is not None:
+        row = _teacher_row(db, m)
+        target_grade = row["grade"] if row["grade"] is not None else row["managed_grade"]
+        if target_grade != scope_grade:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, detail="담당 학년 교사가 아닙니다.")
     # 삭제 규칙: 담임 + 담당 학급 학생 > 0 이면 409
     if (m.position or "담임") == "담임" and m.user_id:
         cls = (
@@ -542,6 +856,30 @@ def delete_teacher(
                 )
     row = _teacher_row(db, m)
     m.status = "disabled"
+    m.managed_grade = None
+    # 담임/보조로 연결돼 있던 반의 링크 정리 (사라진 교사가 반에 남지 않도록)
+    if m.user_id:
+        for c in db.query(ClassRoom).filter(ClassRoom.teacher_id == m.user_id).all():
+            c.teacher_id = None
+        for c in db.query(ClassRoom).filter(ClassRoom.assistant_teacher_id == m.user_id).all():
+            c.assistant_teacher_id = None
+        # 삭제된 교사가 계속 로그인·전교생 조회하지 못하도록 계정 비활성 + 토큰 폐기(디프로비저닝).
+        # 단, 다른 기관에 아직 유효한 멤버십이 있으면 계정은 살려둔다.
+        u = db.get(User, m.user_id)
+        other = (
+            db.query(Membership)
+            .filter(
+                Membership.user_id == m.user_id,
+                Membership.id != m.id,
+                Membership.status != "disabled",
+            )
+            .first()
+        )
+        if u and other is None:
+            u.status = "disabled"
+            if u.role == "grade_head":
+                u.role = "teacher"
+        _auth_service.logout(db, m.user_id)  # refresh 토큰 폐기 → 모든 기기 로그아웃
     audit(
         db,
         action="org.teacher_delete",
@@ -553,6 +891,119 @@ def delete_teacher(
     )
     db.commit()
     return {"ok": True}
+
+
+# ---------------------------------------------------------------- 학년부장 임명/해임 (교장 전용)
+@router.get("/{org_id}/grade-heads")
+def grade_heads(
+    org_id: str,
+    principal: Principal = Depends(require_org_admin),
+    db: Session = Depends(get_db),
+):
+    """현재 학년부장 목록 (교장 화면). 학년별 담당자 확인용."""
+    check_org_scope(principal, org_id)
+    rows = (
+        db.query(Membership)
+        .filter(
+            Membership.organization_id == org_id,
+            Membership.role == "grade_head",
+            Membership.status != "disabled",
+        )
+        .order_by(Membership.managed_grade)
+        .all()
+    )
+    return [_teacher_row(db, m) for m in rows]
+
+
+@router.post("/{org_id}/teachers/{teacher_id}/grade-head")
+def appoint_grade_head(
+    org_id: str,
+    teacher_id: str,
+    req: AppointGradeHead,
+    principal: Principal = Depends(require_org_admin),
+    db: Session = Depends(get_db),
+):
+    """교사를 학년부장으로 임명 — 담당 학년 지정. 교장(org_admin) 전용.
+
+    User.role/Membership.role 를 grade_head 로 승격 + managed_grade 설정.
+    한 학년에 학년부장은 1명 — 기존 담당자가 있으면 교체(기존자는 교사로 강등).
+    """
+    check_org_scope(principal, org_id)
+    m = db.get(Membership, teacher_id)
+    if m is None or m.organization_id != org_id or m.role not in ("teacher", "grade_head"):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="선생님을 찾을 수 없습니다.")
+    if m.user_id is None:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, detail="아직 가입하지 않은 교사는 임명할 수 없습니다."
+        )
+    # 같은 학년 기존 학년부장 강등 (1학년 1명 규칙)
+    prev = (
+        db.query(Membership)
+        .filter(
+            Membership.organization_id == org_id,
+            Membership.role == "grade_head",
+            Membership.managed_grade == req.grade,
+            Membership.id != m.id,
+            Membership.status != "disabled",
+        )
+        .all()
+    )
+    for p in prev:
+        p.role = "teacher"
+        p.managed_grade = None
+        pu = db.get(User, p.user_id) if p.user_id else None
+        if pu and pu.role == "grade_head":
+            pu.role = "teacher"
+    before = {"role": m.role, "managed_grade": m.managed_grade}
+    m.role = "grade_head"
+    m.managed_grade = req.grade
+    user = db.get(User, m.user_id)
+    if user:
+        user.role = "grade_head"  # 로그인 시 학년부장 콘솔로 진입
+    audit(
+        db,
+        action="org.grade_head_appoint",
+        actor_user_id=principal.id,
+        organization_id=org_id,
+        target_type="membership",
+        target_id=m.id,
+        before=before,
+        after={"role": "grade_head", "managed_grade": req.grade},
+    )
+    db.commit()
+    return {"ok": True, "teacher": _teacher_row(db, m)}
+
+
+@router.delete("/{org_id}/teachers/{teacher_id}/grade-head")
+def dismiss_grade_head(
+    org_id: str,
+    teacher_id: str,
+    principal: Principal = Depends(require_org_admin),
+    db: Session = Depends(get_db),
+):
+    """학년부장 해임 → 일반 교사로 강등. 교장 전용."""
+    check_org_scope(principal, org_id)
+    m = db.get(Membership, teacher_id)
+    if m is None or m.organization_id != org_id or m.role != "grade_head":
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="학년부장을 찾을 수 없습니다.")
+    before = {"role": m.role, "managed_grade": m.managed_grade}
+    m.role = "teacher"
+    m.managed_grade = None
+    user = db.get(User, m.user_id) if m.user_id else None
+    if user and user.role == "grade_head":
+        user.role = "teacher"
+    audit(
+        db,
+        action="org.grade_head_dismiss",
+        actor_user_id=principal.id,
+        organization_id=org_id,
+        target_type="membership",
+        target_id=m.id,
+        before=before,
+        after={"role": "teacher", "managed_grade": None},
+    )
+    db.commit()
+    return {"ok": True, "teacher": _teacher_row(db, m)}
 
 
 # ---------------------------------------------------------------- 캡차 설정
@@ -847,7 +1298,7 @@ def _site_status_payload(db: Session, org_id: str) -> dict:
 @router.get("/{org_id}/site-status")
 def site_status(
     org_id: str,
-    principal: Principal = Depends(require_org_admin),
+    principal: Principal = Depends(require_grade_head),  # 읽기 전용 위젯 — 학년부장도 조회
     db: Session = Depends(get_db),
 ):
     check_org_scope(principal, org_id)
@@ -858,7 +1309,7 @@ def site_status(
 @router.get("/{org_id}/sidebar")
 def sidebar(
     org_id: str,
-    principal: Principal = Depends(require_org_admin),
+    principal: Principal = Depends(require_grade_head),  # 공용 레이아웃 위젯 — 학년부장도 조회
     db: Session = Depends(get_db),
 ):
     """OrgLayout 사이드바 위젯 — pro(API 사용률)/semester(담임 배정)/insight 실집계, 없으면 D."""
@@ -958,23 +1409,53 @@ def security_stats(
 def register_students(
     org_id: str,
     req: _RegisterStudentsReq,
-    principal: Principal = Depends(require_org_admin),
+    principal: Principal = Depends(require_grade_head),
     db: Session = Depends(get_db),
 ):
-    """학생 슬롯 N개 생성 + 1회용 가입 코드 발급. 코드 원문은 이 응답에서만 노출."""
+    """학생 슬롯 N개 생성 + 1회용 가입 코드 발급. 코드 원문은 이 응답에서만 노출.
+
+    학년부장은 자기 담당 학년의 반으로만 학생을 등록할 수 있다.
+    """
     check_org_scope(principal, org_id)
+    scope_grade = _scope_grade(db, principal)
+    resolved_class_id = req.class_id
     # 타 기관 소속 class_id를 주입해 학생을 남의 학급에 귀속시키는 것을 차단
     if req.class_id:
         cls = db.get(ClassRoom, req.class_id)
         if cls is None or cls.organization_id != org_id:
             raise HTTPException(status.HTTP_404_NOT_FOUND, detail="학급을 찾을 수 없습니다.")
+        check_grade_scope(db, principal, org_id, _class_grade(cls))
+    elif req.class_label and req.class_label.strip():
+        # 반 이름만 준 경우: 실제 학급으로 연결(find-or-create)해야 활성화 시 학생이 그 반에 배정됨.
+        # (예전엔 class_label만 코드에 저장하고 class_id=None → 학생이 반 없이 활성화되는 누락이 있었음)
+        label = req.class_label.strip()
+        target_grade = parse_grade(label)
+        if scope_grade is not None and target_grade != scope_grade:
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                detail=f"{scope_grade}학년 담당이라 담당 학년 반(예: {scope_grade}-1반)을 지정해야 학생을 등록할 수 있어요.",
+            )
+        cls = (
+            db.query(ClassRoom)
+            .filter(ClassRoom.organization_id == org_id, ClassRoom.name == label)
+            .first()
+        )
+        if cls is None:
+            new_grade = scope_grade if scope_grade is not None else target_grade
+            cls = ClassRoom(organization_id=org_id, name=label, grade=new_grade, status="active")
+            db.add(cls)
+            db.flush()
+        else:
+            check_grade_scope(db, principal, org_id, _class_grade(cls))  # 기존 반이면 학년 범위 재확인
+        resolved_class_id = cls.id
     codes = onboarding_service.generate_join_codes(
         db,
         organization_id=org_id,
         count=req.count,
         class_label=req.class_label,
-        class_id=req.class_id,
+        class_id=resolved_class_id,
         created_by=principal.id,
+        names=req.names,
     )
     return {"ok": True, "issued": codes}
 
@@ -1096,22 +1577,39 @@ def assign_student_class(
     org_id: str,
     student_id: str,
     req: _AssignClassReq,
-    principal: Principal = Depends(require_org_admin),
+    principal: Principal = Depends(require_grade_head),
     db: Session = Depends(get_db),
 ):
-    """학생을 특정 반으로 배정/이동. 반이 없으면 만들어 연결. (반배정)"""
+    """학생을 특정 반으로 배정/이동. 반이 없으면 만들어 연결. (반배정)
+
+    학년부장은 자기 담당 학년의 반으로만 배정/생성할 수 있다.
+    """
     check_org_scope(principal, org_id)
+    scope_grade = _scope_grade(db, principal)  # None=교장(전 학년), 정수=학년부장
     st = _student_in_org(db, org_id, student_id)
     label = (req.class_label or "").strip()
     if not label:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="반 이름이 필요합니다.")
+    target_grade = parse_grade(label)
     cls = (
         db.query(ClassRoom)
         .filter(ClassRoom.organization_id == org_id, ClassRoom.name == label)
         .first()
     )
-    if cls is None:
-        cls = ClassRoom(organization_id=org_id, name=label, status="active")
+    if cls is not None:
+        # 기존 반: 그 반의 실제 학년으로 범위 검사 (grade=None이면 check_grade_scope가 거부 — fail-closed)
+        check_grade_scope(db, principal, org_id, _class_grade(cls))
+        if cls.status != "active":
+            cls.status = "active"  # 해체됐던 반이면 되살려서 배정 (아카이브 반에 학생이 묻히지 않도록)
+    else:
+        # 새 반 생성 — 학년부장은 반 이름이 담당 학년으로 파싱돼야 함(fail-closed).
+        if scope_grade is not None and target_grade != scope_grade:
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                detail=f"{scope_grade}학년 담당이라 담당 학년 반(예: {scope_grade}-1반)만 만들 수 있어요.",
+            )
+        new_grade = target_grade if target_grade is not None else scope_grade
+        cls = ClassRoom(organization_id=org_id, name=label, grade=new_grade, status="active")
         db.add(cls)
         db.flush()
     before = {"class_id": st.class_id}
