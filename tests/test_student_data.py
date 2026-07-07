@@ -271,3 +271,47 @@ def test_game_session_server_graded(client, db, seed_org):
     # 다른 과목은 아직 미지원 → available=False (프론트 데모 유지)
     other = client.get("/api/v1/students/me/game-session?subject=수학", headers=auth(token)).json()
     assert other["available"] is False
+
+
+def test_curriculum_lock_and_replay(client, db, seed_org):
+    """일일 교육과정: 오늘 과제 플레이 · 지난날 복습 가능 · 다음날 잠금(주제만)."""
+    token = _student_token(client, seed_org)
+    res = client.get("/api/v1/students/me/curriculum?subject=생활&back=5&forward=3", headers=auth(token))
+    assert res.status_code == 200
+    body = res.json()
+    assert body["available"] is True
+    today = body["today_day"]
+
+    days = {d["status"]: d for d in body["days"]}
+    assert "today" in days and "past" in days and "future" in days
+    # 오늘은 플레이 가능한 주제(교통안전, single 20)
+    assert days["today"]["topic"] == "교통안전"
+    assert days["today"]["playable_count"] > 0
+    # 미래는 잠금 표시
+    assert days["future"]["locked"] is True
+
+    # 오늘 일차 상세: 5단계 문항 + playable 존재, 잠금 아님
+    d_today = client.get(f"/api/v1/students/me/curriculum/day?subject=생활&day={today}", headers=auth(token)).json()
+    assert d_today["locked"] is False
+    assert len(d_today["stages"]) == 5
+    assert d_today["playable_count"] > 0
+    # 정답 미노출
+    for s in d_today["stages"]:
+        for q in s["questions"]:
+            assert "answer" not in q
+
+    # 다음날 상세: 잠금 + 주제·단계계획만(문항 없음)
+    d_future = client.get(f"/api/v1/students/me/curriculum/day?subject=생활&day={today + 1}", headers=auth(token)).json()
+    assert d_future["locked"] is True
+    assert "topic" in d_future and "stages" not in d_future
+    assert "stage_plan" in d_future
+
+    # game-session: 미래 일차는 available=false(잠금), 오늘은 문항 발급
+    fut = client.get(f"/api/v1/students/me/game-session?subject=생활&day={today + 1}", headers=auth(token)).json()
+    assert fut["available"] is False and fut.get("locked") is True
+    cur = client.get(f"/api/v1/students/me/game-session?subject=생활&day={today}", headers=auth(token)).json()
+    assert cur["available"] is True and len(cur["questions"]) > 0
+    # 지난날은 복습(is_replay=True)
+    past = client.get(f"/api/v1/students/me/game-session?subject=생활&day={today - 3}", headers=auth(token)).json()
+    if past["available"]:
+        assert past["is_replay"] is True

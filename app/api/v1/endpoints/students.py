@@ -997,30 +997,76 @@ class _GameAnswerReq(_GBaseModel):
     replay: bool = False  # 복습 모드 — 상태·코인 반영 없음
 
 
+@router.get("/students/me/curriculum")
+def curriculum(
+    subject: str = Query(default="생활"),
+    back: int = Query(default=7, ge=0, le=30),
+    forward: int = Query(default=5, ge=0, le=14),
+    principal: Principal = Depends(require_student),
+):
+    """일일 교육과정 — 오늘 기준 지난날(복습 가능)·오늘(과제)·다음날(잠금, 주제만).
+
+    현재 '생활'만 실커리큘럼(ms 안전 주제 순환). 그 외 과목은 available=false.
+    """
+    _me(principal)
+    from app.services import curriculum as _cur
+
+    if subject != "생활":
+        return {"available": False, "subject": subject, "days": []}
+    return {"available": True, **_cur.curriculum_window(subject, back, forward)}
+
+
+@router.get("/students/me/curriculum/day")
+def curriculum_day(
+    subject: str = Query(default="생활"),
+    day: int = Query(ge=1),
+    principal: Principal = Depends(require_student),
+):
+    """특정 일차 상세. 미래 일차는 주제만(잠금), 오늘/지난날은 단계별 문항(정답 제거)."""
+    _me(principal)
+    from app.services import curriculum as _cur
+
+    if subject != "생활":
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="지원하지 않는 과목입니다.")
+    return _cur.day_detail(subject, day)
+
+
 @router.get("/students/me/game-session")
 def game_session(
     subject: str = Query(default="생활"),
-    count: int = Query(default=5, ge=1, le=10),
+    day: int | None = Query(default=None, ge=1),
+    count: int = Query(default=5, ge=1, le=25),
     principal: Principal = Depends(require_student),
 ):
     """실제 플레이 가능한 문항 세트 발급 (정답 미포함 — 채점은 서버).
 
-    현재 '생활' 과목만 실문항 지원(capcha_service ms 문제은행 이식분).
-    다른 과목은 available=false → 프론트가 기존 데모 슬롯 유지.
+    day 지정 시: 그 일차 커리큘럼의 playable 문항 (미래 일차는 잠금 → available=false).
+    day 미지정: 생활 전체에서 무작위(빠른 연습용).
     """
     _me(principal)
     if subject != "생활":
         return {"available": False, "subject": subject, "questions": []}
-    import random as _random
-
+    from app.services import curriculum as _cur
     from app.services import life_bank
 
-    picked = _random.sample(life_bank.LIFE_QUESTIONS, min(count, len(life_bank.LIFE_QUESTIONS)))
-    return {
-        "available": True,
-        "subject": subject,
-        "questions": [life_bank.public_question(q) for q in picked],
-    }
+    if day is not None:
+        detail = _cur.day_detail(subject, day)
+        if detail.get("locked"):
+            return {"available": False, "locked": True, "subject": subject, "topic": detail["topic"], "questions": []}
+        playable = detail.get("playable", [])
+        return {
+            "available": len(playable) > 0,
+            "subject": subject,
+            "day": day,
+            "topic": detail["topic"],
+            "is_replay": detail.get("is_replay", False),
+            "questions": playable,
+        }
+    import random as _random
+
+    pool = [q for q in life_bank.LIFE_FULL if q["playable"]]
+    picked = _random.sample(pool, min(count, len(pool)))
+    return {"available": True, "subject": subject, "questions": [life_bank.public_question(q) for q in picked]}
 
 
 @router.post("/students/me/game-answer")
