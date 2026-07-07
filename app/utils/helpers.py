@@ -7,6 +7,22 @@ from sqlalchemy.orm import Session
 
 from app.models import AuditLog
 
+
+# ── 앱 전역 '오늘/지금' 기준 ────────────────────────────────────────────
+# created_at 등은 로컬 naive(datetime.now)로, 만료류는 UTC naive로 저장되는 이중 규약이
+# 남아 있다. "오늘/이번 주" 같은 '날짜 경계 판정'은 반드시 이 헬퍼로 통일해 자정 경계
+# 밀림을 막는다.
+# ⚠️ 배포 시 컨테이너 TZ=Asia/Seoul 로 고정해야 로컬 날짜 판정이 사용자 시간대와 일치한다
+#    (TZ 미고정 시 UTC 자정에 '오늘'이 하루 어긋날 수 있음).
+def today() -> date:
+    """앱 전역 '오늘' (로컬 날짜). 날짜 경계 판정은 이 함수로 통일한다."""
+    return date.today()
+
+
+def now() -> datetime:
+    """앱 전역 '지금' (로컬 시각, created_at 저장 규약과 일치)."""
+    return datetime.now()
+
 # 반 이름 맨 앞의 학년 숫자 ("1-2반", "1학년 2반", "3반" → 1/1/3)
 _GRADE_RE = re.compile(r"^\s*(\d+)")
 

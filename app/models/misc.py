@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import CHAR, JSON, DateTime, Float, ForeignKey, String, Text
+from sqlalchemy import CHAR, JSON, DateTime, Float, ForeignKey, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base, Timestamps, UUIDPk
@@ -24,6 +24,10 @@ class UserSetting(Base, UUIDPk, Timestamps):
     """역할별 설정 JSON (학생 눈건강/알림/소리, 교사 수업환경, 학부모 알림/개인정보 등)"""
 
     __tablename__ = "user_settings"
+    # 주체(user/student)별 설정행 1개 (동시 저장 race로 중복 설정행 차단)
+    __table_args__ = (
+        UniqueConstraint("subject_type", "subject_id", name="uq_user_setting_subject"),
+    )
 
     subject_type: Mapped[str] = mapped_column(String(10))  # user | student
     subject_id: Mapped[str] = mapped_column(CHAR(36), index=True)

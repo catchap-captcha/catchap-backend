@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import CHAR, DateTime, ForeignKey, String
+from sqlalchemy import CHAR, DateTime, ForeignKey, String, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base, Timestamps, UUIDPk
@@ -10,6 +10,11 @@ class Membership(Base, UUIDPk, Timestamps):
     """기관 소속 (교사/기관 관리자). 교사 개별코드(T-xxxx)·담당 정보 포함."""
 
     __tablename__ = "memberships"
+    # 한 사용자가 한 기관에 소속행 1개 (동시 가입/임명 race로 중복 멤버십 차단).
+    # user_id가 NULL(미클레임 교사코드)인 행은 UNIQUE 대상에서 제외됨(NULL != NULL) — 선발급 다수 허용.
+    __table_args__ = (
+        UniqueConstraint("user_id", "organization_id", name="uq_membership_user_org"),
+    )
 
     # 교사 코드(T-xxxx) 선발급 → 가입 시 클레임 구조라 nullable
     user_id: Mapped[str | None] = mapped_column(

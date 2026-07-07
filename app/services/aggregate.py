@@ -70,6 +70,24 @@ def _delta_str(cur: int | None, prev: int | None) -> str:
     return f"{'+' if d >= 0 else ''}{d}%p"
 
 
+def week_label(today: date | None = None) -> str:
+    """현재 주(월~일)의 실제 날짜 라벨 — 고정 문자열 대신 오늘 기준 동적 생성."""
+    today = today or date.today()
+    ws = _week_start(today)
+    we = ws + timedelta(days=6)
+    week_of_month = (ws.day - 1) // 7 + 1
+    return f"{ws.month}월 {week_of_month}째 주 ({ws.month}.{ws.day}~{we.month}.{we.day})"
+
+
+def period_label(period: str, today: date | None = None) -> str:
+    today = today or date.today()
+    if period == "month":
+        return f"{today.year}년 {today.month}월"
+    if period in ("year", "term", "semester"):
+        return f"{today.year}년"
+    return week_label(today)
+
+
 def attempts(
     db: Session,
     *,
@@ -670,6 +688,120 @@ def org_dashboard_overrides(db: Session, org_id: str, period: str) -> dict:
     if rows:
         out["kAvg"] = f"{sum(r.solve_time_ms for r in rows) / len(rows) / 1000:.1f}"
         out["grades"] = _org_grades(db, org_id, rows)
+
+    # 교사(스태프) 수 · 학급 수 · 동적 제목 — 원천(users/classes)이 있으면 항상 실집계
+    from app.models import ClassRoom, Organization, User
+
+    staff_n = (
+        db.query(func.count(User.id))
+        .filter(
+            User.organization_id == org_id,
+            User.role.in_(["teacher", "grade_head"]),
+            User.status != "disabled",
+        )
+        .scalar()
+        or 0
+    )
+    if staff_n:
+        out["kTeachers"] = _fmt_n(staff_n)
+        class_n = (
+            db.query(func.count(ClassRoom.id))
+            .filter(ClassRoom.organization_id == org_id)
+            .scalar()
+            or 0
+        )
+        out["kTeachersSub"] = f"교사 / {class_n} 학급"
+    org = db.get(Organization, org_id)
+    wk = (_week_start(today).day - 1) // 7 + 1
+    out["subtitle"] = (
+        f"{org.name if org else '우리 학교'} · {today.year}년 {today.month}월 {wk}주차 · 실시간 집계"
+    )
+    if "kApi" in out:  # apiCallValue는 kApi와 동일 소스(오늘 호출) — 표시 불일치 제거
+        out["apiCallValue"] = out["kApi"]
+
+    # 캡차 위험 신호 그래프 (r/pass/block/gradeBars) — behavior_summaries 실집계
+    out.update(_org_security(db, org_id, period, start, end))
+    return out
+
+
+def _org_security(db: Session, org_id: str, period: str, start: date, end: date) -> dict:
+    """behavior_summaries 실집계 → 위험 분포 r + 요일/주차별 통과·차단 시계열 + 학년별 pass/fail/block.
+
+    캡차 위험 신호 데이터가 없는 기간/학년은 키를 제외(또는 D 유지) — 실트래픽이 쌓이면 채워진다.
+    정의: pass=사람 통과율(risk_level=='low' 비율), block=플래그율(review+elevated 비율).
+    """
+    out: dict = {}
+    b_rows = (
+        db.query(BehaviorSummary)
+        .filter(
+            BehaviorSummary.organization_id == org_id,
+            BehaviorSummary.created_at >= _dt(start),
+            BehaviorSummary.created_at < _dt(end),
+        )
+        .all()
+    )
+    if not b_rows:
+        return out
+
+    def _pass(rows: Sequence) -> int:
+        return round(sum(1 for b in rows if b.risk_level == "low") / len(rows) * 100)
+
+    def _block(rows: Sequence) -> int:
+        return round(sum(1 for b in rows if b.risk_level in ("review", "elevated")) / len(rows) * 100)
+
+    total = len(b_rows)
+    out["r"] = [
+        round(sum(1 for b in b_rows if b.risk_level == "low") / total * 100),
+        round(sum(1 for b in b_rows if b.risk_level == "review") / total * 100),
+        round(sum(1 for b in b_rows if b.risk_level == "elevated") / total * 100),
+        round(sum(1 for b in b_rows if (b.interaction_result or "") == "fail") / total * 100),
+    ]
+
+    # 시계열 버킷 (week=요일 7, month=주 5, year=월 12) — 원천 있는 버킷만 실값, 없으면 직전값 유지
+    axis_len = {"week": 7, "month": 5}.get(period, 12)
+    buckets, _s, _e = _period_buckets(period, axis_len)
+    grouped: list[list] = [[] for _ in buckets]
+    for b in b_rows:
+        d = (b.created_at.date() if b.created_at else start)
+        for i, (bs, be) in enumerate(buckets):
+            if bs <= d < be:
+                grouped[i].append(b)
+                break
+    pass_series, block_series = [], []
+    pprev, bprev = None, None
+    for g in grouped:
+        p = _pass(g) if g else (pprev if pprev is not None else 0)
+        bl = _block(g) if g else (bprev if bprev is not None else 0)
+        pass_series.append(p)
+        block_series.append(bl)
+        pprev, bprev = p, bl
+    out["pass"] = pass_series
+    out["block"] = block_series
+
+    # 학년별 pass/fail/block (behavior → class.grade)
+    from app.models import ClassRoom
+
+    grade_by_class = {
+        c.id: c.grade for c in db.query(ClassRoom).filter(ClassRoom.organization_id == org_id).all()
+    }
+    class_by_student = {
+        s.id: s.class_id
+        for s in db.query(StudentProfile).filter(StudentProfile.organization_id == org_id).all()
+    }
+    by_grade: dict[int, list] = {}
+    for b in b_rows:
+        g = grade_by_class.get(class_by_student.get(b.student_id))
+        if g is not None:
+            by_grade.setdefault(g, []).append(b)
+    grade_bars = []
+    for g in sorted(by_grade):
+        rows = by_grade[g]
+        p = _pass(rows)
+        fail = round(sum(1 for b in rows if (b.interaction_result or "") == "fail") / len(rows) * 100)
+        block = round(sum(1 for b in rows if b.risk_level == "elevated") / len(rows) * 100)
+        grade_bars.append({"label": f"{g}학년", "pass": p, "fail": fail, "block": block})
+    if grade_bars:
+        out["gradeBars"] = grade_bars
     return out
 
 
@@ -827,6 +959,38 @@ def parent_week_kpis(db: Session, child: StudentProfile) -> list[dict] | None:
         {"value": f"{t_c}초", "label": "평균 풀이 시간", "delta": _cnt_delta(t_c, t_p, "초") if t_p is not None else "+0초"},
         {"value": f"{badges_c}개", "label": "이번 주 새 배지", "delta": _cnt_delta(badges_c, badges_p, "개")},
     ]
+
+
+_PARENT_REASON_BODY = {
+    "개념 혼동": "개념에서 헷갈린 부분이 있었어요. 함께 천천히 짚어보면 좋아요.",
+    "조작 실수": "답은 알지만 터치·드래그 조작에서 실수가 있었어요. 큰 화면으로 연습해요.",
+    "선택지 혼동": "비슷한 선택지 사이에서 여러 번 오갔어요. 헷갈린 것을 함께 읽어봐요.",
+    "UI 문제": "화면 조작이 조금 어려웠던 것 같아요.",
+}
+_PARENT_REASON_ICON = {
+    "개념 혼동": "ph-fill ph-lightbulb",
+    "조작 실수": "ph-fill ph-hand-tap",
+    "선택지 혼동": "ph-fill ph-arrows-left-right",
+    "UI 문제": "ph-fill ph-cursor-click",
+}
+
+
+def parent_reasons(db: Session, child: StudentProfile) -> list[dict] | None:
+    """자녀 최근 28일 오답의 estimated_reason 분포 → 원인 카드 (없으면 None → D 유지)."""
+    rows = attempts(db, student_ids=[child.id], since=date.today() - timedelta(days=28))
+    wrong = [r.estimated_reason for r in rows if r.result != "correct" and r.estimated_reason]
+    if not wrong:
+        return None
+    out = []
+    for reason, _n in Counter(wrong).most_common(3):
+        out.append(
+            {
+                "tag": reason,
+                "body": _PARENT_REASON_BODY.get(reason, f"{reason} 경향이 보였어요."),
+                "icon": _PARENT_REASON_ICON.get(reason, "ph-fill ph-lightbulb"),
+            }
+        )
+    return out
 
 
 def parent_strengths_weaknesses(db: Session, child: StudentProfile) -> dict | None:

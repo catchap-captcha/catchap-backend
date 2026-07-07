@@ -268,9 +268,103 @@ def test_game_session_server_graded(client, db, seed_org):
     results = sorted(r.result for r in rows)
     assert results == ["correct", "incorrect"]  # 서버 판정 그대로 기록됨
 
-    # 다른 과목은 아직 미지원 → available=False (프론트 데모 유지)
-    other = client.get("/api/v1/students/me/game-session?subject=수학", headers=auth(token)).json()
+    # 뱅크 없는 과목(국어)은 미지원 → available=False (프론트 데모 유지)
+    other = client.get("/api/v1/students/me/game-session?subject=국어", headers=auth(token)).json()
     assert other["available"] is False
+
+
+def test_game_session_new_subjects(client, db, seed_org):
+    """수학·과학·역사 실문항 (capcha_service my/sw 이식): 발급 sanitize + 서버 채점 + 오답노트 과목 매핑."""
+    from app.models import LearningAttempt, WrongAnswer
+
+    token = _student_token(client, seed_org)
+    for subject in ("수학", "과학", "역사"):
+        res = client.get(
+            f"/api/v1/students/me/game-session?subject={subject}&count=3", headers=auth(token)
+        )
+        assert res.status_code == 200, subject
+        body = res.json()
+        assert body["available"] is True and len(body["questions"]) == 3, subject
+        for q in body["questions"]:
+            # 정답·해설 미노출 + playable은 bool(원본 값은 정답 id라 유출 금지)
+            assert "answer" not in q and "explain" not in q, subject
+            assert q["playable"] is True, subject
+
+    # 서버 채점: 수학 single 오답 → 오답노트가 과목·카테고리(num)로 기록
+    from app.services.math_bank import MATH_FULL
+
+    mq = next(q for q in MATH_FULL if q["type"] == "single")
+    wrong = next(o["id"] for o in mq["options"] if o["id"] != mq["answer"])
+    r = client.post(
+        "/api/v1/students/me/game-answer",
+        json={"question_id": mq["id"], "subject": "수학", "option_id": wrong},
+        headers=auth(token),
+    )
+    assert r.status_code == 200 and r.json()["correct"] is False
+    wa = db.query(WrongAnswer).filter(WrongAnswer.student_id == seed_org["student"].id).all()
+    assert any(w.subject == "수학" and w.category == "num" for w in wa)
+
+    # 역사 정답 제출 → correct + learning_attempts에 과목 그대로 기록
+    from app.services.history_bank import HISTORY_FULL
+
+    hq = HISTORY_FULL[0]
+    r2 = client.post(
+        "/api/v1/students/me/game-answer",
+        json={"question_id": hq["id"], "subject": "역사", "option_id": hq["answer"]},
+        headers=auth(token),
+    )
+    assert r2.json()["correct"] is True
+    rows = (
+        db.query(LearningAttempt)
+        .filter(LearningAttempt.student_id == seed_org["student"].id, LearningAttempt.subject == "역사")
+        .all()
+    )
+    assert [x.result for x in rows] == ["correct"]
+
+
+def test_game_answer_multi_and_scoping(client, db, seed_org):
+    """복수선택 집합 채점(부분 정답 없음) + 과목 스코프(타 과목 id 교차 제출 404) + 비플레이 문항 400."""
+    token = _student_token(client, seed_org)
+    from app.services.science_bank import SCIENCE_FULL
+
+    mq = next(q for q in SCIENCE_FULL if q["type"] == "multi")
+    # 부분 제출 → 오답
+    partial = client.post(
+        "/api/v1/students/me/game-answer",
+        json={"question_id": mq["id"], "subject": "과학", "option_ids": mq["answer"][:1]},
+        headers=auth(token),
+    )
+    assert partial.status_code == 200 and partial.json()["correct"] is False
+    # 정답 집합(순서 무관) → 정답, answer_ids로 전체 공개
+    exact = client.post(
+        "/api/v1/students/me/game-answer",
+        json={"question_id": mq["id"], "subject": "과학", "option_ids": list(reversed(mq["answer"]))},
+        headers=auth(token),
+    )
+    assert exact.json()["correct"] is True
+    assert sorted(exact.json()["answer_ids"]) == sorted(mq["answer"])
+
+    # 타 과목 문항 id 교차 제출 → 404 (뱅크 스코프)
+    from app.services.life_bank import LIFE_FULL
+
+    life_q = next(q for q in LIFE_FULL if q["playable"])
+    spoof = client.post(
+        "/api/v1/students/me/game-answer",
+        json={"question_id": life_q["id"], "subject": "수학", "option_id": "o1"},
+        headers=auth(token),
+    )
+    assert spoof.status_code == 404
+
+    # 위젯 전용(playable=False) 문항 제출 → 400
+    from app.services.math_bank import MATH_FULL
+
+    np_q = next(q for q in MATH_FULL if not q["playable"])
+    blocked = client.post(
+        "/api/v1/students/me/game-answer",
+        json={"question_id": np_q["id"], "subject": "수학", "option_id": "o1"},
+        headers=auth(token),
+    )
+    assert blocked.status_code == 400
 
 
 def test_curriculum_lock_and_replay(client, db, seed_org):
@@ -284,8 +378,10 @@ def test_curriculum_lock_and_replay(client, db, seed_org):
 
     days = {d["status"]: d for d in body["days"]}
     assert "today" in days and "past" in days and "future" in days
-    # 오늘은 플레이 가능한 주제(교통안전, single 20)
-    assert days["today"]["topic"] == "교통안전"
+    # 오늘 주제는 날짜 순환에 따라 달라짐 — 하드코딩 대신 커리큘럼 모듈로 계산
+    from app.services import curriculum as _cur
+
+    assert days["today"]["topic"] == _cur.topic_for_index(_cur.today_index())
     assert days["today"]["playable_count"] > 0
     # 미래는 잠금 표시
     assert days["future"]["locked"] is True

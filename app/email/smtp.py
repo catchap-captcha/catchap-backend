@@ -34,15 +34,19 @@ def send_email(db: Session, to_email: str, subject: str, html: str, user_id: str
     log = EmailLog(user_id=user_id, to_email=to_email, subject=subject)
 
     if not settings.smtp_enabled:
-        # dry-run: SMTP 미설정 시 발송 흔적만 남긴다.
-        # 본문(인증코드/재설정 토큰 포함)은 개발 환경에서만 콘솔에 노출한다.
-        logger.warning("[EMAIL DRY-RUN] to=%s subject=%s", to_email, subject)
-        if not settings.is_production:
-            # 개발용: 인증코드/재설정코드가 HTML 하단(약 1000번째 글자)에 있어
-            # 잘라내면 코드가 안 보인다 → 본문 전체를 출력한다.
-            print(f"\n===== EMAIL DRY-RUN =====\nTO: {to_email}\nSUBJECT: {subject}\n{html}\n=========================\n")
-        else:
+        # dry-run은 개발(ENV=dev)에서만 허용. 프로덕션은 config fail-fast가 부팅을 막지만,
+        # 만에 하나 이 경로에 도달하면 '발송된 척(return True)' 하지 않고 실패로 정직히 처리한다.
+        if settings.is_production:
             logger.error("SMTP 미설정 상태로 프로덕션에서 메일 발송 시도 — 발송되지 않음 to=%s", to_email)
+            log.status = "failed"
+            log.error_message = "SMTP not configured in production"
+            db.add(log)
+            db.commit()
+            return False
+        # 개발용: 인증코드/재설정코드가 HTML 하단(약 1000번째 글자)에 있어
+        # 잘라내면 코드가 안 보인다 → 본문 전체를 콘솔에 출력한다.
+        logger.warning("[EMAIL DRY-RUN] to=%s subject=%s", to_email, subject)
+        print(f"\n===== EMAIL DRY-RUN =====\nTO: {to_email}\nSUBJECT: {subject}\n{html}\n=========================\n")
         log.status = "dry_run"
         db.add(log)
         db.commit()

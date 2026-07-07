@@ -698,6 +698,16 @@ def purchase(
     )
     if exists:
         raise HTTPException(status.HTTP_409_CONFLICT, detail="이미 보유한 아이템입니다.")
+    from sqlalchemy.exc import IntegrityError
+
+    # 소유 레코드를 UNIQUE(student_id,item_id)로 먼저 확보 → 동시 구매 race를 원자적으로 차단
+    # (차감 뒤 중복 삽입이 실패하면 코인만 빠지는 사태 방지 — 확보 성공 후에만 차감).
+    db.add(StudentItem(student_id=me.id, item_id=item.id))
+    try:
+        db.flush()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status.HTTP_409_CONFLICT, detail="이미 보유한 아이템입니다.")
     # 원자적 차감: 동시 구매 요청이 잔액 검사를 함께 통과해 코인이 음수가 되는 것을 방지
     if item.price > 0:
         updated = (
@@ -709,10 +719,9 @@ def purchase(
             )
         )
         if not updated:
-            db.rollback()
+            db.rollback()  # 잔액 부족 → 방금 확보한 소유 레코드도 함께 되돌림
             raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="냥코인이 부족해요.")
         db.add(CoinTransaction(student_id=me.id, amount=-item.price, reason=f"{item.name} 구매"))
-    db.add(StudentItem(student_id=me.id, item_id=item.id))
     db.commit()
     db.refresh(me)
     return {"ok": True, "coins": me.coins, "item_id": item.id}
@@ -767,20 +776,28 @@ def class_ranking(
     grade = _my_grade(db, me)
 
     # 상위 3위 추가 코인: 오늘 아직 안 받았으면 지급 (학기 누적 랭킹이라 '매일 유지' 보상)
+    # 멱등 지급: daily_rewards(UNIQUE student_id,kind,reward_date)에 INSERT 성공 시에만 지급.
+    # SELECT-then-INSERT 였던 과거엔 동시요청이 둘 다 통과해 이중 지급됐다.
     bonus = 0
     if mine["rank"] in RANK_TOP3_COINS and mine["score"] > 0:
-        already = (
-            db.query(CoinTransaction)
-            .filter(
-                CoinTransaction.student_id == me.id,
-                CoinTransaction.reason.like("%랭킹 보상"),
-                func.date(CoinTransaction.created_at) == date.today(),
+        from sqlalchemy.exc import IntegrityError
+
+        from app.models import DailyReward
+
+        amount = RANK_TOP3_COINS[mine["rank"]]
+        db.add(DailyReward(student_id=me.id, kind="rank_bonus", reward_date=date.today(), amount=amount))
+        try:
+            db.flush()  # 오늘치 최초 지급이면 통과, 중복이면 IntegrityError
+            granted = True
+        except IntegrityError:
+            db.rollback()
+            granted = False
+        if granted:
+            bonus = amount
+            db.query(StudentProfile).filter(StudentProfile.id == me.id).update(
+                {StudentProfile.coins: StudentProfile.coins + bonus},
+                synchronize_session=False,
             )
-            .first()
-        )
-        if already is None:
-            bonus = RANK_TOP3_COINS[mine["rank"]]
-            me.coins += bonus
             db.add(
                 CoinTransaction(
                     student_id=me.id, amount=bonus, reason=f"{mine['rank']}위 랭킹 보상"
@@ -851,6 +868,9 @@ def my_awards(
                 "semester": semester,
             }
         )
+        from sqlalchemy.exc import IntegrityError
+
+        # 배지 find-or-create — badges.name UNIQUE로 동시요청 중복 배지 생성 차단
         badge = db.query(Badge).filter(Badge.name == ATTENDANCE_BADGE_NAME).first()
         if badge is None:
             badge = Badge(
@@ -862,15 +882,27 @@ def my_awards(
                 order_no=99,
             )
             db.add(badge)
-            db.flush()
+            try:
+                db.flush()
+            except IntegrityError:  # 경쟁 요청이 먼저 만듦 → 재조회
+                db.rollback()
+                badge = db.query(Badge).filter(Badge.name == ATTENDANCE_BADGE_NAME).first()
         earned = (
             db.query(StudentBadge)
             .filter(StudentBadge.student_id == me.id, StudentBadge.badge_id == badge.id)
             .first()
         )
         if earned is None:
-            db.add(StudentBadge(student_id=me.id, badge_id=badge.id, earned_at=datetime.now(), progress=1))
-            db.commit()
+            # student_badges(student_id,badge_id) UNIQUE로 동시요청 이중지급 차단
+            db.add(
+                StudentBadge(
+                    student_id=me.id, badge_id=badge.id, earned_at=datetime.now(), progress=1
+                )
+            )
+            try:
+                db.commit()
+            except IntegrityError:
+                db.rollback()
         elif earned.earned_at is None:
             earned.earned_at = datetime.now()
             earned.progress = 1
@@ -910,6 +942,20 @@ def save_attempt(
     )
     db.add(attempt)
 
+    # 행동 데이터(포인터 궤적 포함) — 아동용 캡차 판정 모델의 학습 재료.
+    # require_student 경로라 student_id는 인증된 본인 것만 기록된다.
+    if req.behavior:
+        from app.services.captcha_service import record_behavior_event
+
+        record_behavior_event(
+            db,
+            organization_id=me.organization_id,
+            student_id=me.id,
+            source_type="game",
+            behavior=req.behavior,
+            correct=req.result == "correct",
+        )
+
     coins_earned = 0
     # 복습(replay: 전날 다시풀기·오늘 재도전)은 보상 없음 — 반복 파밍 차단
     if req.result == "correct" and not req.replay:
@@ -926,9 +972,14 @@ def save_attempt(
             .scalar()
             or 0
         )
-        if earned_today < DAILY_LEARNING_COIN_CAP:
-            coins_earned = 10
-            me.coins += coins_earned
+        # 상한 경계 오버슛/레이스 방지: 남은 상한만큼만 지급(0~10으로 클램프).
+        coins_earned = max(0, min(10, DAILY_LEARNING_COIN_CAP - int(earned_today)))
+        if coins_earned > 0:
+            # 원자적 증가: stale read-modify-write(me.coins += ...)는 동시요청 시 lost update.
+            db.query(StudentProfile).filter(StudentProfile.id == me.id).update(
+                {StudentProfile.coins: StudentProfile.coins + coins_earned},
+                synchronize_session=False,
+            )
             db.add(
                 CoinTransaction(
                     student_id=me.id, amount=coins_earned, reason=f"{req.subject} 학습 보상"
@@ -984,17 +1035,24 @@ def save_attempt(
                 student_id=me.id, quiz_date=date.today(), subject=req.subject, status="progress"
             )
             db.add(quiz)
-        quiz.status = "done" if req.completed else ("progress" if quiz.status != "done" else "done")
+        # 랭킹·상장 위조 차단: done 승격은 '완료 신고 + 서버/제출이 정답'일 때만.
+        # 오답으로는 done이 될 수 없다(오답 반복으로 랭킹 만점 방지). 이미 done이면 유지.
+        completed_ok = req.completed and req.result == "correct"
+        quiz.status = "done" if completed_ok else ("progress" if quiz.status != "done" else "done")
     db.commit()
+    db.refresh(me)  # 원자적 코인 증가 후 최신 잔액으로 응답
     return {"ok": True, "attempt_id": attempt.id, "coins_earned": coins_earned, "coins": me.coins}
 
 
-# ---------------------------------------------------------------- 실전 게임 세션 (생활 — ms 문제은행)
+# ---------------------------------------------------------------- 실전 게임 세션 (과목별 문제은행 — subject_banks)
 class _GameAnswerReq(_GBaseModel):
     question_id: str
-    option_id: str
+    subject: str = "생활"  # 문항이 속한 과목 — 뱅크 스코프 조회(타 과목 id 교차 제출 차단)
+    option_id: str = ""  # single 제출
+    option_ids: list[str] | None = None  # multi(복수선택) 제출 — 집합 비교 채점
     last: bool = False  # 세션의 마지막 문항 → 오늘의퀴즈 완료 처리
     replay: bool = False  # 복습 모드 — 상태·코인 반영 없음
+    behavior: dict | None = None  # 문항 풀이 중 포인터 궤적 등 (save_attempt로 전달)
 
 
 @router.get("/students/me/curriculum")
@@ -1040,16 +1098,18 @@ def game_session(
 ):
     """실제 플레이 가능한 문항 세트 발급 (정답 미포함 — 채점은 서버).
 
-    day 지정 시: 그 일차 커리큘럼의 playable 문항 (미래 일차는 잠금 → available=false).
-    day 미지정: 생활 전체에서 무작위(빠른 연습용).
+    day 지정 시(생활 전용 — 일차 커리큘럼): 그 일차의 playable 문항 (미래 일차는 잠금 → available=false).
+    day 미지정: 과목 뱅크 전체에서 무작위. 수학·과학·역사는 뱅크가 작아 커리큘럼 없이 무작위만 지원.
     """
     _me(principal)
-    if subject != "생활":
-        return {"available": False, "subject": subject, "questions": []}
-    from app.services import curriculum as _cur
-    from app.services import life_bank
+    from app.services import subject_banks
 
-    if day is not None:
+    if subject not in subject_banks.LIVE_SUBJECTS:
+        return {"available": False, "subject": subject, "questions": []}
+
+    if day is not None and subject == "생활":
+        from app.services import curriculum as _cur
+
         detail = _cur.day_detail(subject, day)
         if detail.get("locked"):
             return {"available": False, "locked": True, "subject": subject, "topic": detail["topic"], "questions": []}
@@ -1064,9 +1124,76 @@ def game_session(
         }
     import random as _random
 
-    pool = [q for q in life_bank.LIFE_FULL if q["playable"]]
+    pool = subject_banks.playable_pool(subject)
     picked = _random.sample(pool, min(count, len(pool)))
-    return {"available": True, "subject": subject, "questions": [life_bank.public_question(q) for q in picked]}
+    return {"available": True, "subject": subject, "questions": [subject_banks.public_question(q) for q in picked]}
+
+
+def _opt_texts(q: dict, ids: list[str]) -> str:
+    """옵션 id 목록 → 사람이 읽을 답 텍스트 (text 비면 emoji 슬롯의 숫자/기호 사용)."""
+    by_id = {o["id"]: o for o in q.get("options", [])}
+    parts = []
+    for oid in ids:
+        o = by_id.get(oid)
+        if o:
+            parts.append(o.get("text") or o.get("emoji") or "")
+    return ", ".join(p for p in parts if p)
+
+
+def _record_wrong(db: Session, me: StudentProfile, subject: str, q: dict, picked_ids: list[str], answer_ids: list[str]) -> None:
+    """게임 오답을 오답노트(WrongAnswer)·취약추천(Recommendation)에 실기록.
+
+    같은 문항이 이미 '미복습' 상태로 있으면 중복 저장하지 않는다(반복 오답 누적 방지).
+    복습(replay) 오답은 호출부에서 제외한다.
+    """
+    from app.services import subject_banks
+
+    dup = (
+        db.query(WrongAnswer)
+        .filter(
+            WrongAnswer.student_id == me.id,
+            WrongAnswer.question == q["prompt"],
+            WrongAnswer.reviewed.is_(False),
+        )
+        .first()
+    )
+    if dup is None:
+        db.add(
+            WrongAnswer(
+                student_id=me.id,
+                organization_id=me.organization_id,
+                subject=subject,
+                category=subject_banks.WRONG_CATEGORY.get(subject, "safe"),  # D.WRONG_TAGS 키
+                question=q["prompt"],
+                my_answer=_opt_texts(q, picked_ids)[:200],
+                correct_answer=_opt_texts(q, answer_ids)[:200],
+                tip=q.get("explain") or q.get("hint"),
+                wrong_date=date.today(),
+            )
+        )
+
+    # 취약 주제 추천 — 같은 과목·챕터(stage)에 active 추천이 없으면 생성
+    stage = int(q.get("stage") or 1)
+    rec_dup = (
+        db.query(Recommendation)
+        .filter(
+            Recommendation.student_id == me.id,
+            Recommendation.subject == subject,
+            Recommendation.chapter_no == stage,
+            Recommendation.status == "active",
+        )
+        .first()
+    )
+    if rec_dup is None:
+        db.add(
+            Recommendation(
+                student_id=me.id,
+                subject=subject,
+                chapter_no=stage,
+                priority="보통",
+                reason=f"{q.get('topic') or subject} 문제에서 틀린 적이 있어요. 다시 한 번 풀어볼까요?",
+            )
+        )
 
 
 @router.post("/students/me/game-answer")
@@ -1075,30 +1202,51 @@ def game_answer(
     principal: Principal = Depends(require_student),
     db: Session = Depends(get_db),
 ):
-    """문항 1개 서버 채점 + 학습기록 저장 — 자기신고가 아닌 서버 판정 결과를 기록한다."""
-    me = _me(principal)
-    from app.services import life_bank
+    """문항 1개 서버 채점 + 학습기록 저장 — 자기신고가 아닌 서버 판정 결과를 기록한다.
 
-    q = life_bank.get_question(req.question_id)
+    single: option_id 등호 비교 / multi(복수선택): option_ids 집합 비교(부분 정답 없음).
+    문항은 요청 과목의 뱅크에서만 찾는다 — 타 과목 문항 id 교차 제출은 404.
+    """
+    me = _me(principal)
+    from app.services import subject_banks
+
+    q = subject_banks.get_question(req.subject, req.question_id)
     if q is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="문항을 찾을 수 없습니다.")
-    correct = str(req.option_id) == str(q["answer"])
-    answer_opt = next((o for o in q["options"] if o["id"] == q["answer"]), None)
+    if not q["playable"]:
+        # 위젯 전용(조작형·SVG) 문항 — 현재 게임 UI 채점 대상이 아님
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="플레이할 수 없는 문항입니다.")
+
+    if q["type"] == "multi":
+        answer_ids = [str(a) for a in (q["answer"] or [])]
+        picked_ids = [str(x) for x in (req.option_ids or ([req.option_id] if req.option_id else []))]
+        correct = len(picked_ids) > 0 and set(picked_ids) == set(answer_ids)
+    else:
+        answer_ids = [str(q["answer"])]
+        picked_ids = [str(req.option_id)] if req.option_id else []
+        correct = picked_ids == answer_ids
+
+    # 오답이면 오답노트·취약추천에 실기록 (복습은 제외 — 반복 파밍/중복 누적 방지)
+    if not correct and not req.replay:
+        _record_wrong(db, me, req.subject, q, picked_ids, answer_ids)
 
     # 서버 판정 결과를 학습기록으로 저장 (기존 save_attempt와 동일 부수효과: 코인 상한·진도·퀴즈 상태)
     attempt_req = AttemptCreate(
-        subject="생활",
+        subject=req.subject,
         result="correct" if correct else "incorrect",
         score=20 if correct else 0,  # 5문 기준 100점 만점
         completed=req.last and not req.replay,
         replay=req.replay,
+        behavior=req.behavior,
     )
     saved = save_attempt(attempt_req, principal, db)
     return {
         "correct": correct,
-        "answer_id": q["answer"],
-        "answer_text": answer_opt["text"] if answer_opt else "",
-        "hint": q["hint"],
+        "answer_id": answer_ids[0] if answer_ids else "",
+        "answer_ids": answer_ids,
+        "answer_text": _opt_texts(q, answer_ids),
+        # 해설(explain)은 채점 후에만 공개 — 발급 응답(public_question)에는 포함되지 않는다
+        "hint": q.get("explain") or q["hint"],
         "coins_earned": saved.get("coins_earned", 0),
     }
 

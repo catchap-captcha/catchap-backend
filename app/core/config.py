@@ -52,6 +52,12 @@ class Settings(BaseSettings):
             problems.append("JWT_SECRET_KEY는 최소 32자 이상이어야 합니다.")
         if "*" in self.cors_origin_list:
             problems.append("프로덕션에서 CORS_ORIGINS 와일드카드(*)는 허용되지 않습니다.")
+        if not self.smtp_enabled:
+            # B8: 프로덕션에서 SMTP 미설정이면 메일이 '발송된 척' dry-run 되므로 부팅 거부.
+            problems.append(
+                "프로덕션에서 SMTP(SMTP_USER/SMTP_APP_PASSWORD)가 설정되지 않았습니다 "
+                "— 인증/재설정 메일이 실제로 발송되지 않습니다."
+            )
         if problems:
             raise ValueError(
                 "프로덕션 설정 오류 (ENV=%s):\n - %s" % (self.ENV, "\n - ".join(problems))

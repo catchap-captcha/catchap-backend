@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import CHAR, JSON, Boolean, DateTime, ForeignKey, String
+from sqlalchemy import CHAR, JSON, Boolean, DateTime, ForeignKey, String, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base, Timestamps, UUIDPk
@@ -42,6 +42,10 @@ class ParentStudentLink(Base, UUIDPk, Timestamps):
     """학부모-자녀 연결. DB는 요청/승인 구조, 1차 정책: 학생 코드 입력 시 자동 승인."""
 
     __tablename__ = "parent_student_links"
+    # 같은 학부모-자녀 조합은 1행만 (동시 연결 요청 race로 중복 링크 생기던 것 차단)
+    __table_args__ = (
+        UniqueConstraint("parent_user_id", "student_id", name="uq_parent_student_link"),
+    )
 
     parent_user_id: Mapped[str] = mapped_column(CHAR(36), ForeignKey("users.id"), index=True)
     student_id: Mapped[str] = mapped_column(

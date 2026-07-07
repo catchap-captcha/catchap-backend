@@ -1,10 +1,11 @@
 """운영자(ops) API — seed 기반 최소 응답 + 기관 가입 승인."""
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from html import escape
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
@@ -14,15 +15,19 @@ from app.email.smtp import send_email
 from app.models import (
     ApiKey,
     AuditLog,
+    BehaviorSummary,
+    BehaviorTrace,
     Inquiry,
     InquiryReply,
     Membership,
     ModelVersion,
     Organization,
     OrgRegistrationRequest,
+    Plan,
     StudentProfile,
     User,
 )
+from app.services import captcha_service as _cs
 
 router = APIRouter(prefix="/ops", tags=["ops"])
 
@@ -348,3 +353,322 @@ def reject_request(
     )
     db.commit()
     return {"ok": True, "status": "rejected"}
+
+
+# ---------------------------------------------------------------- 캡차 API 키 관리 (운영자)
+class _IssueKeyReq(BaseModel):
+    organization_id: str
+    product: str = Field(pattern="^(captcha|edu)$")
+    subject: str | None = None
+    label: str | None = Field(default=None, max_length=100)
+    domain: str | None = Field(default=None, max_length=255)
+
+
+def _apikey_row(db: Session, k: ApiKey) -> dict:
+    org = db.get(Organization, k.organization_id)
+    plan = _cs.plan_for_org(db, k.organization_id)
+    return {
+        "id": k.id,
+        "organization_id": k.organization_id,
+        "organization_name": org.name if org else None,
+        "product": k.product,
+        "product_name": _cs.PRODUCTS.get(k.product, k.product),
+        "subject": k.subject,
+        "label": k.label,
+        "site_key": k.site_key,  # 공개키 — 목록 노출 OK
+        "status": k.status,
+        "plan": plan.name if plan else "미구독",
+        "last_used_at": k.last_used_at.isoformat() if k.last_used_at else None,
+        "created_at": k.created_at.isoformat() if k.created_at else None,
+    }
+
+
+@router.get("/plans")
+def ops_plans(principal: Principal = Depends(require_ops), db: Session = Depends(get_db)):
+    """요금제 목록 + 제품 허용 범위 (키 발급 시 참고)."""
+    plans = db.query(Plan).order_by(Plan.monthly_price).all()
+    return {
+        "products": _cs.PRODUCTS,
+        "edu_subjects": _cs.EDU_SUBJECTS,
+        "plans": [
+            {
+                "key": p.key, "name": p.name, "monthly_price": p.monthly_price,
+                "api_quota": p.api_quota,
+                "products": _cs.PLAN_PRODUCTS.get(p.key, _cs.DEFAULT_PRODUCTS),
+            }
+            for p in plans
+        ],
+    }
+
+
+@router.get("/api-keys")
+def ops_list_api_keys(principal: Principal = Depends(require_ops), db: Session = Depends(get_db)):
+    rows = db.query(ApiKey).filter(ApiKey.status != "deleted").order_by(ApiKey.created_at.desc()).all()
+    return [_apikey_row(db, k) for k in rows]
+
+
+@router.post("/api-keys")
+def ops_issue_api_key(
+    req: _IssueKeyReq, principal: Principal = Depends(require_ops), db: Session = Depends(get_db)
+):
+    """캡차/교육형 API 키 발급 — 기관 요금제가 그 제품을 허용해야 발급 가능. secret은 1회 노출."""
+    org = db.get(Organization, req.organization_id)
+    if org is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="기관을 찾을 수 없습니다.")
+    plan = _cs.plan_for_org(db, req.organization_id)
+    if req.product not in _cs.allowed_products(plan):
+        raise HTTPException(
+            status.HTTP_402_PAYMENT_REQUIRED,
+            detail=f"{org.name}의 요금제({plan.name if plan else '미구독'})로는 '{_cs.PRODUCTS[req.product]}'를 발급할 수 없어요.",
+        )
+    issued = _cs.issue_key(
+        db, org_id=req.organization_id, product=req.product, subject=req.subject,
+        label=req.label, domain=req.domain, created_by=principal.id,
+    )
+    db.add(
+        AuditLog(
+            actor_user_id=principal.id, organization_id=req.organization_id,
+            action="captcha.api_key_issue", target_type="api_key", target_id=issued["id"],
+            after_json={"product": req.product, "subject": req.subject, "label": req.label},
+        )
+    )
+    db.commit()
+    # secret_key 는 이 응답에서만 노출
+    return {"ok": True, **issued}
+
+
+@router.delete("/api-keys/{key_id}")
+def ops_revoke_api_key(
+    key_id: str, principal: Principal = Depends(require_ops), db: Session = Depends(get_db)
+):
+    k = db.get(ApiKey, key_id)
+    if k is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="키를 찾을 수 없습니다.")
+    k.status = "disabled"
+    db.add(
+        AuditLog(
+            actor_user_id=principal.id, organization_id=k.organization_id,
+            action="captcha.api_key_revoke", target_type="api_key", target_id=k.id,
+        )
+    )
+    db.commit()
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------- 행동 데이터 (아동용 캡차 학습셋)
+# interaction_result 값이 수집 경로에 따라 갈린다:
+# 교육형 API(record_behavior)는 correct|incorrect, 인앱 게임(seed 포함)은 pass|fail.
+_BEHAVIOR_PASS = ("correct", "pass")
+_BEHAVIOR_FAIL = ("incorrect", "fail")
+
+
+def _behavior_group_metrics(db: Session, group: str, *filters) -> dict:
+    """그룹(아동/익명)별 행동 지표 평균 — 아동·성인 행동이 갈라지는지 보는 비교 데이터."""
+    row = (
+        db.query(
+            func.count(BehaviorSummary.id),
+            func.avg(BehaviorSummary.solve_time_ms),
+            func.avg(BehaviorSummary.path_length),
+            func.avg(BehaviorSummary.avg_speed),
+            func.avg(BehaviorSummary.pause_count),
+            func.avg(BehaviorSummary.retry_count),
+        )
+        .filter(*filters)
+        .one()
+    )
+
+    def _r(v, nd: int):
+        return round(float(v), nd) if v is not None else None
+
+    return {
+        "group": group,
+        "count": int(row[0] or 0),
+        "avg_solve_time_ms": _r(row[1], 0),
+        "avg_path_length": _r(row[2], 1),
+        "avg_speed": _r(row[3], 2),
+        "avg_pause_count": _r(row[4], 1),
+        "avg_retry_count": _r(row[5], 1),
+    }
+
+
+@router.get("/behavior/overview")
+def behavior_overview(
+    principal: Principal = Depends(require_ops), db: Session = Depends(get_db)
+):
+    """행동 데이터 수집 현황 — 아동용 캡차 판정 모델 학습셋 구축의 기초 지표.
+
+    핵심은 '아동(학생 계정 연결)' vs '익명(외부 임베드, 성인 포함 추정)' 그룹의
+    행동 지표 비교 — 같은 과제에서 두 그룹이 실제로 갈라지는지 보여준다.
+    """
+    total = db.query(BehaviorSummary).count()
+    # created_at은 로컬 시각(app/db/base.py) — UTC(_now)로 빼면 9시간 과대 집계됨
+    week_ago = datetime.now() - timedelta(days=7)
+    week_count = db.query(BehaviorSummary).filter(BehaviorSummary.created_at >= week_ago).count()
+
+    def _group_counts(col) -> dict:
+        return {
+            (k if k is not None else "unknown"): int(n)
+            for k, n in db.query(col, func.count(BehaviorSummary.id)).group_by(col).all()
+        }
+
+    return {
+        "total": total,
+        "week_count": week_count,
+        "trace_count": db.query(BehaviorTrace).count(),  # 원시 궤적이 남은 레코드 수
+        "by_source": _group_counts(BehaviorSummary.source_type),
+        "by_result": _group_counts(BehaviorSummary.interaction_result),
+        "by_risk": _group_counts(BehaviorSummary.risk_level),
+        "by_dataset": _group_counts(BehaviorSummary.dataset_status),
+        "comparison": [
+            _behavior_group_metrics(db, "child", BehaviorSummary.student_id.isnot(None)),
+            _behavior_group_metrics(db, "anonymous", BehaviorSummary.student_id.is_(None)),
+        ],
+    }
+
+
+@router.get("/behavior/records")
+def behavior_records(
+    source: str | None = None,
+    result_filter: str | None = None,  # pass|fail (correct/pass·incorrect/fail 통합)
+    risk: str | None = None,  # low|review|elevated
+    group: str | None = None,  # student|anonymous
+    dataset: str | None = None,  # candidate|included|excluded
+    limit: int = 50,
+    offset: int = 0,
+    principal: Principal = Depends(require_ops),
+    db: Session = Depends(get_db),
+):
+    """행동 데이터 레코드 목록 (필터 + 페이지네이션, 최신순)."""
+    q = db.query(BehaviorSummary)
+    if source:
+        q = q.filter(BehaviorSummary.source_type == source)
+    if result_filter == "pass":
+        q = q.filter(BehaviorSummary.interaction_result.in_(_BEHAVIOR_PASS))
+    elif result_filter == "fail":
+        q = q.filter(BehaviorSummary.interaction_result.in_(_BEHAVIOR_FAIL))
+    if risk:
+        q = q.filter(BehaviorSummary.risk_level == risk)
+    if group == "student":
+        q = q.filter(BehaviorSummary.student_id.isnot(None))
+    elif group == "anonymous":
+        q = q.filter(BehaviorSummary.student_id.is_(None))
+    if dataset:
+        q = q.filter(BehaviorSummary.dataset_status == dataset)
+
+    total = q.count()
+    limit = max(1, min(200, limit))
+    rows = (
+        # id 보조 정렬: created_at 동률(초 단위) 시 offset 페이지 경계 중복/누락 방지
+        q.order_by(BehaviorSummary.created_at.desc(), BehaviorSummary.id.desc())
+        .offset(max(0, offset))
+        .limit(limit)
+        .all()
+    )
+
+    # 학생/기관 이름·궤적 유무 일괄 조회 (행별 N+1 방지)
+    sids = {r.student_id for r in rows if r.student_id}
+    students = (
+        {s.id: s for s in db.query(StudentProfile).filter(StudentProfile.id.in_(sids)).all()}
+        if sids
+        else {}
+    )
+    oids = {r.organization_id for r in rows}
+    orgs = (
+        {o.id: o for o in db.query(Organization).filter(Organization.id.in_(oids)).all()}
+        if oids
+        else {}
+    )
+    ids = [r.id for r in rows]
+    trace_points = (
+        dict(
+            db.query(BehaviorTrace.behavior_id, BehaviorTrace.point_count)
+            .filter(BehaviorTrace.behavior_id.in_(ids))
+            .all()
+        )
+        if ids
+        else {}
+    )
+
+    def _row(r: BehaviorSummary) -> dict:
+        s = students.get(r.student_id) if r.student_id else None
+        org = orgs.get(r.organization_id)
+        return {
+            "id": r.id,
+            "source_type": r.source_type,
+            "organization_name": org.name if org else None,
+            "student": {
+                "nickname": s.nickname,
+                "student_code": s.student_code,
+                "age": s.age,
+                "grade_band": s.grade_band,
+            }
+            if s
+            else None,
+            "solve_time_ms": r.solve_time_ms,
+            "path_length": r.path_length,
+            "avg_speed": r.avg_speed,
+            "pause_count": r.pause_count,
+            "retry_count": r.retry_count,
+            "drop_distance_norm": r.drop_distance_norm,
+            "interaction_result": r.interaction_result,
+            "risk_level": r.risk_level,
+            "dataset_status": r.dataset_status,
+            "trace_points": trace_points.get(r.id),  # None = 원시 궤적 없음
+            "occurred_at": r.occurred_at.isoformat() if r.occurred_at else None,
+            "created_at": r.created_at.isoformat() if r.created_at else None,
+        }
+
+    return {"total": total, "items": [_row(r) for r in rows]}
+
+
+@router.get("/behavior/records/{record_id}/trace")
+def behavior_trace(
+    record_id: str,
+    principal: Principal = Depends(require_ops),
+    db: Session = Depends(get_db),
+):
+    """레코드의 원시 포인터 궤적 — 목록에서 궤적 뱃지 클릭 시 시각화용."""
+    t = db.query(BehaviorTrace).filter(BehaviorTrace.behavior_id == record_id).first()
+    if t is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="이 레코드에는 궤적이 없습니다.")
+    return {
+        "behavior_id": t.behavior_id,
+        "points": t.points,
+        "point_count": t.point_count,
+        "duration_ms": t.duration_ms,
+        "box_w": t.box_w,
+        "box_h": t.box_h,
+    }
+
+
+class _DatasetMarkReq(BaseModel):
+    dataset_status: str = Field(pattern="^(candidate|included|excluded)$")
+
+
+@router.patch("/behavior/records/{record_id}/dataset")
+def behavior_mark_dataset(
+    record_id: str,
+    req: _DatasetMarkReq,
+    principal: Principal = Depends(require_ops),
+    db: Session = Depends(get_db),
+):
+    """레코드의 학습셋 상태 변경 (candidate|included|excluded) — 감사 로그 기록."""
+    r = db.get(BehaviorSummary, record_id)
+    if r is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="레코드를 찾을 수 없습니다.")
+    before = r.dataset_status
+    if before == req.dataset_status:  # no-op은 감사 로그를 남기지 않음 (연타/재호출 노이즈 방지)
+        return {"ok": True, "dataset_status": before}
+    r.dataset_status = req.dataset_status
+    db.add(
+        AuditLog(
+            actor_user_id=principal.id,
+            organization_id=r.organization_id,
+            action="behavior.dataset_mark",
+            target_type="behavior_summary",
+            target_id=r.id,
+            after_json={"from": before, "to": req.dataset_status},
+        )
+    )
+    db.commit()
+    return {"ok": True, "dataset_status": r.dataset_status}

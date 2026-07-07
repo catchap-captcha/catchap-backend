@@ -6,12 +6,14 @@ from app.models.content import (
     Chapter,
     CoinTransaction,
     Content,
+    DailyReward,
     ShopItem,
     StudentBadge,
     StudentItem,
 )
 from app.models.learning import (
     BehaviorSummary,
+    BehaviorTrace,
     ConceptRead,
     DailyQuizStatus,
     LearningAttempt,
@@ -38,7 +40,13 @@ from app.models.misc import (
 )
 from app.models.onboarding import ParentInviteCode, StudentJoinCode
 from app.models.organization import Institution, Organization, OrgRegistrationRequest
-from app.models.site import ApiKey, ApiUsageLog, CaptchaSetting, Site
+from app.models.site import (
+    ApiKey,
+    ApiUsageLog,
+    CaptchaConsumedToken,
+    CaptchaSetting,
+    Site,
+)
 from app.models.stat import StatBlob
 from app.models.throttle import LoginThrottle
 from app.models.student import ParentStudentLink, StudentProfile
@@ -51,7 +59,9 @@ __all__ = [
     "AuditLog",
     "Badge",
     "BehaviorSummary",
+    "BehaviorTrace",
     "CaptchaAsset",
+    "CaptchaConsumedToken",
     "CaptchaSetting",
     "Chapter",
     "ClassRoom",
@@ -59,6 +69,7 @@ __all__ = [
     "ConceptRead",
     "Content",
     "DailyQuizStatus",
+    "DailyReward",
     "EmailLog",
     "EmailVerificationCode",
     "FamilyMessage",

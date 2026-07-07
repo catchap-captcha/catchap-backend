@@ -10,6 +10,10 @@ from app.services import auth_service, onboarding_service
 router = APIRouter(prefix="/auth", tags=["auth"])
 
 
+def _client_ip(request: Request) -> str:
+    return request.client.host if request.client else "unknown"
+
+
 class ActivateStudentRequest(BaseModel):
     code: str
     nickname: str
@@ -75,7 +79,9 @@ def me(principal: Principal = Depends(get_current_principal), db: Session = Depe
 
 
 @router.post("/email/send")
-def send_email_code(req: s.EmailSendRequest, db: Session = Depends(get_db)):
+def send_email_code(req: s.EmailSendRequest, request: Request, db: Session = Depends(get_db)):
+    # IP 기준 발송 상한(스팸/열거 완화) — 이메일 기준 상한은 서비스에서 별도 적용
+    auth_service.rate_limit(db, f"emailsendip:{_client_ip(request)}", limit=40)
     auth_service.send_email_code(db, req.email, req.purpose, req.for_account)
     return {"ok": True}
 
@@ -117,7 +123,10 @@ def register_org(req: s.RegisterOrgRequest, db: Session = Depends(get_db)):
 
 
 @router.post("/password-reset/request")
-def password_reset_request(req: s.PasswordResetRequest, db: Session = Depends(get_db)):
+def password_reset_request(
+    req: s.PasswordResetRequest, request: Request, db: Session = Depends(get_db)
+):
+    auth_service.rate_limit(db, f"pwresetip:{_client_ip(request)}", limit=40)
     auth_service.password_reset_request(db, req.email)
     return {"ok": True}
 
@@ -129,7 +138,11 @@ def password_reset_confirm(req: s.PasswordResetConfirm, db: Session = Depends(ge
 
 
 @router.post("/verify-org-code")
-def verify_org_code(req: s.OrgCodeVerifyRequest, db: Session = Depends(get_db)):
+def verify_org_code(
+    req: s.OrgCodeVerifyRequest, request: Request, db: Session = Depends(get_db)
+):
+    # 저엔트로피 기관코드 열거 완화 — IP 기준 시도 상한
+    auth_service.rate_limit(db, f"verifyorgip:{_client_ip(request)}", limit=40)
     org = auth_service.verify_org_code(db, req.organization_id, req.code)
     if org:
         return {"valid": True, "organization_name": org.name}
@@ -137,5 +150,9 @@ def verify_org_code(req: s.OrgCodeVerifyRequest, db: Session = Depends(get_db)):
 
 
 @router.post("/verify-teacher-code")
-def verify_teacher_code(req: s.OrgCodeVerifyRequest, db: Session = Depends(get_db)):
+def verify_teacher_code(
+    req: s.OrgCodeVerifyRequest, request: Request, db: Session = Depends(get_db)
+):
+    # 교사 개별코드 열거 완화 — IP 기준 시도 상한
+    auth_service.rate_limit(db, f"verifyteacherip:{_client_ip(request)}", limit=40)
     return {"valid": auth_service.verify_teacher_code(db, req.organization_id, req.code)}

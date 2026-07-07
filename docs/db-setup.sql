@@ -121,17 +121,39 @@ CREATE TABLE behavior_summaries (
 	pause_count INTEGER NOT NULL, 
 	retry_count INTEGER NOT NULL, 
 	drop_distance_norm FLOAT NOT NULL, 
-	interaction_result VARCHAR(20), 
-	risk_level VARCHAR(20) NOT NULL, 
-	occurred_at DATETIME, 
-	id CHAR(36) NOT NULL, 
-	created_at DATETIME NOT NULL DEFAULT now(), 
-	updated_at DATETIME NOT NULL DEFAULT now(), 
+	interaction_result VARCHAR(20),
+	risk_level VARCHAR(20) NOT NULL,
+	occurred_at DATETIME,
+	dataset_status VARCHAR(20) NOT NULL DEFAULT 'candidate',
+	id CHAR(36) NOT NULL,
+	created_at DATETIME NOT NULL DEFAULT now(),
+	updated_at DATETIME NOT NULL DEFAULT now(),
 	PRIMARY KEY (id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE INDEX ix_behavior_summaries_organization_id ON behavior_summaries (organization_id);
 CREATE INDEX ix_behavior_summaries_student_id ON behavior_summaries (student_id);
+CREATE INDEX ix_bs_created ON behavior_summaries (created_at);
+
+-- ─────────────────────────────────────────────
+-- ▶ behavior_traces  [캡차·API]
+--   무엇: 원시 포인터 궤적 [[t,x,y],...] (behavior_summaries 1행당 최대 1행)
+--   왜: 아동용 캡차 판정 모델의 학습 재료 — 요약 지표는 서버가 이 궤적에서 계산
+-- ─────────────────────────────────────────────
+CREATE TABLE behavior_traces (
+	behavior_id CHAR(36) NOT NULL,
+	points JSON NOT NULL,
+	point_count INTEGER NOT NULL DEFAULT 0,
+	duration_ms INTEGER NOT NULL DEFAULT 0,
+	box_w INTEGER NOT NULL DEFAULT 0,
+	box_h INTEGER NOT NULL DEFAULT 0,
+	id CHAR(36) NOT NULL,
+	created_at DATETIME NOT NULL DEFAULT now(),
+	updated_at DATETIME NOT NULL DEFAULT now(),
+	PRIMARY KEY (id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE UNIQUE INDEX ix_behavior_traces_behavior_id ON behavior_traces (behavior_id);
 
 -- ─────────────────────────────────────────────
 -- ▶ captcha_assets  [캡차·API]

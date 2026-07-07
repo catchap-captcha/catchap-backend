@@ -117,6 +117,22 @@ def update_profile(
     return {"ok": True, "name": user.name, "phone": user.phone}
 
 
+def _parent_banner(child: StudentProfile, has_week: bool) -> dict:
+    """자녀 이름이 정확히 들어간 요약 배너. 프리셋이 있으면 그 문구, 없으면 이번 주 활동 여부로 생성."""
+    preset = D.PARENT_SUMMARY.get(child.nickname)
+    if preset:
+        return {"title": preset["banner_title"], "body": preset["banner_body"]}
+    if has_week:
+        return {
+            "title": f"{child.nickname} 이번 주 학습이 순조로워요!",
+            "body": "이번 주 학습 기록을 아래에서 확인해 보세요.",
+        }
+    return {
+        "title": f"{child.nickname} 이번 주 학습을 응원해요!",
+        "body": "아직 이번 주 학습 기록이 많지 않아요. 함께 시작해 볼까요?",
+    }
+
+
 @router.get("/parents/me/children/{child_id}/summary")
 def child_summary(
     child_id: str,
@@ -127,9 +143,12 @@ def child_summary(
     child = db.get(StudentProfile, child_id)
     if child is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="자녀 정보를 찾을 수 없습니다.")
-    preset = D.PARENT_SUMMARY.get(child.nickname, D.PARENT_SUMMARY["하은"])
+    # 숫자 폴백은 프리셋 형태를 재사용하되, 화면에 보이는 배너 문구는 자녀 실제 이름으로 생성한다
+    # (프리셋 없는 자녀에게 '하은' 배너가 나가던 버그 제거).
+    preset = D.PARENT_SUMMARY.get(child.nickname) or D.PARENT_SUMMARY["하은"]
     # KPI/강약점: learning_attempts 실집계 — 이번 주 시도 없으면 D 유지
     sw = aggregate.parent_strengths_weaknesses(db, child) or {}
+    week_kpis = aggregate.parent_week_kpis(db, child)
     return {
         "child": {
             "id": child.id,
@@ -138,9 +157,12 @@ def child_summary(
             "student_code": child.student_code,
         },
         "status": preset["status"],
-        "banner": {"title": preset["banner_title"], "body": preset["banner_body"]},
-        "kpis": fb(aggregate.parent_week_kpis(db, child), preset["kpis"]),
+        "banner": _parent_banner(child, has_week=bool(week_kpis)),
+        "kpis": fb(week_kpis, preset["kpis"]),
         **D.PARENT_SUMMARY_COMMON,
+        # 기간 라벨은 오늘 기준 실제 주로, 원인 카드는 자녀 실제 오답 분포로 (없으면 D 유지)
+        "period_label": aggregate.period_label("week"),
+        "reasons": fb(aggregate.parent_reasons(db, child), D.PARENT_SUMMARY_COMMON["reasons"]),
         "strengths": fb(sw.get("strengths"), D.PARENT_SUMMARY_COMMON["strengths"]),
         "weaknesses": fb(sw.get("weaknesses"), D.PARENT_SUMMARY_COMMON["weaknesses"]),
     }
@@ -159,7 +181,8 @@ def child_report(
     if child is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="자녀 정보를 찾을 수 없습니다.")
     d = D.PARENT_REPORT.get(child.nickname, D.PARENT_REPORT["하은"])
-    period_labels = {"week": "6월 넷째 주 (6.22~6.28)", "month": "2026년 6월", "year": "2026년"}
+    valid_periods = {"week", "month", "year"}
+    period = period if period in valid_periods else "week"
 
     # 기관·학급 라벨: 실테이블(organizations/classes) 기준
     org = db.get(Organization, child.organization_id) if child.organization_id else None
@@ -188,8 +211,8 @@ def child_report(
             "age": child.age,
             "student_code": child.student_code,
         },
-        "period": period if period in period_labels else "week",
-        "period_label": period_labels.get(period, period_labels["week"]),
+        "period": period,
+        "period_label": aggregate.period_label(period),
         "org_label": org_label or "햇살초등학교 1-2반",
         "grade": fb(agg.get("grade"), d["grade"]),
         "percentile": fb(agg.get("percentile"), d["percentile"]),
@@ -207,7 +230,7 @@ def child_report(
             "class_series": fb(agg.get("trend_class_series"), cseries),
             "avg": fb(agg.get("trend_avg"), round(sum(series) / len(series))),
         },
-        "reasons": D.PARENT_SUMMARY_COMMON["reasons"],
+        "reasons": fb(aggregate.parent_reasons(db, child), D.PARENT_SUMMARY_COMMON["reasons"]),
         "recommendations": D.PARENT_SUMMARY_COMMON["recommendations"],
         # 담임 작성 기능이 없으므로 'AI 양육 가이드'로 명명 (구 teacher_comment — 화면 미표시 필드)
         "ai_comment": d.get("ai_comment", d.get("teacher_comment", "")),

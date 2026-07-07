@@ -1,6 +1,16 @@
-from datetime import datetime
+from datetime import date, datetime
 
-from sqlalchemy import CHAR, JSON, DateTime, Float, ForeignKey, String, Text
+from sqlalchemy import (
+    CHAR,
+    JSON,
+    Date,
+    DateTime,
+    Float,
+    ForeignKey,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base, Timestamps, UUIDPk
@@ -39,6 +49,8 @@ class Content(Base, UUIDPk, Timestamps):
 
 class Badge(Base, UUIDPk, Timestamps):
     __tablename__ = "badges"
+    # 배지명 유일 — 자동지급(개근왕 등) find-or-create 가 race로 중복 배지를 만들지 않게
+    __table_args__ = (UniqueConstraint("name", name="uq_badge_name"),)
 
     name: Mapped[str] = mapped_column(String(60))
     description: Mapped[str] = mapped_column(String(200))
@@ -50,6 +62,10 @@ class Badge(Base, UUIDPk, Timestamps):
 
 class StudentBadge(Base, UUIDPk, Timestamps):
     __tablename__ = "student_badges"
+    # 학생·배지당 1행 (자동지급 동시요청 이중지급 차단)
+    __table_args__ = (
+        UniqueConstraint("student_id", "badge_id", name="uq_student_badge"),
+    )
 
     student_id: Mapped[str] = mapped_column(
         CHAR(36), ForeignKey("student_profiles.id"), index=True
@@ -73,6 +89,10 @@ class ShopItem(Base, UUIDPk, Timestamps):
 
 class StudentItem(Base, UUIDPk, Timestamps):
     __tablename__ = "student_items"
+    # 아이템 중복 보유행 차단 (동시 구매 요청 race)
+    __table_args__ = (
+        UniqueConstraint("student_id", "item_id", name="uq_student_item"),
+    )
 
     student_id: Mapped[str] = mapped_column(
         CHAR(36), ForeignKey("student_profiles.id"), index=True
@@ -88,3 +108,23 @@ class CoinTransaction(Base, UUIDPk, Timestamps):
     )
     amount: Mapped[int] = mapped_column()  # +적립 / -사용
     reason: Mapped[str] = mapped_column(String(100))
+
+
+class DailyReward(Base, UUIDPk, Timestamps):
+    """GET 경로에서 하루 1회 지급하는 보상의 멱등 장부.
+
+    (student_id, kind, reward_date) UNIQUE로 INSERT 충돌 시 스킵 → 동시요청 이중지급 차단.
+    kind 예: 'rank_bonus'(학년 랭킹 상위 보너스 코인).
+    """
+
+    __tablename__ = "daily_rewards"
+    __table_args__ = (
+        UniqueConstraint("student_id", "kind", "reward_date", name="uq_daily_reward"),
+    )
+
+    student_id: Mapped[str] = mapped_column(
+        CHAR(36), ForeignKey("student_profiles.id"), index=True
+    )
+    kind: Mapped[str] = mapped_column(String(30), index=True)
+    reward_date: Mapped[date] = mapped_column(Date, index=True)
+    amount: Mapped[int] = mapped_column(default=0)

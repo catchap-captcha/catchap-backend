@@ -1,6 +1,17 @@
 from datetime import date, datetime
 
-from sqlalchemy import CHAR, JSON, Date, DateTime, Float, ForeignKey, Index, String, Text
+from sqlalchemy import (
+    CHAR,
+    JSON,
+    Date,
+    DateTime,
+    Float,
+    ForeignKey,
+    Index,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base, Timestamps, UUIDPk
@@ -10,6 +21,10 @@ class StudentProgress(Base, UUIDPk, Timestamps):
     """과목/챕터별 진도"""
 
     __tablename__ = "student_progress"
+    # 과목당 진도행 1개 (동시 학습 저장 race로 중복행 생겨 집계가 부풀던 것 차단)
+    __table_args__ = (
+        UniqueConstraint("student_id", "subject", name="uq_student_progress_subject"),
+    )
 
     organization_id: Mapped[str] = mapped_column(CHAR(36), index=True)
     student_id: Mapped[str] = mapped_column(
@@ -82,6 +97,12 @@ class DailyQuizStatus(Base, UUIDPk, Timestamps):
     """오늘의퀴즈 과목별 상태"""
 
     __tablename__ = "daily_quiz_status"
+    # 학생·날짜·과목당 1행 (동시 완료 저장 race로 done 행이 중복돼 랭킹 점수가 부풀던 것 차단)
+    __table_args__ = (
+        UniqueConstraint(
+            "student_id", "quiz_date", "subject", name="uq_daily_quiz_student_date_subject"
+        ),
+    )
 
     student_id: Mapped[str] = mapped_column(
         CHAR(36), ForeignKey("student_profiles.id"), index=True
@@ -116,6 +137,8 @@ class LearningSummary(Base, UUIDPk, Timestamps):
 
 class BehaviorSummary(Base, UUIDPk, Timestamps):
     __tablename__ = "behavior_summaries"
+    # 운영 콘솔 행동 데이터 목록의 최신순 정렬/기간 집계 가속 (migration a7b8c9d0e1f2)
+    __table_args__ = (Index("ix_bs_created", "created_at"),)
 
     organization_id: Mapped[str] = mapped_column(CHAR(36), index=True)
     student_id: Mapped[str | None] = mapped_column(CHAR(36), nullable=True, index=True)
@@ -129,6 +152,29 @@ class BehaviorSummary(Base, UUIDPk, Timestamps):
     interaction_result: Mapped[str | None] = mapped_column(String(20), nullable=True)
     risk_level: Mapped[str] = mapped_column(String(20), default="low")  # low|review|elevated
     occurred_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # 아동용 캡차 판정 모델 학습셋 큐레이션 상태 (운영 콘솔에서 관리)
+    # server_default: seed의 bulk_insert_mappings처럼 ORM 기본값을 안 타는 INSERT도 안전하게
+    dataset_status: Mapped[str] = mapped_column(
+        String(20), default="candidate", server_default="candidate"
+    )  # candidate|included|excluded
+
+
+class BehaviorTrace(Base, UUIDPk, Timestamps):
+    """원시 포인터 궤적 — 아동용 캡차 판정 모델의 학습 재료.
+
+    behavior_summaries 1행당 최대 1행. points는 [[t_ms, x, y], ...]
+    (t: 상호작용 시작 기준 ms, x/y: 캡처 영역 기준 0~1 정규화, 서버에서 2000점 캡).
+    요약 지표(path_length 등)는 저장 시 서버가 이 궤적으로부터 직접 계산한다.
+    """
+
+    __tablename__ = "behavior_traces"
+
+    behavior_id: Mapped[str] = mapped_column(CHAR(36), unique=True, index=True)
+    points: Mapped[list] = mapped_column(JSON, default=list)
+    point_count: Mapped[int] = mapped_column(default=0)
+    duration_ms: Mapped[int] = mapped_column(default=0)
+    box_w: Mapped[int] = mapped_column(default=0)  # 캡처 영역 px (좌표 복원용)
+    box_h: Mapped[int] = mapped_column(default=0)
 
 
 class ConceptRead(Base, UUIDPk, Timestamps):

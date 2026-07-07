@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import CHAR, JSON, DateTime, ForeignKey, Index, String
+from sqlalchemy import CHAR, JSON, DateTime, ForeignKey, Index, String, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base, Timestamps, UUIDPk
@@ -29,6 +29,10 @@ class ApiKey(Base, UUIDPk, Timestamps):
     site_id: Mapped[str] = mapped_column(CHAR(36), ForeignKey("sites.id"), index=True)
     site_key: Mapped[str] = mapped_column(String(64), unique=True, index=True)
     secret_key_hash: Mapped[str] = mapped_column(String(64))
+    # 제품 구분: 'captcha'(메인 봇차단) | 'edu'(교육형). edu는 subject로 과목 세분화.
+    product: Mapped[str] = mapped_column(String(20), default="captcha")
+    subject: Mapped[str | None] = mapped_column(String(20), nullable=True)  # edu 전용 과목
+    label: Mapped[str | None] = mapped_column(String(100), nullable=True)  # 발급 메모(예: 우리학교 홈페이지)
     status: Mapped[str] = mapped_column(String(20), default="active")  # active|disabled
     last_used_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
@@ -44,6 +48,23 @@ class ApiUsageLog(Base, UUIDPk, Timestamps):
     method: Mapped[str] = mapped_column(String(10))
     status_code: Mapped[int] = mapped_column(default=200)
     latency_ms: Mapped[int] = mapped_column(default=0)
+
+
+class CaptchaConsumedToken(Base, UUIDPk, Timestamps):
+    """캡차 1회용 토큰 소비 장부 (challenge nonce · verdict jti).
+
+    무상태 서명 토큰의 리플레이 차단은 인메모리로는 멀티워커/재시작에 무효 →
+    (kind, token_id) UNIQUE로 원자적 소비(INSERT 충돌 시 이미 사용됨).
+    """
+
+    __tablename__ = "captcha_consumed_tokens"
+    __table_args__ = (
+        UniqueConstraint("kind", "token_id", name="uq_captcha_consumed"),
+    )
+
+    kind: Mapped[str] = mapped_column(String(20), index=True)  # challenge | verdict
+    token_id: Mapped[str] = mapped_column(String(64), index=True)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
 class CaptchaSetting(Base, UUIDPk, Timestamps):

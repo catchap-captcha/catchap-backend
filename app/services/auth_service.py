@@ -111,6 +111,28 @@ def _check_locked(db: Session, identifier: str) -> None:
     db.commit()
 
 
+# --- 무인증/저비용 엔드포인트 레이트리밋 (이메일/IP 기준, LoginThrottle 재사용) ---
+def rate_limit(db: Session, identifier: str, limit: int, window_seconds: int = 3600) -> None:
+    """window_seconds 창에서 limit회를 넘으면 429.
+
+    LoginThrottle 행(fail_count)을 카운터로 재사용한다. 마지막 요청 이후 창이 지나면
+    카운터를 리셋(슬라이딩) — 정당 사용자가 영구 차단되지 않도록. identifier는
+    "emailsend:", "verifyorg:" 등 로그인 실패 카운터와 겹치지 않게 네임스페이스를 준다.
+    """
+    row = _throttle_row(db, identifier)
+    last = row.updated_at or row.created_at
+    if last and (datetime.now() - last).total_seconds() >= window_seconds:
+        row.fail_count = 0
+    if row.fail_count >= limit:
+        db.commit()
+        raise HTTPException(
+            status.HTTP_429_TOO_MANY_REQUESTS,
+            detail={"message": "요청이 너무 잦아요. 잠시 후 다시 시도해 주세요.", "rate_limited": True},
+        )
+    row.fail_count += 1
+    db.commit()
+
+
 def issue_tokens(db: Session, subject_id: str, role: str, subject_type: str) -> s.TokenPair:
     access = create_access_token(subject_id, role)
     refresh, expires_at = create_refresh_token(subject_id)
@@ -146,10 +168,42 @@ def login(db: Session, req: s.LoginRequest) -> s.TokenPair:
         raise HTTPException(status.HTTP_403_FORBIDDEN, detail="비활성화된 계정입니다.")
     if user.email_verified_at is None:
         raise HTTPException(status.HTTP_403_FORBIDDEN, detail="이메일 인증이 완료되지 않았습니다.")
+    _assert_org_approved(db, user)  # 기관 승인 게이트 (ops 승인 전 로그인 차단)
     _reset_fails(db, identifier)
     user.last_login_at = _now()
     db.commit()
     return issue_tokens(db, user.id, user.role, "user")
+
+
+def _assert_org_approved(db: Session, user: User) -> None:
+    """기관 소속 역할(org_admin/teacher/grade_head)은 기관이 승인(active)된 뒤에만 로그인.
+
+    register_org는 기관·관리자·멤버십을 pending으로 만들고, ops 승인 시 active로 전환한다.
+    승인 전에는 로그인 자체를 막아야 한다(과거엔 pending이어도 로그인됐다).
+    자격증명은 이미 확인했으므로 실패 카운트는 올리지 않고 403(승인 대기)로 거부한다.
+    """
+    if user.role not in ("org_admin", "teacher", "grade_head"):
+        return
+    org = db.get(Organization, user.organization_id) if user.organization_id else None
+    if org is None or org.status != "active":
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            detail="기관 승인 대기 중이에요. 운영팀 승인 후 로그인할 수 있어요.",
+        )
+    # 멤버십이 있으면 그 상태도 active 여야 한다(없는 계정도 있어 존재할 때만 검사).
+    m = (
+        db.query(Membership)
+        .filter(
+            Membership.user_id == user.id,
+            Membership.organization_id == user.organization_id,
+        )
+        .first()
+    )
+    if m is not None and m.status != "active":
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            detail="기관 승인 대기 중이에요. 운영팀 승인 후 로그인할 수 있어요.",
+        )
 
 
 def ops_login(db: Session, req: s.LoginRequest) -> s.TokenPair:
@@ -269,6 +323,8 @@ def send_email_code(db: Session, email: str, purpose: str, for_account: bool = F
     if purpose == "signup" and for_account:
         if db.query(User).filter(User.email == email.strip().lower()).first():
             raise HTTPException(status.HTTP_409_CONFLICT, detail="이미 가입된 이메일입니다.")
+    # 발송 폭주/스팸 방지: 이메일 기준 시간당 발송 상한 (IP 기준 상한은 엔드포인트에서)
+    rate_limit(db, f"emailsend:{email.strip().lower()}", limit=8, window_seconds=3600)
     code = generate_email_code()
     db.add(
         EmailVerificationCode(
@@ -424,11 +480,20 @@ def register_student(db: Session, req: s.RegisterStudentRequest) -> StudentProfi
     return student
 
 
+# 혼동 문자(0/O, 1/I/L) 제외 고엔트로피 알파벳 — onboarding_service와 통일.
+# CAT-XXXXXX (30^6 ≈ 7.3억) → 과거 CAT-1000~9999(9000개) 한계·무한루프 위험 제거.
+_CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
+
+
 def _generate_student_code(db: Session) -> str:
-    while True:
-        code = f"CAT-{secrets.randbelow(9000) + 1000}"
+    """학생 코드 생성 — 시도 횟수 상한(무한루프 제거). 충돌 시 재시도, 초과 시 500."""
+    for _ in range(50):
+        code = "CAT-" + "".join(secrets.choice(_CODE_ALPHABET) for _ in range(6))
         if not db.query(StudentProfile).filter(StudentProfile.student_code == code).first():
             return code
+    raise HTTPException(
+        status.HTTP_500_INTERNAL_SERVER_ERROR, detail="학생 코드 생성에 실패했어요. 다시 시도해 주세요."
+    )
 
 
 def _generate_org_code(db: Session, name: str) -> str:

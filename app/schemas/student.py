@@ -26,6 +26,9 @@ class AttemptCreate(BaseModel):
     estimated_reason: str | None = Field(default=None, max_length=200)
     completed: bool = False  # true면 오늘의퀴즈 해당 과목 완료 처리
     replay: bool = False  # 전날 복습/다시풀기 — 오늘 완료 처리·코인 지급 없음
+    # 행동 데이터 (아동용 캡차 학습 재료): {solve_time_ms, retry_count, trace:[[t,x,y],...], box:{w,h}}
+    # 궤적이 있으면 서버가 지표를 직접 계산한다 (captcha_service.record_behavior_event)
+    behavior: dict | None = None
 
 
 class ConceptReadRequest(BaseModel):
