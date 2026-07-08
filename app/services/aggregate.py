@@ -141,14 +141,80 @@ def _acc_series(rows: Sequence[LearningAttempt], buckets: list[tuple[date, date]
     return filled
 
 
-def _streak_days(days: set[date]) -> int:
-    today = date.today()
+def _streak_days(days: set[date], today: date | None = None) -> int:
+    today = today or date.today()
     cur = today if today in days else today - timedelta(days=1)
     n = 0
     while cur in days:
         n += 1
         cur -= timedelta(days=1)
     return n
+
+
+def student_roster_metrics(
+    db: Session, student_ids: Sequence[str], today: date | None = None
+) -> dict[str, dict]:
+    """학생별 로스터 지표를 learning_attempts에서 실집계 — 교사/기관 명단용.
+
+    반환: {student_id: {acc, streak, solved, today}} — **시도가 1건이라도 있는 학생만** 포함한다.
+    시도가 없는(데모/미플레이) 학생은 키가 없어, 호출부가 기존 seed(LearningSummary) 값으로
+    폴백한다(코드베이스의 fb 철학과 동일). 즉 실제로 푸는 학생은 실데이터, 데모는 그대로.
+    정의: acc=28일 정답률(canonical), streak=오늘 기준 역산 출석 연속, solved=누적 시도,
+    today=오늘 DailyQuizStatus done 여부(권위 완료 정의).
+    """
+    from collections import defaultdict
+
+    from app.models import DailyQuizStatus
+
+    today = today or date.today()
+    ids = [i for i in student_ids]
+    if not ids:
+        return {}
+    since28 = today - timedelta(days=27)  # 오늘 포함 28일 창
+
+    solved: dict[str, int] = defaultdict(int)
+    dates: dict[str, set[date]] = defaultdict(set)
+    acc_n: dict[str, int] = defaultdict(int)
+    acc_d: dict[str, int] = defaultdict(int)
+    rows = (
+        db.query(
+            LearningAttempt.student_id,
+            LearningAttempt.result,
+            func.date(LearningAttempt.created_at),
+        )
+        .filter(LearningAttempt.student_id.in_(ids))
+        .all()
+    )
+    for sid, result, d in rows:
+        dd = d if isinstance(d, date) else date.fromisoformat(str(d)[:10])
+        solved[sid] += 1
+        dates[sid].add(dd)
+        if dd >= since28:
+            acc_d[sid] += 1
+            if result == "correct":
+                acc_n[sid] += 1
+
+    done_today = {
+        r[0]
+        for r in db.query(DailyQuizStatus.student_id)
+        .filter(
+            DailyQuizStatus.student_id.in_(ids),
+            DailyQuizStatus.quiz_date == today,
+            DailyQuizStatus.status == "done",
+        )
+        .distinct()
+        .all()
+    }
+
+    out: dict[str, dict] = {}
+    for sid in solved:  # 시도가 있는 학생만 (없으면 호출부가 seed 폴백)
+        out[sid] = {
+            "acc": round(acc_n[sid] / acc_d[sid] * 100) if acc_d[sid] else 0,
+            "streak": _streak_days(dates[sid], today),
+            "solved": solved[sid],
+            "today": "done" if sid in done_today else "none",
+        }
+    return out
 
 
 def _rel_time(dt: datetime | None) -> str:

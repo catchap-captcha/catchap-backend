@@ -10,6 +10,7 @@ import secrets
 from datetime import datetime, timedelta, timezone
 
 from fastapi import HTTPException, status
+from sqlalchemy import update as sa_update
 from sqlalchemy.orm import Session
 
 from app.core.security import hash_password, sha256_hash
@@ -200,6 +201,21 @@ def consume_parent_invite(db: Session, parent_user_id: str, code: str) -> Parent
             detail=f"연결할 수 있는 자녀는 최대 {MAX_CHILDREN_PER_PARENT}명이에요.",
         )
 
+    # 잔여 횟수 원자적 확보 — 동시에 여러 학부모가 같은 코드를 소비해도 max_uses 초과 불가.
+    # (기존 read-modify-write `used_count += 1`은 lost update로 초과 링크가 생겼다.)
+    # 행 잠금 UPDATE라 동시 요청은 직렬화되고, 링크 INSERT가 실패하면 같은 트랜잭션이라 함께 롤백된다.
+    claimed = db.execute(
+        sa_update(ParentInviteCode)
+        .where(
+            ParentInviteCode.id == row.id,
+            ParentInviteCode.used_count < ParentInviteCode.max_uses,
+        )
+        .values(used_count=ParentInviteCode.used_count + 1)
+    )
+    if claimed.rowcount == 0:
+        db.rollback()
+        raise HTTPException(status.HTTP_409_CONFLICT, detail="이미 사용 횟수를 모두 쓴 코드예요.")
+
     now = _now()
     link = ParentStudentLink(
         parent_user_id=parent_user_id,
@@ -210,6 +226,5 @@ def consume_parent_invite(db: Session, parent_user_id: str, code: str) -> Parent
         approved_at=now,
     )
     db.add(link)
-    row.used_count += 1
     db.commit()
     return link

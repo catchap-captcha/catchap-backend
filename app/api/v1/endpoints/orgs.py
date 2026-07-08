@@ -489,6 +489,8 @@ def roster(
         )
         .all()
     }
+    # learning_attempts 실집계 — 실제 푸는 학생은 실정답률, 미플레이/데모는 seed 폴백
+    real = aggregate.student_roster_metrics(db, [s.id for s in students])
     linked_ids = {
         l.student_id
         for l in db.query(ParentStudentLink)
@@ -507,7 +509,7 @@ def roster(
             continue
         if cls and cls_name != cls:
             continue
-        acc = _acc_pct(summaries.get(s.id)) or meta.get("acc", 0)
+        acc = (real[s.id]["acc"] if s.id in real else _acc_pct(summaries.get(s.id))) or meta.get("acc", 0)
         out.append(
             {
                 "id": s.id,

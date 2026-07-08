@@ -97,19 +97,30 @@ def _display_name(s: StudentProfile) -> str:
     return s.nickname
 
 
-def _student_row(s: StudentProfile, summary: LearningSummary | None) -> dict:
+def _student_row(
+    s: StudentProfile, summary: LearningSummary | None, real: dict | None = None
+) -> dict:
+    """학생 1명 명단 행. real(learning_attempts 실집계)이 있으면 실데이터,
+    없으면(미플레이/데모) seed LearningSummary 값으로 폴백한다."""
     detail = (summary.detail if summary else {}) or {}
+    if real is not None:
+        today, acc, streak, solved = real["today"], real["acc"], real["streak"], real["solved"]
+    else:
+        today = detail.get("today", "none")
+        acc = _acc(summary)
+        streak = summary.streak_days if summary else 0
+        solved = summary.total_count if summary else 0
     return {
         "id": s.id,
         "name": _display_name(s),
         "nickname": s.nickname,
         "age": s.age,
         "code": s.student_code,
-        "today": detail.get("today", "none"),
-        "acc": _acc(summary),
-        "streak": summary.streak_days if summary else 0,
+        "today": today,
+        "acc": acc,
+        "streak": streak,
         "status": status_label(s.status),
-        "solved": summary.total_count if summary else 0,
+        "solved": solved,
     }
 
 
@@ -161,11 +172,13 @@ def my_class_students(
         .order_by(StudentProfile.student_login_id)
         .all()
     )
+    # learning_attempts 실집계 — 실제 푸는 학생은 실데이터, 미플레이/데모는 seed 폴백
+    real = aggregate.student_roster_metrics(db, [s.id for s in students])
     return {
         "class_id": cls.id,
         "class_name": cls.name,
         "total": len(students),
-        "students": [_student_row(s, summaries.get(s.id)) for s in students],
+        "students": [_student_row(s, summaries.get(s.id), real.get(s.id)) for s in students],
         "directory_codes": [d["code"] for d in D.CLASS_DIRECTORY],
     }
 
@@ -325,6 +338,10 @@ def all_students(
         else []
     )
     summaries = {r.student_id: r for r in rows}
+    # 실집계 오버레이 — 실제 푸는 학생은 실정답률, 미플레이/데모는 seed 폴백.
+    # (주의: 어떤 학생이 목록에 뜨는지는 아직 seed LearningSummary.detail.roster가 결정한다.
+    #  실제 배정 학생 기준 목록으로 바꾸려면 전교 명단 쿼리 자체의 재설계가 필요 — 별도 과제.)
+    real = aggregate.student_roster_metrics(db, list(roster_meta.keys()))
 
     groups: dict[str, list[dict]] = {}
     for s in students:
@@ -342,7 +359,7 @@ def all_students(
                 "id": s.id,
                 "name": s.nickname,
                 "code": s.student_code,  # 반배정용 학생코드 (전체 학생 조회 표시)
-                "acc": _acc(summaries.get(s.id)),
+                "acc": real[s.id]["acc"] if s.id in real else _acc(summaries.get(s.id)),
                 "sessions": meta.get("sessions", ""),
                 "weak": meta.get("weak", ""),
                 "status": status_label(s.status),
