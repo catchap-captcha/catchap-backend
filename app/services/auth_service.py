@@ -406,10 +406,31 @@ def register_parent(db: Session, req: s.RegisterParentRequest) -> User:
     return user
 
 
+def _assign_pending_class(db: Session, org_id: str, membership: Membership, user_id: str) -> None:
+    """교사 초대 시 예약된 담당 반(pending_class)에 담임/보조로 연결. 반이 없으면 생성."""
+    from app.models import ClassRoom
+    from app.utils.helpers import parse_grade
+
+    cname = (membership.pending_class or "").strip()
+    if not cname:
+        return
+    cls = (
+        db.query(ClassRoom)
+        .filter(ClassRoom.organization_id == org_id, ClassRoom.name == cname)
+        .first()
+    )
+    if cls is None:
+        cls = ClassRoom(organization_id=org_id, name=cname, grade=parse_grade(cname), status="active")
+        db.add(cls)
+        db.flush()
+    if membership.position == "보조":
+        cls.assistant_teacher_id = user_id
+    else:  # 담임(기본)
+        cls.teacher_id = user_id
+
+
 def register_teacher(db: Session, req: s.RegisterTeacherRequest) -> User:
     email = req.email.strip().lower()
-    _ensure_email_unused(db, email)
-
     membership = (
         db.query(Membership)
         .filter(
@@ -420,23 +441,49 @@ def register_teacher(db: Session, req: s.RegisterTeacherRequest) -> User:
     )
     if membership is None:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="교사 개별 코드가 올바르지 않습니다.")
-    if membership.user_id is not None:
+
+    # 초대 시 이메일을 입력했으면 add_teacher가 pending(placeholder) 계정을 미리 만들어 둔다.
+    # 그 경우 새 계정을 만들지 않고 이 placeholder를 '클레임'(비번·이름 설정, 활성화)해야
+    # self-가입이 409로 막히지 않는다. 이미 활성 계정이면(코드 재사용) 409.
+    placeholder = db.get(User, membership.user_id) if membership.user_id else None
+    if placeholder is not None and placeholder.status != "pending":
         raise HTTPException(status.HTTP_409_CONFLICT, detail="이미 사용된 교사 코드입니다.")
 
+    # 이메일 중복 검사 — 클레임할 placeholder 자신은 제외(자기 이메일과의 충돌 방지)
+    dup = db.query(User).filter(User.email == email)
+    if placeholder is not None:
+        dup = dup.filter(User.id != placeholder.id)
+    if dup.first() is not None:
+        raise HTTPException(status.HTTP_409_CONFLICT, detail="이미 가입된 이메일입니다.")
+
     _consume_verified_code(db, email, req.email_code, "signup")
-    user = User(
-        email=email,
-        password_hash=hash_password(req.password),
-        name=req.name,
-        role="teacher",
-        organization_id=req.organization_id,
-        email_verified_at=_now(),
-    )
-    db.add(user)
-    db.flush()
-    membership.user_id = user.id
+    if placeholder is not None:
+        placeholder.email = email
+        placeholder.password_hash = hash_password(req.password)
+        placeholder.name = req.name
+        placeholder.role = "teacher"
+        placeholder.status = "active"
+        placeholder.organization_id = req.organization_id
+        placeholder.email_verified_at = _now()
+        user = placeholder
+    else:
+        user = User(
+            email=email,
+            password_hash=hash_password(req.password),
+            name=req.name,
+            role="teacher",
+            organization_id=req.organization_id,
+            email_verified_at=_now(),
+        )
+        db.add(user)
+        db.flush()
+        membership.user_id = user.id
     membership.status = "active"
     membership.joined_at = _now()
+    # 초대 시 예약된 담당 반이 있으면 가입 시점에 자동 배정(담임/보조)
+    if membership.pending_class:
+        _assign_pending_class(db, req.organization_id, membership, user.id)
+        membership.pending_class = None
     db.commit()
     return user
 

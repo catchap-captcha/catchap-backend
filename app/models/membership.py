@@ -27,6 +27,9 @@ class Membership(Base, UUIDPk, Timestamps):
     status: Mapped[str] = mapped_column(String(20), default="active")  # active|pending|disabled
     teacher_code: Mapped[str | None] = mapped_column(String(20), unique=True, nullable=True)
     position: Mapped[str | None] = mapped_column(String(50), nullable=True)  # 담임 | 수학 전담 등
+    # 교사 초대 시 지정한 담당 반 — 가입(코드 클레임) 시 이 반의 담임/보조로 자동 배정 후 비움.
+    # (초대 시점엔 교사 계정이 없어 즉시 배정 불가한 경우를 위한 예약 슬롯)
+    pending_class: Mapped[str | None] = mapped_column(String(50), nullable=True)
     # 학년부장(grade_head)이 담당하는 학년(정수). teacher/org_admin은 NULL.
     # role=grade_head 인데 managed_grade 가 있으면 그 학년 범위만 관리 가능.
     managed_grade: Mapped[int | None] = mapped_column(nullable=True)

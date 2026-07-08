@@ -735,12 +735,17 @@ def add_teacher(
             db.add(placeholder)
             db.flush()
             membership.user_id = placeholder.id
-    # 역할→권한 실제 반영: 담임은 담당 교사, 보조는 보조 담임(결원 대체)으로 반에 연결
-    if req.class_name and membership.user_id:
-        if req.role == "담임":
-            _link_homeroom(db, org_id, req.class_name.strip(), membership.user_id, scope_grade)
-        elif req.role == "보조":
-            _link_assistant(db, org_id, req.class_name.strip(), membership.user_id, scope_grade)
+    # 역할→권한 실제 반영: 담임은 담당 교사, 보조는 보조 담임(결원 대체)으로 반에 연결.
+    # 계정이 아직 없으면(코드만 발급) pending_class에 예약 → 가입(코드 클레임) 시 자동 배정.
+    if req.class_name:
+        cname = req.class_name.strip()
+        if membership.user_id:
+            if req.role == "담임":
+                _link_homeroom(db, org_id, cname, membership.user_id, scope_grade)
+            elif req.role == "보조":
+                _link_assistant(db, org_id, cname, membership.user_id, scope_grade)
+        elif req.role in ("담임", "보조"):
+            membership.pending_class = cname
     audit(
         db,
         action="org.teacher_add",
