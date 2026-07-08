@@ -225,6 +225,8 @@ def dashboard(
         "classes": fb(extras.get("classes"), D.ORG_ANALYTICS_CLASSES),
         **overrides,
         "site": _site_status_payload(db, org_id),
+        # 학습 실집계(학급별)가 없어 정답률·학급표·그래프가 디자인(데모)값이면 demo=True
+        "demo": not extras.get("classes"),
     }
 
 
@@ -277,6 +279,8 @@ def analytics(
         "subjTarget": "85%",
         "gradeTarget": "85%",
         "ai_summary": D.ORG_ANALYTICS_AI,  # AI 분석 요약 (stat_blobs 수정 가능)
+        # 학습 실집계가 없어 정답률 시리즈·과목·학급 표가 디자인(데모)값이면 demo=True
+        "demo": not agg and not extras.get("classes"),
     }
 
 
@@ -520,6 +524,8 @@ def roster(
                 "link": s.id in linked_ids or bool(meta.get("link")),
                 "acc": acc,
                 "risk": meta.get("risk") or ("주의" if acc < 75 else "낮음"),
+                # 실플레이 없어 정답률이 seed/디자인 폴백인 행 = 데모칸
+                "demo": s.id not in real,
             }
         )
     if scope_grade is None:

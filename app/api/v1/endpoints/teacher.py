@@ -121,6 +121,8 @@ def _student_row(
         "streak": streak,
         "status": status_label(s.status),
         "solved": solved,
+        # 실집계(real)가 없어 seed 데모값으로 표시된 행 = '데모칸'. 프론트가 '데모' 라벨.
+        "demo": real is None,
     }
 
 
@@ -146,6 +148,8 @@ def dashboard(principal: Principal = Depends(require_teacher), db: Session = Dep
         "bar_data": fb(agg.get("bar_data"), d.get("bar_data")),
         "game_bars": fb(agg.get("game_bars"), d.get("game_bars")),
         "attention": fb(agg.get("attention"), d.get("attention")),
+        # 학급에 실 시도가 없어 그래프·KPI가 전부 디자인(데모)값이면 demo=True
+        "demo": not agg,
     }
 
 
@@ -314,6 +318,18 @@ def remove_class_student(
 
 
 # ---------------------------------------------------------------- 전교 roster
+def _class_gc(c: ClassRoom) -> tuple[int | None, int | None]:
+    """ClassRoom → (학년, 반번호). grade 컬럼 우선, 반번호는 이름('1-2반')에서 파싱."""
+    parts = (c.name or "").replace("반", "").split("-")
+    g = c.grade if c.grade is not None else (int(parts[0]) if parts and parts[0].isdigit() else None)
+    cn = None
+    if len(parts) > 1 and parts[1].isdigit():
+        cn = int(parts[1])
+    elif parts and parts[0].isdigit():
+        cn = int(parts[0])
+    return g, cn
+
+
 @router.get("/students")
 def all_students(
     grade: int | None = Query(default=None),
@@ -323,74 +339,69 @@ def all_students(
     db: Session = Depends(get_db),
 ):
     org_id = principal.organization_id
-    rows = (
-        db.query(LearningSummary)
+    # 실배정 학생 전체 (student_profiles/classes 실테이블 기준) — seed roster 폐기
+    students = (
+        db.query(StudentProfile)
         .filter(
-            LearningSummary.organization_id == org_id,
-            LearningSummary.period_type == "week",
+            StudentProfile.organization_id == org_id,
+            StudentProfile.class_id.isnot(None),
+            StudentProfile.status != "disabled",
         )
         .all()
     )
-    roster_meta = {r.student_id: (r.detail or {}) for r in rows if (r.detail or {}).get("roster")}
-    students = (
-        db.query(StudentProfile).filter(StudentProfile.id.in_(list(roster_meta.keys()))).all()
-        if roster_meta
-        else []
-    )
-    summaries = {r.student_id: r for r in rows}
-    # 실집계 오버레이 — 실제 푸는 학생은 실정답률, 미플레이/데모는 seed 폴백.
-    # (주의: 어떤 학생이 목록에 뜨는지는 아직 seed LearningSummary.detail.roster가 결정한다.
-    #  실제 배정 학생 기준 목록으로 바꾸려면 전교 명단 쿼리 자체의 재설계가 필요 — 별도 과제.)
-    real = aggregate.student_roster_metrics(db, list(roster_meta.keys()))
+    classes = {c.id: c for c in db.query(ClassRoom).filter(ClassRoom.organization_id == org_id).all()}
+    real = aggregate.student_roster_metrics(db, [s.id for s in students])
 
     groups: dict[str, list[dict]] = {}
     for s in students:
-        meta = roster_meta[s.id]
-        g, c = meta.get("g"), meta.get("c")
+        c = classes.get(s.class_id)
+        if c is None:
+            continue
+        g, cn = _class_gc(c)
         if grade is not None and g != grade:
             continue
-        if cls is not None and c != cls:
+        if cls is not None and cn != cls:
             continue
-        if q and q.strip() and q.strip() not in s.nickname:
+        if q and q.strip() and q.strip() not in (s.nickname or "") and q.strip() not in (s.real_name or ""):
             continue
-        key = f"{g}-{c}"
-        groups.setdefault(key, []).append(
+        m = real.get(s.id)
+        groups.setdefault(f"{g}-{cn}", []).append(
             {
                 "id": s.id,
-                "name": s.nickname,
-                "code": s.student_code,  # 반배정용 학생코드 (전체 학생 조회 표시)
-                "acc": real[s.id]["acc"] if s.id in real else _acc(summaries.get(s.id)),
-                "sessions": meta.get("sessions", ""),
-                "weak": meta.get("weak", ""),
+                "name": _display_name(s),
+                "code": s.student_code,
+                "acc": m["acc"] if m else 0,
+                "sessions": m["solved"] if m else 0,
+                "weak": "",
                 "status": status_label(s.status),
+                # 실플레이 없는 학생 = 데모칸(정답률 0·미활동) — 프론트가 '데모' 라벨
+                "demo": m is None,
             }
         )
-    # 담당 교사: 실테이블(classes.teacher_id → users) 우선, 없으면 디자인 매핑
+    # 담당 교사 (classes.teacher_id → users)
     teacher_by_key: dict[str, str] = {}
-    class_rows = (
-        db.query(ClassRoom, User)
-        .outerjoin(User, User.id == ClassRoom.teacher_id)
-        .filter(ClassRoom.organization_id == org_id, ClassRoom.status == "active")
-        .all()
-    )
-    for c_row, u in class_rows:
+    for c in classes.values():
+        if c.status != "active" or not c.teacher_id:
+            continue
+        g, cn = _class_gc(c)
+        u = db.get(User, c.teacher_id)
         if u is not None:
-            teacher_by_key[c_row.name.replace("반", "")] = u.name
+            teacher_by_key[f"{g}-{cn}"] = u.name
 
     out = []
     for key in sorted(groups):
-        g, c = key.split("-")
+        g, cn = key.split("-")
         out.append(
             {
-                "label": f"{g}학년 {c}반",
+                "label": f"{g}학년 {cn}반",
                 "badge": key,
-                "teacher": teacher_by_key.get(key) or D.ROSTER_TEACHERS.get(key, "미배정"),
+                "teacher": teacher_by_key.get(key, "미배정"),
                 "count": len(groups[key]),
                 "students": sorted(groups[key], key=lambda x: x["name"]),
             }
         )
     total = sum(g["count"] for g in out)
-    return {"total": len(roster_meta), "filtered": total, "groups": out}
+    return {"total": len(students), "filtered": total, "groups": out}
 
 
 # ---------------------------------------------------------------- 학습 분석
@@ -438,6 +449,8 @@ def analytics(
         "subjTarget": "80%",
         "ai_summary": D.TEACHER_ANALYTICS_AI,  # AI 분석 요약 (stat_blobs 수정 가능)
         "insight": D.TEACHER_ANALYTICS_INSIGHT,  # 사이드바 인사이트 문구
+        # 실 시도가 없어 시리즈·수치가 전부 디자인(데모)값이면 demo=True (문구는 항상 디자인)
+        "demo": not agg,
     }
 
 

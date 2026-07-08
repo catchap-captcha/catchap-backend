@@ -165,6 +165,8 @@ def child_summary(
         "reasons": fb(aggregate.parent_reasons(db, child), D.PARENT_SUMMARY_COMMON["reasons"]),
         "strengths": fb(sw.get("strengths"), D.PARENT_SUMMARY_COMMON["strengths"]),
         "weaknesses": fb(sw.get("weaknesses"), D.PARENT_SUMMARY_COMMON["weaknesses"]),
+        # 자녀의 이번 주 실 학습기록이 없어 KPI가 디자인(데모)값이면 demo=True
+        "demo": week_kpis is None,
     }
 
 
@@ -234,6 +236,8 @@ def child_report(
         "recommendations": D.PARENT_SUMMARY_COMMON["recommendations"],
         # 담임 작성 기능이 없으므로 'AI 양육 가이드'로 명명 (구 teacher_comment — 화면 미표시 필드)
         "ai_comment": d.get("ai_comment", d.get("teacher_comment", "")),
+        # 자녀 기간 실집계가 없어 등급·백분위·차트가 디자인(데모)값이면 demo=True
+        "demo": not agg,
     }
 
 

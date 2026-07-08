@@ -245,6 +245,7 @@ def dashboard(
     board = _class_board(db, me)
     my_rank = next(r["rank"] for r in board if r["me"])
     band = f"상위 {max(1, round(my_rank / len(board) * 100))}%"
+    growth = aggregate.student_growth(db, me)  # 시도 없으면 None → 성장 그래프 데모
     return {
         "nickname": me.nickname,
         "level": me.level,
@@ -252,8 +253,10 @@ def dashboard(
         "student_code": me.student_code,
         "today": {"done": today_done, "total": today_total},
         "subjects": subjects,
-        # 성장 그래프: learning_attempts 실집계 (시도 없으면 D)
-        "growth": fb(aggregate.student_growth(db, me), D.HOME_GROWTH),
+        # 성장 그래프: learning_attempts 실집계 (시도 없으면 D 데모값)
+        "growth": fb(growth, D.HOME_GROWTH),
+        # 성장 그래프가 데모값(시도 없음)이면 demo=True. 코인·레벨·오늘상태 등은 항상 실데이터.
+        "demo": growth is None,
         "badges": {"earned": earned, "total": db.query(Badge).count()},
         "class_rank": {"band": band, "note": D.HOME_CLASS_RANK_NOTE},
         "ai_comment": D.HOME_AI_COMMENT,
@@ -355,6 +358,8 @@ def records(
         "activities": fb(agg.get("activities"), D.RECORDS_ACTIVITIES),
         # 상단 통계 4종: 전체 기간 실집계 (시도 없으면 디자인 수치 유지)
         "stats": fb(agg.get("stats"), D.RECORDS_STATS),
+        # 시도 기록이 없어 전부 디자인(데모)값이면 demo=True
+        "demo": not agg,
     }
 
 
@@ -1319,7 +1324,8 @@ def result(
     me = _me(principal)
     key = subject if subject in D.RESULT_SUBJECTS else "국어"
     # 오늘 해당 과목 시도 실집계(정답/오답/점수/시간/연속) — 없으면 D 프리셋
-    s = {**D.RESULT_SUBJECTS[key], **(aggregate.student_result_today(db, me, key) or {})}
+    res_agg = aggregate.student_result_today(db, me, key)
+    s = {**D.RESULT_SUBJECTS[key], **(res_agg or {})}
     # 오늘 완료 과목: daily_quiz_status 실데이터 기준
     done_today = {
         r.subject
@@ -1340,6 +1346,8 @@ def result(
         "today_done": sorted(done_set, key=D.SUBJECT_ORDER.index),
         "subject_order": D.SUBJECT_ORDER,
         "all_done_today": done_set >= set(D.SUBJECT_ORDER),
+        # 오늘 이 과목 시도가 없어 점수·정답 수치가 디자인(데모)값이면 demo=True
+        "demo": not res_agg,
     }
 
 
