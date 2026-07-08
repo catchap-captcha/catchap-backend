@@ -24,6 +24,9 @@ from app.models import (
 # 혼동 문자(0/O, 1/I/L) 제외한 고엔트로피 알파벳
 _ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
 
+# 학부모 1명당 연결 가능한 자녀 수 상한 (프론트 UI가 2명 전제로 설계됨)
+MAX_CHILDREN_PER_PARENT = 2
+
 
 def _now() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
@@ -181,6 +184,21 @@ def consume_parent_invite(db: Session, parent_user_id: str, code: str) -> Parent
     )
     if existing:
         raise HTTPException(status.HTTP_409_CONFLICT, detail="이미 연결된 자녀예요.")
+
+    # 자녀 수 상한: 학부모당 최대 MAX_CHILDREN_PER_PARENT명 (프론트 UI 전제와 일치).
+    linked_count = (
+        db.query(ParentStudentLink)
+        .filter(
+            ParentStudentLink.parent_user_id == parent_user_id,
+            ParentStudentLink.status == "approved",
+        )
+        .count()
+    )
+    if linked_count >= MAX_CHILDREN_PER_PARENT:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail=f"연결할 수 있는 자녀는 최대 {MAX_CHILDREN_PER_PARENT}명이에요.",
+        )
 
     now = _now()
     link = ParentStudentLink(

@@ -84,33 +84,88 @@ def _my_grade(db: Session, me: StudentProfile) -> int | None:
     return cls.grade if cls else None
 
 
-# 랭킹 점수 산식(사용자 결정 2026-07-07): "일일 과제 완료" 기반 · 학년별로만 합산 · 학기 누적(리셋 없음).
-# - 과목 완료 1개당 10점, 하루 전 과목(6과목) 완료 보너스 +40 → 하루 최대 100점
-# - 문제 수·속도 경쟁이 아니라 꾸준함이 점수가 된다 (개근과 자연 연동)
-RANK_SUBJECT_POINT = 10
-RANK_FULLDAY_BONUS = 40
+# 랭킹 점수 산식(사용자 결정 2026-07-08): 정답률·풀이속도 + 6과목 완주 보너스 + 연속 완주 보너스.
+# 학년별로만 합산 · 학기 누적(리셋 없음). 완료(daily_quiz_status done) 과목·일에 대해서만 점수 부여.
+# - 정답률: 과목·일 정답률 0~100% → 0~10점
+# - 풀이속도: 그 과목·일 '정답' 문항의 평균 풀이시간 — 빠를수록 0~5점(오답 빠른 찍기엔 점수 없음)
+# - 6과목 완주: 하루 6과목 전부 완료 시 +30
+# - 연속 완주: 6과목 완주가 전날에도 이어지면 그 날마다 +10 (꾸준함 보상)
+RANK_ACC_MAX = 10  # 과목·일 정답률 만점(100%)
+RANK_SPEED_MAX = 5  # 과목·일 속도 만점(빠른 정답)
+RANK_SPEED_FAST_MS = 4000  # 평균 4초 이하 정답 → 속도 만점
+RANK_SPEED_SLOW_MS = 20000  # 평균 20초 이상 → 속도 0점
+RANK_FULLDAY_BONUS = 30  # 하루 6과목 완주 보너스
+RANK_STREAK_STEP = 10  # 6과목 완주 연속 하루당 추가
+
+
+def _speed_points(avg_ms: float) -> int:
+    """정답 평균 풀이시간 → 속도 점수(0~RANK_SPEED_MAX). 빠를수록 높음."""
+    if avg_ms <= 0:
+        return 0
+    if avg_ms <= RANK_SPEED_FAST_MS:
+        return RANK_SPEED_MAX
+    if avg_ms >= RANK_SPEED_SLOW_MS:
+        return 0
+    span = RANK_SPEED_SLOW_MS - RANK_SPEED_FAST_MS
+    return round(RANK_SPEED_MAX * (RANK_SPEED_SLOW_MS - avg_ms) / span)
 
 
 def _grade_scores(db: Session, student_ids: list[str]) -> dict[str, int]:
-    """학생별 랭킹 점수 = 완료 과목 수 × 10 + 전과목 완료일 수 × 40 (daily_quiz_status 실집계)."""
-    rows = (
-        db.query(
-            DailyQuizStatus.student_id,
-            DailyQuizStatus.quiz_date,
-            func.count(DailyQuizStatus.id),
-        )
-        .filter(
-            DailyQuizStatus.student_id.in_(student_ids),
-            DailyQuizStatus.status == "done",
-        )
-        .group_by(DailyQuizStatus.student_id, DailyQuizStatus.quiz_date)
+    """학생별 랭킹 점수 = 정답률·풀이속도(완료 과목·일) + 6과목 완주 보너스 + 연속 완주 보너스."""
+    if not student_ids:
+        return {}
+    full = len(D.SUBJECT_ORDER)  # 전 과목 수 (6)
+
+    # 1) 완료(done) 과목 집합 — 일자별. 점수 부여 대상 + 완주/연속 보너스 판정 근거.
+    done_rows = (
+        db.query(DailyQuizStatus.student_id, DailyQuizStatus.quiz_date, DailyQuizStatus.subject)
+        .filter(DailyQuizStatus.student_id.in_(student_ids), DailyQuizStatus.status == "done")
         .all()
     )
-    full = len(D.SUBJECT_ORDER)  # 전 과목 수 (6)
+    done: dict[str, dict[date, set[str]]] = {}
+    for sid, day, subj in done_rows:
+        done.setdefault(sid, {}).setdefault(day, set()).add(subj)
+
+    # 2) 과목·일별 정답률/정답 평균 풀이시간 (learning_attempts 실집계).
+    #    (sid, day, subject) → [시도수, 정답수, 정답 풀이시간 합].
+    att_rows = (
+        db.query(
+            LearningAttempt.student_id,
+            func.date(LearningAttempt.created_at),
+            LearningAttempt.subject,
+            LearningAttempt.result,
+            LearningAttempt.solve_time_ms,
+        )
+        .filter(LearningAttempt.student_id.in_(student_ids))
+        .all()
+    )
+    stat: dict[tuple[str, date, str], list[int]] = {}
+    for sid, day, subj, result, solve_ms in att_rows:
+        d = day if isinstance(day, date) else date.fromisoformat(str(day)[:10])
+        s = stat.setdefault((sid, d, subj), [0, 0, 0])
+        s[0] += 1
+        if result == "correct":
+            s[1] += 1
+            s[2] += int(solve_ms or 0)
+
     scores: dict[str, int] = {}
-    for sid, _day, done_cnt in rows:
-        pts = int(done_cnt) * RANK_SUBJECT_POINT + (RANK_FULLDAY_BONUS if int(done_cnt) >= full else 0)
-        scores[sid] = scores.get(sid, 0) + pts
+    for sid, day_map in done.items():
+        total = 0
+        all6: set[date] = set()
+        for day, subs in day_map.items():
+            for subj in subs:
+                s = stat.get((sid, day, subj))
+                if s and s[0] > 0:
+                    acc_pts = round(s[1] / s[0] * RANK_ACC_MAX)
+                    avg_ms = (s[2] / s[1]) if s[1] else 0
+                    total += acc_pts + _speed_points(avg_ms)
+                # 시도 기록 없이 완료만 있으면 정답률·속도 0점 — 완주/연속 보너스로만 반영.
+            if len(subs) >= full:
+                total += RANK_FULLDAY_BONUS
+                all6.add(day)
+        # 연속 완주 보너스: 6과목 완주일의 '전날'도 6과목 완주면 그 날마다 +STEP.
+        total += RANK_STREAK_STEP * sum(1 for d in all6 if (d - timedelta(days=1)) in all6)
+        scores[sid] = total
     return scores
 
 
@@ -959,6 +1014,9 @@ def save_attempt(
     coins_earned = 0
     # 복습(replay: 전날 다시풀기·오늘 재도전)은 보상 없음 — 반복 파밍 차단
     if req.result == "correct" and not req.replay:
+        # 학생 행 잠금(SELECT ... FOR UPDATE)으로 동시 적립을 직렬화 — earned_today를
+        # 읽고 지급하는 사이에 다른 요청이 끼어들면 상한 경계에서 수 코인 오버슛이 났다.
+        db.query(StudentProfile).filter(StudentProfile.id == me.id).with_for_update().first()
         # 파밍 방지: 하루 학습 보상 코인 총량 상한(자기신고 반복으로 무한 적립 차단).
         # 정식 서버 채점(정답 검증)은 교육 API 단계에서 대체.
         earned_today = (

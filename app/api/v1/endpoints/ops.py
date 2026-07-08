@@ -612,6 +612,8 @@ def behavior_records(
             "drop_distance_norm": r.drop_distance_norm,
             "interaction_result": r.interaction_result,
             "risk_level": r.risk_level,
+            "input_type": r.input_type,
+            "sample_label": r.sample_label,
             "dataset_status": r.dataset_status,
             "trace_points": trace_points.get(r.id),  # None = 원시 궤적 없음
             "occurred_at": r.occurred_at.isoformat() if r.occurred_at else None,

@@ -40,7 +40,7 @@
 
 1. **인앱 학생 게임** (`source_type=game`): GameScreen `#captcha-mount` 영역에 `pointerTrace` 부착 →
    문항 제출 시 `POST /students/me/game-answer`의 `behavior`로 전송 → `save_attempt` 안에서 기록.
-   **생활·수학·과학·역사 4과목 실전 플레이 전부 이 경로를 탄다** (2026-07-08 수학·과학·역사 추가).
+   **생활·수학·과학·역사·영어 5과목 실전 플레이 전부 이 경로를 탄다** (2026-07-08 수학·과학·역사, 이어 영어 추가).
    학생 인증 경로라 `student_id`는 항상 본인 것만 기록된다.
 2. **교육형 API / 임베드 위젯** (`source_type=edu-api`): `catchap-widget.js`가 위젯 박스 안 포인터를
    자체 캡처 → `POST /captcha/v1/verify`의 `behavior` → `record_behavior()` (student_id 위조 방어 포함).

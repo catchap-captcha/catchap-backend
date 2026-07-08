@@ -131,7 +131,7 @@ def test_daily_quiz_reflects_daily_quiz_status(client, db, seed_org):
 
 
 def test_grade_ranking_daily_completion(client, db, seed_org):
-    """랭킹: 학년별 풀 + 일일 과제 완료 점수(과목당 10, 전과목 보너스 40) + 상위3 보너스 코인."""
+    """랭킹: 학년별 풀 + 일일 완료 점수(정답률·속도 + 6과목 완주 보너스 30 + 연속) + 상위3 보너스 코인."""
     from app.core.security import hash_password
     from app.models import ClassRoom, DailyQuizStatus, StudentProfile
 
@@ -168,8 +168,9 @@ def test_grade_ranking_daily_completion(client, db, seed_org):
     names = [r["name"] for r in body["board"]]
     assert "친구닉" in names  # 닉네임만 노출
     me_row = next(r for r in body["board"] if r["me"])
-    # 점수 = 어제 2과목×10 + 오늘 6과목×10 + 전과목 보너스 40 = 120
-    assert me_row["score"] == 120
+    # 시도(learning_attempts) 기록이 없어 정답률·속도 0점. 오늘 6과목 완주 → 완주 보너스 30.
+    # 어제는 2과목뿐(완주 아님), 연속 완주도 아님 → 총 30점.
+    assert me_row["score"] == 30
     assert me_row["rank"] == 1  # 코인 999인 친구보다 위 (완료 기반 점수)
     # 1위 보너스 코인 30 지급 (하루 1회)
     assert body["bonus_coins"] == 30
@@ -274,11 +275,11 @@ def test_game_session_server_graded(client, db, seed_org):
 
 
 def test_game_session_new_subjects(client, db, seed_org):
-    """수학·과학·역사 실문항 (capcha_service my/sw 이식): 발급 sanitize + 서버 채점 + 오답노트 과목 매핑."""
+    """수학·과학·역사·영어 실문항 (capcha_service my/sw/ms 이식): 발급 sanitize + 서버 채점 + 오답노트 과목 매핑."""
     from app.models import LearningAttempt, WrongAnswer
 
     token = _student_token(client, seed_org)
-    for subject in ("수학", "과학", "역사"):
+    for subject in ("수학", "과학", "역사", "영어"):
         res = client.get(
             f"/api/v1/students/me/game-session?subject={subject}&count=3", headers=auth(token)
         )
@@ -320,6 +321,30 @@ def test_game_session_new_subjects(client, db, seed_org):
         .all()
     )
     assert [x.result for x in rows] == ["correct"]
+
+    # 영어 single 오답 → 오답노트 category=eng, 정답 제출 → learning_attempts 과목=영어
+    from app.services.english_bank import ENGLISH_FULL
+
+    eq = next(q for q in ENGLISH_FULL if q["type"] == "single")
+    ewrong = next(o["id"] for o in eq["options"] if o["id"] != eq["answer"])
+    re1 = client.post(
+        "/api/v1/students/me/game-answer",
+        json={"question_id": eq["id"], "subject": "영어", "option_id": ewrong},
+        headers=auth(token),
+    )
+    assert re1.status_code == 200 and re1.json()["correct"] is False
+    assert re1.json()["answer_text"] == next(o["text"] for o in eq["options"] if o["id"] == eq["answer"])
+    wa2 = db.query(WrongAnswer).filter(WrongAnswer.student_id == seed_org["student"].id).all()
+    assert any(w.subject == "영어" and w.category == "eng" for w in wa2)
+    re2 = client.post(
+        "/api/v1/students/me/game-answer",
+        json={"question_id": eq["id"], "subject": "영어", "option_id": eq["answer"]},
+        headers=auth(token),
+    )
+    assert re2.json()["correct"] is True
+    assert db.query(LearningAttempt).filter(
+        LearningAttempt.student_id == seed_org["student"].id, LearningAttempt.subject == "영어"
+    ).count() >= 1
 
 
 def test_game_answer_multi_and_scoping(client, db, seed_org):

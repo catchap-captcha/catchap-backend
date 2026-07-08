@@ -248,16 +248,22 @@ _MAIN_CATEGORIES = [
 ]
 
 
-def make_challenge(product: str, subject: str | None) -> dict:
-    """공개 응답용 챌린지(정답 미포함) + 검증용 서명 토큰."""
+def make_challenge(product: str, subject: str | None, day: int | None = None, replay: bool = False) -> dict:
+    """공개 응답용 챌린지(정답 미포함) + 검증용 서명 토큰.
+
+    day/replay(교육형·인앱): 커리큘럼 일차 문항 발급 + 복습 표시. 토큰에 서명돼
+    verify 시점에 위조 없이 복원된다.
+    """
     if product == "edu":
-        return _edu_challenge(subject)
+        return _edu_challenge(subject, day, replay)
     return _main_challenge()
 
 
-def _wrap(kind: str, answer, public: dict) -> dict:
+def _wrap(kind: str, answer, public: dict, meta: dict | None = None) -> dict:
+    """meta(subj/qid/day/rp)는 토큰에만 서명 포함 — verify에서 학생 적립·오답노트에 쓴다."""
     token = _sign(
-        {"k": kind, "a": answer, "exp": time.time() + CHALLENGE_TTL, "n": secrets.token_hex(16)}
+        {"k": kind, "a": answer, "exp": time.time() + CHALLENGE_TTL, "n": secrets.token_hex(16),
+         **(meta or {})}
     )
     return {"challenge_token": token, **public}
 
@@ -350,7 +356,7 @@ TRACE_LEN_RATIO_MAX = 2.5  # 그린 길이 ≤ 템플릿 길이 × 2.5 (빽빽�
 TRACE_LEN_RATIO_MIN = 0.5  # 그린 길이 ≥ 템플릿 길이 × 0.5 (점 몇 개 찍기 차단)
 
 
-def _edu_drag_challenge(subject: str) -> dict:
+def _edu_drag_challenge(subject: str, meta: dict | None = None) -> dict:
     s = random.choice(_DRAG_SETS)
     # 시작(좌측 하단 부근)·목표(우측 상단 부근) 위치를 매번 조금씩 흔든다
     start = {"x": round(random.uniform(0.12, 0.3), 3), "y": round(random.uniform(0.55, 0.8), 3)}
@@ -363,10 +369,11 @@ def _edu_drag_challenge(subject: str) -> dict:
          "item": s["item"], "item_label": s["item_label"],
          "target": s["target"], "target_label": s["target_label"],
          "start": start, "zone": zone},
+        meta,
     )
 
 
-def _edu_trace_challenge(subject: str) -> dict:
+def _edu_trace_challenge(subject: str, meta: dict | None = None) -> dict:
     glyphs = _TRACE_GLYPHS.get(subject) or _TRACE_SHAPES
     name, path = random.choice(glyphs)
     return _wrap(
@@ -375,6 +382,7 @@ def _edu_trace_challenge(subject: str) -> dict:
          "prompt": f"점선을 따라 '{name}'을(를) 그려보세요!",
          "hint": "점선 위를 천천히 따라 그으면 돼요.",
          "glyph": name, "path": path},
+        meta,
     )
 
 
@@ -468,41 +476,65 @@ def _grade_trace(answer, template: list) -> bool:
     return covered >= TRACE_COVER_FRAC and stray < TRACE_STRAY_THRESHOLD
 
 
-def _edu_challenge(subject: str) -> dict:
+def _wrap_bank_question(subject: str, q: dict, meta: dict) -> dict:
+    """뱅크 문항 → 위젯 챌린지 포맷. 토큰 meta에 qid를 실어 verify에서 오답노트에 쓴다."""
+    opts = [{"id": o["id"], "emoji": o["emoji"], "text": o["text"]} for o in q["options"]]
+    meta = {**meta, "qid": q["id"]}
+    if q["type"] == "multi":
+        # 복수선택 — 위젯 multi 렌더러가 배열 제출, 서버는 집합 비교(select_all)로 채점
+        return _wrap(
+            "select_all", sorted(q["answer"]),
+            {"type": "multi", "subject": subject, "topic": q["topic"],
+             "prompt": q["prompt"], "hint": q["hint"], "options": opts},
+            meta,
+        )
+    return _wrap(
+        "single", q["answer"],
+        {"type": "single", "subject": subject, "topic": q["topic"],
+         "prompt": q["prompt"], "hint": q["hint"], "options": opts},
+        meta,
+    )
+
+
+def _edu_challenge(subject: str, day: int | None = None, replay: bool = False) -> dict:
+    from app.services import subject_banks
+
+    # 커리큘럼 일차 지정(생활): 그 일차의 문항만 낸다 — 실전 세션과 동일 의미.
+    # is_replay(지난 일차)는 서버가 판정해 토큰에 서명 — 클라이언트가 복습 여부를 위조 못 함.
+    if day is not None and subject == "생활":
+        from app.services import curriculum as _cur
+
+        detail = _cur.day_detail(subject, day)
+        if detail.get("locked"):
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="아직 잠긴 일차예요. 오늘 과제부터 풀어봐요!")
+        playable = detail.get("playable", [])
+        if not playable:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, detail="플레이할 문항이 없어요.")
+        pub = random.choice(playable)
+        q = subject_banks.get_question(subject, pub["id"])
+        if q is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, detail="문항을 찾을 수 없어요.")
+        rp = bool(replay or detail.get("is_replay"))
+        ch = _wrap_bank_question(subject, q, {"subj": subject, "rp": rp, "day": day})
+        return {**ch, "topic": detail.get("topic"), "day": day, "is_replay": rp}
+
+    meta = {"subj": subject, "rp": bool(replay)}
+    if subject not in subject_banks.LIVE_SUBJECTS:
+        # 뱅크 없는 과목(국어)은 동작형만 낸다 — '정답 예시' 데모 문항은 폐기
+        # (문제은행 연동 전까지: 데모는 정답이 뻔해 학습기록·코인 적립 대상이 될 수 없음)
+        if random.random() < 0.5:
+            return _edu_drag_challenge(subject, meta)
+        return _edu_trace_challenge(subject, meta)
     # 드래그·그리기 궤적이 아동용 캡차 학습셋의 핵심 재료 — 절반은 동작형 문제를 낸다
     roll = random.random()
     if roll < 0.25:
-        return _edu_drag_challenge(subject)
+        return _edu_drag_challenge(subject, meta)
     if roll < 0.5:
-        return _edu_trace_challenge(subject)
-    from app.services import subject_banks
-
-    if subject in subject_banks.LIVE_SUBJECTS:
-        # 실문항 뱅크 (생활=ms / 수학·과학=my / 역사=sw — capcha_service 이식)
-        pool = subject_banks.playable_pool(subject)
-        q = random.choice(pool)
-        opts = [{"id": o["id"], "emoji": o["emoji"], "text": o["text"]} for o in q["options"]]
-        if q["type"] == "multi":
-            # 복수선택 — 위젯 multi 렌더러가 배열 제출, 서버는 집합 비교(select_all)로 채점
-            return _wrap(
-                "select_all", sorted(q["answer"]),
-                {"type": "multi", "subject": subject, "topic": q["topic"],
-                 "prompt": q["prompt"], "hint": q["hint"], "options": opts},
-            )
-        return _wrap(
-            "single", q["answer"],
-            {"type": "single", "subject": subject, "topic": q["topic"],
-             "prompt": q["prompt"], "hint": q["hint"], "options": opts},
-        )
-    # 그 외 과목(국어·영어): 데모 문항 (교육 콘텐츠 팀 문제은행 연동 예정)
-    from app.services.stats import D
-
-    gq = D.GAME_QUESTIONS.get(subject, D.GAME_QUESTIONS["국어"])
-    opts = [{"id": "o1", "text": "정답 예시"}, {"id": "o2", "text": "오답 1"}, {"id": "o3", "text": "오답 2"}]
-    return _wrap(
-        "single", "o1",
-        {"type": "single", "subject": subject, "prompt": gq["q"], "hint": "", "options": opts, "demo": True},
-    )
+        return _edu_trace_challenge(subject, meta)
+    # 실문항 뱅크 (생활=ms / 수학·과학=my / 역사=sw / 영어=ms english — capcha_service 이식)
+    pool = subject_banks.playable_pool(subject)
+    q = random.choice(pool)
+    return _wrap_bank_question(subject, q, meta)
 
 
 def verify_challenge(db: Session, challenge_token: str, answer) -> dict:
@@ -518,10 +550,12 @@ def verify_challenge(db: Session, challenge_token: str, answer) -> dict:
     if not _consume(db, "challenge", data.get("n", ""), data.get("exp", 0)):
         raise HTTPException(status.HTTP_409_CONFLICT, detail="이미 사용된 챌린지예요.")
     kind, target = data["k"], data["a"]
-    extra: dict = {}
+    # 발급 시 서명해 둔 문항 메타(과목·문항id·일차·복습) — 엔드포인트가 학생 적립에 쓰고 응답 전 제거
+    extra: dict = {"meta": {k: data[k] for k in ("subj", "qid", "day", "rp") if k in data}}
     if kind == "select_all":
-        picked = sorted(str(x) for x in (answer or []))
-        ok = picked == sorted(str(x) for x in target)
+        # answer 타입 미방어 시 정수 등 비반복형 입력이 TypeError → 공개 엔드포인트 500
+        picked = sorted(str(x) for x in answer) if isinstance(answer, (list, tuple)) else []
+        ok = len(picked) > 0 and picked == sorted(str(x) for x in target)
     elif kind == "drop":
         # 끌어다 놓기 — 드롭 지점 거리로 채점. 거리는 서버 진실값으로 행동 데이터에 기록
         ok, dist = _grade_drop(answer, target)
@@ -532,7 +566,9 @@ def verify_challenge(db: Session, challenge_token: str, answer) -> dict:
     else:  # single
         ok = str(answer) == str(target)
     if not ok:
-        return {"success": False, **extra}
+        # 오답에도 정답을 내린다(교육형 피드백 "정답은 X"용) — 챌린지는 1회 소비돼
+        # 이미 무효라 재제출 오라클이 되지 않고, 매 챌린지 정답이 새로 나와 파밍 가치도 없다.
+        return {"success": False, "answer": target, **extra}
     verdict = _sign({"v": 1, "exp": time.time() + VERDICT_TTL, "n": secrets.token_hex(16)})
     return {"success": True, "verdict_token": verdict, "answer": target, **extra}
 
@@ -644,6 +680,10 @@ def record_behavior_event(
 
     trace = _parse_trace(b)
     m = _trace_metrics(trace) if trace else None
+    # 입력 방식(mouse|touch|pen) — 그 외/미상은 unknown. 판정 모델의 기기 축.
+    input_type = str(b.get("input_type") or "unknown").lower()
+    if input_type not in ("mouse", "touch", "pen"):
+        input_type = "unknown"
     bid = new_uuid()
     db.add(
         BehaviorSummary(
@@ -651,6 +691,8 @@ def record_behavior_event(
             organization_id=organization_id,
             student_id=student_id,
             source_type=source_type,
+            input_type=input_type,
+            # sample_label은 모델 기본값 'organic'(실트래픽·미검증) — 봇 주입 시에만 명시 설정.
             solve_time_ms=min(3_600_000, max(0, _i("solve_time_ms"))),
             # 자기신고 값도 상한 — 통계(그룹 평균) 부풀리기 차단
             path_length=m["path_length"] if m else min(PATH_LENGTH_CAP, max(0.0, _f("path_length"))),

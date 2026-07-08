@@ -717,6 +717,7 @@ WRONG_TAGS = {
     "img": {"label": "이미지 선택", "icon": "ph-fill ph-image", "color": "#2E7BFF", "bg": "#E6F0FF"},
     "safe": {"label": "생활 안전", "icon": "ph-fill ph-shield-check", "color": "#8B6BFF", "bg": "#EDE6FF"},
     "hist": {"label": "역사·문화", "icon": "ph-fill ph-scroll", "color": "#17B08C", "bg": "#DFF6EE"},
+    "eng": {"label": "영어·어휘", "icon": "ph-fill ph-translate", "color": "#E0489E", "bg": "#FCE4F1"},
 }
 
 # 취약문제추천 REC 6건

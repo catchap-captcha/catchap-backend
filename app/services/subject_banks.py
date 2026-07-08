@@ -6,20 +6,21 @@
 - 수학·과학: capcha_service my 브랜치 / 역사: capcha_service sw 브랜치(02-history)
 """
 
-from app.services import history_bank, life_bank, math_bank, science_bank
+from app.services import english_bank, history_bank, life_bank, math_bank, science_bank
 
 BANKS: dict[str, list[dict]] = {
     "생활": life_bank.LIFE_FULL,
     "수학": math_bank.MATH_FULL,
     "과학": science_bank.SCIENCE_FULL,
     "역사": history_bank.HISTORY_FULL,
+    "영어": english_bank.ENGLISH_FULL,
 }
 
 # 실전(서버 채점) 지원 과목 — 나머지 과목은 game-session available=false(프론트 데모 유지)
 LIVE_SUBJECTS = frozenset(BANKS)
 
 # 오답노트 카테고리(D.WRONG_TAGS 키) 매핑
-WRONG_CATEGORY = {"생활": "safe", "수학": "num", "과학": "img", "역사": "hist"}
+WRONG_CATEGORY = {"생활": "safe", "수학": "num", "과학": "img", "역사": "hist", "영어": "eng"}
 
 _BY_ID: dict[str, dict[str, dict]] = {
     subject: {q["id"]: q for q in bank} for subject, bank in BANKS.items()

@@ -7,17 +7,24 @@
 교육형도 같은 경로에 product='edu' 키를 쓰면 동작 (키에 과목이 박혀 있음).
 """
 
+from datetime import date
+
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
+from jwt import PyJWTError
 from pydantic import BaseModel
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from app.core.security import sha256_hash
+from app.core.security import decode_token, sha256_hash
 from app.db.session import get_db
-from app.models import ApiKey
+from app.models import ApiKey, DailyQuizStatus, LearningAttempt, StudentProfile
 from app.services import auth_service
 from app.services import captcha_service as cs
 
 router = APIRouter(prefix="/captcha/v1", tags=["captcha-api"])
+
+# 교육형 인앱 세션 길이 — 오늘의퀴즈는 과목당 이 문항 수를 채우면 완료 신고
+EDU_SESSION_TOTAL = 5
 
 # 공개 엔드포인트 IP 레이트리밋 (분당) — 월 quota와 별개로 버스트/스크래핑 억제.
 # 학교 NAT 뒤 다수 학생을 감안해 넉넉히, 봇 폭주는 막는 수준.
@@ -47,11 +54,106 @@ def _origin_guard(db: Session, request: Request, api: ApiKey) -> None:
     )
 
 
+def _optional_student(db: Session, request: Request) -> StudentProfile | None:
+    """Authorization 헤더가 유효한 학생 토큰이면 학생을 돌려준다 — 없거나 무효면 None.
+
+    공개 API라 무효 토큰으로 401을 내지 않는다(외부 임베드는 인증 없이 동작해야 함).
+    인증되면 verify가 채점 결과를 그 학생의 학습기록(코인·진도·오늘의퀴즈)에 적립한다.
+    """
+    auth = request.headers.get("authorization") or ""
+    if not auth.lower().startswith("bearer "):
+        return None
+    try:
+        payload = decode_token(auth[7:])
+    except PyJWTError:
+        return None
+    if payload.get("type") != "access" or payload.get("role") != "student":
+        return None
+    student = db.get(StudentProfile, str(payload.get("sub", "")))
+    if student is None or student.status == "disabled":
+        return None
+    return student
+
+
+def _credit_student(db: Session, student: StudentProfile, meta: dict, correct: bool, answer) -> dict:
+    """교육형 채점 결과 1건을 학생 학습기록으로 적립 — 실전 모드(game-answer)와 동일 부수효과.
+
+    서버 채점 결과만 기록하므로 자기신고 위조가 없다. 오늘 EDU_SESSION_TOTAL번째
+    문항부터 완료 신고(completed) — 오늘의퀴즈 done은 save_attempt가 '정답일 때만' 승격한다.
+    복습(rp: 발급 토큰에 서명된 값)은 코인·퀴즈 상태에 반영하지 않는다.
+    """
+    from app.api.v1.endpoints.students import _record_wrong, save_attempt  # 지연 import (순환 회피)
+    from app.core.permissions import Principal
+    from app.schemas.student import AttemptCreate
+    from app.services import subject_banks
+
+    subject = str(meta.get("subj") or "")
+    replay = bool(meta.get("rp"))
+    qid = meta.get("qid")
+
+    principal = Principal(kind="student", id=student.id, role="student", student=student)
+
+    # 뱅크 문항 오답 → 오답노트·취약추천 (동작형 drag/trace는 대상 아님, 복습 제외)
+    if qid and not correct and not replay:
+        q = subject_banks.get_question(subject, str(qid))
+        if q is not None:
+            if q["type"] == "multi":
+                picked_ids = [str(x) for x in (answer or [])]
+                answer_ids = [str(a) for a in (q["answer"] or [])]
+            else:
+                picked_ids = [str(answer)] if answer is not None else []
+                answer_ids = [str(q["answer"])]
+            _record_wrong(db, student, subject, q, picked_ids, answer_ids)
+
+    answered_before = (
+        db.query(func.count(LearningAttempt.id))
+        .filter(
+            LearningAttempt.student_id == student.id,
+            LearningAttempt.subject == subject,
+            func.date(LearningAttempt.created_at) == date.today(),
+        )
+        .scalar()
+        or 0
+    )
+    answered = answered_before + 1
+    attempt_req = AttemptCreate(
+        subject=subject,
+        result="correct" if correct else "incorrect",
+        score=20 if correct else 0,  # 5문 기준 100점 만점 (game-answer와 동일)
+        completed=answered >= EDU_SESSION_TOTAL and not replay,
+        replay=replay,
+        behavior=None,  # 행동데이터는 record_behavior(edu-api)로 이미 적재 — 이중 기록 방지
+    )
+    saved = save_attempt(attempt_req, principal, db)
+
+    quiz_done = (
+        db.query(DailyQuizStatus)
+        .filter(
+            DailyQuizStatus.student_id == student.id,
+            DailyQuizStatus.quiz_date == date.today(),
+            DailyQuizStatus.subject == subject,
+            DailyQuizStatus.status == "done",
+        )
+        .first()
+        is not None
+    )
+    return {
+        "answered": answered,
+        "total": EDU_SESSION_TOTAL,
+        "quiz_done": quiz_done,
+        "replay": replay,
+        "coins_earned": saved.get("coins_earned", 0),
+        "coins": saved.get("coins"),
+    }
+
+
 @router.post("/challenge")
 def challenge(
     request: Request,
     x_site_key: str | None = Header(default=None),
     subject: str | None = None,  # edu 전용 과목 오버라이드 (?subject=수학) — 1st-party 인앱 임베드용
+    day: int | None = None,  # edu·생활: 커리큘럼 일차 문항 (미래 일차는 잠금 에러)
+    replay: bool = False,  # edu: 복습 세션 — verify 적립 시 코인·퀴즈 상태 미반영
     db: Session = Depends(get_db),
 ):
     _throttle(db, request, "chall", RATE_CHALLENGE_PER_MIN)
@@ -63,7 +165,7 @@ def challenge(
     eff_subject = api.subject
     if api.product == "edu" and subject and subject in cs.EDU_SUBJECTS:
         eff_subject = subject
-    ch = cs.make_challenge(api.product, eff_subject)
+    ch = cs.make_challenge(api.product, eff_subject, day=day, replay=replay)
     cs.log_call(db, api, "captcha/challenge", 200)
     db.commit()
     return {"product": api.product, "subject": eff_subject, **ch}
@@ -86,13 +188,21 @@ def verify(
     api = _key(db, x_site_key)
     _origin_guard(db, request, api)
     result = cs.verify_challenge(db, req.challenge_token, req.answer)
+    meta = result.pop("meta", {})  # 발급 토큰에 서명된 문항 메타 — 클라이언트 응답에는 내리지 않음
     # 교육형 API는 통과/실패보다 '행동데이터 수집'이 목적 — 정답 여부와 무관하게 적재
     if api.product == "edu":
+        student = _optional_student(db, request)
         behavior = req.behavior
         # 끌어다 놓기의 드롭 거리는 서버 채점값을 기록 (클라이언트 자기신고 대체)
         if "drop_distance_norm" in result:
             behavior = {**(behavior or {}), "drop_distance_norm": result["drop_distance_norm"]}
+        if student is not None:
+            # 인증 학생의 행동데이터는 본인 귀속 (record_behavior가 기관 일치를 재검증)
+            behavior = {**(behavior or {}), "student_id": student.id}
         cs.record_behavior(db, api, behavior, bool(result.get("success")))
+        # 인앱(인증 학생) 풀이는 학습기록으로 적립 — 코인·진도·오늘의퀴즈 (실전 모드 대체)
+        if student is not None and meta.get("subj"):
+            result["session"] = _credit_student(db, student, meta, bool(result.get("success")), req.answer)
     cs.log_call(db, api, "captcha/verify", 200 if result["success"] else 400)
     db.commit()
     return result

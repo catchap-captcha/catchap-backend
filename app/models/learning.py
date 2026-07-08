@@ -151,6 +151,15 @@ class BehaviorSummary(Base, UUIDPk, Timestamps):
     drop_distance_norm: Mapped[float] = mapped_column(Float, default=0)
     interaction_result: Mapped[str | None] = mapped_column(String(20), nullable=True)
     risk_level: Mapped[str] = mapped_column(String(20), default="low")  # low|review|elevated
+    # 입력 방식 — 궤적 모양이 기기별로 크게 다르므로 판정 모델의 핵심 축.
+    # 수집 시점에만 알 수 있어 소급 복구 불가 → 지금부터 저장한다. mouse|touch|pen|unknown
+    input_type: Mapped[str] = mapped_column(
+        String(10), default="unknown", server_default="unknown"
+    )
+    # 지도학습용 정답 라벨 자리 — organic(실트래픽·미검증) 기본, 이후 bot(합성/자동화)·human(검증) 부여.
+    sample_label: Mapped[str] = mapped_column(
+        String(12), default="organic", server_default="organic"
+    )
     occurred_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     # 아동용 캡차 판정 모델 학습셋 큐레이션 상태 (운영 콘솔에서 관리)
     # server_default: seed의 bulk_insert_mappings처럼 ORM 기본값을 안 타는 INSERT도 안전하게

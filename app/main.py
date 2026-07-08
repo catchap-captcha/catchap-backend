@@ -71,7 +71,9 @@ async def _captcha_public_cors(request: Request, call_next):
             headers={
                 "Access-Control-Allow-Origin": "*",
                 "Access-Control-Allow-Methods": "POST, OPTIONS",
-                "Access-Control-Allow-Headers": "Content-Type, X-Site-Key, X-Secret-Key",
+                # Authorization: 인앱(1st-party) 위젯이 학생 토큰을 실어 적립 — ACAO:* 에서도
+                # 쿠키가 아닌 명시 헤더라 안전하고, 토큰 검증은 서버(_optional_student)가 한다.
+                "Access-Control-Allow-Headers": "Content-Type, X-Site-Key, X-Secret-Key, Authorization",
                 "Access-Control-Max-Age": "600",
             },
         )
