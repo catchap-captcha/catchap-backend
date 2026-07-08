@@ -313,12 +313,32 @@ def classes(
         .group_by(StudentProfile.class_id)
         .all()
     )
+    # 학급별 실 정답률: 반 학생들의 28일 정답률 평균(learning_attempts 실집계). 없으면 디자인 폴백.
+    cls_students: dict[str, list[str]] = {}
+    for sid, cid in (
+        db.query(StudentProfile.id, StudentProfile.class_id)
+        .filter(
+            StudentProfile.organization_id == org_id,
+            StudentProfile.class_id.isnot(None),
+            StudentProfile.status != "disabled",
+        )
+        .all()
+    ):
+        cls_students.setdefault(cid, []).append(sid)
+    metrics = aggregate.student_roster_metrics(db, [s for lst in cls_students.values() for s in lst])
+
+    def _class_acc(cid: str) -> int | None:
+        accs = [metrics[s]["acc"] for s in cls_students.get(cid, []) if s in metrics]
+        return round(sum(accs) / len(accs)) if accs else None
+
     out = []
     for c in rows:
         d = design.get(c.name, {})
         teacher_user = db.get(User, c.teacher_id) if c.teacher_id else None
         assistant_user = db.get(User, c.assistant_teacher_id) if c.assistant_teacher_id else None
         real_count = int(counts.get(c.id, 0))
+        real_acc = _class_acc(c.id)  # 실플레이 학생이 있으면 실정답률
+        acc = real_acc if real_acc is not None else d.get("acc", 0)
         out.append(
             {
                 "id": c.id,
@@ -331,8 +351,10 @@ def classes(
                 "assistant": assistant_user.name if assistant_user else None,
                 # 학생 수: 실테이블 우선 (배정 학생이 없으면 디자인 수치 유지)
                 "count": real_count or d.get("count", 0),
-                "acc": d.get("acc", 0),
-                "risk": d.get("risk", "낮음"),
+                # 정답률·위험도: 반 학생 실집계 (없으면 디자인 폴백), demo 플래그로 표기
+                "acc": acc,
+                "risk": ("주의" if acc < 75 else "낮음") if real_acc is not None else d.get("risk", "낮음"),
+                "demo": real_acc is None,
             }
         )
     return out
@@ -518,9 +540,12 @@ def roster(
             {
                 "id": s.id,
                 "name": _roster_display_name(s),
+                "nickname": s.nickname,
+                "login_id": s.student_login_id,  # 학교 발급 로그인 아이디(학생관리 표시용)
                 "age": s.age,
                 "cls": cls_name,
                 "code": s.student_code,
+                "status": s.status,  # active | pending 등 (학생관리 상태 표시)
                 "link": s.id in linked_ids or bool(meta.get("link")),
                 "acc": acc,
                 "risk": meta.get("risk") or ("주의" if acc < 75 else "낮음"),

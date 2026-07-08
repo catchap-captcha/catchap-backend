@@ -1081,6 +1081,26 @@ def save_attempt(
     correct = prev_correct + (1 if req.result == "correct" else 0)
     prog.accuracy = round(correct / total * 100, 1)
 
+    # 완료 챕터 실계산: 과목 챕터를 순서대로 누적, questions_done이 채운 챕터 수만큼 done.
+    # (기존엔 chapters_done을 seed에서만 기록해 학습해도 진도·챕터 잠금이 영구 고정되던 실버그 해소)
+    _chapters = (
+        db.query(Chapter)
+        .filter(Chapter.subject == req.subject)
+        .order_by(Chapter.order_no)
+        .all()
+    )
+    if _chapters:
+        _cum = 0
+        _done_ch = 0
+        for _ch in _chapters:
+            _cum += _ch.total_questions or 1
+            if (prog.questions_done or 0) >= _cum:
+                _done_ch += 1
+            else:
+                break
+        prog.chapters_done = _done_ch
+        prog.current_chapter = min(len(_chapters), _done_ch + 1)
+
     # 일일 잠금 규칙: 오늘의퀴즈 상태는 '오늘' 것만 갱신 가능(미래 날짜 미리 완료 불가 —
     # quiz_date는 항상 서버의 오늘). 복습(replay)은 상태를 건드리지 않는다(전날 다시풀기는 기록만).
     if not req.replay:
