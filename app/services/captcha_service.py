@@ -248,14 +248,18 @@ _MAIN_CATEGORIES = [
 ]
 
 
-def make_challenge(product: str, subject: str | None, day: int | None = None, replay: bool = False) -> dict:
+def make_challenge(
+    product: str, subject: str | None, day: int | None = None,
+    replay: bool = False, learning: bool = False,
+) -> dict:
     """공개 응답용 챌린지(정답 미포함) + 검증용 서명 토큰.
 
     day/replay(교육형·인앱): 커리큘럼 일차 문항 발급 + 복습 표시. 토큰에 서명돼
     verify 시점에 위조 없이 복원된다.
+    learning(1st-party 인앱): 뱅크 있는 과목은 조작형 대신 실제 문제만 낸다.
     """
     if product == "edu":
-        return _edu_challenge(subject, day, replay)
+        return _edu_challenge(subject, day, replay, learning)
     return _main_challenge()
 
 
@@ -496,7 +500,9 @@ def _wrap_bank_question(subject: str, q: dict, meta: dict) -> dict:
     )
 
 
-def _edu_challenge(subject: str, day: int | None = None, replay: bool = False) -> dict:
+def _edu_challenge(
+    subject: str, day: int | None = None, replay: bool = False, learning: bool = False
+) -> dict:
     from app.services import subject_banks
 
     # 커리큘럼 일차 지정(생활): 그 일차의 문항만 낸다 — 실전 세션과 동일 의미.
@@ -525,12 +531,15 @@ def _edu_challenge(subject: str, day: int | None = None, replay: bool = False) -
         if random.random() < 0.5:
             return _edu_drag_challenge(subject, meta)
         return _edu_trace_challenge(subject, meta)
-    # 드래그·그리기 궤적이 아동용 캡차 학습셋의 핵심 재료 — 절반은 동작형 문제를 낸다
-    roll = random.random()
-    if roll < 0.25:
-        return _edu_drag_challenge(subject, meta)
-    if roll < 0.5:
-        return _edu_trace_challenge(subject, meta)
+    # 외부 임베드(learning=False): 드래그·그리기 궤적이 아동용 캡차 학습셋의 핵심 재료라
+    # 절반은 동작형 문제를 낸다. 1st-party 인앱 학습(learning=True)은 과목 무관 조작형이
+    # 학습 흐름을 깨므로 건너뛰고 실제 문제만 낸다(예: 영어엔 영어 문제만).
+    if not learning:
+        roll = random.random()
+        if roll < 0.25:
+            return _edu_drag_challenge(subject, meta)
+        if roll < 0.5:
+            return _edu_trace_challenge(subject, meta)
     # 실문항 뱅크 (생활=ms / 수학·과학=my / 역사=sw / 영어=ms english — capcha_service 이식)
     pool = subject_banks.playable_pool(subject)
     q = random.choice(pool)

@@ -163,9 +163,16 @@ def challenge(
     # 교육형 키는 발급 시 과목이 박혀 있지만, 우리 앱(과목별 게임화면)이 붙을 땐
     # 화면 과목에 맞춰 요청별로 과목을 바꿀 수 있게 허용한다. (EDU_SUBJECTS 안에서만)
     eff_subject = api.subject
+    learning = False
     if api.product == "edu" and subject and subject in cs.EDU_SUBJECTS:
         eff_subject = subject
-    ch = cs.make_challenge(api.product, eff_subject, day=day, replay=replay)
+        # ?subject= 오버라이드는 1st-party 인앱 학습 게임 신호 — 뱅크 있는 과목은
+        # 과목 무관 조작형(드래그/따라그리기) 대신 실제 문제만 낸다(학습 목적).
+        # 외부 임베드(고정 subject 키)는 learning=False라 조작형이 유지된다(행동데이터).
+        learning = True
+    if day is not None:
+        learning = True  # 커리큘럼 일차(생활 인앱)도 학습 세션
+    ch = cs.make_challenge(api.product, eff_subject, day=day, replay=replay, learning=learning)
     cs.log_call(db, api, "captcha/challenge", 200)
     db.commit()
     return {"product": api.product, "subject": eff_subject, **ch}
