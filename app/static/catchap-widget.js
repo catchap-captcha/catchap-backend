@@ -452,9 +452,23 @@
         }
         if (d.hint) hintLine(d.hint);
       } else {
-        // single / arithmetic — 보기 중 하나 선택
+        // single / arithmetic / listen — 보기 중 하나 선택
         // 풋터 모드: 클릭은 '선택'만(테두리 강조), 제출은 풋터의 다음 문제 버튼이 담당
         lastOptions = d.options || [];
+        // 듣기(listen): 🔊 오디오 재생 버튼 — 파일은 불투명 이름이라 정답(단어) 노출 없음
+        if (d.type === 'listen' && d.audio) {
+          var au = h('audio'); au.src = base + '/captcha/v1/audio/' + d.audio; au.preload = 'auto';
+          var playBtn = h('button'); playBtn.textContent = '🔊 다시 듣기';
+          css(playBtn, footerOn
+            ? { display: 'block', margin: '0 auto 18px', padding: '14px 28px', fontSize: '18px', fontWeight: '800',
+                border: 'none', borderRadius: '30px', background: C, color: '#fff', cursor: 'pointer' }
+            : { display: 'block', margin: '0 auto 12px', padding: '10px 20px', fontSize: '15px', fontWeight: '800',
+                border: 'none', borderRadius: '24px', background: C, color: '#fff', cursor: 'pointer' });
+          playBtn.onclick = function () { try { au.currentTime = 0; au.play(); } catch (e) {} };
+          body.appendChild(au);
+          body.appendChild(playBtn);
+          setTimeout(function () { try { au.play(); } catch (e) {} }, 150); // 자동재생 시도(막히면 버튼으로)
+        }
         var chosen = null;
         var optBtns = [];
         var opts = h('div');

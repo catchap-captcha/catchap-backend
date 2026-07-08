@@ -484,20 +484,18 @@ def _wrap_bank_question(subject: str, q: dict, meta: dict) -> dict:
     """뱅크 문항 → 위젯 챌린지 포맷. 토큰 meta에 qid를 실어 verify에서 오답노트에 쓴다."""
     opts = [{"id": o["id"], "emoji": o["emoji"], "text": o["text"]} for o in q["options"]]
     meta = {**meta, "qid": q["id"]}
+    public = {
+        "type": q["type"], "subject": subject, "topic": q["topic"],
+        "prompt": q["prompt"], "hint": q["hint"], "options": opts,
+    }
+    # 듣기: 오디오 파일(불투명 이름)을 실어 위젯이 🔊 재생하게 한다 — 정답 단어는 미포함
+    if q.get("audio"):
+        public["audio"] = q["audio"]
     if q["type"] == "multi":
         # 복수선택 — 위젯 multi 렌더러가 배열 제출, 서버는 집합 비교(select_all)로 채점
-        return _wrap(
-            "select_all", sorted(q["answer"]),
-            {"type": "multi", "subject": subject, "topic": q["topic"],
-             "prompt": q["prompt"], "hint": q["hint"], "options": opts},
-            meta,
-        )
-    return _wrap(
-        "single", q["answer"],
-        {"type": "single", "subject": subject, "topic": q["topic"],
-         "prompt": q["prompt"], "hint": q["hint"], "options": opts},
-        meta,
-    )
+        return _wrap("select_all", sorted(q["answer"]), public, meta)
+    # single·listen: 단일 선택(옵션 등호 비교)
+    return _wrap("single", q["answer"], public, meta)
 
 
 def _edu_challenge(

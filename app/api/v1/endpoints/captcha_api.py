@@ -8,8 +8,10 @@
 """
 
 from datetime import date
+from pathlib import Path
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
+from fastapi.responses import Response
 from jwt import PyJWTError
 from pydantic import BaseModel
 from sqlalchemy import func
@@ -31,6 +33,27 @@ EDU_SESSION_TOTAL = 5
 RATE_CHALLENGE_PER_MIN = 120
 RATE_VERIFY_PER_MIN = 120
 RATE_VALIDATE_PER_MIN = 240
+
+# 듣기(영어 sound-match) 오디오 서빙 — 불투명 파일명만 화이트리스트 허용(경로조작·정답유출 차단)
+_AUDIO_DIR = Path(__file__).resolve().parents[3] / "static" / "audio"  # app/static/audio
+
+
+@router.get("/audio/{name}")
+def audio(name: str):
+    """듣기 문항 오디오(.m4a) 서빙. 파일명은 불투명(snd-NN)이라 정답 단어를 노출하지 않는다.
+    화이트리스트(english_listen.AUDIO_FILES) 밖 이름은 404 — 임의 파일 접근 차단."""
+    from app.services.english_listen import AUDIO_FILES
+
+    if name not in AUDIO_FILES:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="not found")
+    path = _AUDIO_DIR / name
+    if not path.exists():
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="not found")
+    return Response(
+        content=path.read_bytes(),
+        media_type="audio/mp4",
+        headers={"Access-Control-Allow-Origin": "*", "Cache-Control": "public, max-age=86400"},
+    )
 
 
 def _client_ip(request: Request) -> str:

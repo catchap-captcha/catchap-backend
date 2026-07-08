@@ -6,14 +6,22 @@
 - 수학·과학: capcha_service my 브랜치 / 역사: capcha_service sw 브랜치(02-history)
 """
 
-from app.services import english_bank, history_bank, life_bank, math_bank, science_bank
+from app.services import (
+    english_bank,
+    english_listen,
+    history_bank,
+    life_bank,
+    math_bank,
+    science_bank,
+)
 
 BANKS: dict[str, list[dict]] = {
     "생활": life_bank.LIFE_FULL,
     "수학": math_bank.MATH_FULL,
     "과학": science_bank.SCIENCE_FULL,
     "역사": history_bank.HISTORY_FULL,
-    "영어": english_bank.ENGLISH_FULL,
+    # 영어 = 문법·그림문장(텍스트) + 듣기(오디오 sound-match)
+    "영어": english_bank.ENGLISH_FULL + english_listen.ENGLISH_LISTEN,
 }
 
 # 실전(서버 채점) 지원 과목 — 나머지 과목은 game-session available=false(프론트 데모 유지)
@@ -41,8 +49,12 @@ def public_question(q: dict) -> dict:
 
     playable은 bool로 변환한다(원본은 정답 옵션 id를 담고 있어 그대로 내리면 정답 유출).
     """
-    return {
+    pub = {
         "id": q["id"], "topic": q["topic"], "stage": q["stage"], "type": q["type"],
         "prompt": q["prompt"], "hint": q["hint"], "options": q["options"],
         "playable": bool(q["playable"]),
     }
+    # 듣기: 오디오 파일(불투명 이름)만 내려준다 — 정답 단어(explain)는 절대 포함하지 않음
+    if q.get("audio"):
+        pub["audio"] = q["audio"]
+    return pub
