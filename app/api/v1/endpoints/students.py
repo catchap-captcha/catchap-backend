@@ -1601,7 +1601,8 @@ def result(
         "nickname": me.nickname,
         "meta": D.SUBJECT_META[key],
         **s,
-        "total": 5,
+        # 세션 문항 수(마지막 세션 실집계). 시도 없으면 프리셋과 맞춰 5.
+        "total": s.get("total", 5),
         "levels": D.RESULT_LEVELS,
         "today_done": sorted(done_set, key=D.SUBJECT_ORDER.index),
         "subject_order": D.SUBJECT_ORDER,

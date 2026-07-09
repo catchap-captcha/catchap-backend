@@ -446,19 +446,41 @@ def student_result_today(db: Session, me: StudentProfile, subject: str) -> dict 
     rows = attempts(db, student_ids=[me.id], since=date.today(), subject=subject)
     if not rows:
         return None
-    correct = sum(1 for r in rows if r.result == "correct")
-    score = sum(r.score for r in rows)
-    total_ms = sum(r.solve_time_ms for r in rows)
+    # 결과 화면은 '방금 끝낸 세션'을 보여준다 — 오늘 누적(전 단계·재시도 합산)이 아니라
+    # 마지막 세션만 집계한다. 세션 경계는 (a) 한 세션 문항 수(EDU_SESSION_TOTAL, 5)와
+    # (b) 시도 사이 시간 간격(SESSION_GAP 초과면 다른 세션)으로 판정한다. 이렇게 안 하면
+    # correct/total이 452/5처럼 어긋난다(오늘 616회 시도가 통째로 잡히던 버그).
+    session_gap = timedelta(minutes=15)
+    session_size = 5  # captcha_api.EDU_SESSION_TOTAL과 동일(순환 import 회피 위해 로컬 상수)
+    session = [rows[-1]]
+    for r in reversed(rows[:-1]):
+        if len(session) >= session_size:
+            break
+        prev = session[-1]
+        if prev.created_at and r.created_at and (prev.created_at - r.created_at) <= session_gap:
+            session.append(r)
+        else:
+            break
+    session.reverse()  # 시간 오름차순
+    correct = sum(1 for r in session if r.result == "correct")
+    score = sum(r.score for r in session)
+    # 걸린 시간: 문항별 solve_time_ms 합(폴백 저장 경로)과 세션 첫~끝 시각 간격(위젯
+    # 경로는 solve_time_ms=0이라 이쪽이 실측) 중 큰 값. 둘 다 없으면 0:00.
+    total_ms = sum(r.solve_time_ms for r in session)
+    if len(session) >= 2 and session[0].created_at and session[-1].created_at:
+        span_ms = (session[-1].created_at - session[0].created_at).total_seconds() * 1000
+        total_ms = max(total_ms, span_ms)
     m, s = divmod(round(total_ms / 1000), 60)
     streak = 0
-    for r in reversed(rows):
+    for r in reversed(session):
         if r.result == "correct":
             streak += 1
         else:
             break
     return {
         "correct": correct,
-        "wrong": len(rows) - correct,
+        "wrong": len(session) - correct,
+        "total": len(session),
         "score": f"+{score}",
         "time": f"{m}:{s:02d}",
         "streak": streak,

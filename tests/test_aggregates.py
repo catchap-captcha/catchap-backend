@@ -127,6 +127,42 @@ def test_result_reflects_today_attempts(client, db, seed_org):
     assert res["score"] == "+200"
 
 
+def test_result_shows_only_last_session_not_daily_total(client, db, seed_org):
+    """결과 화면은 오늘 누적이 아니라 '방금 끝낸 세션'만 보여준다.
+
+    오늘 사회를 옛 세션(6문제)+최근 세션(5문제)로 나눠 풀면, result는 최근 5문제만
+    집계해야 한다(correct/total이 452/5처럼 어긋나던 버그 회귀 방지).
+    """
+    from app.models import LearningAttempt
+
+    org_id, sid = seed_org["org"].id, seed_org["student"].id
+    base = datetime.combine(date.today(), time(10, 0))
+
+    def add(offset_min, result):
+        db.add(LearningAttempt(
+            organization_id=org_id, student_id=sid, subject="사회", chapter_no=1,
+            result=result, score=100 if result == "correct" else 0, solve_time_ms=0,
+            created_at=base + timedelta(minutes=offset_min),
+        ))
+
+    # 옛 세션: 10:00~10:05, 6문제 전부 정답 (오늘 누적에 섞임)
+    for i in range(6):
+        add(i, "correct")
+    # 최근 세션: 14:00~14:02, 4정답 + 마지막 1오답 (15분 이상 벌어져 별도 세션)
+    recent = ["correct", "correct", "correct", "correct", "incorrect"]
+    for i, r in enumerate(recent):
+        add(240 + i * 0.5, r)
+    db.commit()
+
+    token = _student_token(client, seed_org)
+    res = client.get("/api/v1/students/me/result?subject=사회", headers=auth(token)).json()
+    # 오늘 정답은 10건이지만, 결과는 최근 세션 5건만 — 누적이면 여기서 깨진다
+    assert res["total"] == 5
+    assert res["correct"] == 4
+    assert res["wrong"] == 1
+    assert res["score"] == "+400"
+
+
 # ---------------------------------------------------------------- 교사
 def test_teacher_dashboard_and_analytics_reflect_attempts(client, db, seed_org):
     from app.core.security import hash_password
