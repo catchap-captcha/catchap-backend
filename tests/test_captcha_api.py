@@ -123,9 +123,10 @@ def test_edu_key_requires_subject_and_plan(client, db, seed_org):
     ch = client.post("/api/v1/captcha/v1/challenge", headers={"X-Site-Key": r2.json()["site_key"]})
     assert ch.status_code == 200
     assert ch.json()["subject"] == "생활"
-    # 교육형은 실문항(객관식·조작형) 외에 동작형(드래그·따라그리기)도 확률적으로 출제된다
+    # 교육형은 실문항(객관식·조작형·따라쓰기·길찾기·퍼즐) 외에 동작형(드래그·따라그리기)도 출제된다
     assert ch.json()["type"] in {
-        "single", "multi", "connect", "sort", "order", "place", "drag_drop", "trace_path",
+        "single", "multi", "connect", "sort", "order", "place", "route", "puzzle",
+        "drag_drop", "trace_path",
     }
 
     # subject 없이 edu 발급 → 400
