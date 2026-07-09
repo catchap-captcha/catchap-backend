@@ -16,15 +16,17 @@ from app.services import subject_banks
 CHAPTER_SIZE = 10  # 한 챕터 = 10문제
 STAGE_SIZE = 2  # 한 단계 = 2문제
 STAGES = 5  # 챕터당 5단계
-MAX_CHAPTERS = 5  # 과목당 최대 챕터 수
+# 챕터 수는 문제은행 크기(÷10)로만 정한다 — 인위적 상한 없음(은행 늘면 자동 확장).
+# 폭주 방지용 안전 상한(1년치)만 둔다.
+MAX_CHAPTERS = 52
 # 챕터1 = 이번 주(2026-07-06 월요일) — 전체 공통 달력 기준(모든 학생 같은 주에 같은 챕터).
 ANCHOR_MONDAY = date(2026, 7, 6)
 
 
 def max_chapters(subject: str) -> int:
-    """그 과목 playable 문항으로 반복 없이 채울 수 있는 챕터 수 (최대 5).
+    """그 과목 playable 문항으로 반복 없이 채울 수 있는 챕터 수(문제은행÷10).
 
-    예: 생활55·영어64·수학51→5, 역사45→4, 과학33→3. 은행이 늘면 자동 확장.
+    예(현재): 영어64→6, 생활55·수학51→5, 역사45→4, 과학33→3. 은행이 늘면 자동 확장.
     """
     pool = subject_banks.playable_pool(subject)
     return min(MAX_CHAPTERS, len(pool) // CHAPTER_SIZE)
