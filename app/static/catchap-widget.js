@@ -410,6 +410,16 @@
         return b;
       }
       var PAIRC = ['#FF7A59', '#2E7BFF', '#17B08C', '#8B6BFF', '#FF922E', '#E0489E'];
+      // 보기 내용 채우기 — svg(그림) 문항은 서버 뱅크의 신뢰된 SVG 마크업을 렌더(+라벨).
+      function setOpt(el, o) {
+        if (o.svg) {
+          el.innerHTML = '<span class="cc-svg" style="display:block">' + o.svg + '</span>'
+            + (o.text ? '<span style="display:block;font-size:12px;margin-top:4px;color:#6B6157">' + o.text + '</span>' : '');
+          var g = el.querySelector('svg'); if (g) { g.style.width = '84px'; g.style.height = 'auto'; g.style.maxWidth = '100%'; }
+        } else {
+          el.textContent = (o.emoji ? o.emoji + '  ' : '') + o.text;
+        }
+      }
 
       if (d.type === 'drag_drop') {
         renderDrag(d, token);
@@ -468,7 +478,7 @@
           : { display: 'grid', gap: '8px' });
         lastOptions.forEach(function (o) {
           var mb = h('button');
-          mb.textContent = (o.emoji ? o.emoji + '  ' : '') + o.text;
+          setOpt(mb, o);
           css(mb, footerOn
             ? { textAlign: 'center', padding: '16px 24px', minWidth: '110px', border: '2px solid #F0E4D8',
                 borderRadius: '14px', background: '#fff', cursor: 'pointer', fontSize: '16px', fontWeight: '700', color: '#3A3226' }
@@ -619,7 +629,7 @@
           : { display: 'grid', gap: '8px' });
         d.options.forEach(function (o) {
           var b = h('button');
-          b.textContent = (o.emoji ? o.emoji + '  ' : '') + o.text;
+          setOpt(b, o);
           css(b, footerOn
             ? { textAlign: 'center', padding: '16px 24px', minWidth: '110px', border: '2px solid #F0E4D8',
                 borderRadius: '14px', background: '#fff', cursor: 'pointer', fontSize: '16px', fontWeight: '700', color: '#3A3226' }
