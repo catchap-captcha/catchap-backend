@@ -12,6 +12,7 @@ class AvatarRequest(BaseModel):
 class StudentProfileUpdate(BaseModel):
     nickname: str | None = Field(default=None, max_length=50)
     age: int | None = Field(default=None, ge=3, le=13)
+    gender: str | None = Field(default=None, pattern="^(male|female|other)$")
 
 
 class AttemptCreate(BaseModel):

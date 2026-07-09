@@ -546,6 +546,8 @@ def register_student(db: Session, req: s.RegisterStudentRequest) -> StudentProfi
         student_code=_generate_student_code(db),
         password_hash=hash_password(req.password),
         nickname=req.name,
+        age=req.age,
+        gender=req.gender,
         coins=0,
         level=1,
     )

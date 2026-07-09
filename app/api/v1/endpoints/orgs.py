@@ -543,6 +543,7 @@ def roster(
                 "nickname": s.nickname,
                 "login_id": s.student_login_id,  # 학교 발급 로그인 아이디(학생관리 표시용)
                 "age": s.age,
+                "gender": s.gender,
                 "cls": cls_name,
                 "code": s.student_code,
                 "status": s.status,  # active | pending 등 (학생관리 상태 표시)

@@ -30,6 +30,8 @@ class StudentProfile(Base, UUIDPk, Timestamps):
     # 학생·학부모·랭킹 화면에는 절대 노출하지 않는다 (아이들 사이 가명 유지).
     real_name: Mapped[str | None] = mapped_column(String(100), nullable=True)
     age: Mapped[int | None] = mapped_column(nullable=True)
+    # 성별 — 학습 분석·외부 익명 집계의 인구통계 축. male|female|other|None(미입력).
+    gender: Mapped[str | None] = mapped_column(String(10), nullable=True)
     grade_band: Mapped[str] = mapped_column(String(30), default="kindergarten")
     avatar: Mapped[dict] = mapped_column(JSON, default=dict)  # {hat, background, sticker}
     coins: Mapped[int] = mapped_column(default=0)

@@ -1,15 +1,24 @@
 """운영자(ops) API — seed 기반 최소 응답 + 기관 가입 승인."""
 
+import csv
+import hashlib
+import io
+import secrets
+from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from html import escape
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, Field
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
+from app.utils.helpers import audit
+
 from app.core.config import get_settings
 from app.core.permissions import Principal, require_ops
+from app.core.security import hash_password
 from app.db.session import get_db
 from app.email.smtp import send_email
 from app.models import (
@@ -25,6 +34,7 @@ from app.models import (
     OrgRegistrationRequest,
     Plan,
     StudentProfile,
+    Subscription,
     User,
 )
 from app.services import captcha_service as _cs
@@ -53,19 +63,224 @@ def dashboard(principal: Principal = Depends(require_ops), db: Session = Depends
 @router.get("/orgs")
 def orgs(principal: Principal = Depends(require_ops), db: Session = Depends(get_db)):
     rows = db.query(Organization).order_by(Organization.created_at).all()
-    return [
-        {
-            "id": o.id,
-            "name": o.name,
-            "code": o.code,
-            "org_type": o.org_type,
-            "status": o.status,
-            "students": db.query(StudentProfile)
-            .filter(StudentProfile.organization_id == o.id, StudentProfile.status != "disabled")
-            .count(),
-        }
-        for o in rows
-    ]
+    return [_org_admin_row(db, o) for o in rows]
+
+
+# ---------------------------------------------------------------- 기관 등록/수정/삭제 (운영자)
+# 운영자 콘솔은 기관 '엔티티'만 관리한다. 학생 명단·실명 등 기관 내부 데이터는
+# 여기서 다루지 않으며(아동 PII 분리), 그건 기관 관리자/학년부장의 /orgs/* 콘솔 몫이다.
+def _org_admin_row(db: Session, o: Organization) -> dict:
+    """운영자 기관 목록/상세 행 — 기관 메타 + 학생 수(집계값만, PII 아님)."""
+    return {
+        "id": o.id,
+        "name": o.name,
+        "code": o.code,
+        "org_type": o.org_type,
+        "status": o.status,
+        "contact_email": o.contact_email,
+        "contact_phone": o.contact_phone,
+        "address": o.address,
+        "business_number": o.business_number,
+        "students": db.query(StudentProfile)
+        .filter(StudentProfile.organization_id == o.id, StudentProfile.status != "disabled")
+        .count(),
+        "created_at": o.created_at.isoformat() if o.created_at else None,
+    }
+
+
+class _OrgCreateReq(BaseModel):
+    name: str = Field(min_length=1, max_length=150)
+    org_type: str = Field(default="초등학교", max_length=30)
+    status: str = Field(default="active", pattern="^(active|pending|disabled)$")
+    contact_email: EmailStr | None = None
+    contact_phone: str | None = Field(default=None, max_length=30)
+    address: str | None = Field(default=None, max_length=255)
+    business_number: str | None = Field(default=None, max_length=30)
+    # 기관을 실제로 쓰려면 로그인 가능한 관리자(교장) 계정이 필요하다.
+    admin_name: str = Field(min_length=1, max_length=100)
+    admin_email: EmailStr
+
+
+class _OrgUpdateReq(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=150)
+    org_type: str | None = Field(default=None, max_length=30)
+    status: str | None = Field(default=None, pattern="^(active|pending|disabled)$")
+    contact_email: EmailStr | None = None
+    contact_phone: str | None = Field(default=None, max_length=30)
+    address: str | None = Field(default=None, max_length=255)
+    business_number: str | None = Field(default=None, max_length=30)
+
+
+@router.post("/orgs")
+def ops_create_org(
+    req: _OrgCreateReq,
+    principal: Principal = Depends(require_ops),
+    db: Session = Depends(get_db),
+):
+    """기관 신규 등록 — 기관 + 관리자(교장) 계정 생성. 임시 비밀번호는 응답에서만 1회 노출.
+
+    자체 가입(register_org)과 달리 운영자가 직접 만드는 경로라 이메일 인증을 생략하고
+    바로 사용 가능(active) 상태로 만든다.
+    """
+    admin_email = req.admin_email.strip().lower()
+    if db.query(User).filter(User.email == admin_email).first():
+        raise HTTPException(status.HTTP_409_CONFLICT, detail="이미 가입된 관리자 이메일입니다.")
+    if req.business_number and (
+        db.query(Organization)
+        .filter(Organization.business_number == req.business_number)
+        .first()
+    ):
+        raise HTTPException(status.HTTP_409_CONFLICT, detail="이미 등록된 사업자번호입니다.")
+
+    from app.services.auth_service import _generate_org_code
+
+    org = Organization(
+        name=req.name,
+        code=_generate_org_code(db, req.name),
+        org_type=req.org_type,
+        status=req.status,
+        contact_email=(req.contact_email.strip().lower() if req.contact_email else admin_email),
+        contact_phone=req.contact_phone,
+        address=req.address,
+        business_number=req.business_number,
+        code_expires_at=_now() + timedelta(days=365),
+    )
+    db.add(org)
+    db.flush()
+
+    temp_password = secrets.token_urlsafe(9)
+    admin = User(
+        email=admin_email,
+        password_hash=hash_password(temp_password),
+        name=req.admin_name,
+        phone=req.contact_phone,
+        role="org_admin",
+        status="active",
+        organization_id=org.id,
+        email_verified_at=_now(),
+    )
+    db.add(admin)
+    db.flush()
+    db.add(
+        Membership(
+            user_id=admin.id,
+            organization_id=org.id,
+            role="org_admin",
+            status="active",
+            joined_at=_now(),
+        )
+    )
+    # 기본 요금제(basic) 연결 — 키 발급·요금제 게이팅이 동작하도록
+    basic = db.query(Plan).filter(Plan.key == "basic").first()
+    if basic:
+        db.add(Subscription(organization_id=org.id, plan_id=basic.id))
+    db.add(
+        AuditLog(
+            actor_user_id=principal.id,
+            organization_id=org.id,
+            action="org.create",
+            target_type="organization",
+            target_id=org.id,
+            after_json={"name": org.name, "code": org.code, "admin_email": admin_email},
+        )
+    )
+    db.commit()
+    return {
+        "ok": True,
+        **_org_admin_row(db, org),
+        "admin_email": admin_email,
+        "admin_temp_password": temp_password,  # 1회 노출 — 응답 이후 조회 불가
+    }
+
+
+@router.patch("/orgs/{org_id}")
+def ops_update_org(
+    org_id: str,
+    req: _OrgUpdateReq,
+    principal: Principal = Depends(require_ops),
+    db: Session = Depends(get_db),
+):
+    """기관 정보 수정 — 이름·유형·상태·연락처. 상태를 disabled로 두면 이용 중지."""
+    org = db.get(Organization, org_id)
+    if org is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="기관을 찾을 수 없습니다.")
+    if req.business_number and req.business_number != org.business_number and (
+        db.query(Organization)
+        .filter(Organization.business_number == req.business_number, Organization.id != org_id)
+        .first()
+    ):
+        raise HTTPException(status.HTTP_409_CONFLICT, detail="이미 등록된 사업자번호입니다.")
+    fields = ("name", "org_type", "status", "contact_email", "contact_phone", "address", "business_number")
+    before = {f: getattr(org, f) for f in fields}
+    for f in fields:
+        value = getattr(req, f)
+        if value is not None:
+            setattr(org, f, value.strip().lower() if f == "contact_email" else value)
+    db.add(
+        AuditLog(
+            actor_user_id=principal.id,
+            organization_id=org.id,
+            action="org.update",
+            target_type="organization",
+            target_id=org.id,
+            before_json=before,
+            after_json={f: getattr(org, f) for f in fields},
+        )
+    )
+    db.commit()
+    return _org_admin_row(db, org)
+
+
+@router.delete("/orgs/{org_id}")
+def ops_delete_org(
+    org_id: str,
+    principal: Principal = Depends(require_ops),
+    db: Session = Depends(get_db),
+):
+    """기관 삭제 — 소속 데이터(학생·API 키)가 없는 빈 기관만 실제 삭제한다.
+
+    학생/키가 남아 있으면 삭제 대신 409를 반환하고, 이용을 막으려면 '중지'(status=disabled)를
+    쓰도록 안내한다. 아동 학습 데이터를 실수로 고아(orphan)로 만들지 않기 위한 안전장치.
+    """
+    org = db.get(Organization, org_id)
+    if org is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="기관을 찾을 수 없습니다.")
+    student_count = db.query(StudentProfile).filter(StudentProfile.organization_id == org_id).count()
+    if student_count:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail=f"소속 학생 {student_count}명이 있어 삭제할 수 없습니다. 이용을 막으려면 '중지'로 변경하세요.",
+        )
+    key_count = (
+        db.query(ApiKey)
+        .filter(ApiKey.organization_id == org_id, ApiKey.status != "deleted")
+        .count()
+    )
+    if key_count:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail=f"발급된 API 키 {key_count}개가 있어 삭제할 수 없습니다. 키를 먼저 폐기하세요.",
+        )
+    # 빈 기관: 관리자 계정·멤버십·구독·가입신청·기관을 정리한다.
+    db.query(Membership).filter(Membership.organization_id == org_id).delete()
+    db.query(Subscription).filter(Subscription.organization_id == org_id).delete()
+    db.query(User).filter(User.organization_id == org_id).delete()
+    db.query(OrgRegistrationRequest).filter(
+        OrgRegistrationRequest.organization_id == org_id
+    ).delete()
+    db.add(
+        AuditLog(
+            actor_user_id=principal.id,
+            organization_id=None,  # 기관이 삭제되므로 FK 없는 참조로 남기지 않는다
+            action="org.delete",
+            target_type="organization",
+            target_id=org_id,
+            before_json={"name": org.name, "code": org.code},
+        )
+    )
+    db.delete(org)
+    db.commit()
+    return {"ok": True}
 
 
 @router.get("/inquiries")
@@ -219,12 +434,41 @@ def system(principal: Principal = Depends(require_ops)):
 @router.get("/logs")
 def logs(principal: Principal = Depends(require_ops), db: Session = Depends(get_db)):
     rows = db.query(AuditLog).order_by(AuditLog.created_at.desc()).limit(50).all()
+    # 실행자/기관을 사람이 읽을 수 있게 — '누가·언제·무엇을'의 '누가'가 UUID면 감사 로그 목적 미달
+    actor_ids = {log.actor_user_id for log in rows if log.actor_user_id}
+    org_ids = {log.organization_id for log in rows if log.organization_id}
+    users = {u.id: u for u in db.query(User).filter(User.id.in_(list(actor_ids) or [""]))}
+    students = {
+        s.id: s
+        for s in db.query(StudentProfile).filter(StudentProfile.id.in_(list(actor_ids) or [""]))
+    }
+    orgs = {o.id: o for o in db.query(Organization).filter(Organization.id.in_(list(org_ids) or [""]))}
+
+    _salt = get_settings().JWT_SECRET_KEY
+
+    def _actor(log: AuditLog) -> str | None:
+        aid = log.actor_user_id
+        if not aid:
+            return None
+        u = users.get(aid)
+        if u is not None:
+            role = {"ops": "운영자", "org_admin": "기관 관리자", "grade_head": "학년부장", "teacher": "교사", "parent": "학부모"}.get(u.role, u.role)
+            return f"{u.name} ({role})"
+        s = students.get(aid)
+        if s is not None:
+            # 학생은 익명(anon_code) — 운영자는 학생 식별정보(닉네임 포함)를 보지 않는다.
+            code = hashlib.sha256(f"{_salt}:{s.id}".encode()).hexdigest()[:6].upper()
+            return f"학생 {code}"
+        return None
+
     return [
         {
             "id": log.id,
             "action": log.action,
             "actor_user_id": log.actor_user_id,
+            "actor_name": _actor(log),
             "organization_id": log.organization_id,
+            "org_name": orgs[log.organization_id].name if log.organization_id in orgs else None,
             "target_type": log.target_type,
             "target_id": log.target_id,
             "created_at": log.created_at.isoformat() if log.created_at else None,
@@ -463,13 +707,19 @@ _BEHAVIOR_FAIL = ("incorrect", "fail")
 
 
 def _behavior_group_metrics(db: Session, group: str, *filters) -> dict:
-    """그룹(아동/익명)별 행동 지표 평균 — 아동·성인 행동이 갈라지는지 보는 비교 데이터."""
+    """그룹(아동/익명)별 행동 지표 평균 — 아동·성인 행동이 갈라지는지 보는 비교 데이터.
+
+    평균 속도는 상한(AVG_SPEED_CAP=100 px/ms)에 걸린 자기신고 값을 제외한다 —
+    단위가 어긋난 클라이언트 신고분이 섞이면 그룹 평균이 통째로 오염된다.
+    """
+    from sqlalchemy import case
+
     row = (
         db.query(
             func.count(BehaviorSummary.id),
             func.avg(BehaviorSummary.solve_time_ms),
             func.avg(BehaviorSummary.path_length),
-            func.avg(BehaviorSummary.avg_speed),
+            func.avg(case((BehaviorSummary.avg_speed < 100, BehaviorSummary.avg_speed))),
             func.avg(BehaviorSummary.pause_count),
             func.avg(BehaviorSummary.retry_count),
         )
@@ -526,6 +776,29 @@ def behavior_overview(
     }
 
 
+def _trace_preview(points: list, cap: int = 24) -> list[list[float]] | None:
+    """원시 궤적을 목록 인라인 스파크라인용으로 다운샘플 — [x, y] 정규화 좌표만, 최대 cap개.
+
+    목록 한 페이지(최대 200행)의 각 궤적 전체 좌표(최대 2000점)를 그대로 내려보내면
+    응답이 과대해지므로, 시작·끝을 보존하며 균등 간격으로 줄인다. t(시간)는 뺀다.
+    """
+    if not points:
+        return None
+    n = len(points)
+    if n <= cap:
+        idxs = range(n)
+    else:
+        # 시작(0)과 끝(n-1)을 포함하도록 균등 샘플
+        step = (n - 1) / (cap - 1)
+        idxs = sorted({int(round(i * step)) for i in range(cap)} | {0, n - 1})
+    out: list[list[float]] = []
+    for i in idxs:
+        p = points[i]
+        if len(p) >= 3:
+            out.append([round(float(p[1]), 4), round(float(p[2]), 4)])
+    return out or None
+
+
 @router.get("/behavior/records")
 def behavior_records(
     source: str | None = None,
@@ -579,15 +852,26 @@ def behavior_records(
         else {}
     )
     ids = [r.id for r in rows]
-    trace_points = (
-        dict(
-            db.query(BehaviorTrace.behavior_id, BehaviorTrace.point_count)
+    trace_points: dict[str, int] = {}
+    trace_previews: dict[str, list] = {}
+    if ids:
+        for bid, pc, pts in (
+            db.query(BehaviorTrace.behavior_id, BehaviorTrace.point_count, BehaviorTrace.points)
             .filter(BehaviorTrace.behavior_id.in_(ids))
             .all()
-        )
-        if ids
-        else {}
-    )
+        ):
+            trace_points[bid] = pc
+            preview = _trace_preview(pts)
+            if preview:
+                trace_previews[bid] = preview
+
+    # 아동 PII 비노출: 운영자에게는 닉네임·학생코드·정확나이 대신 익명 코드만 내려준다.
+    # JWT 시크릿을 소금으로 쓴 해시라 감사로그 등 다른 화면의 ID와 대조해도 특정 불가,
+    # 같은 학생은 항상 같은 코드라 학습셋 큐레이션(동일인 묶기)은 유지된다.
+    _salt = get_settings().JWT_SECRET_KEY
+
+    def _anon_code(student_id: str) -> str:
+        return hashlib.sha256(f"{_salt}:{student_id}".encode()).hexdigest()[:6].upper()
 
     def _row(r: BehaviorSummary) -> dict:
         s = students.get(r.student_id) if r.student_id else None
@@ -597,9 +881,7 @@ def behavior_records(
             "source_type": r.source_type,
             "organization_name": org.name if org else None,
             "student": {
-                "nickname": s.nickname,
-                "student_code": s.student_code,
-                "age": s.age,
+                "anon_code": _anon_code(s.id),
                 "grade_band": s.grade_band,
             }
             if s
@@ -616,6 +898,7 @@ def behavior_records(
             "sample_label": r.sample_label,
             "dataset_status": r.dataset_status,
             "trace_points": trace_points.get(r.id),  # None = 원시 궤적 없음
+            "trace_preview": trace_previews.get(r.id),  # 인라인 스파크라인용 [x,y] (없으면 None)
             "occurred_at": r.occurred_at.isoformat() if r.occurred_at else None,
             "created_at": r.created_at.isoformat() if r.created_at else None,
         }
@@ -641,6 +924,148 @@ def behavior_trace(
         "box_w": t.box_w,
         "box_h": t.box_h,
     }
+
+
+# ---------------------------------------------------------------- 외부 업체 제공용 익명 내보내기
+K_ANON_MIN = 5  # 집계 소집단 최소 고유 학생 수 — 이 미만 그룹은 제외(단독 재식별 방지)
+
+
+@router.get("/behavior/export")
+def behavior_export(
+    mode: str = "aggregate",  # aggregate(집계·개인0·k익명) | rows(행단위 가명)
+    fmt: str = "csv",  # csv | json
+    dataset: str = "included",  # dataset_status 필터: included(큐레이션됨) | candidate | all
+    source_type: str | None = None,
+    principal: Principal = Depends(require_ops),
+    db: Session = Depends(get_db),
+):
+    """외부 업체(학습지사)에 넘길 **익명** 행동데이터 내보내기 — 학교명·학생 식별정보 전부 제거.
+
+    - aggregate: 집단 통계만(개인 0건). k-익명성(고유 학생 K_ANON_MIN 미만 집단 제외)로 소집단
+      단독 재식별 차단. **외부 판매에 가장 안전.**
+    - rows: 행 단위. 학생은 가명(anon_code, 외부는 재식별 불가)·나이대·성별·날짜(정확시각 제거)만.
+      모델 학습용. anon_code는 가명이므로 재식별 금지 계약(DUA)이 전제.
+
+    내보낼 때마다 감사로그(behavior.export)를 남긴다.
+    """
+    if mode not in ("aggregate", "rows"):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="mode는 aggregate|rows.")
+    if fmt not in ("csv", "json"):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="fmt는 csv|json.")
+
+    q = db.query(BehaviorSummary).filter(BehaviorSummary.student_id.isnot(None))
+    if dataset in ("included", "candidate", "excluded"):
+        q = q.filter(BehaviorSummary.dataset_status == dataset)
+    if source_type:
+        q = q.filter(BehaviorSummary.source_type == source_type)
+    rows = q.all()
+
+    sids = {r.student_id for r in rows}
+    students = (
+        {s.id: s for s in db.query(StudentProfile).filter(StudentProfile.id.in_(sids)).all()}
+        if sids
+        else {}
+    )
+    _salt = get_settings().JWT_SECRET_KEY
+
+    def _anon(sid: str) -> str:  # 가명(salted 해시) — 시크릿 없는 외부는 되돌릴 수 없음
+        return hashlib.sha256(f"{_salt}:{sid}".encode()).hexdigest()[:6].upper()
+
+    def _gb(s):
+        return (s.grade_band if s else None) or "unknown"
+
+    def _gd(s):
+        return (s.gender if s and s.gender else None) or "unknown"
+
+    k_dropped = 0
+    if mode == "rows":
+        cols = [
+            "anon_code", "grade_band", "gender", "source_type", "input_type",
+            "interaction_result", "risk_level", "sample_label", "solve_time_ms",
+            "path_length", "avg_speed", "pause_count", "retry_count",
+            "drop_distance_norm", "date",
+        ]
+        records = []
+        for r in rows:
+            s = students.get(r.student_id)
+            when = r.occurred_at or r.created_at
+            records.append({
+                "anon_code": _anon(r.student_id),  # 가명 — 학교명·실ID 없음
+                "grade_band": _gb(s),
+                "gender": _gd(s),
+                "source_type": r.source_type,
+                "input_type": r.input_type,
+                "interaction_result": r.interaction_result,
+                "risk_level": r.risk_level,
+                "sample_label": r.sample_label,
+                "solve_time_ms": r.solve_time_ms,
+                "path_length": r.path_length,
+                "avg_speed": r.avg_speed,
+                "pause_count": r.pause_count,
+                "retry_count": r.retry_count,
+                "drop_distance_norm": r.drop_distance_norm,
+                "date": when.date().isoformat() if when else None,  # 정확 시각 제거·날짜만
+            })
+    else:  # aggregate — 집단 통계(개인 0) + k-익명성
+        cols = [
+            "grade_band", "gender", "source_type", "input_type", "n_events",
+            "n_students", "avg_solve_time_ms", "avg_path_length", "avg_pause_count",
+            "correct_rate",
+        ]
+        groups: dict = defaultdict(
+            lambda: {"n": 0, "uids": set(), "solve": 0.0, "path": 0.0, "pause": 0.0, "correct": 0}
+        )
+        for r in rows:
+            s = students.get(r.student_id)
+            key = (_gb(s), _gd(s), r.source_type, r.input_type or "unknown")
+            g = groups[key]
+            g["n"] += 1
+            g["uids"].add(r.student_id)
+            g["solve"] += r.solve_time_ms or 0
+            g["path"] += r.path_length or 0
+            g["pause"] += r.pause_count or 0
+            if r.interaction_result == "correct":
+                g["correct"] += 1
+        records = []
+        for (gb, gd, src, inp), g in groups.items():
+            if len(g["uids"]) < K_ANON_MIN:  # k-익명성: 소집단 제외
+                k_dropped += 1
+                continue
+            n = g["n"]
+            records.append({
+                "grade_band": gb, "gender": gd, "source_type": src, "input_type": inp,
+                "n_events": n, "n_students": len(g["uids"]),
+                "avg_solve_time_ms": round(g["solve"] / n, 1),
+                "avg_path_length": round(g["path"] / n, 1),
+                "avg_pause_count": round(g["pause"] / n, 2),
+                "correct_rate": round(g["correct"] / n * 100, 1),
+            })
+
+    # 내보내기 감사 — 누가·언제·무슨 모드/필터로·몇 건 (재식별 금지 계약 이행 추적)
+    audit(
+        db, action="behavior.export", actor_user_id=principal.id,
+        after={"mode": mode, "fmt": fmt, "dataset": dataset, "source_type": source_type,
+               "count": len(records), "k_dropped": k_dropped},
+    )
+    db.commit()
+
+    stamp = datetime.utcnow().strftime("%Y%m%d")
+    fname = f"catchap_behavior_{mode}_{stamp}.{fmt}"
+    if fmt == "json":
+        return {
+            "mode": mode, "count": len(records), "k_anon_min": K_ANON_MIN,
+            "k_dropped": k_dropped, "columns": cols, "rows": records,
+        }
+    buf = io.StringIO()
+    w = csv.DictWriter(buf, fieldnames=cols)
+    w.writeheader()
+    for rec in records:
+        w.writerow(rec)
+    return StreamingResponse(
+        iter([buf.getvalue()]),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+    )
 
 
 class _DatasetMarkReq(BaseModel):

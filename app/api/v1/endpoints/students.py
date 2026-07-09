@@ -847,8 +847,10 @@ def update_profile(
         me.nickname = req.nickname.strip()[:8]
     if req.age is not None:
         me.age = req.age
+    if req.gender is not None:
+        me.gender = req.gender
     db.commit()
-    return {"ok": True, "nickname": me.nickname, "age": me.age}
+    return {"ok": True, "nickname": me.nickname, "age": me.age, "gender": me.gender}
 
 
 # ---------------------------------------------------------------- 학년 랭킹
@@ -1216,7 +1218,7 @@ def game_session(
     """실제 플레이 가능한 문항 세트 발급 (정답 미포함 — 채점은 서버).
 
     day 지정 시(생활 전용 — 일차 커리큘럼): 그 일차의 playable 문항 (미래 일차는 잠금 → available=false).
-    day 미지정: 과목 뱅크 전체에서 무작위. 수학·과학·역사는 뱅크가 작아 커리큘럼 없이 무작위만 지원.
+    day 미지정: 과목 뱅크 전체에서 무작위. 수학·과학·사회는 뱅크가 작아 커리큘럼 없이 무작위만 지원.
     """
     _me(principal)
     from app.services import subject_banks

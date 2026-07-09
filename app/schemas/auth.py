@@ -71,6 +71,8 @@ class RegisterStudentRequest(BaseModel):
     email_code: str
     student_login_id: str = Field(min_length=3)
     password: str = Field(min_length=4)
+    age: int | None = Field(default=None, ge=3, le=13)
+    gender: str | None = Field(default=None, pattern="^(male|female|other)$")
 
 
 class RegisterOrgRequest(BaseModel):
