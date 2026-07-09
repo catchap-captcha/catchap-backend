@@ -57,19 +57,25 @@ def _today_quiz_rows(db: Session, student_id: str) -> list[DailyQuizStatus]:
         .filter(DailyQuizStatus.student_id == student_id, DailyQuizStatus.quiz_date == today)
         .all()
     )
-    if not rows:
-        for preset in D.DAILY_QUIZ:
-            rows.append(
-                DailyQuizStatus(
-                    student_id=student_id,
-                    quiz_date=today,
-                    subject=preset["subject"],
-                    topic=preset["topic"],
-                    status="todo",
-                    reward_coins=preset["reward"],
-                )
+    # 프리셋 6과목 중 오늘 행이 없는 과목을 보충 생성.
+    # (기존엔 '행이 하나도 없을 때만' 6과목 생성 → 한 과목만 풀어 그 행이 생기면 나머지 5과목이
+    #  사라져 오늘의퀴즈에 한 과목만 보이던 버그 해소)
+    have = {r.subject for r in rows}
+    new_rows = []
+    for preset in D.DAILY_QUIZ:
+        if preset["subject"] not in have:
+            r = DailyQuizStatus(
+                student_id=student_id,
+                quiz_date=today,
+                subject=preset["subject"],
+                topic=preset["topic"],
+                status="todo",
+                reward_coins=preset["reward"],
             )
-        db.add_all(rows)
+            new_rows.append(r)
+            rows.append(r)
+    if new_rows:
+        db.add_all(new_rows)
         db.commit()
     order = {s: i for i, s in enumerate(D.SUBJECT_ORDER)}
     rows.sort(key=lambda r: order.get(r.subject, len(order)))
