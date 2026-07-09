@@ -129,6 +129,15 @@ def issue_key(
     }
 
 
+def rotate_secret(db: Session, api: ApiKey) -> str:
+    """secret_key만 재발급 — site_key는 유지(위젯 재배포 불필요). 새 secret은 이 반환에서만 노출."""
+    secret = f"cs_{secrets.token_hex(20)}"
+    api.secret_key_hash = sha256_hash(secret)
+    db.add(api)
+    db.commit()
+    return secret
+
+
 def auth_site_key(db: Session, site_key: str) -> ApiKey:
     api = db.query(ApiKey).filter(ApiKey.site_key == site_key, ApiKey.status == "active").first()
     if api is None:
@@ -250,10 +259,16 @@ def _usage_this_month(db: Session, org_id: str) -> int:
     )
 
 
-def log_call(db: Session, api: ApiKey, endpoint: str, status_code: int, latency_ms: int = 0) -> None:
+def log_call(
+    db: Session, api: ApiKey, endpoint: str, status_code: int, latency_ms: int = 0,
+    subject: str | None = None,
+) -> None:
+    # subject: 그 요청의 '효과 과목'(1st-party 키가 ?subject=로 전환한 실제 과목). 미지정 시
+    # 키에 박힌 과목. 과목별 사용량이 실제 출제 과목과 맞게 집계된다.
     db.add(
         ApiUsageLog(
             organization_id=api.organization_id, site_id=api.site_id,
+            api_key_id=api.id, product=api.product, subject=subject or api.subject,
             endpoint=endpoint, method="POST", status_code=status_code, latency_ms=latency_ms,
         )
     )

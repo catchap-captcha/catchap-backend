@@ -228,7 +228,7 @@ def challenge(
         api.product, eff_subject, day=day, replay=replay, learning=learning,
         chapter=chapter, stage=stage,
     )
-    cs.log_call(db, api, "captcha/challenge", 200)
+    cs.log_call(db, api, "captcha/challenge", 200, subject=eff_subject)
     db.commit()
     return {"product": api.product, "subject": eff_subject, **ch}
 

@@ -47,6 +47,10 @@ class ApiUsageLog(Base, UUIDPk, Timestamps):
 
     organization_id: Mapped[str] = mapped_column(CHAR(36), index=True)
     site_id: Mapped[str | None] = mapped_column(CHAR(36), nullable=True, index=True)
+    # 키별·과목별 사용량 집계용 (migration b2c3d4e5f6a7). 과거 로그는 NULL.
+    api_key_id: Mapped[str | None] = mapped_column(CHAR(36), nullable=True, index=True)
+    product: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    subject: Mapped[str | None] = mapped_column(String(20), nullable=True)
     endpoint: Mapped[str] = mapped_column(String(150))
     method: Mapped[str] = mapped_column(String(10))
     status_code: Mapped[int] = mapped_column(default=200)

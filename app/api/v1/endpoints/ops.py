@@ -941,7 +941,7 @@ class _IssueKeyReq(BaseModel):
     first_party: bool = False
 
 
-def _apikey_row(db: Session, k: ApiKey) -> dict:
+def _apikey_row(db: Session, k: ApiKey, usage: int = 0) -> dict:
     org = db.get(Organization, k.organization_id)
     plan = _cs.plan_for_org(db, k.organization_id)
     return {
@@ -955,6 +955,7 @@ def _apikey_row(db: Session, k: ApiKey) -> dict:
         "first_party": k.first_party,
         "site_key": k.site_key,  # 공개키 — 목록 노출 OK
         "status": k.status,
+        "usage_month": usage,  # 이번 달 이 키의 challenge 발급 수
         "plan": plan.name if plan else "미구독",
         "last_used_at": k.last_used_at.isoformat() if k.last_used_at else None,
         "created_at": k.created_at.isoformat() if k.created_at else None,
@@ -982,7 +983,19 @@ def ops_plans(principal: Principal = Depends(require_ops), db: Session = Depends
 @router.get("/api-keys")
 def ops_list_api_keys(principal: Principal = Depends(require_ops), db: Session = Depends(get_db)):
     rows = db.query(ApiKey).filter(ApiKey.status != "deleted").order_by(ApiKey.created_at.desc()).all()
-    return [_apikey_row(db, k) for k in rows]
+    # 키별 이번 달 challenge 호출 수(전 기관 한 번에)
+    first = _now().replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    usage = dict(
+        db.query(ApiUsageLog.api_key_id, func.count(ApiUsageLog.id))
+        .filter(
+            ApiUsageLog.created_at >= first,
+            ApiUsageLog.endpoint.like("%challenge%"),
+            ApiUsageLog.api_key_id.isnot(None),
+        )
+        .group_by(ApiUsageLog.api_key_id)
+        .all()
+    )
+    return [_apikey_row(db, k, usage.get(k.id, 0)) for k in rows]
 
 
 @router.post("/api-keys")
@@ -1039,6 +1052,25 @@ def ops_revoke_api_key(
     )
     db.commit()
     return {"ok": True}
+
+
+@router.post("/api-keys/{key_id}/rotate-secret")
+def ops_rotate_secret(
+    key_id: str, principal: Principal = Depends(require_ops), db: Session = Depends(get_db)
+):
+    """secret_key 재발급(유출 대응) — site_key 유지. secret 1회 노출."""
+    k = db.get(ApiKey, key_id)
+    if k is None or k.status == "deleted":
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="키를 찾을 수 없습니다.")
+    secret = _cs.rotate_secret(db, k)
+    db.add(
+        AuditLog(
+            actor_user_id=principal.id, organization_id=k.organization_id,
+            action="captcha.api_key_rotate", target_type="api_key", target_id=k.id,
+        )
+    )
+    db.commit()
+    return {"ok": True, "site_key": k.site_key, "secret_key": secret}
 
 
 class _EntitlementReq(BaseModel):

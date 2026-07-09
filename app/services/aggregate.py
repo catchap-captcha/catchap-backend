@@ -940,6 +940,40 @@ def org_api_usage_month(db: Session, org_id: str) -> int:
     )
 
 
+def key_usage_this_month(db: Session, org_id: str) -> dict[str, int]:
+    """키별 이번 달 challenge 발급 수(과금 단위=challenge 1건). {api_key_id: count}."""
+    first = date.today().replace(day=1)
+    rows = (
+        db.query(ApiUsageLog.api_key_id, func.count(ApiUsageLog.id))
+        .filter(
+            ApiUsageLog.organization_id == org_id,
+            ApiUsageLog.created_at >= _dt(first),
+            ApiUsageLog.endpoint.like("%challenge%"),
+            ApiUsageLog.api_key_id.isnot(None),
+        )
+        .group_by(ApiUsageLog.api_key_id)
+        .all()
+    )
+    return {kid: n for kid, n in rows}
+
+
+def subject_usage_this_month(db: Session, org_id: str) -> dict[str, int]:
+    """과목별 이번 달 교육형 challenge 수 — 과목별 사용량 대시보드용. {subject: count}."""
+    first = date.today().replace(day=1)
+    rows = (
+        db.query(ApiUsageLog.subject, func.count(ApiUsageLog.id))
+        .filter(
+            ApiUsageLog.organization_id == org_id,
+            ApiUsageLog.created_at >= _dt(first),
+            ApiUsageLog.endpoint.like("%challenge%"),
+            ApiUsageLog.subject.isnot(None),
+        )
+        .group_by(ApiUsageLog.subject)
+        .all()
+    )
+    return {s: n for s, n in rows}
+
+
 def org_analytics_extras(db: Session, org_id: str, start: date, end: date) -> dict:
     """학급별/학년별 표 — 데이터 있는 학급만, 없으면 빈 리스트(D fallback)."""
     from app.models import ClassRoom, User

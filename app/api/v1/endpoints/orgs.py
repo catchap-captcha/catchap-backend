@@ -1322,6 +1322,12 @@ def _site_status_payload(db: Session, org_id: str) -> dict:
             .scalar()
             or 0
         )
+    active_keys = (
+        db.query(func.count(ApiKey.id))
+        .filter(ApiKey.organization_id == org_id, ApiKey.status == "active")
+        .scalar()
+        or 0
+    )
     return {
         "status": "정상",
         "message": "모든 서비스 정상 작동 중",
@@ -1332,6 +1338,9 @@ def _site_status_payload(db: Session, org_id: str) -> dict:
         "calls_month": month_n if month_n else 86540,
         "error_rate": fb(error_rate, "0.3%"),
         "avg_latency_ms": fb(avg_latency, 142),
+        "active_keys": active_keys,
+        # 과목별 이번 달 교육형 호출 — 대시보드 과목별 사용량 위젯
+        "subject_usage": aggregate.subject_usage_this_month(db, org_id),
     }
 
 
@@ -1532,26 +1541,15 @@ def reset_student_password(
     principal: Principal = Depends(require_org_admin),
     db: Session = Depends(get_db),
 ):
-    """학생 비밀번호 초기화 — 임시 비번 발급 + 기존 세션(refresh) 전부 폐기 + 감사 로그.
+    """(정책 변경) 학생 비밀번호 초기화는 담임 교사만 — 교장(org_admin)은 할 수 없다.
 
-    학생은 이메일이 없어 스스로 재설정 불가 → 학교(관리자/교사)가 초기화.
+    담임이 자기 반 학생을 `POST /teacher/class/students/{id}/reset-password`로 초기화한다.
+    이 경로는 교장 전용이었으나, "담당 선생님만 초기화" 정책으로 차단한다.
     """
-    check_org_scope(principal, org_id)
-    st = _student_in_org(db, org_id, student_id)
-    temp = f"cat-{_secrets.randbelow(9000) + 1000}"
-    st.password_hash = _hash_password(temp)
-    st.must_change_password = True  # 첫 로그인 시 새 비번 설정 강제
-    _auth_service.logout(db, st.id)  # 기존 refresh 토큰 폐기 → 모든 기기 로그아웃
-    audit(
-        db,
-        action="student.password_reset",
-        actor_user_id=principal.id,
-        organization_id=org_id,
-        target_type="student",
-        target_id=st.id,
+    raise HTTPException(
+        status.HTTP_403_FORBIDDEN,
+        detail="학생 비밀번호 초기화는 담임 교사만 할 수 있어요. 담당 선생님에게 요청해 주세요.",
     )
-    db.commit()
-    return {"ok": True, "temp_password": temp}  # 임시 비번은 1회 노출
 
 
 @router.get("/{org_id}/students/{student_id}/parent-links")
@@ -1679,7 +1677,7 @@ class _OrgIssueKeyReq(_BaseModel):
     domain: str | None = None
 
 
-def _org_key_row(k: ApiKey) -> dict:
+def _org_key_row(k: ApiKey, usage: int = 0) -> dict:
     from app.services import captcha_service as _cs
 
     return {
@@ -1691,6 +1689,7 @@ def _org_key_row(k: ApiKey) -> dict:
         "first_party": k.first_party,
         "site_key": k.site_key,  # 공개키 — 노출 OK
         "status": k.status,
+        "usage_month": usage,  # 이번 달 이 키의 challenge 발급 수
         "last_used_at": k.last_used_at.isoformat() if k.last_used_at else None,
         "created_at": k.created_at.isoformat() if k.created_at else None,
     }
@@ -1712,6 +1711,8 @@ def org_api_entitlements(
         "used": _cs._usage_this_month(db, org_id),
         "quota": plan.api_quota if plan else 0,
     }
+    # 과목별 이번 달 호출 — 과목별 판매/사용량 대시보드용
+    ent["subject_usage"] = aggregate.subject_usage_this_month(db, org_id)
     ent["product_names"] = _cs.PRODUCTS
     return ent
 
@@ -1730,7 +1731,8 @@ def org_api_keys(
         .order_by(ApiKey.created_at.desc())
         .all()
     )
-    return [_org_key_row(k) for k in rows]
+    usage = aggregate.key_usage_this_month(db, org_id)  # {api_key_id: 이달 호출수}
+    return [_org_key_row(k, usage.get(k.id, 0)) for k in rows]
 
 
 @router.post("/{org_id}/api-keys")
@@ -1795,3 +1797,26 @@ def org_revoke_api_key(
     )
     db.commit()
     return {"ok": True}
+
+
+@router.post("/{org_id}/api-keys/{key_id}/rotate-secret")
+def org_rotate_secret(
+    org_id: str,
+    key_id: str,
+    principal: Principal = Depends(require_org_admin),
+    db: Session = Depends(get_db),
+):
+    """secret_key 재발급 — 유출 대응. site_key는 그대로라 위젯 재배포 불필요. secret 1회 노출."""
+    check_org_scope(principal, org_id)
+    from app.services import captcha_service as _cs
+
+    k = db.get(ApiKey, key_id)
+    if k is None or k.organization_id != org_id or k.status == "deleted":
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="키를 찾을 수 없습니다.")
+    secret = _cs.rotate_secret(db, k)
+    audit(
+        db, action="captcha.api_key_rotate", actor_user_id=principal.id,
+        organization_id=org_id, target_type="api_key", target_id=k.id,
+    )
+    db.commit()
+    return {"ok": True, "site_key": k.site_key, "secret_key": secret}
