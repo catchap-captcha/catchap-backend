@@ -1263,16 +1263,7 @@ def chapters(
 
     me = _me(principal)
     subjects = [subject] if subject in D.SUBJECT_ORDER else D.SUBJECT_ORDER
-    # 과목별 챕터 이름(있으면) — Chapter 테이블 order_no 매핑, 없으면 'N주차'
-    name_rows = (
-        db.query(Chapter)
-        .filter(Chapter.subject.in_(subjects))
-        .order_by(Chapter.subject, Chapter.order_no)
-        .all()
-    )
-    names: dict[str, dict[int, str]] = {}
-    for c in name_rows:
-        names.setdefault(c.subject, {})[c.order_no] = c.name
+    # 챕터 이름은 실제 문제은행 topic으로 생성(_ch.chapter_title) — 옛 Chapter 테이블 고정명 폐기
     # 과목 정답률(숙련도) — 있으면 패널에 표시
     acc_by = {
         p.subject: p.accuracy
@@ -1302,7 +1293,7 @@ def chapters(
             chs.append(
                 {
                     "no": no,
-                    "name": names.get(sub, {}).get(no, f"{no}주차"),
+                    "name": _ch.chapter_title(sub, no),
                     "stages": _ch.STAGES,
                     "stages_done": sd,
                     "questions": _ch.CHAPTER_SIZE,

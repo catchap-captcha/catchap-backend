@@ -42,6 +42,26 @@ def unlocked_count(subject: str, today: date | None = None) -> int:
     return max(1, min(mx, weeks + 1))
 
 
+def chapter_title(subject: str, chapter_no: int) -> str:
+    """챕터 제목 — 그 챕터(10문항)를 채우는 실제 문제은행 topic으로 만든다.
+
+    옛 Chapter 테이블의 고정 5개 이름(콘텐츠와 불일치·6주차↑ 무명)을 대체한다.
+    한 챕터가 여러 topic을 걸치면 상위 2개를 '·'로 잇는다.
+    """
+    pool = subject_banks.playable_pool(subject)
+    start = (chapter_no - 1) * CHAPTER_SIZE
+    sliced = pool[start : start + CHAPTER_SIZE]
+    if not sliced:
+        return f"{chapter_no}주차"
+    from collections import Counter
+
+    topics = [q.get("topic") for q in sliced if q.get("topic")]
+    if not topics:
+        return f"{chapter_no}주차"
+    common = [t for t, _ in Counter(topics).most_common(2)]
+    return " · ".join(common)
+
+
 def stage_questions(subject: str, chapter_no: int, stage: int) -> list[dict]:
     """(챕터, 단계)에 해당하는 2문항 — public_question(정답·해설 제거). 범위 밖이면 빈 리스트."""
     if chapter_no < 1 or stage < 1 or stage > STAGES:
