@@ -53,6 +53,7 @@ class _RegisterStudentsReq(_BaseModel):
     class_label: str | None = None
     class_id: str | None = None
     names: list[str] | None = None  # 학생 실명(슬롯 순서대로, 교사·기관 화면 전용)
+    genders: list[str | None] | None = None  # 성별(슬롯 순서대로, 선생님 입력 — 아이가 안 고름)
 from app.services.stats import D  # DB(stat_blobs) 우선, design_data fallback
 from app.utils.helpers import audit, parse_grade
 
@@ -1495,6 +1496,7 @@ def register_students(
         class_id=resolved_class_id,
         created_by=principal.id,
         names=req.names,
+        genders=req.genders,
     )
     return {"ok": True, "issued": codes}
 

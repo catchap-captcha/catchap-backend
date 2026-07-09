@@ -115,6 +115,7 @@ def _student_row(
         "name": _display_name(s),
         "nickname": s.nickname,
         "age": s.age,
+        "gender": s.gender,
         "code": s.student_code,
         "today": today,
         "acc": acc,
@@ -271,13 +272,15 @@ def update_class_student(
     db: Session = Depends(get_db),
 ):
     cls, student = _get_class_student(db, principal, student_id)
-    before = {"nickname": student.nickname, "real_name": student.real_name, "age": student.age, "status": student.status}
+    before = {"nickname": student.nickname, "real_name": student.real_name, "age": student.age, "gender": student.gender, "status": student.status}
     if req.nickname is not None and req.nickname.strip():
         student.nickname = req.nickname.strip()[:10]
     if req.real_name is not None and req.real_name.strip():
         student.real_name = req.real_name.strip()[:100]
     if req.age is not None:
         student.age = req.age
+    if req.gender is not None:
+        student.gender = req.gender or None  # 빈문자면 미입력으로
     if req.status is not None:
         student.status = status_key(req.status)
     audit(
@@ -288,7 +291,7 @@ def update_class_student(
         target_type="student_profile",
         target_id=student.id,
         before=before,
-        after={"nickname": student.nickname, "age": student.age, "status": student.status},
+        after={"nickname": student.nickname, "age": student.age, "gender": student.gender, "status": student.status},
     )
     db.commit()
     summaries = _week_summaries(db, cls.organization_id)

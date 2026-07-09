@@ -847,8 +847,6 @@ def update_profile(
         me.nickname = req.nickname.strip()[:8]
     if req.age is not None:
         me.age = req.age
-    if req.gender is not None:
-        me.gender = req.gender
     db.commit()
     return {"ok": True, "nickname": me.nickname, "age": me.age, "gender": me.gender}
 
@@ -1535,8 +1533,12 @@ def game_answer(
     if q is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="문항을 찾을 수 없습니다.")
     if not q["playable"]:
-        # 위젯 전용(조작형·SVG) 문항 — 현재 게임 UI 채점 대상이 아님
+        # 위젯 전용(SVG·미지원) 문항 — 현재 게임 UI 채점 대상이 아님
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="플레이할 수 없는 문항입니다.")
+    if q["type"] not in ("single", "multi"):
+        # 조작형(connect/sort/order/place)은 위젯(교육형 챌린지)에서만 서버 채점한다.
+        # game-answer는 옵션 등호·집합 채점 전용 — 매핑/순서 채점은 captcha verify 경로.
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="위젯에서 풀 수 있는 문항이에요.")
 
     if q["type"] == "multi":
         answer_ids = [str(a) for a in (q["answer"] or [])]

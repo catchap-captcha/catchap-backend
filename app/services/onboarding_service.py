@@ -68,10 +68,13 @@ def generate_join_codes(
     created_by: str | None = None,
     expires_days: int = 30,
     names: list[str] | None = None,
+    genders: list[str | None] | None = None,
 ) -> list[dict]:
     """학생 슬롯 N개에 대한 1회용 가입 코드 발급. 코드 원문은 이 응답에서만 노출.
 
     names: 기관이 입력한 학생 실명(슬롯 순서대로). 활성화 시 real_name 으로 복사됨.
+    genders: 기관(선생님)이 입력한 성별(슬롯 순서대로, male|female|other). 활성화 시 복사 —
+             아이가 스스로 고르지 않는다.
     """
     org = db.query(Organization).filter(Organization.id == organization_id).first()
     if org is None:
@@ -82,6 +85,8 @@ def generate_join_codes(
         login_id = _unique_login_id(db, org)
         raw = f"JOIN-{_seg(4)}-{_seg(4)}"
         real_name = (names[i].strip()[:100] if names and i < len(names) and names[i] and names[i].strip() else None)
+        g = genders[i] if genders and i < len(genders) else None
+        gender = g if g in ("male", "female", "other") else None
         db.add(
             StudentJoinCode(
                 organization_id=organization_id,
@@ -90,11 +95,12 @@ def generate_join_codes(
                 code_hash=sha256_hash(raw),
                 class_label=class_label,
                 real_name=real_name,
+                gender=gender,
                 expires_at=_now() + timedelta(days=expires_days),
                 created_by=created_by,
             )
         )
-        out.append({"login_id": login_id, "join_code": raw, "class_label": class_label, "real_name": real_name})
+        out.append({"login_id": login_id, "join_code": raw, "class_label": class_label, "real_name": real_name, "gender": gender})
     db.commit()
     return out
 
@@ -125,6 +131,7 @@ def activate_student(db: Session, code: str, nickname: str, password: str) -> tu
         password_hash=hash_password(password),
         nickname=nickname,  # 자유 중복 허용
         real_name=row.real_name,  # 기관 입력 실명 (교사·기관 화면 전용)
+        gender=row.gender,  # 기관(선생님) 입력 성별 — 아이가 고르지 않음
         status="good",
     )
     db.add(profile)

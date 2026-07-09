@@ -12,7 +12,7 @@ class AvatarRequest(BaseModel):
 class StudentProfileUpdate(BaseModel):
     nickname: str | None = Field(default=None, max_length=50)
     age: int | None = Field(default=None, ge=3, le=13)
-    gender: str | None = Field(default=None, pattern="^(male|female|other)$")
+    # 성별은 학생 본인이 바꾸지 않는다 — 선생님(명단/코드 생성)이 관리
 
 
 class AttemptCreate(BaseModel):
