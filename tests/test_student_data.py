@@ -155,7 +155,7 @@ def test_grade_ranking_daily_completion(client, db, seed_org):
     yesterday = date.today() - __import__("datetime").timedelta(days=1)
     for subj in ["국어", "수학"]:
         db.add(DailyQuizStatus(student_id=me_id, quiz_date=yesterday, subject=subj, status="done"))
-    for subj in ["국어", "영어", "수학", "과학", "역사", "생활"]:
+    for subj in ["국어", "영어", "수학", "과학", "사회", "생활"]:
         db.add(DailyQuizStatus(student_id=me_id, quiz_date=date.today(), subject=subj, status="done"))
     db.commit()
 
@@ -275,11 +275,11 @@ def test_game_session_server_graded(client, db, seed_org):
 
 
 def test_game_session_new_subjects(client, db, seed_org):
-    """수학·과학·역사·영어 실문항 (capcha_service my/sw/ms 이식): 발급 sanitize + 서버 채점 + 오답노트 과목 매핑."""
+    """수학·과학·사회·영어 실문항 (capcha_service my/sw/ms 이식): 발급 sanitize + 서버 채점 + 오답노트 과목 매핑."""
     from app.models import LearningAttempt, WrongAnswer
 
     token = _student_token(client, seed_org)
-    for subject in ("수학", "과학", "역사", "영어"):
+    for subject in ("수학", "과학", "사회", "영어"):
         res = client.get(
             f"/api/v1/students/me/game-session?subject={subject}&count=3", headers=auth(token)
         )
@@ -305,19 +305,19 @@ def test_game_session_new_subjects(client, db, seed_org):
     wa = db.query(WrongAnswer).filter(WrongAnswer.student_id == seed_org["student"].id).all()
     assert any(w.subject == "수학" and w.category == "num" for w in wa)
 
-    # 역사 정답 제출 → correct + learning_attempts에 과목 그대로 기록
-    from app.services.history_bank import HISTORY_FULL
+    # 사회 정답 제출 → correct + learning_attempts에 과목 그대로 기록
+    from app.services.social_bank import SOCIAL_FULL
 
-    hq = HISTORY_FULL[0]
+    hq = SOCIAL_FULL[0]
     r2 = client.post(
         "/api/v1/students/me/game-answer",
-        json={"question_id": hq["id"], "subject": "역사", "option_id": hq["answer"]},
+        json={"question_id": hq["id"], "subject": "사회", "option_id": hq["answer"]},
         headers=auth(token),
     )
     assert r2.json()["correct"] is True
     rows = (
         db.query(LearningAttempt)
-        .filter(LearningAttempt.student_id == seed_org["student"].id, LearningAttempt.subject == "역사")
+        .filter(LearningAttempt.student_id == seed_org["student"].id, LearningAttempt.subject == "사회")
         .all()
     )
     assert [x.result for x in rows] == ["correct"]

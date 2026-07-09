@@ -33,7 +33,7 @@ from app.models import ApiKey, ApiUsageLog, CaptchaConsumedToken, Plan, Site, Su
 
 # ── 제품 · 요금제 엔타이틀먼트 ─────────────────────────────────
 PRODUCTS = {"captcha": "메인 캡차 API", "edu": "교육형 API (행동데이터 수집)"}
-EDU_SUBJECTS = ["국어", "영어", "수학", "과학", "역사", "생활"]
+EDU_SUBJECTS = ["국어", "영어", "수학", "과학", "사회", "생활"]
 
 # 요금제(key)별 사용 가능한 제품. Basic=메인만, Pro↑=교육형까지.
 PLAN_PRODUCTS = {
@@ -556,7 +556,7 @@ def _edu_challenge(
             return _edu_drag_challenge(subject, meta)
         if roll < 0.5:
             return _edu_trace_challenge(subject, meta)
-    # 실문항 뱅크 (생활=ms / 수학·과학=my / 역사=sw / 영어=ms english / 국어=jy — capcha_service 이식)
+    # 실문항 뱅크 (생활=ms / 수학·과학=my / 사회=sw / 영어=ms english / 국어=jy — capcha_service 이식)
     pool = subject_banks.playable_pool(subject)
     q = random.choice(pool)
     return _wrap_bank_question(subject, q, meta)

@@ -26,7 +26,7 @@ ANCHOR_MONDAY = date(2026, 7, 6)
 def max_chapters(subject: str) -> int:
     """그 과목 playable 문항으로 반복 없이 채울 수 있는 챕터 수(문제은행÷10).
 
-    예(현재): 영어64→6, 생활55·수학51→5, 역사45→4, 과학33→3. 은행이 늘면 자동 확장.
+    예(현재): 영어64→6, 생활55·수학51→5, 사회45→4, 과학33→3. 은행이 늘면 자동 확장.
     """
     pool = subject_banks.playable_pool(subject)
     return min(MAX_CHAPTERS, len(pool) // CHAPTER_SIZE)

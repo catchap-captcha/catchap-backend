@@ -3,14 +3,14 @@
 과목 추가 시 여기 BANKS에만 등록하면 game-session 발급·서버 채점·오답노트·행동데이터가
 같은 파이프라인을 탄다. 정답(answer)·해설(explain)은 서버에만 존재한다.
 - 생활: capcha_service ms 브랜치 (커리큘럼 일차 순환은 생활 전용 — curriculum.py)
-- 수학·과학: capcha_service my 브랜치 / 역사: capcha_service sw 브랜치(02-history)
+- 수학·과학: capcha_service my 브랜치 / 사회: capcha_service sw 브랜치(02-history) → ms social 예정
 - 국어: capcha_service jy 브랜치 (4학년 국어 13유형)
 """
 
 from app.services import (
     english_bank,
     english_listen,
-    history_bank,
+    social_bank,
     korean_bank,
     life_bank,
     math_bank,
@@ -22,7 +22,7 @@ BANKS: dict[str, list[dict]] = {
     "생활": life_bank.LIFE_FULL,
     "수학": math_bank.MATH_FULL,
     "과학": science_bank.SCIENCE_FULL,
-    "역사": history_bank.HISTORY_FULL,
+    "사회": social_bank.SOCIAL_FULL,
     # 영어 = 문법·그림문장(텍스트) + 듣기(오디오 sound-match)
     "영어": english_bank.ENGLISH_FULL + english_listen.ENGLISH_LISTEN,
 }
@@ -32,7 +32,7 @@ LIVE_SUBJECTS = frozenset(BANKS)
 
 # 오답노트 카테고리(D.WRONG_TAGS 키) 매핑
 WRONG_CATEGORY = {
-    "국어": "word", "생활": "safe", "수학": "num", "과학": "img", "역사": "hist", "영어": "eng",
+    "국어": "word", "생활": "safe", "수학": "num", "과학": "img", "사회": "soc", "영어": "eng",
 }
 
 _BY_ID: dict[str, dict[str, dict]] = {

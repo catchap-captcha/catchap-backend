@@ -21,7 +21,7 @@ class Chapter(Base, UUIDPk, Timestamps):
 
     __tablename__ = "chapters"
 
-    subject: Mapped[str] = mapped_column(String(20), index=True)  # 국어|영어|수학|과학|역사|생활
+    subject: Mapped[str] = mapped_column(String(20), index=True)  # 국어|영어|수학|과학|사회|생활
     order_no: Mapped[int] = mapped_column()
     name: Mapped[str] = mapped_column(String(100))
     total_questions: Mapped[int] = mapped_column(default=5)

@@ -1,17 +1,17 @@
-"""디자인 원본(.dc.html)에서 추출한 화면 데이터 상수.
+﻿"""디자인 원본(.dc.html)에서 추출한 화면 데이터 상수.
 
 seed와 대시보드 blob 응답이 같은 값을 쓰도록 한 곳에 모았다.
 (화면이 디자인과 동일하게 보이는 것이 목표 — 실명/실기관 아님, 디자인 속 가명 그대로)
 """
 
-SUBJECT_ORDER = ["국어", "영어", "수학", "과학", "역사", "생활"]
+SUBJECT_ORDER = ["국어", "영어", "수학", "과학", "사회", "생활"]
 
 SUBJECT_META = {
     "국어": {"color": "#FF5A4D", "soft": "#FFE0DB", "grad": "linear-gradient(150deg,#FF7A7A,#FF5A6E)", "icon": "ph-fill ph-book-open"},
     "영어": {"color": "#FF922E", "soft": "#FFEDD6", "grad": "linear-gradient(150deg,#FFB43C,#FF922E)", "icon": "ph-fill ph-translate"},
     "수학": {"color": "#17B08C", "soft": "#DFF6EE", "grad": "linear-gradient(150deg,#33C892,#17B0A0)", "icon": "ph-fill ph-plus-minus"},
     "과학": {"color": "#2E7BFF", "soft": "#E1EDFF", "grad": "linear-gradient(150deg,#4AA6FF,#2E7BFF)", "icon": "ph-fill ph-flask"},
-    "역사": {"color": "#8B6BFF", "soft": "#EAE2FF", "grad": "linear-gradient(150deg,#A98CFF,#8B6BFF)", "icon": "ph-fill ph-scroll"},
+    "사회": {"color": "#8B6BFF", "soft": "#EAE2FF", "grad": "linear-gradient(150deg,#A98CFF,#8B6BFF)", "icon": "ph-fill ph-scroll"},
     "생활": {"color": "#FF6DA6", "soft": "#FFE3EF", "grad": "linear-gradient(150deg,#FF93BE,#FF6DA6)", "icon": "ph-fill ph-house-line"},
 }
 
@@ -21,12 +21,12 @@ CHAPTERS = {
     "영어": [("알파벳", 4), ("파닉스 소리", 5), ("쉬운 단어", 5), ("짧은 문장", 4), ("종합 복습", 5)],
     "수학": [("수 세기", 4), ("더하기", 5), ("빼기", 5), ("모양과 규칙", 4), ("종합 복습", 5)],
     "과학": [("동물 친구", 4), ("식물 관찰", 4), ("날씨와 계절", 5), ("물과 공기", 4), ("종합 복습", 5)],
-    "역사": [("옛날 사람들", 4), ("위인 이야기", 5), ("우리 문화", 4), ("나라의 시작", 4), ("종합 복습", 5)],
+    "사회": [("옛날 사람들", 4), ("위인 이야기", 5), ("우리 문화", 4), ("나라의 시작", 4), ("종합 복습", 5)],
     "생활": [("교통 안전", 4), ("우리 집 안전", 4), ("친구 사이", 5), ("건강 습관", 4), ("종합 복습", 5)],
 }
 
 # 챕터지도 DEFAULT_DONE (하은 진도)
-DEFAULT_DONE = {"국어": 2, "영어": 1, "수학": 3, "과학": 0, "역사": 1, "생활": 2}
+DEFAULT_DONE = {"국어": 2, "영어": 1, "수학": 3, "과학": 0, "사회": 1, "생활": 2}
 
 # 나의기록 과목별 정답률 흐름(최근 6회) — '전체' 포함
 RECORD_ACC_SERIES = {
@@ -35,7 +35,7 @@ RECORD_ACC_SERIES = {
     "영어": {"color": "#FF922E", "data": [60, 66, 70, 68, 74, 79]},
     "수학": {"color": "#2E7BFF", "data": [70, 74, 72, 80, 83, 86]},
     "과학": {"color": "#8B6BFF", "data": [55, 62, 60, 68, 72, 77]},
-    "역사": {"color": "#33C892", "data": [64, 68, 72, 75, 79, 84]},
+    "사회": {"color": "#33C892", "data": [64, 68, 72, 75, 79, 84]},
     "생활": {"color": "#FF6DA6", "data": [78, 80, 79, 85, 88, 91]},
 }
 
@@ -69,12 +69,12 @@ CONCEPTS = {
         {"icon": "ph-fill ph-drop", "summary": "물과 공기는 보이거나 안 보여요.", "points": ["물은 얼면 얼음, 끓으면 김이 돼요.", "공기는 안 보여도 우리 곁에 있어요.", "바람은 움직이는 공기예요."], "example": "물이 얼면 단단한 얼음이 돼요 🧊"},
         {"icon": "ph-fill ph-star", "summary": "배운 과학을 떠올려봐요.", "points": ["동물, 식물, 날씨를 관찰해봐요.", "궁금한 걸 '왜?' 하고 물어봐요.", "오늘 본 것 하나를 그려봐요."], "example": "창밖 날씨를 관찰하고 말해봐요!"},
     ],
-    "역사": [
+    "사회": [
         {"icon": "ph-fill ph-users-three", "summary": "옛날 사람들은 지금과 다르게 살았어요.", "points": ["동굴이나 초가집에서 살았어요.", "돌과 나무로 도구를 만들었어요.", "불을 사용하며 생활이 편해졌어요."], "example": "아주 먼 옛날엔 돌로 도구를 만들었어요 🪨"},
         {"icon": "ph-fill ph-crown", "summary": "훌륭한 일을 한 위인이 있어요.", "points": ["세종대왕은 한글을 만드셨어요.", "이순신 장군은 나라를 지켰어요.", "위인의 노력을 배울 수 있어요."], "example": "세종대왕님 덕분에 한글을 써요 👑"},
         {"icon": "ph-fill ph-scroll", "summary": "우리나라만의 멋진 문화가 있어요.", "points": ["한복, 한옥, 한글이 있어요.", "설날·추석 같은 명절이 있어요.", "전통 놀이와 음식이 있어요."], "example": "설날에는 세배를 하고 떡국을 먹어요 🥢"},
         {"icon": "ph-fill ph-flag", "summary": "우리나라는 아주 오래전에 시작됐어요.", "points": ["단군 이야기가 전해져요.", "여러 나라가 있다가 하나가 됐어요.", "옛 이야기로 시작을 알 수 있어요."], "example": "먼 옛날의 이야기가 전해 내려와요 📜"},
-        {"icon": "ph-fill ph-star", "summary": "배운 역사를 이야기처럼 정리해요.", "points": ["옛날 사람들의 생활을 떠올려봐요.", "기억나는 위인을 말해봐요.", "좋아하는 옛이야기를 골라봐요."], "example": "가장 기억에 남는 이야기를 말해봐요!"},
+        {"icon": "ph-fill ph-star", "summary": "배운 사회를 이야기처럼 정리해요.", "points": ["옛날 사람들의 생활을 떠올려봐요.", "기억나는 위인을 말해봐요.", "좋아하는 옛이야기를 골라봐요."], "example": "가장 기억에 남는 이야기를 말해봐요!"},
     ],
     "생활": [
         {"icon": "ph-fill ph-traffic-sign", "summary": "길에서는 안전 약속을 지켜요.", "points": ["초록불에 손 들고 건너요.", "좌우를 살피고 건너요.", "횡단보도로만 건너요."], "example": "초록불이 켜지면 좌우를 보고 건너요 🚦"},
@@ -157,7 +157,7 @@ SEARCH_ITEMS = [
     {"title": "영어", "tag": "과목", "desc": "알파벳과 쉬운 단어를 만나는 영어 한 판", "icon": "ph-fill ph-translate", "subject": "영어", "href": "/student/game?subject=영어", "kw": "영어 알파벳 단어 eng english"},
     {"title": "수학", "tag": "과목", "desc": "수와 셈을 놀이로 배우는 수학 한 판", "icon": "ph-fill ph-plus-minus", "subject": "수학", "href": "/student/game?subject=수학", "kw": "수학 숫자 셈 덧셈 뺄셈 연산 math"},
     {"title": "과학", "tag": "과목", "desc": "관찰하고 탐구하는 과학 한 판", "icon": "ph-fill ph-flask", "subject": "과학", "href": "/student/game?subject=과학", "kw": "과학 관찰 탐구 실험 sci"},
-    {"title": "역사", "tag": "과목", "desc": "옛날 이야기와 지혜를 만나는 역사 한 판", "icon": "ph-fill ph-scroll", "subject": "역사", "href": "/student/game?subject=역사", "kw": "역사 이야기 옛날 hist"},
+    {"title": "사회", "tag": "과목", "desc": "옛날 이야기와 지혜를 만나는 사회 한 판", "icon": "ph-fill ph-scroll", "subject": "사회", "href": "/student/game?subject=사회", "kw": "사회 이야기 옛날 soc"},
     {"title": "생활", "tag": "과목", "desc": "생활 속 안전과 지혜를 배우는 생활 한 판", "icon": "ph-fill ph-house-line", "subject": "생활", "href": "/student/game?subject=생활", "kw": "생활 안전 지혜 life"},
     {"title": "한글 낱말 찾기", "tag": "놀이", "desc": "그림을 보고 알맞은 낱말 고르기", "icon": "ph-fill ph-text-aa", "subject": "국어", "href": "/student/game?subject=국어", "kw": "한글 낱말 찾기 글자 단어"},
     {"title": "숫자 놀이터", "tag": "놀이", "desc": "더하기·빼기 답을 상자에 담기", "icon": "ph-fill ph-calculator", "subject": "수학", "href": "/student/game?subject=수학", "kw": "숫자 놀이터 더하기 빼기 계산"},
@@ -175,7 +175,7 @@ GAME_SUBJECTS = {
     "영어": {"gameTitle": "Word Match", "gameSub": "그림 보고 영어 단어 고르기", "catLabel": "Word·English", "cheer": "한 문제씩 차근차근 가볼까요? ✨", "current": 1, "total": 5, "score": 150, "correct": 0, "wrong": 0, "streak": 0},
     "수학": {"gameTitle": "숫자 세기", "gameSub": "그림 세고 숫자 고르기", "catLabel": "수·셈", "cheer": "집중력이 대단해요! 👏", "current": 4, "total": 5, "score": 320, "correct": 3, "wrong": 0, "streak": 3},
     "과학": {"gameTitle": "과학 관찰 퀴즈", "gameSub": "잘 보고 알맞은 답 고르기", "catLabel": "관찰·과학", "cheer": "궁금한 걸 잘 찾아내고 있어요! 🔍", "current": 1, "total": 5, "score": 40, "correct": 0, "wrong": 0, "streak": 0},
-    "역사": {"gameTitle": "역사 이야기 퀴즈", "gameSub": "이야기 읽고 답 고르기", "catLabel": "이야기·역사", "cheer": "옛날 이야기, 참 잘 기억하네요! 📜", "current": 2, "total": 5, "score": 120, "correct": 1, "wrong": 0, "streak": 1},
+    "사회": {"gameTitle": "사회 이야기 퀴즈", "gameSub": "이야기 읽고 답 고르기", "catLabel": "이야기·사회", "cheer": "옛날 이야기, 참 잘 기억하네요! 📜", "current": 2, "total": 5, "score": 120, "correct": 1, "wrong": 0, "streak": 1},
     "생활": {"gameTitle": "생활 안전 퀴즈", "gameSub": "상황 보고 바른 행동 고르기", "catLabel": "안전·생활", "cheer": "안전을 잘 챙기고 있어요! 🚸", "current": 4, "total": 5, "score": 260, "correct": 2, "wrong": 1, "streak": 1},
 }
 
@@ -184,11 +184,11 @@ GAME_QUESTIONS = {
     "영어": {"q": "이 그림은 영어로 뭘까요? 🔤", "pre": "그림을 잘 보고, 알맞은 ", "hi": "영어 단어", "post": "를 눌러요."},
     "수학": {"q": "별이 모두 몇 개일까요? ⭐", "pre": "별을 하나씩 세고, 알맞은 ", "hi": "숫자 카드", "post": "를 눌러요."},
     "과학": {"q": "물에 둥둥 뜨는 것은? 💧", "pre": "가볍고 물에 뜨는 것을 생각하며, 알맞은 ", "hi": "답 카드", "post": "를 눌러요."},
-    "역사": {"q": "한글을 만드신 임금님은? 👑", "pre": "옛날 이야기를 떠올리며, 알맞은 ", "hi": "답 카드", "post": "를 눌러요."},
+    "사회": {"q": "한글을 만드신 임금님은? 👑", "pre": "옛날 이야기를 떠올리며, 알맞은 ", "hi": "답 카드", "post": "를 눌러요."},
     "생활": {"q": "횡단보도에서 바른 행동은? 🚸", "pre": "안전을 먼저 생각하며, 알맞은 ", "hi": "행동 카드", "post": "를 눌러요."},
 }
 
-GAME_REWARDS = {"국어": 3, "영어": 1, "수학": 4, "과학": 0, "역사": 2, "생활": 4}
+GAME_REWARDS = {"국어": 3, "영어": 1, "수학": 4, "과학": 0, "사회": 2, "생활": 4}
 
 # 학습결과 SUBJECTS 프리셋
 RESULT_SUBJECTS = {
@@ -196,7 +196,7 @@ RESULT_SUBJECTS = {
     "영어": {"cleared": 3, "correct": 4, "score": "+90", "time": "2:10", "streak": 3, "ai": "영어 단어를 척척 맞혔어요! 알파벳 소리를 떠올리면 더 쉬워요. 다음 단계도 잘 해낼 거예요! 🐾"},
     "수학": {"cleared": 5, "correct": 5, "score": "+160", "time": "3:05", "streak": 5, "ai": "수 세기가 아주 정확했어요! 하나씩 짚으며 세는 방법이 완벽했어요. 수학 전 단계 클리어! 🐾"},
     "과학": {"cleared": 2, "correct": 4, "score": "+95", "time": "2:20", "streak": 3, "ai": "관찰을 참 잘했어요! 무겁고 가벼운 걸 잘 구분했어요. 다음엔 더 어려운 관찰에 도전해봐요! 🐾"},
-    "역사": {"cleared": 1, "correct": 4, "score": "+80", "time": "2:05", "streak": 3, "ai": "옛날 이야기를 잘 기억하고 있네요! 세종대왕님 이야기, 아주 멋지게 맞혔어요. 다음 단계로 가볼까요? 🐾"},
+    "사회": {"cleared": 1, "correct": 4, "score": "+80", "time": "2:05", "streak": 3, "ai": "옛날 이야기를 잘 기억하고 있네요! 세종대왕님 이야기, 아주 멋지게 맞혔어요. 다음 단계로 가볼까요? 🐾"},
     "생활": {"cleared": 1, "correct": 4, "score": "+110", "time": "2:35", "streak": 4, "ai": "안전 규칙을 잘 지켰어요! 멈추고, 살피고, 건너기 — 참 잘 기억했어요. 다음 단계도 안전하게! 🐾"},
 }
 RESULT_LEVELS = ["기초 익히기", "기초 다지기", "조금 더 어렵게", "도전 문제", "마스터 챌린지"]
@@ -216,7 +216,7 @@ STUDENT_AI_ANSWERS = {
     "그림 찾기가 어려워요": "고양이는 귀가 뾰족하고 수염이 길어요. 강아지는 귀가 아래로 처진 경우가 많지! 헷갈릴 땐 \"귀 모양\"부터 보면 훨씬 쉬워져요. 다음엔 100% 맞힐 수 있을 거야! 💪",
     "받침이 자꾸 헷갈려요": "받침은 글자 아래에 오는 소리예요. 예를 들어 \"곰\"은 ㄱ+ㅗ+ㅁ, 마지막 ㅁ이 받침이야. 소리를 천천히 나눠서 말해보면 어떤 받침인지 들려요! 🎵",
     "오늘 뭐 배우면 좋아?": "어제 숫자 놀이터를 조금 어려워했으니까, 오늘은 숫자 놀이터 2단계를 추천해! 그리고 아직 시작 안 한 안전 지킴이도 재미있을 거야. 같이 해볼까? 🚀",
-    "나 칭찬해줘!": "하은이는 12일 연속으로 학습했어! 정말 대단해 👏 끌어놓기 놀이는 정답률 95%나 돼. 꾸준함이 최고의 재능이야. 오늘도 최고! 🌟",
+    "나 칭찬해줘!": "하은이는 요즘 꾸준히 학습하고 있어! 정말 대단해 👏 끌어놓기 놀이도 점점 늘고 있어. 꾸준함이 최고의 재능이야. 오늘도 최고! 🌟",
 }
 STUDENT_AI_DEFAULT = "좋은 질문이야! 천천히 같이 알아보자. 😊"
 
@@ -247,7 +247,7 @@ PARENT_REPORT = {
     "하은": {
         "grade": "A", "percentile": "12%",
         "strengths": [{"name": "국어", "pct": "96%"}, {"name": "과학", "pct": "92%"}, {"name": "생활", "pct": "88%"}],
-        "weaknesses": [{"name": "수학", "pct": "72%"}, {"name": "영어", "pct": "78%"}, {"name": "역사", "pct": "75%"}],
+        "weaknesses": [{"name": "수학", "pct": "72%"}, {"name": "영어", "pct": "78%"}, {"name": "사회", "pct": "75%"}],
         "strength_note": "국어·과학에서 꾸준히 높은 정답률을 유지하고 있어요. 새로운 도전 문제도 잘 소화해요.",
         "weakness_note": "수학에서 개념 오답이 반복돼요. 사과 세기처럼 눈으로 보는 활동이 도움돼요.",
         "bars": [{"label": "3주전", "v": 80}, {"label": "2주전", "v": 83}, {"label": "지난주", "v": 85}, {"label": "이번주", "v": 89}],
@@ -261,8 +261,8 @@ PARENT_REPORT = {
         ],
         "trend_base": [80, 82, 83, 85, 87, 89],
         "class_base": [79, 80, 80, 81, 82, 82],
-        "subj_last": {"all": 89, "국어": 96, "영어": 78, "수학": 72, "과학": 92, "역사": 75, "생활": 88},
-        "class_last": {"all": 82, "국어": 88, "영어": 74, "수학": 69, "과학": 85, "역사": 72, "생활": 83},
+        "subj_last": {"all": 89, "국어": 96, "영어": 78, "수학": 72, "과학": 92, "사회": 75, "생활": 88},
+        "class_last": {"all": 82, "국어": 88, "영어": 74, "수학": 69, "과학": 85, "사회": 72, "생활": 83},
     },
     "도윤": {
         "grade": "B+", "percentile": "28%",
@@ -281,8 +281,8 @@ PARENT_REPORT = {
         ],
         "trend_base": [68, 70, 71, 72, 74, 78],
         "class_base": [79, 80, 80, 81, 82, 82],
-        "subj_last": {"all": 78, "국어": 84, "영어": 73, "수학": 64, "과학": 82, "역사": 72, "생활": 90},
-        "class_last": {"all": 82, "국어": 88, "영어": 74, "수학": 69, "과학": 85, "역사": 72, "생활": 83},
+        "subj_last": {"all": 78, "국어": 84, "영어": 73, "수학": 64, "과학": 82, "사회": 72, "생활": 90},
+        "class_last": {"all": 82, "국어": 88, "영어": 74, "수학": 69, "과학": 85, "사회": 72, "생활": 83},
     },
 }
 
@@ -382,7 +382,7 @@ TEACHER_ANALYTICS = {
     "term": {"kAcc": "86", "kAccDelta": "+9%p", "kActive": "22 / 22명", "kActiveSub": "학기 중 학습 학생", "kSolved": "38,600", "kSolvedSub": "학기 중 푼 문제", "kHelp": "5",
              "trendSub": "월별 반 평균", "axis": ["3월", "4월", "5월", "6월", "7월"], "accPct": [78, 82, 85, 88, 90]},
 }
-TEACHER_ANALYTICS_SUBJ_LAST = {"국어": 94, "영어": 82, "수학": 71, "과학": 90, "역사": 85, "생활": 88}
+TEACHER_ANALYTICS_SUBJ_LAST = {"국어": 94, "영어": 82, "수학": 71, "과학": 90, "사회": 85, "생활": 88}
 TEACHER_ANALYTICS_SUBJECTS = [
     {"name": "한글 낱말", "icon": "ph-fill ph-book-open", "pct": 94, "delta": 3, "total": 320},
     {"name": "그림 찾기", "icon": "ph-fill ph-image", "pct": 92, "delta": 5, "total": 280},
@@ -521,7 +521,7 @@ ORG_ROSTER_META = {
 ORG_DASHBOARD = {
     "week": {
         "subtitle": "햇살초등학교 · 2026년 6월 4주차 · 실시간 집계",
-        "periodLabel": "이번 주", "lineSub": "요일별 위험 신호로 step-up·restrict가 권고된 비율 (실험값)",
+        "periodLabel": "이번 주", "lineSub": "요일별로 추가 확인·잠시 제한이 권장된 비율",
         "kStudents": "248", "kTeachers": "16", "kTeachersSub": "교사 / 12 학급",
         "kApi": "3,912", "kApiSub": "오늘 API 요청", "kPass": "94.2", "kAvg": "11.4", "kFail": "8.1",
         "block": [97, 95, 98, 93, 96, 99, 97], "pass": [86, 88, 84, 90, 88, 93, 91],
@@ -533,7 +533,7 @@ ORG_DASHBOARD = {
     },
     "month": {
         "subtitle": "햇살초등학교 · 2026년 6월 · 실시간 집계",
-        "periodLabel": "이번 달", "lineSub": "주차별 위험 신호로 step-up·restrict가 권고된 비율 (실험값)",
+        "periodLabel": "이번 달", "lineSub": "주차별로 추가 확인·잠시 제한이 권장된 비율",
         "kStudents": "251", "kTeachers": "16", "kTeachersSub": "교사 / 12 학급",
         "kApi": "86,540", "kApiSub": "이번 달 API 요청", "kPass": "93.1", "kAvg": "11.8", "kFail": "8.6",
         "block": [95, 96, 97, 98, 99], "pass": [85, 87, 89, 90, 92],
@@ -545,7 +545,7 @@ ORG_DASHBOARD = {
     },
     "year": {
         "subtitle": "햇살초등학교 · 2026년 · 실시간 집계",
-        "periodLabel": "올해", "lineSub": "월별 위험 신호로 step-up·restrict가 권고된 비율 (실험값)",
+        "periodLabel": "올해", "lineSub": "월별로 추가 확인·잠시 제한이 권장된 비율",
         "kStudents": "263", "kTeachers": "18", "kTeachersSub": "교사 / 13 학급",
         "kApi": "1.02M", "kApiSub": "올해 API 요청", "kPass": "92.4", "kAvg": "12.2", "kFail": "9.0",
         "block": [92, 93, 94, 95, 96, 95, 97, 97, 98, 98, 99, 99], "pass": [82, 84, 85, 86, 87, 88, 89, 90, 90, 91, 92, 93],
@@ -583,13 +583,13 @@ ORG_ANALYTICS = {
              "trendSub": "월별 기관 평균", "axis": ["1월", "2월", "3월", "4월", "5월", "6월", "7월", "8월", "9월", "10월", "11월", "12월"],
              "accPct": [80, 82, 81, 84, 85, 86, 87, 88, 89, 90, 91, 92]},
 }
-ORG_ANALYTICS_SUBJ_LAST = {"국어": 94, "영어": 82, "수학": 71, "과학": 90, "역사": 85, "생활": 88}
+ORG_ANALYTICS_SUBJ_LAST = {"국어": 94, "영어": 82, "수학": 71, "과학": 90, "사회": 85, "생활": 88}
 ORG_ANALYTICS_SUBJECTS = [
     {"name": "국어", "icon": "ph-fill ph-book-open", "pct": 94, "delta": 5, "total": 3200},
     {"name": "영어", "icon": "ph-fill ph-translate", "pct": 82, "delta": 2, "total": 2600},
     {"name": "수학", "icon": "ph-fill ph-plus-minus", "pct": 71, "delta": -4, "total": 2400},
     {"name": "과학", "icon": "ph-fill ph-flask", "pct": 90, "delta": 3, "total": 2900},
-    {"name": "역사", "icon": "ph-fill ph-scroll", "pct": 85, "delta": 1, "total": 2100},
+    {"name": "사회", "icon": "ph-fill ph-scroll", "pct": 85, "delta": 1, "total": 2100},
     {"name": "생활", "icon": "ph-fill ph-house-line", "pct": 88, "delta": 6, "total": 2500},
 ]
 ORG_ANALYTICS_GRADES = [
@@ -603,7 +603,7 @@ ORG_ANALYTICS_CLASSES = [
     {"name": "1-2반", "teacher": "이수진", "acc": 90, "sessions": "118회", "weak": "수학", "trend": "상승"},
     {"name": "2-1반", "teacher": "박민호", "acc": 92, "sessions": "126회", "weak": "영어", "trend": "상승"},
     {"name": "1-3반", "teacher": "최유나", "acc": 84, "sessions": "98회", "weak": "수학", "trend": "하락"},
-    {"name": "3-2반", "teacher": "정하늘", "acc": 95, "sessions": "131회", "weak": "역사", "trend": "유지"},
+    {"name": "3-2반", "teacher": "정하늘", "acc": 95, "sessions": "131회", "weak": "사회", "trend": "유지"},
     {"name": "2-3반", "teacher": "강도현", "acc": 81, "sessions": "88회", "weak": "수학", "trend": "하락"},
 ]
 
@@ -669,7 +669,7 @@ STUDENT_NOTIFICATIONS = [
     {"title": "새 배지 획득 🏅", "message": "\"매의 눈\" 배지를 얻었어요. 배지함에서 확인해 보세요.", "category": "배지", "type": "badge", "unread": True},
     {"title": "오늘의 추천 문제", "message": "하은이에게 딱 맞는 숫자 놀이터 5문제를 준비했어요! 지금 도전해 볼까요?", "category": "추천문제", "type": "recommend", "unread": True},
     {"title": "AI 선생님 냥냥이", "message": "\"오늘 숫자 놀이터도 같이 해볼까? 5문제만 도전!\"", "category": "AI", "type": "ai", "unread": True},
-    {"title": "연속 학습 리마인드 🔥", "message": "오늘 학습하면 12일 연속 기록을 이어갈 수 있어요!", "category": "진도", "type": "progress", "unread": False},
+    {"title": "연속 학습 리마인드 🔥", "message": "오늘도 학습하면 연속 기록이 쭉 이어져요!", "category": "진도", "type": "progress", "unread": False},
     {"title": "끌어놓기 놀이 완료", "message": "정답률 100%! 드래그 마스터 배지에 한 걸음 가까워졌어요.", "category": "진도", "type": "progress", "unread": False},
     {"title": "새 추천 문제 도착", "message": "받침이 조금 헷갈렸죠? 한글 낱말 3문제를 추천해 드려요.", "category": "추천문제", "type": "recommend", "unread": False},
     {"title": "AI 선생님 냥냥이", "message": "\"받침이 조금 헷갈렸구나. 천천히 소리 내어 읽어보자!\"", "category": "AI", "type": "ai", "unread": False},
@@ -693,7 +693,7 @@ DAILY_QUIZ = [
     {"subject": "영어", "topic": "알파벳과 쉬운 단어", "status": "progress", "reward": 10},
     {"subject": "수학", "topic": "더하기·빼기 놀이", "status": "todo", "reward": 15},
     {"subject": "과학", "topic": "관찰하고 골라요", "status": "todo", "reward": 15},
-    {"subject": "역사", "topic": "옛날 이야기 속으로", "status": "todo", "reward": 20},
+    {"subject": "사회", "topic": "옛날 이야기 속으로", "status": "todo", "reward": 20},
     {"subject": "생활", "topic": "안전하게 생활해요", "status": "todo", "reward": 15},
 ]
 DAILY_QUIZ_WEEK = [
@@ -716,7 +716,7 @@ WRONG_TAGS = {
     "num": {"label": "수·연산", "icon": "ph-fill ph-plus-minus", "color": "#FF922E", "bg": "#FFEDE0"},
     "img": {"label": "이미지 선택", "icon": "ph-fill ph-image", "color": "#2E7BFF", "bg": "#E6F0FF"},
     "safe": {"label": "생활 안전", "icon": "ph-fill ph-shield-check", "color": "#8B6BFF", "bg": "#EDE6FF"},
-    "hist": {"label": "역사·문화", "icon": "ph-fill ph-scroll", "color": "#17B08C", "bg": "#DFF6EE"},
+    "soc": {"label": "사회·문화", "icon": "ph-fill ph-scroll", "color": "#17B08C", "bg": "#DFF6EE"},
     "eng": {"label": "영어·어휘", "icon": "ph-fill ph-translate", "color": "#E0489E", "bg": "#FCE4F1"},
 }
 
@@ -726,7 +726,7 @@ RECOMMENDATIONS = [
     {"title": "동물 친구 관찰하기", "subject": "과학", "chapter": 1, "priority": "우선", "reason": "정답을 골랐다가 자주 바꿨어요. 한 번 더 연습!"},
     {"title": "받침 있는 낱말 찾기", "subject": "국어", "chapter": 2, "priority": "보통", "reason": "비슷한 낱말에서 살짝 헷갈렸어요."},
     {"title": "알파벳 소리 맞히기", "subject": "영어", "chapter": 2, "priority": "보통", "reason": "파닉스 소리에서 헷갈린 적이 있어요."},
-    {"title": "위인 이야기 떠올리기", "subject": "역사", "chapter": 2, "priority": "낮음", "reason": "대체로 잘했지만 한 문제만 다시 볼까요?"},
+    {"title": "위인 이야기 떠올리기", "subject": "사회", "chapter": 2, "priority": "낮음", "reason": "대체로 잘했지만 한 문제만 다시 볼까요?"},
     {"title": "안전한 행동 고르기", "subject": "생활", "chapter": 1, "priority": "낮음", "reason": "상황을 보고 바른 행동을 한 번 더 골라봐요."},
 ]
 
@@ -756,7 +756,7 @@ HOME_SUBJECT_CARDS = [
     {"subject": "영어", "desc": "알파벳과 쉬운 단어를 만나는 영어 한 판", "done": 3, "total": 5, "state": "progress"},
     {"subject": "수학", "desc": "수와 셈을 놀이로 배우는 수학 한 판", "done": 5, "total": 5, "state": "done"},
     {"subject": "과학", "desc": "그림을 관찰하고 탐구하는 과학 한 판", "done": 0, "total": 5, "state": "todo"},
-    {"subject": "역사", "desc": "옛날 이야기와 지혜를 만나는 역사 한 판", "done": 0, "total": 5, "state": "todo"},
+    {"subject": "사회", "desc": "옛날 이야기와 지혜를 만나는 사회 한 판", "done": 0, "total": 5, "state": "todo"},
     {"subject": "생활", "desc": "생활 속 안전과 지혜를 배우는 생활 한 판", "done": 0, "total": 5, "state": "todo"},
 ]
 HOME_GROWTH = {
