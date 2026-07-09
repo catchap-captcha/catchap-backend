@@ -585,12 +585,14 @@ def daily_quiz(
             week.append(day)
     else:
         week = D.DAILY_QUIZ_WEEK
+    # 연속 도전 = 오늘(오늘 아직이면 어제)부터 역방향으로 연속 완료한 일수.
+    # (월요일부터 정방향으로 세면 월요일을 안 한 주엔 화·수·목 다 해도 0으로 끊기던 버그 해소)
+    _ti = today.weekday()
+    _i = _ti if (0 <= _ti < len(week) and week[_ti].get("done")) else _ti - 1
     streak = 0
-    for day in week:
-        if day.get("done"):
-            streak += 1
-        else:
-            break
+    while 0 <= _i < len(week) and week[_i].get("done"):
+        streak += 1
+        _i -= 1
 
     return {
         "quizzes": quizzes,
