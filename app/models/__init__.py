@@ -14,6 +14,7 @@ from app.models.content import (
 from app.models.learning import (
     BehaviorSummary,
     BehaviorTrace,
+    ChapterProgress,
     ConceptRead,
     DailyQuizStatus,
     LearningAttempt,
@@ -64,6 +65,7 @@ __all__ = [
     "CaptchaConsumedToken",
     "CaptchaSetting",
     "Chapter",
+    "ChapterProgress",
     "ClassRoom",
     "CoinTransaction",
     "ConceptRead",

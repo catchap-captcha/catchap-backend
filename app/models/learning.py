@@ -37,6 +37,27 @@ class StudentProgress(Base, UUIDPk, Timestamps):
     accuracy: Mapped[float] = mapped_column(Float, default=0)  # 0~100
 
 
+class ChapterProgress(Base, UUIDPk, Timestamps):
+    """전체학습 주간 챕터의 단계 진행(이어하기 커서) — 오늘의퀴즈(습관)와 분리된 '학습' 축.
+
+    (student, subject, chapter_no)당 1행. stages_done(0~5) = 5단계 바 채움 + 재개 지점.
+    5면 챕터 완료. 챕터 자체는 문제은행을 10문제(5단계×2)씩 자른 것(services/chapters.py),
+    잠금 해제는 달력(월요일) 기준이라 여기 저장하지 않는다.
+    """
+
+    __tablename__ = "chapter_progress"
+    __table_args__ = (
+        UniqueConstraint("student_id", "subject", "chapter_no", name="uq_chapter_progress"),
+    )
+
+    student_id: Mapped[str] = mapped_column(
+        CHAR(36), ForeignKey("student_profiles.id"), index=True
+    )
+    subject: Mapped[str] = mapped_column(String(20), index=True)
+    chapter_no: Mapped[int] = mapped_column()
+    stages_done: Mapped[int] = mapped_column(default=0)  # 0~5
+
+
 class LearningAttempt(Base, UUIDPk, Timestamps):
     __tablename__ = "learning_attempts"
     # 대시보드 기간 집계 가속용 복합 인덱스 (migration ce50a1b2c3d4)

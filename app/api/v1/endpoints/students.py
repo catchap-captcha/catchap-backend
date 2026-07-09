@@ -13,6 +13,7 @@ from app.db.session import get_db
 from app.models import (
     Badge,
     Chapter,
+    ChapterProgress,
     ClassRoom,
     CoinTransaction,
     ConceptRead,
@@ -227,9 +228,14 @@ def dashboard(
     # 과목 카드: 오늘 상태(daily_quiz_status) + 오늘 학습 시도 수 (실데이터)
     quiz_by_subject = {q.subject: q for q in quiz}
     today_start = datetime.combine(date.today(), time.min)
+    # 오늘의퀴즈(습관) 진행바 — 전체학습 주간 챕터 플레이(chapter_no 있음)는 제외해 분리 유지.
     attempts_today = dict(
         db.query(LearningAttempt.subject, func.count(LearningAttempt.id))
-        .filter(LearningAttempt.student_id == me.id, LearningAttempt.created_at >= today_start)
+        .filter(
+            LearningAttempt.student_id == me.id,
+            LearningAttempt.created_at >= today_start,
+            LearningAttempt.chapter_no.is_(None),
+        )
         .group_by(LearningAttempt.subject)
         .all()
     )
@@ -559,9 +565,14 @@ def daily_quiz(
     rows = _today_quiz_rows(db, me.id)
     # 과목별 오늘 시도 수(5단계 진행 바용) — 하루 5문제(5단계) 기준
     _today_start = datetime.combine(date.today(), time.min)
+    # 전체학습 주간 챕터 플레이(chapter_no 있음)는 오늘의퀴즈 진행바에서 제외(학습·습관 분리).
     _att_today = dict(
         db.query(LearningAttempt.subject, func.count(LearningAttempt.id))
-        .filter(LearningAttempt.student_id == me.id, LearningAttempt.created_at >= _today_start)
+        .filter(
+            LearningAttempt.student_id == me.id,
+            LearningAttempt.created_at >= _today_start,
+            LearningAttempt.chapter_no.is_(None),
+        )
         .group_by(LearningAttempt.subject)
         .all()
     )
@@ -1123,7 +1134,7 @@ def save_attempt(
 
     # 일일 잠금 규칙: 오늘의퀴즈 상태는 '오늘' 것만 갱신 가능(미래 날짜 미리 완료 불가 —
     # quiz_date는 항상 서버의 오늘). 복습(replay)은 상태를 건드리지 않는다(전날 다시풀기는 기록만).
-    if not req.replay:
+    if not req.replay and req.daily:
         quiz = (
             db.query(DailyQuizStatus)
             .filter(
@@ -1153,9 +1164,12 @@ class _GameAnswerReq(_GBaseModel):
     subject: str = "생활"  # 문항이 속한 과목 — 뱅크 스코프 조회(타 과목 id 교차 제출 차단)
     option_id: str = ""  # single 제출
     option_ids: list[str] | None = None  # multi(복수선택) 제출 — 집합 비교 채점
-    last: bool = False  # 세션의 마지막 문항 → 오늘의퀴즈 완료 처리
+    last: bool = False  # 세션의 마지막 문항 → 오늘의퀴즈 완료(또는 챕터 단계 완료) 처리
     replay: bool = False  # 복습 모드 — 상태·코인 반영 없음
     behavior: dict | None = None  # 문항 풀이 중 포인터 궤적 등 (save_attempt로 전달)
+    # 전체학습 주간 챕터 플레이 — 지정 시 오늘의퀴즈(습관) 미갱신, last면 단계 커서 전진.
+    chapter_no: int | None = None
+    stage: int | None = None
 
 
 @router.get("/students/me/curriculum")
@@ -1230,6 +1244,187 @@ def game_session(
     pool = subject_banks.playable_pool(subject)
     picked = _random.sample(pool, min(count, len(pool)))
     return {"available": True, "subject": subject, "questions": [subject_banks.public_question(q) for q in picked]}
+
+
+# ---------------------------------------------------------------- 전체학습 주간 챕터 (오늘의퀴즈와 분리)
+@router.get("/students/me/chapters")
+def chapters(
+    subject: str | None = Query(default=None),
+    principal: Principal = Depends(require_student),
+    db: Session = Depends(get_db),
+):
+    """전체학습 주간 챕터 — 과목별 챕터 목록 + 5단계 진행 + 달력 잠금(월요일 해제).
+
+    오늘의 퀴즈(매일 습관·연속도전)와 분리된 '학습(숙련도)' 축이다. 챕터는 문제은행을
+    10문제(5단계×2)씩 자른 것이고, 잠금은 전체 공통 달력(chapters.ANCHOR_MONDAY) 기준이라
+    모든 학생이 같은 주에 같은 챕터를 본다. 문제은행이 작은 과목은 채울 수 있는 만큼만 챕터 생성.
+    """
+    from app.services import chapters as _ch
+
+    me = _me(principal)
+    subjects = [subject] if subject in D.SUBJECT_ORDER else D.SUBJECT_ORDER
+    # 과목별 챕터 이름(있으면) — Chapter 테이블 order_no 매핑, 없으면 'N주차'
+    name_rows = (
+        db.query(Chapter)
+        .filter(Chapter.subject.in_(subjects))
+        .order_by(Chapter.subject, Chapter.order_no)
+        .all()
+    )
+    names: dict[str, dict[int, str]] = {}
+    for c in name_rows:
+        names.setdefault(c.subject, {})[c.order_no] = c.name
+    # 과목 정답률(숙련도) — 있으면 패널에 표시
+    acc_by = {
+        p.subject: p.accuracy
+        for p in db.query(StudentProgress).filter(StudentProgress.student_id == me.id).all()
+    }
+    # 학생 단계 진행(이어하기 커서)
+    prog_rows = (
+        db.query(ChapterProgress)
+        .filter(ChapterProgress.student_id == me.id, ChapterProgress.subject.in_(subjects))
+        .all()
+    )
+    stages_by = {
+        (p.subject, p.chapter_no): max(0, min(_ch.STAGES, p.stages_done)) for p in prog_rows
+    }
+
+    out = []
+    for sub in subjects:
+        mx = _ch.max_chapters(sub)
+        unlocked = _ch.unlocked_count(sub)
+        chs = []
+        current = None  # 이어할 챕터 = 열린 것 중 미완료 최저
+        for no in range(1, mx + 1):
+            sd = stages_by.get((sub, no), 0)
+            is_unlocked = no <= unlocked
+            if is_unlocked and sd < _ch.STAGES and current is None:
+                current = no
+            chs.append(
+                {
+                    "no": no,
+                    "name": names.get(sub, {}).get(no, f"{no}주차"),
+                    "stages": _ch.STAGES,
+                    "stages_done": sd,
+                    "questions": _ch.CHAPTER_SIZE,
+                    "unlocked": is_unlocked,
+                }
+            )
+        for c in chs:
+            if not c["unlocked"]:
+                c["state"] = "locked"
+            elif c["stages_done"] >= _ch.STAGES:
+                c["state"] = "done"
+            elif c["no"] == current:
+                c["state"] = "current"
+            else:
+                c["state"] = "available"
+        out.append(
+            {
+                "subject": sub,
+                "meta": D.SUBJECT_META[sub],
+                "available": mx > 0,  # 문제은행 없는 과목(국어)은 false → 프론트 준비중
+                "max_chapters": mx,
+                "unlocked_chapters": unlocked,
+                "current_chapter": current or (unlocked if mx else 0),
+                "accuracy": acc_by.get(sub, 0),
+                "chapters": chs,
+            }
+        )
+    if subject in D.SUBJECT_ORDER:
+        return out[0]
+    return {"subjects": out, "anchor_monday": str(_ch.ANCHOR_MONDAY)}
+
+
+@router.get("/students/me/chapter-session")
+def chapter_session(
+    subject: str = Query(...),
+    chapter: int = Query(..., ge=1),
+    stage: int | None = Query(default=None, ge=1, le=5),
+    principal: Principal = Depends(require_student),
+    db: Session = Depends(get_db),
+):
+    """전체학습 챕터의 한 단계(2문항) 발급 — 정답 미포함, 채점은 game-answer.
+
+    stage 미지정 시 이어하기: 그 챕터의 다음 미완료 단계를 낸다. 완료한 단계를 다시 지정하면
+    복습(is_replay=true, 코인·진행 갱신 없음). 달력상 잠긴 챕터는 막는다.
+    """
+    from app.services import chapters as _ch
+    from app.services import subject_banks
+
+    me = _me(principal)
+    if subject not in D.SUBJECT_ORDER:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="알 수 없는 과목입니다.")
+    if subject not in subject_banks.LIVE_SUBJECTS:
+        return {"available": False, "subject": subject, "questions": []}
+    mx = _ch.max_chapters(subject)
+    if chapter > mx:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="없는 챕터입니다.")
+    if chapter > _ch.unlocked_count(subject):
+        return {
+            "available": False,
+            "locked": True,
+            "subject": subject,
+            "chapter": chapter,
+            "questions": [],
+        }
+    cp = (
+        db.query(ChapterProgress)
+        .filter(
+            ChapterProgress.student_id == me.id,
+            ChapterProgress.subject == subject,
+            ChapterProgress.chapter_no == chapter,
+        )
+        .first()
+    )
+    done = max(0, min(_ch.STAGES, cp.stages_done if cp else 0))
+    use_stage = stage if stage is not None else min(_ch.STAGES, done + 1)
+    qs = _ch.stage_questions(subject, chapter, use_stage)
+    return {
+        "available": len(qs) > 0,
+        "subject": subject,
+        "chapter": chapter,
+        "stage": use_stage,
+        "stages": _ch.STAGES,
+        "stages_done": done,
+        "is_replay": use_stage <= done,  # 완료한 단계 다시풀기 → 커서/코인 갱신 없음
+        "questions": qs,
+    }
+
+
+def _bump_chapter_stage(
+    db: Session, me: StudentProfile, subject: str, chapter_no: int, stage: int
+) -> int | None:
+    """챕터 단계 완료 커서 전진 — 다음 단계를 마쳤을 때만 stages_done +1 (순차·위조 방지).
+
+    이미 지난 단계(복습)나 건너뛴 단계는 커서를 움직이지 않는다. UNIQUE(student,subject,chapter)로
+    중복행 없음, sequential 가드로 이중 완료는 멱등.
+    """
+    from app.services import chapters as _ch
+
+    if chapter_no < 1 or chapter_no > _ch.max_chapters(subject):
+        return None
+    if chapter_no > _ch.unlocked_count(subject):
+        return None
+    if stage < 1 or stage > _ch.STAGES:
+        return None
+    cp = (
+        db.query(ChapterProgress)
+        .filter(
+            ChapterProgress.student_id == me.id,
+            ChapterProgress.subject == subject,
+            ChapterProgress.chapter_no == chapter_no,
+        )
+        .first()
+    )
+    if cp is None:
+        cp = ChapterProgress(
+            student_id=me.id, subject=subject, chapter_no=chapter_no, stages_done=0
+        )
+        db.add(cp)
+    if stage == cp.stages_done + 1:
+        cp.stages_done = stage
+    db.commit()
+    return cp.stages_done
 
 
 def _opt_texts(q: dict, ids: list[str]) -> str:
@@ -1334,15 +1529,23 @@ def game_answer(
         _record_wrong(db, me, req.subject, q, picked_ids, answer_ids)
 
     # 서버 판정 결과를 학습기록으로 저장 (기존 save_attempt와 동일 부수효과: 코인 상한·진도·퀴즈 상태)
+    # 챕터 플레이(chapter_no 지정)는 daily=False — 코인·정답률(숙련도)은 반영하되 오늘의퀴즈(습관) 미갱신.
+    is_chapter = req.chapter_no is not None
     attempt_req = AttemptCreate(
         subject=req.subject,
+        chapter_no=req.chapter_no,
         result="correct" if correct else "incorrect",
         score=20 if correct else 0,  # 5문 기준 100점 만점
         completed=req.last and not req.replay,
         replay=req.replay,
+        daily=not is_chapter,
         behavior=req.behavior,
     )
     saved = save_attempt(attempt_req, principal, db)
+    # 챕터 단계 완료: 단계 마지막 문항(last)까지 풀면 stages_done 커서 전진(이어하기 저장).
+    stages_done = None
+    if is_chapter and req.stage is not None and req.last and not req.replay:
+        stages_done = _bump_chapter_stage(db, me, req.subject, req.chapter_no, req.stage)
     return {
         "correct": correct,
         "answer_id": answer_ids[0] if answer_ids else "",
@@ -1351,6 +1554,7 @@ def game_answer(
         # 해설(explain)은 채점 후에만 공개 — 발급 응답(public_question)에는 포함되지 않는다
         "hint": q.get("explain") or q["hint"],
         "coins_earned": saved.get("coins_earned", 0),
+        "stages_done": stages_done,
     }
 
 
