@@ -68,10 +68,7 @@ def captcha_required(db: Session, identifier: str) -> bool:
 
 
 def _login_failed(db: Session, identifier: str, message: str) -> HTTPException:
-    """실패 기록 + 5회 이상이면 captcha_required 플래그를 포함한 401 반환.
-
-    NOTE: 실제 캡차 토큰 검증은 메인 CAPTCHA API 단계에서 추가 (현재 프론트 데모 팝업).
-    """
+    """실패 기록 + 5회 이상이면 captcha_required 플래그를 포함한 401 반환."""
     count = _record_fail(db, identifier)
     return HTTPException(
         status.HTTP_401_UNAUTHORIZED,
@@ -79,6 +76,31 @@ def _login_failed(db: Session, identifier: str, message: str) -> HTTPException:
             "message": message,
             "captcha_required": count >= CAPTCHA_FAIL_THRESHOLD,
             "fail_count": count,
+        },
+    )
+
+
+def _require_captcha_if_needed(db: Session, identifier: str, captcha_token: str | None) -> None:
+    """5회 이상 실패한 identifier면, 메인 캡차(forest) 통과 토큰을 요구·소비한다.
+
+    자격 검증 '전에' 막는다 — 토큰이 없거나 무효면 401(captcha_required)로 즉시 거부하되
+    실패 카운트는 올리지 않는다(캡차 미완료로 하드락까지 밀려 정당 사용자가 잠기는 것 방지).
+    유효 토큰은 단일 사용으로 소비되므로, 자격이 또 틀리면 다음 시도엔 새 캡차가 필요하다.
+    """
+    if not captcha_required(db, identifier):
+        return
+    from app.models import LoginThrottle
+    from app.services import forest_captcha as fc
+
+    if fc.service.consume_token(captcha_token):
+        return  # 유효 토큰 소비 — 이 시도를 자격 검증으로 진행 허용
+    row = db.query(LoginThrottle).filter(LoginThrottle.identifier == identifier).first()
+    raise HTTPException(
+        status.HTTP_401_UNAUTHORIZED,
+        detail={
+            "message": "보안 확인(캡차)을 완료해 주세요.",
+            "captcha_required": True,
+            "fail_count": row.fail_count if row else CAPTCHA_FAIL_THRESHOLD,
         },
     )
 
@@ -151,6 +173,7 @@ def issue_tokens(db: Session, subject_id: str, role: str, subject_type: str) -> 
 def login(db: Session, req: s.LoginRequest) -> s.TokenPair:
     identifier = f"user:{req.email.strip().lower()}"
     _check_locked(db, identifier)  # H1: 과도한 실패 시 실제 차단
+    _require_captcha_if_needed(db, identifier, req.captcha_token)  # 5회+ 실패 → 메인 캡차 요구
     user = db.query(User).filter(User.email == req.email.strip().lower()).first()
     if user is None or not verify_password(req.password, user.password_hash):
         raise _login_failed(db, identifier, "이메일 또는 비밀번호가 올바르지 않습니다.")
@@ -214,6 +237,7 @@ def ops_login(db: Session, req: s.LoginRequest) -> s.TokenPair:
     """
     identifier = f"user:{req.email.strip().lower()}"
     _check_locked(db, identifier)  # H1: 과도한 실패 시 실제 차단
+    _require_captcha_if_needed(db, identifier, req.captcha_token)  # 5회+ 실패 → 메인 캡차 요구
     user = db.query(User).filter(User.email == req.email.strip().lower()).first()
     if (
         user is None
@@ -231,6 +255,9 @@ def ops_login(db: Session, req: s.LoginRequest) -> s.TokenPair:
 
 def student_login(db: Session, req: s.StudentLoginRequest) -> s.TokenPair:
     _check_locked(db, f"student:{req.student_login_id.strip()}")  # H1: 과도한 실패 시 차단
+    _require_captcha_if_needed(
+        db, f"student:{req.student_login_id.strip()}", req.captcha_token
+    )  # 5회+ 실패 → 메인 캡차 요구
     # 탈퇴/비활성 학생은 로그인 차단 (B2) — 성인 로그인과 동일 정책
     query = db.query(StudentProfile).filter(
         StudentProfile.student_login_id == req.student_login_id.strip(),

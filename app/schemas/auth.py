@@ -13,6 +13,8 @@ class LoginRequest(BaseModel):
     role: str | None = None
     email: str
     password: str
+    # 5회 이상 실패해 캡차가 요구된 뒤, 메인 캡차(forest)를 통과하고 받은 단일사용 토큰.
+    captcha_token: str | None = None
 
 
 class StudentLoginRequest(BaseModel):
@@ -20,6 +22,7 @@ class StudentLoginRequest(BaseModel):
     organization_id: str | None = None
     student_login_id: str
     password: str
+    captcha_token: str | None = None  # 캡차 요구 후 forest 캡차 통과 토큰(단일사용)
 
 
 class RefreshRequest(BaseModel):

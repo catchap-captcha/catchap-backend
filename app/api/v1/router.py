@@ -3,6 +3,7 @@ from fastapi import APIRouter
 from app.api.v1.endpoints import (
     auth,
     captcha_api,
+    forest_captcha,
     health,
     institutions,
     misc,
@@ -32,6 +33,7 @@ for _mod in (
     misc,
     ops,
     captcha_api,
+    forest_captcha,
     widget,
 ):
     api_router.include_router(_mod.router)
