@@ -153,11 +153,11 @@ SHOP_CATALOG = {
 
 # 검색 화면 ITEMS 14건 (kw: 검색 키워드)
 SEARCH_ITEMS = [
-    {"title": "국어", "tag": "과목", "desc": "글자와 낱말을 익히는 국어 한 판", "icon": "ph-fill ph-book-open", "subject": "국어", "href": "/student/game?subject=국어", "kw": "국어 한글 낱말 글자 읽기 kor"},
-    {"title": "영어", "tag": "과목", "desc": "알파벳과 쉬운 단어를 만나는 영어 한 판", "icon": "ph-fill ph-translate", "subject": "영어", "href": "/student/game?subject=영어", "kw": "영어 알파벳 단어 eng english"},
-    {"title": "수학", "tag": "과목", "desc": "수와 셈을 놀이로 배우는 수학 한 판", "icon": "ph-fill ph-plus-minus", "subject": "수학", "href": "/student/game?subject=수학", "kw": "수학 숫자 셈 덧셈 뺄셈 연산 math"},
+    {"title": "국어", "tag": "과목", "desc": "낱말·문장·글의 속뜻을 익히는 국어 한 판", "icon": "ph-fill ph-book-open", "subject": "국어", "href": "/student/game?subject=국어", "kw": "국어 한글 낱말 글자 읽기 kor"},
+    {"title": "영어", "tag": "과목", "desc": "단어·문장·문법으로 배우는 영어 한 판", "icon": "ph-fill ph-translate", "subject": "영어", "href": "/student/game?subject=영어", "kw": "영어 알파벳 단어 eng english"},
+    {"title": "수학", "tag": "과목", "desc": "수·연산·도형·측정을 배우는 수학 한 판", "icon": "ph-fill ph-plus-minus", "subject": "수학", "href": "/student/game?subject=수학", "kw": "수학 숫자 셈 덧셈 뺄셈 연산 math"},
     {"title": "과학", "tag": "과목", "desc": "관찰하고 탐구하는 과학 한 판", "icon": "ph-fill ph-flask", "subject": "과학", "href": "/student/game?subject=과학", "kw": "과학 관찰 탐구 실험 sci"},
-    {"title": "사회", "tag": "과목", "desc": "옛날 이야기와 지혜를 만나는 사회 한 판", "icon": "ph-fill ph-scroll", "subject": "사회", "href": "/student/game?subject=사회", "kw": "사회 이야기 옛날 soc"},
+    {"title": "사회", "tag": "과목", "desc": "지도·지역·공공기관을 알아가는 사회 한 판", "icon": "ph-fill ph-scroll", "subject": "사회", "href": "/student/game?subject=사회", "kw": "사회 이야기 옛날 soc"},
     {"title": "생활", "tag": "과목", "desc": "생활 속 안전과 지혜를 배우는 생활 한 판", "icon": "ph-fill ph-house-line", "subject": "생활", "href": "/student/game?subject=생활", "kw": "생활 안전 지혜 life"},
     {"title": "한글 낱말 찾기", "tag": "놀이", "desc": "그림을 보고 알맞은 낱말 고르기", "icon": "ph-fill ph-text-aa", "subject": "국어", "href": "/student/game?subject=국어", "kw": "한글 낱말 찾기 글자 단어"},
     {"title": "숫자 놀이터", "tag": "놀이", "desc": "더하기·빼기 답을 상자에 담기", "icon": "ph-fill ph-calculator", "subject": "수학", "href": "/student/game?subject=수학", "kw": "숫자 놀이터 더하기 빼기 계산"},
@@ -175,7 +175,7 @@ GAME_SUBJECTS = {
     "영어": {"gameTitle": "Word Match", "gameSub": "그림 보고 영어 단어 고르기", "catLabel": "Word·English", "cheer": "한 문제씩 차근차근 가볼까요? ✨", "current": 1, "total": 5, "score": 150, "correct": 0, "wrong": 0, "streak": 0},
     "수학": {"gameTitle": "숫자 세기", "gameSub": "그림 세고 숫자 고르기", "catLabel": "수·셈", "cheer": "집중력이 대단해요! 👏", "current": 4, "total": 5, "score": 320, "correct": 3, "wrong": 0, "streak": 3},
     "과학": {"gameTitle": "과학 관찰 퀴즈", "gameSub": "잘 보고 알맞은 답 고르기", "catLabel": "관찰·과학", "cheer": "궁금한 걸 잘 찾아내고 있어요! 🔍", "current": 1, "total": 5, "score": 40, "correct": 0, "wrong": 0, "streak": 0},
-    "사회": {"gameTitle": "사회 이야기 퀴즈", "gameSub": "이야기 읽고 답 고르기", "catLabel": "이야기·사회", "cheer": "옛날 이야기, 참 잘 기억하네요! 📜", "current": 2, "total": 5, "score": 120, "correct": 1, "wrong": 0, "streak": 1},
+    "사회": {"gameTitle": "사회 탐구 퀴즈", "gameSub": "이야기 읽고 답 고르기", "catLabel": "지역·사회", "cheer": "우리 지역, 참 잘 아네요! 🗺️", "current": 2, "total": 5, "score": 120, "correct": 1, "wrong": 0, "streak": 1},
     "생활": {"gameTitle": "생활 안전 퀴즈", "gameSub": "상황 보고 바른 행동 고르기", "catLabel": "안전·생활", "cheer": "안전을 잘 챙기고 있어요! 🚸", "current": 4, "total": 5, "score": 260, "correct": 2, "wrong": 1, "streak": 1},
 }
 
@@ -690,7 +690,7 @@ PARENT_NOTIFICATIONS = [
 # 오늘의퀴즈 (오늘의퀴즈.dc.html)
 DAILY_QUIZ = [
     {"subject": "국어", "topic": "그림 보고 낱말 찾기", "status": "done", "reward": 10},
-    {"subject": "영어", "topic": "알파벳과 쉬운 단어", "status": "progress", "reward": 10},
+    {"subject": "영어", "topic": "단어와 문장", "status": "progress", "reward": 10},
     {"subject": "수학", "topic": "더하기·빼기 놀이", "status": "todo", "reward": 15},
     {"subject": "과학", "topic": "관찰하고 골라요", "status": "todo", "reward": 15},
     {"subject": "사회", "topic": "옛날 이야기 속으로", "status": "todo", "reward": 20},
@@ -752,11 +752,11 @@ RECORDS_ACTIVITIES = [
 
 # 학습 홈 (학습 홈.dc.html)
 HOME_SUBJECT_CARDS = [
-    {"subject": "국어", "desc": "글자와 낱말을 익히는 오늘의 국어 한 판", "done": 5, "total": 5, "state": "done"},
-    {"subject": "영어", "desc": "알파벳과 쉬운 단어를 만나는 영어 한 판", "done": 3, "total": 5, "state": "progress"},
-    {"subject": "수학", "desc": "수와 셈을 놀이로 배우는 수학 한 판", "done": 5, "total": 5, "state": "done"},
+    {"subject": "국어", "desc": "낱말·문장·글의 속뜻을 익히는 오늘의 국어 한 판", "done": 5, "total": 5, "state": "done"},
+    {"subject": "영어", "desc": "단어·문장·문법으로 배우는 영어 한 판", "done": 3, "total": 5, "state": "progress"},
+    {"subject": "수학", "desc": "수·연산·도형·측정을 배우는 수학 한 판", "done": 5, "total": 5, "state": "done"},
     {"subject": "과학", "desc": "그림을 관찰하고 탐구하는 과학 한 판", "done": 0, "total": 5, "state": "todo"},
-    {"subject": "사회", "desc": "옛날 이야기와 지혜를 만나는 사회 한 판", "done": 0, "total": 5, "state": "todo"},
+    {"subject": "사회", "desc": "지도·지역·공공기관을 알아가는 사회 한 판", "done": 0, "total": 5, "state": "todo"},
     {"subject": "생활", "desc": "생활 속 안전과 지혜를 배우는 생활 한 판", "done": 0, "total": 5, "state": "todo"},
 ]
 HOME_GROWTH = {
