@@ -1056,11 +1056,20 @@ def behavior_export(
             "mode": mode, "count": len(records), "k_anon_min": K_ANON_MIN,
             "k_dropped": k_dropped, "columns": cols, "rows": records,
         }
+    # CSV 수식 인젝션 방어: 문자열 셀이 =+-@ 등으로 시작하면 스프레드시트가 수식으로 실행할 수 있어
+    # 앞에 작은따옴표를 붙여 무력화한다(현재 값은 열거형이라 안전하지만 미래 필드까지 대비).
+    _danger = ("=", "+", "-", "@", "\t", "\r")
+
+    def _safe(v):
+        if isinstance(v, str) and v and v[0] in _danger:
+            return "'" + v
+        return v
+
     buf = io.StringIO()
     w = csv.DictWriter(buf, fieldnames=cols)
     w.writeheader()
     for rec in records:
-        w.writerow(rec)
+        w.writerow({k: _safe(v) for k, v in rec.items()})
     return StreamingResponse(
         iter([buf.getvalue()]),
         media_type="text/csv; charset=utf-8",
