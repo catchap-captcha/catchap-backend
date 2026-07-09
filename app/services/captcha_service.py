@@ -487,7 +487,30 @@ def _grade_trace(answer, template: list) -> bool:
 # right/cards/items는 이미 셔플되어 정답 순서를 노출하지 않는다.
 _WIDGET_RENDER_FIELDS = ("options", "left", "right", "bins", "items", "cards", "zones",
                          "reference", "mapStyle", "compass", "start", "layout", "audio",
-                         "template", "glyph")
+                         "template", "glyph", "character", "dest", "dangers")
+
+
+def _in_box(px: float, py: float, box: dict, pad: float = 0.0) -> bool:
+    """점(px,py)이 box(x,y,w,h, 0~1)의 [±pad] 안에 있는지."""
+    return (box["x"] - pad <= px <= box["x"] + box["w"] + pad
+            and box["y"] - pad <= py <= box["y"] + box["h"] + pad)
+
+
+def _grade_route(answer, dest: dict, dangers: list) -> bool:
+    """길찾기 채점 — 그린 경로가 (1) 도착 지점에서 끝나고 (2) 어떤 위험존도 지나지 않는다.
+
+    시작점 근처에서 출발해 도착 상자 안에서 끝나야 하며, 경로 어느 점도 위험존을 통과하면 실패.
+    """
+    pts = _clean_xy_points(answer, 600)
+    if len(pts) < TRACE_MIN_USER_POINTS:
+        return False
+    if not _in_box(pts[-1][0], pts[-1][1], dest):
+        return False
+    for (px, py) in pts:
+        for d in dangers:
+            if _in_box(px, py, d):
+                return False
+    return True
 
 
 def _wrap_bank_question(subject: str, q: dict, meta: dict) -> dict:
@@ -520,6 +543,10 @@ def _wrap_bank_question(subject: str, q: dict, meta: dict) -> dict:
         # template(안내 점선)은 비밀이 아니라 public에 노출한다(정답 유출 아님).
         public = {**public, "type": "trace_path", "path": q["template"]}
         return _wrap("trace", q["template"], public, meta)
+    if t == "route":
+        # 길찾기 — 위젯이 경로 궤적 제출, 끝점 dest 도달 + 위험존 회피로 채점.
+        # dest/dangers는 화면에 보이는 요소라 노출 정상(정답 좌표가 아님).
+        return _wrap("route", {"dest": q["dest"], "dangers": q.get("dangers", [])}, public, meta)
     # single·place·listen: 단일 값 등호 비교
     return _wrap("single", q["answer"], public, meta)
 
@@ -620,6 +647,9 @@ def verify_challenge(db: Session, challenge_token: str, answer) -> dict:
     elif kind == "trace":
         # 따라 그리기 — 궤적 유사도(커버리지+이탈)로 채점
         ok = _grade_trace(answer, target)
+    elif kind == "route":
+        # 길찾기 — 끝점이 도착지 + 위험존 미통과
+        ok = _grade_route(answer, target.get("dest", {}), target.get("dangers", [])) if isinstance(target, dict) else False
     else:  # single
         ok = str(answer) == str(target)
     if not ok:

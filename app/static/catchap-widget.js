@@ -339,6 +339,48 @@
       else { redo.onclick = function () { if (answered) return; doRedo(); redoCount += 1; }; submit.onclick = doSubmit; }
     }
 
+    function renderRoute(d, token) {
+      var NS = 'http://www.w3.org/2000/svg';
+      function mk(tag, attrs) { var e = document.createElementNS(NS, tag); for (var k in attrs) e.setAttribute(k, attrs[k]); return e; }
+      var svg = mk('svg', { viewBox: '0 0 100 100', preserveAspectRatio: 'xMidYMid meet' });
+      css(svg, { width: '100%', maxWidth: '440px', margin: '0 auto', height: '300px', display: 'block',
+        background: '#F2F8F1', border: '2px solid #DCEBD8', borderRadius: '14px', touchAction: 'none', cursor: 'crosshair' });
+      // 위험존(빨강) → 도착(초록) → 시작(캐릭터)
+      function zone(z, fill, stroke) {
+        svg.appendChild(mk('rect', { x: z.x * 100, y: z.y * 100, width: z.w * 100, height: z.h * 100, rx: 3, fill: fill, stroke: stroke, 'stroke-width': 1 }));
+        if (z.emoji) { var t = mk('text', { x: (z.x + z.w / 2) * 100, y: (z.y + z.h / 2) * 100 + 3, 'text-anchor': 'middle', 'font-size': '9' }); t.textContent = z.emoji; svg.appendChild(t); }
+        if (z.label) { var l = mk('text', { x: (z.x + z.w / 2) * 100, y: (z.y + z.h) * 100 + 4, 'text-anchor': 'middle', 'font-size': '4', fill: '#6B7B66' }); l.textContent = z.label; svg.appendChild(l); }
+      }
+      (d.dangers || []).forEach(function (z) { zone(z, 'rgba(226,87,76,0.14)', '#E2574C'); });
+      if (d.dest) zone(d.dest, 'rgba(23,176,140,0.16)', '#17B08C');
+      var user = mk('polyline', { fill: 'none', stroke: C, 'stroke-width': '3', 'stroke-linecap': 'round', 'stroke-linejoin': 'round' });
+      svg.appendChild(user);
+      var st = mk('text', { x: d.start.x * 100, y: d.start.y * 100 + 3, 'text-anchor': 'middle', 'font-size': '9' }); st.textContent = d.character || '🧒'; svg.appendChild(st);
+      body.appendChild(svg);
+      if (!footerOn) { var row = h('div'); css(row, { display: 'flex', gap: '8px' });
+        var redo = h('button'); redo.textContent = '다시 그리기'; css(redo, btnStyle('#eee', '#555'));
+        var submit = h('button'); submit.textContent = '도착했어요!'; css(submit, btnStyle(C, '#fff')); submit.disabled = true; submit.style.opacity = '0.5';
+        row.appendChild(redo); row.appendChild(submit); body.appendChild(row);
+        var refs = { redo: redo, submit: submit };
+      }
+      if (d.hint) hintLine(d.hint);
+      var drawing = false, pts = [];
+      function normp(e) { var r = svg.getBoundingClientRect(); return [Math.max(0, Math.min(1, (e.clientX - r.left) / r.width)), Math.max(0, Math.min(1, (e.clientY - r.top) / r.height))]; }
+      function draw() {
+        user.setAttribute('points', pts.map(function (p) { return (p[0] * 100) + ',' + (p[1] * 100); }).join(' '));
+        var enough = pts.length >= 8;
+        if (footerOn) { footerState(pts.length > 0, enough); return; }
+        refs.submit.disabled = !enough; refs.submit.style.opacity = enough ? '1' : '0.5';
+      }
+      svg.addEventListener('pointerdown', function (e) { if (answered) return; drawing = true; svg.setPointerCapture(e.pointerId); pts = [normp(e)]; draw(); e.preventDefault(); });
+      svg.addEventListener('pointermove', function (e) { if (!drawing || answered || pts.length >= 600) return; var p = normp(e), last = pts[pts.length - 1]; if (last && Math.abs(p[0] - last[0]) < 0.005 && Math.abs(p[1] - last[1]) < 0.005) return; pts.push(p); draw(); });
+      svg.addEventListener('pointerup', function () { drawing = false; });
+      function doRedo() { if (answered) return; pts = []; draw(); }
+      function doSubmit() { if (answered || pts.length < 8) return; verify(token, pts.map(function (p) { return [Math.round(p[0] * 1e4) / 1e4, Math.round(p[1] * 1e4) / 1e4]; })); }
+      if (footerOn) { pendingRedo = doRedo; pendingSubmit = doSubmit; }
+      else { refs.redo.onclick = function () { if (answered) return; doRedo(); redoCount += 1; }; refs.submit.onclick = doSubmit; }
+    }
+
     function render(d) {
       body.innerHTML = '';
       // retries는 리셋하지 않는다 — 캡차 오답 재발급을 건너 누적돼야 행동데이터
@@ -373,6 +415,8 @@
         renderDrag(d, token);
       } else if (d.type === 'trace_path') {
         renderTrace(d, token);
+      } else if (d.type === 'route') {
+        renderRoute(d, token);
       } else if (d.type === 'image_select') {
         var picked = {};
         var cellEls = [];
