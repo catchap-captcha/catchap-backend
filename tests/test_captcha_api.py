@@ -190,3 +190,76 @@ def test_captcha_cors_preflight_any_origin(client):
     assert r.status_code == 204
     assert r.headers["access-control-allow-origin"] == "*"
     assert "X-Site-Key" in r.headers["access-control-allow-headers"]
+
+
+def _org_admin(client, db, org):
+    admin = User(
+        email="admin@t.dev", password_hash=hash_password("Password123!"), name="교장",
+        role="org_admin", organization_id=org.id, email_verified_at=datetime.utcnow(),
+    )
+    db.add(admin)
+    db.commit()
+    r = client.post("/api/v1/auth/login",
+                    json={"role": "teacher", "email": "admin@t.dev", "password": "Password123!"})
+    return r.json()["access_token"]
+
+
+def test_subject_scope_enforced_for_external_key(client, db, seed_org):
+    """외부 판매 키(first_party=False)는 발급 과목에 고정 — ?subject=로 다른 과목 못 받는다.
+    1st-party 키만 과목 전환 허용."""
+    org = seed_org["org"]
+    _, pro = _plans(db)
+    db.add(Subscription(organization_id=org.id, plan_id=pro.id, status="active"))
+    db.commit()
+    tok = _ops(client, db)
+
+    ext = client.post("/api/v1/ops/api-keys",
+                      json={"organization_id": org.id, "product": "edu", "subject": "국어"},
+                      headers=auth(tok)).json()["site_key"]
+    ch = client.post("/api/v1/captcha/v1/challenge", params={"subject": "수학"},
+                     headers={"X-Site-Key": ext})
+    assert ch.status_code == 200
+    assert ch.json()["subject"] == "국어"  # 수학 요청 무시, 발급 과목 고정
+
+    fp = client.post("/api/v1/ops/api-keys",
+                     json={"organization_id": org.id, "product": "edu", "subject": "국어",
+                           "first_party": True},
+                     headers=auth(tok)).json()["site_key"]
+    ch2 = client.post("/api/v1/captcha/v1/challenge", params={"subject": "수학"},
+                      headers={"X-Site-Key": fp})
+    assert ch2.json()["subject"] == "수학"  # 1st-party는 전환 허용
+
+
+def test_org_admin_self_service_scoped_to_purchase(client, db, seed_org):
+    """기관 관리자(교장)는 구매 과목 내에서만 키 발급 — 교사는 접근 불가."""
+    org = seed_org["org"]
+    _, pro = _plans(db)
+    db.add(Subscription(organization_id=org.id, plan_id=pro.id, status="active"))
+    org.edu_subjects = ["국어"]  # 국어만 구매
+    db.commit()
+    admin = _org_admin(client, db, org)
+
+    ent = client.get(f"/api/v1/orgs/{org.id}/api-entitlements", headers=auth(admin)).json()
+    assert "edu" in ent["products"] and ent["edu_subjects"] == ["국어"]
+
+    ok = client.post(f"/api/v1/orgs/{org.id}/api-keys",
+                     json={"product": "edu", "subject": "국어", "label": "우리학교"},
+                     headers=auth(admin))
+    assert ok.status_code == 200, ok.text
+    assert ok.json()["secret_key"] and ok.json()["first_party"] is False
+    assert ok.json()["subject"] == "국어"
+
+    denied = client.post(f"/api/v1/orgs/{org.id}/api-keys",
+                         json={"product": "edu", "subject": "수학"}, headers=auth(admin))
+    assert denied.status_code == 402  # 구매 안 한 과목
+
+    keys = client.get(f"/api/v1/orgs/{org.id}/api-keys", headers=auth(admin)).json()
+    assert len(keys) >= 1
+    assert client.delete(f"/api/v1/orgs/{org.id}/api-keys/{keys[0]['id']}",
+                         headers=auth(admin)).status_code == 200
+
+    # 교사 토큰(비교장) → 403
+    tt = client.post("/api/v1/auth/login",
+                     json={"role": "teacher", "email": "t1@test.dev", "password": "Password123!"}
+                     ).json()["access_token"]
+    assert client.get(f"/api/v1/orgs/{org.id}/api-keys", headers=auth(tt)).status_code == 403

@@ -211,12 +211,15 @@ def challenge(
     # 화면 과목에 맞춰 요청별로 과목을 바꿀 수 있게 허용한다. (EDU_SUBJECTS 안에서만)
     eff_subject = api.subject
     learning = False
-    if api.product == "edu" and subject and subject in cs.EDU_SUBJECTS:
-        eff_subject = subject
-        # ?subject= 오버라이드는 1st-party 인앱 학습 게임 신호 — 뱅크 있는 과목은
-        # 과목 무관 조작형(드래그/따라그리기) 대신 실제 문제만 낸다(학습 목적).
-        # 외부 임베드(고정 subject 키)는 learning=False라 조작형이 유지된다(행동데이터).
-        learning = True
+    if api.product == "edu":
+        # 과목 스코프 강제: 외부 판매 키(first_party=False)는 발급 과목에 고정한다 —
+        # ?subject=로 다른 과목을 받아 구매 안 한 과목에 접근하는 것을 막는다.
+        # 1st-party(우리 인앱) 키만 요청별 과목 전환을 허용한다(한 키로 6과목 게임화면).
+        if api.first_party and subject and subject in cs.EDU_SUBJECTS:
+            eff_subject = subject
+        # 교육형 키는 자기 과목의 실제 문제를 낸다(구매 고객 = 그 과목 학습 API).
+        if eff_subject in cs.EDU_SUBJECTS:
+            learning = True
     if day is not None:
         learning = True  # 커리큘럼 일차(생활 인앱)도 학습 세션
     if chapter is not None:

@@ -92,8 +92,12 @@ def _consume(db: Session, kind: str, token_id: str, exp: float) -> bool:
 def issue_key(
     db: Session, org_id: str, product: str, subject: str | None, label: str | None,
     site_name: str | None = None, domain: str | None = None, created_by: str | None = None,
+    first_party: bool = False,
 ) -> dict:
-    """API 키 발급. secret 원문은 이 반환에서만 노출(이후 hash만 보관)."""
+    """API 키 발급. secret 원문은 이 반환에서만 노출(이후 hash만 보관).
+
+    first_party: 우리 인앱 키(요청별 과목 전환 허용). 외부 판매 키는 False → 발급 과목 고정.
+    """
     if product not in PRODUCTS:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="알 수 없는 제품입니다.")
     if product == "edu" and subject not in EDU_SUBJECTS:
@@ -114,12 +118,14 @@ def issue_key(
         organization_id=org_id, site_id=site.id, site_key=site_key,
         secret_key_hash=sha256_hash(secret), product=product,
         subject=subject if product == "edu" else None, label=label, status="active",
+        first_party=bool(first_party),
     )
     db.add(api)
     db.commit()
     return {
         "id": api.id, "site_key": site_key, "secret_key": secret, "product": product,
         "subject": api.subject, "label": label, "site_id": site.id,
+        "first_party": api.first_party,
     }
 
 
@@ -190,6 +196,23 @@ def allowed_products(plan: Plan | None) -> list[str]:
     if plan is None:
         return DEFAULT_PRODUCTS
     return PLAN_PRODUCTS.get(plan.key, DEFAULT_PRODUCTS)
+
+
+def org_entitlements(db: Session, org_id: str) -> dict:
+    """이 기관이 발급 가능한 범위 — 요금제 허용 제품 + 구매한 교육형 과목.
+
+    기관 관리자 자율 발급은 이 범위로 제한된다(구매 안 한 과목·제품 발급 차단).
+    """
+    from app.models import Organization
+
+    plan = plan_for_org(db, org_id)
+    org = db.get(Organization, org_id)
+    subjects = [s for s in (org.edu_subjects or []) if s in EDU_SUBJECTS] if org else []
+    return {
+        "products": allowed_products(plan),
+        "edu_subjects": subjects,
+        "plan": plan.name if plan else "미구독",
+    }
 
 
 def assert_entitled(db: Session, api: ApiKey) -> Plan | None:

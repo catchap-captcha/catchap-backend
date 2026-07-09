@@ -32,6 +32,9 @@ class ApiKey(Base, UUIDPk, Timestamps):
     # 제품 구분: 'captcha'(메인 봇차단) | 'edu'(교육형). edu는 subject로 과목 세분화.
     product: Mapped[str] = mapped_column(String(20), default="captcha")
     subject: Mapped[str | None] = mapped_column(String(20), nullable=True)  # edu 전용 과목
+    # 1st-party(우리 인앱) 키만 요청별 과목 오버라이드(?subject=) 허용 — 한 키로 6과목 게임화면.
+    # 외부 판매 키는 False → 발급 과목에 고정(구매 안 한 과목 접근 차단).
+    first_party: Mapped[bool] = mapped_column(default=False)
     label: Mapped[str | None] = mapped_column(String(100), nullable=True)  # 발급 메모(예: 우리학교 홈페이지)
     status: Mapped[str] = mapped_column(String(20), default="active")  # active|disabled
     last_used_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)

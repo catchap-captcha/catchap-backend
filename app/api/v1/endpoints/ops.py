@@ -12,27 +12,35 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import func
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.utils.helpers import audit
 
 from app.core.config import get_settings
 from app.core.permissions import Principal, require_ops
-from app.core.security import hash_password
+from app.core.security import hash_password, verify_password
 from app.db.session import get_db
 from app.email.smtp import send_email
 from app.models import (
     ApiKey,
+    ApiUsageLog,
     AuditLog,
     BehaviorSummary,
     BehaviorTrace,
+    CaptchaSetting,
+    ClassRoom,
     Inquiry,
     InquiryReply,
+    Invitation,
+    Invoice,
     Membership,
     ModelVersion,
     Organization,
     OrgRegistrationRequest,
+    PaymentMethod,
     Plan,
+    Site,
     StudentProfile,
     Subscription,
     User,
@@ -81,6 +89,7 @@ def _org_admin_row(db: Session, o: Organization) -> dict:
         "contact_phone": o.contact_phone,
         "address": o.address,
         "business_number": o.business_number,
+        "edu_subjects": list(o.edu_subjects or []),  # 구매한 교육형 과목(발급 허용 범위)
         "students": db.query(StudentProfile)
         .filter(StudentProfile.organization_id == o.id, StudentProfile.status != "disabled")
         .count(),
@@ -158,6 +167,7 @@ def ops_create_org(
         status="active",
         organization_id=org.id,
         email_verified_at=_now(),
+        must_change_password=True,  # 첫 로그인 시 새 비번 강제 (운영자·승인 발급과 통일)
     )
     db.add(admin)
     db.flush()
@@ -170,10 +180,31 @@ def ops_create_org(
             joined_at=_now(),
         )
     )
-    # 기본 요금제(basic) 연결 — 키 발급·요금제 게이팅이 동작하도록
-    basic = db.query(Plan).filter(Plan.key == "basic").first()
+    # 기본 요금제(Basic) 연결 — 키 발급·요금제 게이팅이 동작하도록.
+    # plans.key는 대문자('Basic') — 과거 소문자 조회 버그로 신규 기관에 구독이 안 붙던 것 수정.
+    basic = db.query(Plan).filter(func.lower(Plan.key) == "basic").first()
     if basic:
         db.add(Subscription(organization_id=org.id, plan_id=basic.id))
+
+    # 관리자 임시 비번을 본인 이메일로 자동 통보 (평문 미저장, 이 순간에만 발송)
+    pw = escape(temp_password)
+    html = (
+        "<div style='font-family:sans-serif;line-height:1.7;color:#333'>"
+        f"<p>{escape(req.admin_name)}님, 안녕하세요. CatChap 운영팀입니다.</p>"
+        f"<p><b>{escape(org.name)}</b>의 기관 관리자 계정이 발급되었습니다.</p>"
+        "<div style='margin:16px 0;padding:14px 16px;background:#fff3ee;border-radius:10px'>"
+        f"<b>로그인 이메일</b><br>{escape(admin_email)}<br><br>"
+        f"<b>임시 비밀번호</b><br>"
+        f"<span style='font-size:18px;font-weight:700;color:#e85b2a;letter-spacing:1px'>{pw}</span>"
+        "</div>"
+        "<p>보안을 위해 <b>첫 로그인 후 반드시 새 비밀번호로 변경</b>해 주세요.</p>"
+        "<p>감사합니다. 🐾</p></div>"
+    )
+    sent = send_email(
+        db, to_email=admin_email, subject="[CatChap] 기관 관리자 계정이 발급되었습니다",
+        html=html, user_id=admin.id,
+    )
+    email_status = "dry_run" if not get_settings().smtp_enabled else ("sent" if sent else "failed")
     db.add(
         AuditLog(
             actor_user_id=principal.id,
@@ -181,7 +212,10 @@ def ops_create_org(
             action="org.create",
             target_type="organization",
             target_id=org.id,
-            after_json={"name": org.name, "code": org.code, "admin_email": admin_email},
+            after_json={
+                "name": org.name, "code": org.code,
+                "admin_email": admin_email, "email_status": email_status,
+            },
         )
     )
     db.commit()
@@ -189,7 +223,8 @@ def ops_create_org(
         "ok": True,
         **_org_admin_row(db, org),
         "admin_email": admin_email,
-        "admin_temp_password": temp_password,  # 1회 노출 — 응답 이후 조회 불가
+        "admin_temp_password": temp_password,  # 이메일 실패/dry-run 시 수동 전달용 (1회 노출)
+        "admin_email_status": email_status,
     }
 
 
@@ -261,26 +296,186 @@ def ops_delete_org(
             status.HTTP_409_CONFLICT,
             detail=f"발급된 API 키 {key_count}개가 있어 삭제할 수 없습니다. 키를 먼저 폐기하세요.",
         )
-    # 빈 기관: 관리자 계정·멤버십·구독·가입신청·기관을 정리한다.
-    db.query(Membership).filter(Membership.organization_id == org_id).delete()
-    db.query(Subscription).filter(Subscription.organization_id == org_id).delete()
-    db.query(User).filter(User.organization_id == org_id).delete()
-    db.query(OrgRegistrationRequest).filter(
-        OrgRegistrationRequest.organization_id == org_id
-    ).delete()
+    # 빈 기관: organizations.id 를 참조하는 기관 스코프 행을 모두 정리한 뒤 기관을 지운다.
+    # (classes·invitations·sites·captcha_settings 는 organizations 에 FK 가 걸려 있어
+    #  남아 있으면 db.delete(org) 가 IntegrityError → 500 이 난다. 청구/사용로그도 함께 정리해 고아 방지.)
+    # 자식→부모 순서로 삭제한다(예: api_usage_logs→api_keys→sites — api_keys.site_id FK).
+    # 정리·삭제 전체를 한 트랜잭션으로 감싸, 예상 못 한 잔여 FK 로 IntegrityError 가 나면 500 이
+    # 아니라 정직한 409 로 되돌린다(벌크 delete 는 즉시 실행돼 커밋 전에도 터질 수 있으므로).
+    try:
+        for model in (
+            ApiUsageLog,
+            ApiKey,
+            CaptchaSetting,
+            Site,
+            Invitation,
+            ClassRoom,
+            Invoice,
+            PaymentMethod,
+            Membership,
+            Subscription,
+            User,
+        ):
+            db.query(model).filter(model.organization_id == org_id).delete(
+                synchronize_session=False
+            )
+        db.query(OrgRegistrationRequest).filter(
+            OrgRegistrationRequest.organization_id == org_id
+        ).delete(synchronize_session=False)
+        db.add(
+            AuditLog(
+                actor_user_id=principal.id,
+                organization_id=None,  # 기관이 삭제되므로 FK 없는 참조로 남기지 않는다
+                action="org.delete",
+                target_type="organization",
+                target_id=org_id,
+                before_json={"name": org.name, "code": org.code},
+            )
+        )
+        db.delete(org)
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail="아직 정리되지 않은 연결 데이터가 있어 삭제할 수 없습니다. 이용을 막으려면 '중지'로 변경하세요.",
+        )
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------- 운영자 계정 관리 (운영자)
+# 플랫폼 운영자(ops) 계정은 공개 가입이 아니라 여기서만 만든다. 최초 운영자는 시드로 심고,
+# 이후 운영자가 다른 운영자를 추가·중지할 수 있다(모든 변경은 감사 로그에 남음).
+def _operator_row(u: User) -> dict:
+    return {
+        "id": u.id,
+        "name": u.name,
+        "email": u.email,
+        "status": u.status,
+        "two_factor_enabled": bool(u.two_factor_enabled),
+        "last_login_at": u.last_login_at.isoformat() if u.last_login_at else None,
+        "created_at": u.created_at.isoformat() if u.created_at else None,
+    }
+
+
+class _OperatorCreateReq(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    email: EmailStr
+
+
+class _OperatorUpdateReq(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=100)
+    status: str | None = Field(default=None, pattern="^(active|disabled)$")
+
+
+@router.get("/operators")
+def list_operators(principal: Principal = Depends(require_ops), db: Session = Depends(get_db)):
+    rows = db.query(User).filter(User.role == "ops").order_by(User.created_at).all()
+    return [_operator_row(u) for u in rows]
+
+
+@router.post("/operators")
+def create_operator(
+    req: _OperatorCreateReq,
+    principal: Principal = Depends(require_ops),
+    db: Session = Depends(get_db),
+):
+    """운영자 계정 신규 발급 — 임시 비밀번호를 본인 이메일로 자동 통보하고, 첫 로그인 시 변경을 강제한다.
+
+    운영자는 일반 로그인 폼이 아니라 숨겨진 /ops/login 에서만 인증된다(auth_service.ops_login).
+    임시 비번은 응답에서도 1회 노출한다(이메일 dry-run/실패 시 수동 전달용).
+    """
+    email = req.email.strip().lower()
+    if db.query(User).filter(User.email == email).first():
+        raise HTTPException(status.HTTP_409_CONFLICT, detail="이미 가입된 이메일입니다.")
+    temp_password = secrets.token_urlsafe(9)
+    op = User(
+        email=email,
+        password_hash=hash_password(temp_password),
+        name=req.name,
+        role="ops",
+        status="active",
+        email_verified_at=_now(),
+        must_change_password=True,  # 첫 로그인 시 새 비번 강제 (전역 ForcePasswordGate)
+    )
+    db.add(op)
+    db.flush()
+
+    # 임시 비번을 본인 이메일로 자동 통보 (평문은 저장하지 않고 이 순간에만 발송)
+    pw = escape(temp_password)
+    html = (
+        "<div style='font-family:sans-serif;line-height:1.7;color:#333'>"
+        f"<p>{escape(op.name)}님, 안녕하세요. CatChap 운영팀입니다.</p>"
+        "<p>CatChap <b>운영자 계정</b>이 발급되었습니다.</p>"
+        "<div style='margin:16px 0;padding:14px 16px;background:#f1ecff;border-radius:10px'>"
+        f"<b>로그인 이메일</b><br>{escape(op.email)}<br><br>"
+        f"<b>임시 비밀번호</b><br>"
+        f"<span style='font-size:18px;font-weight:700;color:#7a5bd6;letter-spacing:1px'>{pw}</span>"
+        "</div>"
+        "<p>운영자 전용 로그인 화면에서 접속하고, 보안을 위해 <b>첫 로그인 후 반드시 새 비밀번호로 변경</b>해 주세요.</p>"
+        "<p>감사합니다. 🐾</p></div>"
+    )
+    sent = send_email(
+        db, to_email=op.email, subject="[CatChap] 운영자 계정이 발급되었습니다", html=html, user_id=op.id
+    )
+    email_status = "dry_run" if not get_settings().smtp_enabled else ("sent" if sent else "failed")
     db.add(
         AuditLog(
             actor_user_id=principal.id,
-            organization_id=None,  # 기관이 삭제되므로 FK 없는 참조로 남기지 않는다
-            action="org.delete",
-            target_type="organization",
-            target_id=org_id,
-            before_json={"name": org.name, "code": org.code},
+            action="ops.operator_create",
+            target_type="user",
+            target_id=op.id,
+            after_json={"name": op.name, "email": email, "email_status": email_status},
         )
     )
-    db.delete(org)
     db.commit()
-    return {"ok": True}
+    return {
+        "ok": True,
+        **_operator_row(op),
+        "temp_password": temp_password,  # 이메일 실패/dry-run 시 수동 전달용 (1회 노출)
+        "email_status": email_status,
+    }
+
+
+@router.patch("/operators/{op_id}")
+def update_operator(
+    op_id: str,
+    req: _OperatorUpdateReq,
+    principal: Principal = Depends(require_ops),
+    db: Session = Depends(get_db),
+):
+    """운영자 계정 수정 — 이름 변경 / 활성화·중지. 자기 잠금·전체 잠금은 막는다."""
+    op = db.get(User, op_id)
+    if op is None or op.role != "ops":
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="운영자 계정을 찾을 수 없습니다.")
+    if req.status == "disabled":
+        if op_id == principal.id:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="자기 계정은 중지할 수 없어요.")
+        active_ops = (
+            db.query(User).filter(User.role == "ops", User.status == "active").count()
+        )
+        if op.status == "active" and active_ops <= 1:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                detail="마지막 활성 운영자예요. 다른 운영자를 먼저 추가한 뒤 중지하세요.",
+            )
+    before = {"name": op.name, "status": op.status}
+    if req.name is not None:
+        op.name = req.name
+    if req.status is not None:
+        op.status = req.status
+    db.add(
+        AuditLog(
+            actor_user_id=principal.id,
+            action="ops.operator_update",
+            target_type="user",
+            target_id=op.id,
+            before_json=before,
+            after_json={"name": op.name, "status": op.status},
+        )
+    )
+    db.commit()
+    return _operator_row(op)
 
 
 @router.get("/inquiries")
@@ -365,6 +560,8 @@ def answer_inquiry(
             action="inquiry.answer",
             target_type="inquiry",
             target_id=i.id,
+            # 감사 로그에서 '어떤 답변을 보냈는지' 미리보기로 볼 수 있게 답변 본문을 함께 남긴다.
+            after_json={"answer": req.answer},
         )
     )
     db.commit()
@@ -461,16 +658,68 @@ def logs(principal: Principal = Depends(require_ops), db: Session = Depends(get_
             return f"학생 {code}"
         return None
 
+    def _actor_email(log: AuditLog) -> str | None:
+        # 계정을 유일하게 식별하는 이메일 — 같은 이름의 운영자/기관 관리자가 여러 명이어도
+        # 누구인지 구분할 수 있게 한다. 학생·삭제된 계정은 None(학생은 이메일 없음/익명 코드로 식별).
+        u = users.get(log.actor_user_id) if log.actor_user_id else None
+        return u.email if u else None
+
+    # 문의 답변(inquiry.answer) 로그는 미리보기로 '원래 문의(질문)와 그 문의에 달린 모든 답변'을
+    # 함께 보여준다(1문의 : N답변). 답변 스레드가 비어 있는 구(舊) 기록은 after_json 에 저장된
+    # 답변이라도 복원한다.
+    answer_inquiry_ids = {
+        log.target_id for log in rows if log.action == "inquiry.answer" and log.target_id
+    }
+    inquiries_by_id: dict[str, Inquiry] = {}
+    replies_by_inquiry: dict[str, list[InquiryReply]] = {}
+    if answer_inquiry_ids:
+        for inq in db.query(Inquiry).filter(Inquiry.id.in_(answer_inquiry_ids)).all():
+            inquiries_by_id[inq.id] = inq
+        for rep in (
+            db.query(InquiryReply)
+            .filter(InquiryReply.inquiry_id.in_(answer_inquiry_ids))
+            .order_by(InquiryReply.created_at)
+            .all()
+        ):
+            replies_by_inquiry.setdefault(rep.inquiry_id, []).append(rep)
+
+    def _detail(log: AuditLog) -> dict | None:
+        if log.action != "inquiry.answer" or not log.target_id:
+            return None
+        inq = inquiries_by_id.get(log.target_id)
+        reps = replies_by_inquiry.get(log.target_id, [])
+        answers = [
+            {"body": r.body, "at": r.created_at.isoformat() if r.created_at else None}
+            for r in reps
+        ]
+        # 구 기록 폴백: 답변 스레드가 비었으면 감사로그 after_json 에 저장된 답변이라도 보여준다.
+        if not answers and log.after_json and log.after_json.get("answer"):
+            answers = [
+                {"body": log.after_json["answer"],
+                 "at": log.created_at.isoformat() if log.created_at else None}
+            ]
+        if inq is None and not answers:
+            return None
+        return {
+            "question": inq.content if inq else None,
+            "question_by": inq.name if inq else None,
+            "question_email": inq.email if inq else None,  # 회신용 — 문의 처리엔 필요
+            "question_at": inq.created_at.isoformat() if inq and inq.created_at else None,
+            "answers": answers,
+        }
+
     return [
         {
             "id": log.id,
             "action": log.action,
             "actor_user_id": log.actor_user_id,
             "actor_name": _actor(log),
+            "actor_email": _actor_email(log),
             "organization_id": log.organization_id,
             "org_name": orgs[log.organization_id].name if log.organization_id in orgs else None,
             "target_type": log.target_type,
             "target_id": log.target_id,
+            "detail": _detail(log),  # 문의 답변 미리보기용 본문 (그 외 액션은 None)
             "created_at": log.created_at.isoformat() if log.created_at else None,
         }
         for log in rows
@@ -546,6 +795,10 @@ def approve_request(
         raise HTTPException(status.HTTP_409_CONFLICT, detail=f"이미 처리된 신청입니다({r.status}).")
     r.status = "approved"
     r.approved_at = _now()
+    # 승인 시 관리자 계정 자격증명 발급 — 신청 단계엔 비번이 없다(신청서 흐름).
+    # email_verified_at 이 None 인 org_admin = 미발급 계정 → 임시 비번 발급 + active 전환.
+    # 임시 비번은 이 응답에서만 1회 노출된다(이후 조회 불가) — 운영자가 담당자에게 전달.
+    issued_admins: list[dict] = []
     if r.organization_id:
         org = db.query(Organization).filter(Organization.id == r.organization_id).first()
         if org:
@@ -556,6 +809,20 @@ def approve_request(
             .all()
         ):
             m.status = "active"
+        for u in (
+            db.query(User)
+            .filter(User.organization_id == r.organization_id, User.role == "org_admin")
+            .all()
+        ):
+            u.status = "active"
+            if u.email_verified_at is None:  # 신청서 흐름으로 만든 미발급 계정
+                temp_password = secrets.token_urlsafe(9)
+                u.password_hash = hash_password(temp_password)
+                u.email_verified_at = _now()  # 운영자 승인으로 이메일 소유 확인 갈음
+                u.must_change_password = True  # 임시 비번 첫 로그인 시 강제 변경
+                issued_admins.append(
+                    {"email": u.email, "temp_password": temp_password, "organization_id": org.id}
+                )
     db.add(
         AuditLog(
             actor_user_id=principal.id,
@@ -566,7 +833,71 @@ def approve_request(
         )
     )
     db.commit()
-    return {"ok": True, "status": "approved"}
+    return {"ok": True, "status": "approved", "admin_credentials": issued_admins}
+
+
+class _SendCredReq(BaseModel):
+    email: EmailStr
+    temp_password: str
+
+
+@router.post("/orgs/{org_id}/send-admin-credentials")
+def send_admin_credentials(
+    org_id: str,
+    req: _SendCredReq,
+    principal: Principal = Depends(require_ops),
+    db: Session = Depends(get_db),
+):
+    """승인 시 발급한 관리자 임시 비밀번호를 담당자 이메일로 발송.
+
+    평문 비번은 저장하지 않는다(승인 응답에서만 1회 노출) → 방금 발급한 값을
+    클라이언트가 되돌려주면 계정 해시와 대조해 '현재 유효한 비번'일 때만 발송한다.
+    이렇게 하면 오래된/조작된 값을 잘못 메일로 보내는 일을 막는다.
+    """
+    email = req.email.strip().lower()
+    user = (
+        db.query(User)
+        .filter(User.organization_id == org_id, User.email == email, User.role == "org_admin")
+        .first()
+    )
+    if user is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="관리자 계정을 찾을 수 없습니다.")
+    if not verify_password(req.temp_password, user.password_hash):
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            detail="임시 비밀번호가 현재 계정과 일치하지 않아요. 승인 직후 화면에서만 발송할 수 있어요.",
+        )
+    org = db.query(Organization).filter(Organization.id == org_id).first()
+    org_name = escape(org.name) if org else "기관"
+    pw = escape(req.temp_password)
+    html = (
+        "<div style='font-family:sans-serif;line-height:1.7;color:#333'>"
+        f"<p>{escape(user.name)}님, 안녕하세요. CatChap 운영팀입니다.</p>"
+        f"<p><b>{org_name}</b>의 기관 등록 신청이 승인되어 관리자 계정이 발급되었습니다.</p>"
+        "<div style='margin:16px 0;padding:14px 16px;background:#fff3ee;border-radius:10px'>"
+        f"<b>로그인 이메일</b><br>{escape(user.email)}<br><br>"
+        f"<b>임시 비밀번호</b><br>"
+        f"<span style='font-size:18px;font-weight:700;color:#e85b2a;letter-spacing:1px'>{pw}</span>"
+        "</div>"
+        "<p>보안을 위해 <b>첫 로그인 후 반드시 새 비밀번호로 변경</b>해 주세요.</p>"
+        "<p>감사합니다. 🐾</p></div>"
+    )
+    sent = send_email(
+        db, to_email=user.email, subject="[CatChap] 기관 관리자 계정이 발급되었습니다", html=html
+    )
+    email_status = "dry_run" if not get_settings().smtp_enabled else ("sent" if sent else "failed")
+    db.add(
+        AuditLog(
+            actor_user_id=principal.id,
+            organization_id=org_id,
+            action="org.admin_credentials_sent",
+            target_type="user",
+            target_id=user.id,
+            after_json={"to": user.email, "email_status": email_status},
+        )
+    )
+    db.commit()
+    return {"ok": True, "email_sent": sent, "email_status": email_status, "to": user.email}
 
 
 @router.post("/registration-requests/{request_id}/reject")
@@ -606,6 +937,8 @@ class _IssueKeyReq(BaseModel):
     subject: str | None = None
     label: str | None = Field(default=None, max_length=100)
     domain: str | None = Field(default=None, max_length=255)
+    # 우리 인앱 키(과목 전환 허용)면 True. 외부 판매 키는 False(발급 과목 고정) — 기본값.
+    first_party: bool = False
 
 
 def _apikey_row(db: Session, k: ApiKey) -> dict:
@@ -619,6 +952,7 @@ def _apikey_row(db: Session, k: ApiKey) -> dict:
         "product_name": _cs.PRODUCTS.get(k.product, k.product),
         "subject": k.subject,
         "label": k.label,
+        "first_party": k.first_party,
         "site_key": k.site_key,  # 공개키 — 목록 노출 OK
         "status": k.status,
         "plan": plan.name if plan else "미구독",
@@ -668,12 +1002,20 @@ def ops_issue_api_key(
     issued = _cs.issue_key(
         db, org_id=req.organization_id, product=req.product, subject=req.subject,
         label=req.label, domain=req.domain, created_by=principal.id,
+        first_party=req.first_party,
     )
+    # 판매 프로비저닝: edu 키를 발급하면 그 과목을 기관 구매목록(edu_subjects)에 자동 반영 →
+    # 이후 기관 관리자가 그 과목 키를 셀프 발급할 수 있게 된다.
+    if req.product == "edu" and req.subject:
+        subs = list(org.edu_subjects or [])
+        if req.subject not in subs:
+            org.edu_subjects = subs + [req.subject]
     db.add(
         AuditLog(
             actor_user_id=principal.id, organization_id=req.organization_id,
             action="captcha.api_key_issue", target_type="api_key", target_id=issued["id"],
-            after_json={"product": req.product, "subject": req.subject, "label": req.label},
+            after_json={"product": req.product, "subject": req.subject, "label": req.label,
+                        "first_party": req.first_party},
         )
     )
     db.commit()
@@ -697,6 +1039,34 @@ def ops_revoke_api_key(
     )
     db.commit()
     return {"ok": True}
+
+
+class _EntitlementReq(BaseModel):
+    edu_subjects: list[str] = Field(default_factory=list)
+
+
+@router.patch("/orgs/{org_id}/entitlements")
+def ops_set_org_entitlements(
+    org_id: str, req: _EntitlementReq,
+    principal: Principal = Depends(require_ops), db: Session = Depends(get_db),
+):
+    """기관이 구매한 교육형 과목(edu_subjects) 설정 — 판매 프로비저닝. 기관 관리자는
+    이 범위 안에서만 키를 셀프 발급할 수 있다."""
+    org = db.get(Organization, org_id)
+    if org is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="기관을 찾을 수 없습니다.")
+    subs = [s for s in req.edu_subjects if s in _cs.EDU_SUBJECTS]
+    before = list(org.edu_subjects or [])
+    org.edu_subjects = subs
+    db.add(
+        AuditLog(
+            actor_user_id=principal.id, organization_id=org_id,
+            action="org.entitlements_set", target_type="organization", target_id=org_id,
+            before_json={"edu_subjects": before}, after_json={"edu_subjects": subs},
+        )
+    )
+    db.commit()
+    return {"ok": True, "edu_subjects": subs}
 
 
 # ---------------------------------------------------------------- 행동 데이터 (아동용 캡차 학습셋)

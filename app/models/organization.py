@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import CHAR, DateTime, String, Text
+from sqlalchemy import CHAR, JSON, DateTime, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base, Timestamps, UUIDPk
@@ -20,6 +20,9 @@ class Organization(Base, UUIDPk, Timestamps):
     address: Mapped[str | None] = mapped_column(String(255), nullable=True)
     business_number: Mapped[str | None] = mapped_column(String(30), unique=True, nullable=True)
     code_expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # 이 기관이 구매한 교육형 과목 목록(예: ["국어"]). 외부 API 키 발급 허용 범위 —
+    # 기관 관리자는 이 안에서만 키를 만들 수 있고, 운영자가 판매 시 설정한다.
+    edu_subjects: Mapped[list] = mapped_column(JSON, default=list)
 
 
 class OrgRegistrationRequest(Base, UUIDPk, Timestamps):

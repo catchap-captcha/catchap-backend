@@ -1667,3 +1667,131 @@ def assign_student_class(
     )
     db.commit()
     return {"ok": True, "class_id": cls.id, "class_name": cls.name}
+
+
+# ---------------------------------------------------------------- 기관 API 키 관리 (교장 전용)
+# 자기 기관 키만. 발급은 구매 범위(요금제 제품 + 구매 과목)로 강제되고, 외부 키라
+# first_party=False로 발급 과목에 고정된다. 운영자(OPS) 콘솔과 권한·범위가 분리된다.
+class _OrgIssueKeyReq(_BaseModel):
+    product: str
+    subject: str | None = None
+    label: str | None = None
+    domain: str | None = None
+
+
+def _org_key_row(k: ApiKey) -> dict:
+    from app.services import captcha_service as _cs
+
+    return {
+        "id": k.id,
+        "product": k.product,
+        "product_name": _cs.PRODUCTS.get(k.product, k.product),
+        "subject": k.subject,
+        "label": k.label,
+        "first_party": k.first_party,
+        "site_key": k.site_key,  # 공개키 — 노출 OK
+        "status": k.status,
+        "last_used_at": k.last_used_at.isoformat() if k.last_used_at else None,
+        "created_at": k.created_at.isoformat() if k.created_at else None,
+    }
+
+
+@router.get("/{org_id}/api-entitlements")
+def org_api_entitlements(
+    org_id: str,
+    principal: Principal = Depends(require_org_admin),
+    db: Session = Depends(get_db),
+):
+    """이 기관이 발급 가능한 제품·과목 + 이달 사용량/한도 — 발급 폼이 이 범위만 보여준다."""
+    check_org_scope(principal, org_id)
+    from app.services import captcha_service as _cs
+
+    ent = _cs.org_entitlements(db, org_id)
+    plan = _cs.plan_for_org(db, org_id)
+    ent["usage"] = {
+        "used": _cs._usage_this_month(db, org_id),
+        "quota": plan.api_quota if plan else 0,
+    }
+    ent["product_names"] = _cs.PRODUCTS
+    return ent
+
+
+@router.get("/{org_id}/api-keys")
+def org_api_keys(
+    org_id: str,
+    principal: Principal = Depends(require_org_admin),
+    db: Session = Depends(get_db),
+):
+    """자기 기관 API 키 목록(secret 제외 — 공개 site_key만)."""
+    check_org_scope(principal, org_id)
+    rows = (
+        db.query(ApiKey)
+        .filter(ApiKey.organization_id == org_id, ApiKey.status != "deleted")
+        .order_by(ApiKey.created_at.desc())
+        .all()
+    )
+    return [_org_key_row(k) for k in rows]
+
+
+@router.post("/{org_id}/api-keys")
+def org_issue_api_key(
+    org_id: str,
+    req: _OrgIssueKeyReq,
+    principal: Principal = Depends(require_org_admin),
+    db: Session = Depends(get_db),
+):
+    """기관 관리자 셀프 발급 — 구매 범위 내에서만. 외부 키(first_party=False)로 과목 고정.
+
+    secret_key는 이 응답에서만 노출된다.
+    """
+    check_org_scope(principal, org_id)
+    from app.services import captcha_service as _cs
+
+    ent = _cs.org_entitlements(db, org_id)
+    if req.product not in _cs.PRODUCTS:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="알 수 없는 제품입니다.")
+    if req.product not in ent["products"]:
+        raise HTTPException(
+            status.HTTP_402_PAYMENT_REQUIRED,
+            detail=f"현재 요금제로는 '{_cs.PRODUCTS[req.product]}'를 발급할 수 없어요. 운영자에게 문의해 주세요.",
+        )
+    if req.product == "edu":
+        if req.subject not in _cs.EDU_SUBJECTS:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="교육형은 과목을 지정해야 합니다.")
+        if req.subject not in ent["edu_subjects"]:
+            raise HTTPException(
+                status.HTTP_402_PAYMENT_REQUIRED,
+                detail=f"'{req.subject}' 과목은 아직 구매하지 않았어요. 운영자에게 문의해 주세요.",
+            )
+    issued = _cs.issue_key(
+        db, org_id=org_id, product=req.product, subject=req.subject,
+        label=req.label, domain=req.domain, created_by=principal.id, first_party=False,
+    )
+    audit(
+        db, action="captcha.api_key_issue", actor_user_id=principal.id,
+        organization_id=org_id, target_type="api_key", target_id=issued["id"],
+        after={"product": req.product, "subject": req.subject, "label": req.label, "by": "org"},
+    )
+    db.commit()
+    return {"ok": True, **issued}
+
+
+@router.delete("/{org_id}/api-keys/{key_id}")
+def org_revoke_api_key(
+    org_id: str,
+    key_id: str,
+    principal: Principal = Depends(require_org_admin),
+    db: Session = Depends(get_db),
+):
+    """자기 기관 키만 비활성(soft disable)."""
+    check_org_scope(principal, org_id)
+    k = db.get(ApiKey, key_id)
+    if k is None or k.organization_id != org_id or k.status == "deleted":
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="키를 찾을 수 없습니다.")
+    k.status = "disabled"
+    audit(
+        db, action="captcha.api_key_revoke", actor_user_id=principal.id,
+        organization_id=org_id, target_type="api_key", target_id=k.id,
+    )
+    db.commit()
+    return {"ok": True}
