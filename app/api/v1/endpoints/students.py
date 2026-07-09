@@ -557,6 +557,15 @@ def daily_quiz(
 ):
     me = _me(principal)
     rows = _today_quiz_rows(db, me.id)
+    # 과목별 오늘 시도 수(5단계 진행 바용) — 하루 5문제(5단계) 기준
+    _today_start = datetime.combine(date.today(), time.min)
+    _att_today = dict(
+        db.query(LearningAttempt.subject, func.count(LearningAttempt.id))
+        .filter(LearningAttempt.student_id == me.id, LearningAttempt.created_at >= _today_start)
+        .group_by(LearningAttempt.subject)
+        .all()
+    )
+    STAGES = 5
     quizzes = [
         {
             "id": r.id,
@@ -565,6 +574,9 @@ def daily_quiz(
             "status": r.status,
             "reward": r.reward_coins,
             "meta": D.SUBJECT_META.get(r.subject, {}),
+            # 5단계 진행 바: 완료면 5/5, 아니면 오늘 시도 수(최대 5)
+            "stages": STAGES,
+            "stage_done": STAGES if r.status == "done" else min(STAGES, int(_att_today.get(r.subject, 0))),
         }
         for r in rows
     ]
