@@ -54,7 +54,8 @@ def playable_pool(subject: str) -> list[dict]:
 # 이미 셔플되어 정답 순서를 노출하지 않는다. answer/explain/playable(정답 id)은 절대 미포함.
 _RENDER_FIELDS = ("options", "left", "right", "bins", "items", "cards", "zones",
                   "reference", "mapStyle", "compass", "start", "layout", "audio",
-                  "template", "glyph", "character", "dest", "dangers")
+                  "template", "glyph", "character", "dest", "dangers",
+                  "flag", "cols", "rows", "slots", "pieces")
 
 
 def public_question(q: dict) -> dict:

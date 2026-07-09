@@ -56,6 +56,24 @@ def audio(name: str):
     )
 
 
+_FLAG_DIR = Path(__file__).resolve().parents[3] / "static" / "flags"  # app/static/flags
+
+
+@router.get("/flag/{code}")
+def flag(code: str):
+    """국기 조각 맞추기 문항용 국기 SVG 서빙. 화이트리스트(2글자 국가코드) 밖은 404."""
+    if not code.isalpha() or len(code) != 2:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="not found")
+    path = _FLAG_DIR / f"{code.lower()}.svg"
+    if not path.exists():
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="not found")
+    return Response(
+        content=path.read_bytes(),
+        media_type="image/svg+xml",
+        headers={"Access-Control-Allow-Origin": "*", "Cache-Control": "public, max-age=86400"},
+    )
+
+
 def _client_ip(request: Request) -> str:
     return request.client.host if request.client else "unknown"
 

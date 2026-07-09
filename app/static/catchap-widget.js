@@ -603,6 +603,47 @@
         if (footerOn) { pendingRedo = function () { pSel = null; d.zones.forEach(function (z) { pEls[z.id].style.borderColor = '#E3D6C6'; pEls[z.id].style.background = '#fff'; }); footerState(false, false); }; pendingSubmit = subP; }
         else { var pbtn = h('button'); pbtn.textContent = '확인'; css(pbtn, btnStyle(C, '#fff')); pbtn.onclick = subP; body.appendChild(pbtn); }
         if (d.hint) hintLine(d.hint);
+      } else if (d.type === 'puzzle') {
+        // 국기 완성 — 조각(국기 크롭)을 그리드 슬롯에 배치. 제출 {slotId:pieceId}, 서버 match 채점.
+        var GW = 180, GH = 120, cw = GW / d.cols, chh = GH / d.rows;
+        var flagUrl = base + '/captcha/v1/flag/' + d.flag;
+        function crop(el, col, row) {
+          el.style.backgroundImage = "url('" + flagUrl + "')";
+          el.style.backgroundSize = GW + 'px ' + GH + 'px';
+          el.style.backgroundPosition = '-' + (col * cw) + 'px -' + (row * chh) + 'px';
+          el.style.backgroundRepeat = 'no-repeat';
+        }
+        var placed = {}, zSel = null, pieceEls = {}, slotEls = {};
+        var gridBox = h('div');
+        css(gridBox, { display: 'grid', gridTemplateColumns: 'repeat(' + d.cols + ',' + cw + 'px)', gridTemplateRows: 'repeat(' + d.rows + ',' + chh + 'px)',
+          width: GW + 'px', margin: '0 auto 16px', border: '2px solid #C9B79E', borderRadius: '4px', overflow: 'hidden', background: '#faf6ef' });
+        d.slots.forEach(function (sl) {
+          var slot = h('div'); css(slot, { border: '1px dashed #D8C8B4', cursor: 'pointer', backgroundRepeat: 'no-repeat' });
+          slot.onclick = function () { if (answered || zSel == null) return; Object.keys(placed).forEach(function (k) { if (placed[k] === zSel) delete placed[k]; }); placed[sl.id] = zSel; zSel = null; pzPaint(); };
+          slotEls[sl.id] = slot; gridBox.appendChild(slot);
+        });
+        body.appendChild(gridBox);
+        var tray = h('div'); css(tray, { display: 'flex', flexWrap: 'wrap', gap: '8px', justifyContent: 'center' });
+        d.pieces.forEach(function (p) {
+          var pc = h('button'); css(pc, { width: cw + 'px', height: chh + 'px', border: '2px solid #F0E4D8', borderRadius: '6px', cursor: 'pointer', padding: '0' });
+          crop(pc, p.col, p.row);
+          pc.onclick = function () { if (answered) return; zSel = zSel === p.id ? null : p.id; pzPaint(); };
+          pieceEls[p.id] = pc; tray.appendChild(pc);
+        });
+        body.appendChild(tray);
+        function pzPaint() {
+          d.slots.forEach(function (sl) { var el = slotEls[sl.id]; var pid = placed[sl.id];
+            if (pid) { var pc = d.pieces.filter(function (x) { return x.id === pid; })[0]; crop(el, pc.col, pc.row); el.style.borderColor = C; el.style.borderStyle = 'solid'; }
+            else { el.style.backgroundImage = 'none'; el.style.borderColor = '#D8C8B4'; el.style.borderStyle = 'dashed'; } });
+          d.pieces.forEach(function (p) { var el = pieceEls[p.id]; var used = Object.keys(placed).some(function (k) { return placed[k] === p.id; });
+            el.style.opacity = used ? '0.25' : '1'; el.style.borderColor = zSel === p.id ? C : '#F0E4D8'; });
+          var done = Object.keys(placed).length === d.slots.length;
+          if (footerOn) footerState(Object.keys(placed).length > 0 || zSel != null, done);
+        }
+        function subPz() { if (Object.keys(placed).length === d.slots.length) verify(token, placed); }
+        if (footerOn) { pendingRedo = function () { placed = {}; zSel = null; pzPaint(); }; pendingSubmit = subPz; }
+        else { var pzb = h('button'); pzb.textContent = '확인'; css(pzb, btnStyle(C, '#fff')); pzb.onclick = subPz; body.appendChild(pzb); }
+        if (d.hint) hintLine(d.hint);
       } else {
         // single / arithmetic / listen — 보기 중 하나 선택
         // 풋터 모드: 클릭은 '선택'만(테두리 강조), 제출은 풋터의 다음 문제 버튼이 담당

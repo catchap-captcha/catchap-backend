@@ -487,7 +487,8 @@ def _grade_trace(answer, template: list) -> bool:
 # right/cards/items는 이미 셔플되어 정답 순서를 노출하지 않는다.
 _WIDGET_RENDER_FIELDS = ("options", "left", "right", "bins", "items", "cards", "zones",
                          "reference", "mapStyle", "compass", "start", "layout", "audio",
-                         "template", "glyph", "character", "dest", "dangers")
+                         "template", "glyph", "character", "dest", "dangers",
+                         "flag", "cols", "rows", "slots", "pieces")
 
 
 def _in_box(px: float, py: float, box: dict, pad: float = 0.0) -> bool:
@@ -532,8 +533,8 @@ def _wrap_bank_question(subject: str, q: dict, meta: dict) -> dict:
     t = q["type"]
     if t == "multi":
         return _wrap("select_all", sorted(q["answer"]), public, meta)
-    if t in ("connect", "sort"):
-        # 매핑 채점 — 위젯이 {leftId:rightId}/{itemId:binId} 제출, 서버가 dict 정확 비교
+    if t in ("connect", "sort", "puzzle"):
+        # 매핑 채점 — {leftId:rightId}/{itemId:binId}/{slotId:pieceId} 딕셔너리 정확 비교
         return _wrap("match", dict(q["answer"]), public, meta)
     if t == "order":
         # 순서 채점 — 위젯이 [cardId,...] 제출, 서버가 리스트 정확 비교
