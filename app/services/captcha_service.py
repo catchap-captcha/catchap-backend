@@ -486,7 +486,8 @@ def _grade_trace(answer, template: list) -> bool:
 # 조작형 문항의 표시 필드(정답 아님) — verify에서 위젯이 렌더할 데이터. 추출 단계에서
 # right/cards/items는 이미 셔플되어 정답 순서를 노출하지 않는다.
 _WIDGET_RENDER_FIELDS = ("options", "left", "right", "bins", "items", "cards", "zones",
-                         "reference", "mapStyle", "compass", "start", "layout", "audio")
+                         "reference", "mapStyle", "compass", "start", "layout", "audio",
+                         "template", "glyph")
 
 
 def _wrap_bank_question(subject: str, q: dict, meta: dict) -> dict:
@@ -514,6 +515,11 @@ def _wrap_bank_question(subject: str, q: dict, meta: dict) -> dict:
     if t == "order":
         # 순서 채점 — 위젯이 [cardId,...] 제출, 서버가 리스트 정확 비교
         return _wrap("sequence", list(q["answer"]), public, meta)
+    if t == "trace":
+        # 따라쓰기 — 위젯 trace_path 렌더러가 궤적 제출, _grade_trace로 채점.
+        # template(안내 점선)은 비밀이 아니라 public에 노출한다(정답 유출 아님).
+        public = {**public, "type": "trace_path", "path": q["template"]}
+        return _wrap("trace", q["template"], public, meta)
     # single·place·listen: 단일 값 등호 비교
     return _wrap("single", q["answer"], public, meta)
 

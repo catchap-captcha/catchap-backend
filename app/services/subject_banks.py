@@ -10,6 +10,7 @@
 from app.services import (
     english_bank,
     english_listen,
+    english_trace,
     social_bank,
     korean_bank,
     life_bank,
@@ -23,8 +24,8 @@ BANKS: dict[str, list[dict]] = {
     "수학": math_bank.MATH_FULL,
     "과학": science_bank.SCIENCE_FULL,
     "사회": social_bank.SOCIAL_FULL,
-    # 영어 = 문법·그림문장(텍스트) + 듣기(오디오 sound-match)
-    "영어": english_bank.ENGLISH_FULL + english_listen.ENGLISH_LISTEN,
+    # 영어 = 문법·그림문장·생성기(텍스트) + 듣기(오디오) + 알파벳 따라쓰기(trace)
+    "영어": english_bank.ENGLISH_FULL + english_listen.ENGLISH_LISTEN + english_trace.ENGLISH_TRACE,
 }
 
 # 실전(서버 채점) 지원 과목 — 나머지 과목은 game-session available=false(프론트 데모 유지)
@@ -52,7 +53,8 @@ def playable_pool(subject: str) -> list[dict]:
 # 조작형 렌더 필드 — 정답(answer)이 아닌 표시 데이터만. right/cards/items는 추출 단계에서
 # 이미 셔플되어 정답 순서를 노출하지 않는다. answer/explain/playable(정답 id)은 절대 미포함.
 _RENDER_FIELDS = ("options", "left", "right", "bins", "items", "cards", "zones",
-                  "reference", "mapStyle", "compass", "start", "layout", "audio")
+                  "reference", "mapStyle", "compass", "start", "layout", "audio",
+                  "template", "glyph")
 
 
 def public_question(q: dict) -> dict:
