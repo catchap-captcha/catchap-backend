@@ -11,7 +11,7 @@
 
 from datetime import date, timedelta
 
-from app.services import life_bank
+from app.services import life_bank, subject_banks
 
 # 커리큘럼 시작 기준일. 10주제가 순환하므로 이 날은 위상(phase) 기준.
 # 데모 편의상 '오늘'이 플레이 가능한 첫 주제(교통안전)에 오도록 맞춤 (지난 10일 복습 가능).
@@ -100,9 +100,9 @@ def day_detail(subject: str, day: int, today: date | None = None) -> dict:
     # 오늘/지난날: 단계별 문항 (정답 제거). 현재 UI로는 playable(single)만 실제 플레이.
     stages = []
     for s in range(1, STAGES + 1):
-        s_qs = [life_bank.public_question(q) for q in qs if q["stage"] == s]
+        s_qs = [subject_banks.public_question(q) for q in qs if q["stage"] == s]
         stages.append({"stage": s, "questions": s_qs})
-    playable = [life_bank.public_question(q) for q in qs if q["playable"]]
+    playable = [subject_banks.public_question(q) for q in qs if q["playable"]]
     return {
         "day": day, "date": date_for_index(idx).isoformat(), "topic": topic,
         "locked": False, "status": day_status(idx, tix),

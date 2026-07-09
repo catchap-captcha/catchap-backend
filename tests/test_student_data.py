@@ -236,17 +236,18 @@ def test_game_session_server_graded(client, db, seed_org):
     assert res.status_code == 200
     body = res.json()
     assert body["available"] is True and len(body["questions"]) == 3
-    q = body["questions"][0]
-    assert "answer" not in q and "answer_id" not in q  # 정답 미노출
+    for pub in body["questions"]:
+        assert "answer" not in pub and "answer_id" not in pub  # 정답 미노출
 
-    # 일부러 오답 제출 → 서버가 incorrect 판정
-    from app.services.life_bank import get_question
+    # game-answer(단일선택) 채점 경로 검증 — 뱅크에서 single 문항을 골라 제출
+    from app.services import subject_banks
 
-    real = get_question(q["id"])
+    real = next(q for q in subject_banks.playable_pool("생활") if q["type"] == "single")
+    qid = real["id"]
     wrong = next(o["id"] for o in real["options"] if o["id"] != real["answer"])
     r1 = client.post(
         "/api/v1/students/me/game-answer",
-        json={"question_id": q["id"], "option_id": wrong},
+        json={"question_id": qid, "subject": "생활", "option_id": wrong},
         headers=auth(token),
     )
     assert r1.status_code == 200
@@ -256,7 +257,7 @@ def test_game_session_server_graded(client, db, seed_org):
     # 정답 제출 → correct + 기록 확인
     r2 = client.post(
         "/api/v1/students/me/game-answer",
-        json={"question_id": q["id"], "option_id": real["answer"], "last": True},
+        json={"question_id": qid, "subject": "생활", "option_id": real["answer"], "last": True},
         headers=auth(token),
     )
     assert r2.json()["correct"] is True
@@ -305,10 +306,10 @@ def test_game_session_new_subjects(client, db, seed_org):
     wa = db.query(WrongAnswer).filter(WrongAnswer.student_id == seed_org["student"].id).all()
     assert any(w.subject == "수학" and w.category == "num" for w in wa)
 
-    # 사회 정답 제출 → correct + learning_attempts에 과목 그대로 기록
+    # 사회 정답 제출 → correct + learning_attempts에 과목 그대로 기록 (single 문항 선택)
     from app.services.social_bank import SOCIAL_FULL
 
-    hq = SOCIAL_FULL[0]
+    hq = next(q for q in SOCIAL_FULL if q["type"] == "single")
     r2 = client.post(
         "/api/v1/students/me/game-answer",
         json={"question_id": hq["id"], "subject": "사회", "option_id": hq["answer"]},
@@ -431,13 +432,13 @@ def test_game_answer_multi_and_scoping(client, db, seed_org):
     )
     assert spoof.status_code == 404
 
-    # 위젯 전용(playable=False) 문항 제출 → 400
-    from app.services.math_bank import MATH_FULL
+    # 조작형(connect 등) 문항을 game-answer로 제출 → 400 (위젯 채점 전용)
+    from app.services.social_bank import SOCIAL_FULL
 
-    np_q = next(q for q in MATH_FULL if not q["playable"])
+    op_q = next(q for q in SOCIAL_FULL if q["type"] == "connect")
     blocked = client.post(
         "/api/v1/students/me/game-answer",
-        json={"question_id": np_q["id"], "subject": "수학", "option_id": "o1"},
+        json={"question_id": op_q["id"], "subject": "사회", "option_id": "o1"},
         headers=auth(token),
     )
     assert blocked.status_code == 400

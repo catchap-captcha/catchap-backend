@@ -49,17 +49,23 @@ def playable_pool(subject: str) -> list[dict]:
     return [q for q in BANKS.get(subject, []) if q["playable"]]
 
 
+# 조작형 렌더 필드 — 정답(answer)이 아닌 표시 데이터만. right/cards/items는 추출 단계에서
+# 이미 셔플되어 정답 순서를 노출하지 않는다. answer/explain/playable(정답 id)은 절대 미포함.
+_RENDER_FIELDS = ("options", "left", "right", "bins", "items", "cards", "zones",
+                  "reference", "mapStyle", "compass", "start", "layout", "audio")
+
+
 def public_question(q: dict) -> dict:
     """프론트로 내려줄 형태 — 정답(answer)·해설(explain) 제거.
 
     playable은 bool로 변환한다(원본은 정답 옵션 id를 담고 있어 그대로 내리면 정답 유출).
+    조작형(connect/sort/order/place)은 유형별 렌더 필드만 노출한다.
     """
     pub = {
         "id": q["id"], "topic": q["topic"], "stage": q["stage"], "type": q["type"],
-        "prompt": q["prompt"], "hint": q["hint"], "options": q["options"],
-        "playable": bool(q["playable"]),
+        "prompt": q["prompt"], "hint": q["hint"], "playable": bool(q["playable"]),
     }
-    # 듣기: 오디오 파일(불투명 이름)만 내려준다 — 정답 단어(explain)는 절대 포함하지 않음
-    if q.get("audio"):
-        pub["audio"] = q["audio"]
+    for f in _RENDER_FIELDS:
+        if f in q:
+            pub[f] = q[f]
     return pub

@@ -483,21 +483,38 @@ def _grade_trace(answer, template: list) -> bool:
     return covered >= TRACE_COVER_FRAC and stray < TRACE_STRAY_THRESHOLD
 
 
+# 조작형 문항의 표시 필드(정답 아님) — verify에서 위젯이 렌더할 데이터. 추출 단계에서
+# right/cards/items는 이미 셔플되어 정답 순서를 노출하지 않는다.
+_WIDGET_RENDER_FIELDS = ("options", "left", "right", "bins", "items", "cards", "zones",
+                         "reference", "mapStyle", "compass", "start", "layout", "audio")
+
+
 def _wrap_bank_question(subject: str, q: dict, meta: dict) -> dict:
-    """뱅크 문항 → 위젯 챌린지 포맷. 토큰 meta에 qid를 실어 verify에서 오답노트에 쓴다."""
-    opts = [{"id": o["id"], "emoji": o["emoji"], "text": o["text"]} for o in q["options"]]
+    """뱅크 문항 → 위젯 챌린지 포맷. 토큰 meta에 qid를 실어 verify에서 오답노트에 쓴다.
+
+    유형별 채점 kind(정답은 토큰에만 서명, public엔 미포함):
+      single/place → single(등호) · multi → select_all(집합) ·
+      connect/sort → match(딕셔너리 정확 일치) · order → sequence(순서 일치)
+    """
     meta = {**meta, "qid": q["id"]}
-    public = {
+    public: dict = {
         "type": q["type"], "subject": subject, "topic": q["topic"],
-        "prompt": q["prompt"], "hint": q["hint"], "options": opts,
+        "prompt": q["prompt"], "hint": q["hint"],
     }
-    # 듣기: 오디오 파일(불투명 이름)을 실어 위젯이 🔊 재생하게 한다 — 정답 단어는 미포함
-    if q.get("audio"):
-        public["audio"] = q["audio"]
-    if q["type"] == "multi":
-        # 복수선택 — 위젯 multi 렌더러가 배열 제출, 서버는 집합 비교(select_all)로 채점
+    for f in _WIDGET_RENDER_FIELDS:
+        if f in q:
+            public[f] = q[f]
+
+    t = q["type"]
+    if t == "multi":
         return _wrap("select_all", sorted(q["answer"]), public, meta)
-    # single·listen: 단일 선택(옵션 등호 비교)
+    if t in ("connect", "sort"):
+        # 매핑 채점 — 위젯이 {leftId:rightId}/{itemId:binId} 제출, 서버가 dict 정확 비교
+        return _wrap("match", dict(q["answer"]), public, meta)
+    if t == "order":
+        # 순서 채점 — 위젯이 [cardId,...] 제출, 서버가 리스트 정확 비교
+        return _wrap("sequence", list(q["answer"]), public, meta)
+    # single·place·listen: 단일 값 등호 비교
     return _wrap("single", q["answer"], public, meta)
 
 
@@ -581,6 +598,15 @@ def verify_challenge(db: Session, challenge_token: str, answer) -> dict:
         # answer 타입 미방어 시 정수 등 비반복형 입력이 TypeError → 공개 엔드포인트 500
         picked = sorted(str(x) for x in answer) if isinstance(answer, (list, tuple)) else []
         ok = len(picked) > 0 and picked == sorted(str(x) for x in target)
+    elif kind == "match":
+        # connect/sort — {leftId:rightId}/{itemId:binId} 딕셔너리 정확 일치.
+        # 비-dict 입력(위조·정수)은 조용히 오답 처리(500 방지). 부분 정답 없음.
+        sub = {str(k): str(v) for k, v in answer.items()} if isinstance(answer, dict) else {}
+        ok = bool(target) and sub == {str(k): str(v) for k, v in target.items()}
+    elif kind == "sequence":
+        # order — [cardId,...] 순서 정확 일치. 비-list 입력은 오답.
+        seq = [str(x) for x in answer] if isinstance(answer, (list, tuple)) else []
+        ok = len(seq) > 0 and seq == [str(x) for x in target]
     elif kind == "drop":
         # 끌어다 놓기 — 드롭 지점 거리로 채점. 거리는 서버 진실값으로 행동 데이터에 기록
         ok, dist = _grade_drop(answer, target)
