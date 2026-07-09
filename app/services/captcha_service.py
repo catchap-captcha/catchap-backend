@@ -542,7 +542,7 @@ def _edu_challenge(
 
     meta = {"subj": subject, "rp": bool(replay)}
     if subject not in subject_banks.LIVE_SUBJECTS:
-        # 뱅크 없는 과목(국어)은 동작형만 낸다 — '정답 예시' 데모 문항은 폐기
+        # 뱅크 없는 과목은 동작형만 낸다 — '정답 예시' 데모 문항은 폐기
         # (문제은행 연동 전까지: 데모는 정답이 뻔해 학습기록·코인 적립 대상이 될 수 없음)
         if random.random() < 0.5:
             return _edu_drag_challenge(subject, meta)
@@ -556,7 +556,7 @@ def _edu_challenge(
             return _edu_drag_challenge(subject, meta)
         if roll < 0.5:
             return _edu_trace_challenge(subject, meta)
-    # 실문항 뱅크 (생활=ms / 수학·과학=my / 역사=sw / 영어=ms english — capcha_service 이식)
+    # 실문항 뱅크 (생활=ms / 수학·과학=my / 역사=sw / 영어=ms english / 국어=jy — capcha_service 이식)
     pool = subject_banks.playable_pool(subject)
     q = random.choice(pool)
     return _wrap_bank_question(subject, q, meta)

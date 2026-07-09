@@ -269,8 +269,8 @@ def test_game_session_server_graded(client, db, seed_org):
     results = sorted(r.result for r in rows)
     assert results == ["correct", "incorrect"]  # 서버 판정 그대로 기록됨
 
-    # 뱅크 없는 과목(국어)은 미지원 → available=False (프론트 데모 유지)
-    other = client.get("/api/v1/students/me/game-session?subject=국어", headers=auth(token)).json()
+    # 존재하지 않는 과목은 미지원 → available=False (전 6과목이 뱅크를 갖춰 실과목 데모는 없음)
+    other = client.get("/api/v1/students/me/game-session?subject=코딩", headers=auth(token)).json()
     assert other["available"] is False
 
 
@@ -345,6 +345,57 @@ def test_game_session_new_subjects(client, db, seed_org):
     assert db.query(LearningAttempt).filter(
         LearningAttempt.student_id == seed_org["student"].id, LearningAttempt.subject == "영어"
     ).count() >= 1
+
+
+def test_game_session_korean(client, db, seed_org):
+    """국어 실문항 (capcha_service jy 이식): 발급 sanitize + 서버 채점 + 오답노트 word + 의견 multi."""
+    from app.models import LearningAttempt, WrongAnswer
+
+    token = _student_token(client, seed_org)
+    res = client.get("/api/v1/students/me/game-session?subject=국어&count=3", headers=auth(token))
+    assert res.status_code == 200
+    body = res.json()
+    assert body["available"] is True and len(body["questions"]) == 3
+    for q in body["questions"]:
+        assert "answer" not in q and "explain" not in q
+        assert q["playable"] is True
+
+    # single 오답 → 오답노트 category=word(낱말·한글), 정답 → learning_attempts 과목=국어
+    from app.services.korean_bank import KOREAN_FULL
+
+    kq = next(q for q in KOREAN_FULL if q["type"] == "single")
+    kwrong = next(o["id"] for o in kq["options"] if o["id"] != kq["answer"])
+    r1 = client.post(
+        "/api/v1/students/me/game-answer",
+        json={"question_id": kq["id"], "subject": "국어", "option_id": kwrong},
+        headers=auth(token),
+    )
+    assert r1.status_code == 200 and r1.json()["correct"] is False
+    wa = db.query(WrongAnswer).filter(WrongAnswer.student_id == seed_org["student"].id).all()
+    assert any(w.subject == "국어" and w.category == "word" for w in wa)
+    r2 = client.post(
+        "/api/v1/students/me/game-answer",
+        json={"question_id": kq["id"], "subject": "국어", "option_id": kq["answer"]},
+        headers=auth(token),
+    )
+    assert r2.json()["correct"] is True
+    assert db.query(LearningAttempt).filter(
+        LearningAttempt.student_id == seed_org["student"].id, LearningAttempt.subject == "국어"
+    ).count() >= 1
+
+    # 사실·의견(multi): 부분 선택 → 오답, 의견 전체(순서 무관) → 정답
+    mq = next(q for q in KOREAN_FULL if q["type"] == "multi" and len(q["answer"]) > 1)
+    partial = client.post(
+        "/api/v1/students/me/game-answer",
+        json={"question_id": mq["id"], "subject": "국어", "option_ids": mq["answer"][:1]},
+        headers=auth(token),
+    )
+    ok_full = client.post(
+        "/api/v1/students/me/game-answer",
+        json={"question_id": mq["id"], "subject": "국어", "option_ids": list(reversed(mq["answer"]))},
+        headers=auth(token),
+    )
+    assert (partial.json()["correct"], ok_full.json()["correct"]) == (False, True)
 
 
 def test_game_answer_multi_and_scoping(client, db, seed_org):

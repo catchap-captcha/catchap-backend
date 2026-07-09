@@ -4,18 +4,21 @@
 같은 파이프라인을 탄다. 정답(answer)·해설(explain)은 서버에만 존재한다.
 - 생활: capcha_service ms 브랜치 (커리큘럼 일차 순환은 생활 전용 — curriculum.py)
 - 수학·과학: capcha_service my 브랜치 / 역사: capcha_service sw 브랜치(02-history)
+- 국어: capcha_service jy 브랜치 (4학년 국어 13유형)
 """
 
 from app.services import (
     english_bank,
     english_listen,
     history_bank,
+    korean_bank,
     life_bank,
     math_bank,
     science_bank,
 )
 
 BANKS: dict[str, list[dict]] = {
+    "국어": korean_bank.KOREAN_FULL,
     "생활": life_bank.LIFE_FULL,
     "수학": math_bank.MATH_FULL,
     "과학": science_bank.SCIENCE_FULL,
@@ -28,7 +31,9 @@ BANKS: dict[str, list[dict]] = {
 LIVE_SUBJECTS = frozenset(BANKS)
 
 # 오답노트 카테고리(D.WRONG_TAGS 키) 매핑
-WRONG_CATEGORY = {"생활": "safe", "수학": "num", "과학": "img", "역사": "hist", "영어": "eng"}
+WRONG_CATEGORY = {
+    "국어": "word", "생활": "safe", "수학": "num", "과학": "img", "역사": "hist", "영어": "eng",
+}
 
 _BY_ID: dict[str, dict[str, dict]] = {
     subject: {q["id"]: q for q in bank} for subject, bank in BANKS.items()
