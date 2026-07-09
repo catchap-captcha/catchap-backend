@@ -251,15 +251,18 @@ _MAIN_CATEGORIES = [
 def make_challenge(
     product: str, subject: str | None, day: int | None = None,
     replay: bool = False, learning: bool = False,
+    chapter: int | None = None, stage: int | None = None,
 ) -> dict:
     """공개 응답용 챌린지(정답 미포함) + 검증용 서명 토큰.
 
     day/replay(교육형·인앱): 커리큘럼 일차 문항 발급 + 복습 표시. 토큰에 서명돼
     verify 시점에 위조 없이 복원된다.
+    chapter/stage(전체학습 주간 챕터): 그 단계 문항만 출제 + 토큰에 서명 →
+    verify가 오늘의퀴즈를 건드리지 않게(학습·습관 분리) 판별한다.
     learning(1st-party 인앱): 뱅크 있는 과목은 조작형 대신 실제 문제만 낸다.
     """
     if product == "edu":
-        return _edu_challenge(subject, day, replay, learning)
+        return _edu_challenge(subject, day, replay, learning, chapter, stage)
     return _main_challenge()
 
 
@@ -499,9 +502,24 @@ def _wrap_bank_question(subject: str, q: dict, meta: dict) -> dict:
 
 
 def _edu_challenge(
-    subject: str, day: int | None = None, replay: bool = False, learning: bool = False
+    subject: str, day: int | None = None, replay: bool = False, learning: bool = False,
+    chapter: int | None = None, stage: int | None = None,
 ) -> dict:
     from app.services import subject_banks
+
+    # 전체학습 주간 챕터: 그 (챕터,단계)의 2문항에서만 출제한다. chapter/stage를 토큰 meta에
+    # 서명해 verify가 오늘의퀴즈(습관)를 건드리지 않게 판별한다(학습·습관 분리).
+    if chapter is not None and stage is not None and subject in subject_banks.LIVE_SUBJECTS:
+        from app.services import chapters as _ch
+
+        ids = _ch.chapter_question_ids(subject, chapter, stage)
+        pool = [q for q in (subject_banks.get_question(subject, i) for i in ids) if q is not None]
+        if not pool:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, detail="플레이할 문항이 없어요.")
+        q = random.choice(pool)
+        return _wrap_bank_question(
+            subject, q, {"subj": subject, "rp": bool(replay), "chapter": chapter, "stage": stage}
+        )
 
     # 커리큘럼 일차 지정(생활): 그 일차의 문항만 낸다 — 실전 세션과 동일 의미.
     # is_replay(지난 일차)는 서버가 판정해 토큰에 서명 — 클라이언트가 복습 여부를 위조 못 함.
@@ -558,7 +576,7 @@ def verify_challenge(db: Session, challenge_token: str, answer) -> dict:
         raise HTTPException(status.HTTP_409_CONFLICT, detail="이미 사용된 챌린지예요.")
     kind, target = data["k"], data["a"]
     # 발급 시 서명해 둔 문항 메타(과목·문항id·일차·복습) — 엔드포인트가 학생 적립에 쓰고 응답 전 제거
-    extra: dict = {"meta": {k: data[k] for k in ("subj", "qid", "day", "rp") if k in data}}
+    extra: dict = {"meta": {k: data[k] for k in ("subj", "qid", "day", "rp", "chapter", "stage") if k in data}}
     if kind == "select_all":
         # answer 타입 미방어 시 정수 등 비반복형 입력이 TypeError → 공개 엔드포인트 500
         picked = sorted(str(x) for x in answer) if isinstance(answer, (list, tuple)) else []

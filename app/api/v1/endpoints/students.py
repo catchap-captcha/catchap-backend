@@ -1427,6 +1427,27 @@ def _bump_chapter_stage(
     return cp.stages_done
 
 
+class _ChapterStageDoneReq(_GBaseModel):
+    subject: str
+    chapter: int
+    stage: int
+
+
+@router.post("/students/me/chapter-stage-complete")
+def chapter_stage_complete(
+    req: _ChapterStageDoneReq,
+    principal: Principal = Depends(require_student),
+    db: Session = Depends(get_db),
+):
+    """전체학습 위젯 세션(한 단계=2문항) 완료 시 단계 커서 전진 — 위젯 채점(game-answer 아님)
+    경로라 별도 호출. 순차 가드로 건너뛰기·위조 방지(_bump_chapter_stage)."""
+    me = _me(principal)
+    if req.subject not in D.SUBJECT_ORDER:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="알 수 없는 과목입니다.")
+    sd = _bump_chapter_stage(db, me, req.subject, req.chapter, req.stage)
+    return {"ok": True, "stages_done": sd}
+
+
 def _opt_texts(q: dict, ids: list[str]) -> str:
     """옵션 id 목록 → 사람이 읽을 답 텍스트 (text 비면 emoji 슬롯의 숫자/기호 사용)."""
     by_id = {o["id"]: o for o in q.get("options", [])}

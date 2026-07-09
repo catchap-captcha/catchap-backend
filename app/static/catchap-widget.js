@@ -37,6 +37,8 @@
     var authStatic = box.getAttribute('data-auth') || '';      // 학생 access token(고정) → 적립
     var authFn = typeof box.catchapAuth === 'function' ? box.catchapAuth : null; // 매 요청 호출(만료 자동 갱신)
     var day = box.getAttribute('data-day') || '';              // 커리큘럼 일차
+    var chapter = box.getAttribute('data-chapter') || '';      // 전체학습 주간 챕터
+    var stage = box.getAttribute('data-stage') || '';          // 챕터 단계(1~5)
     var replay = box.getAttribute('data-replay') === '1';      // 복습(코인·퀴즈 상태 미반영)
     var sessionTotal = parseInt(box.getAttribute('data-total') || '0', 10) || 0; // 세션 문항 수
     if (!key) { box.textContent = 'CatChap: data-site-key 가 필요합니다.'; return; }
@@ -564,6 +566,8 @@
       var qs = [];
       if (subject) qs.push('subject=' + encodeURIComponent(subject));
       if (day) qs.push('day=' + encodeURIComponent(day));
+      if (chapter) qs.push('chapter=' + encodeURIComponent(chapter));
+      if (stage) qs.push('stage=' + encodeURIComponent(stage));
       if (replay) qs.push('replay=true');
       var path = '/captcha/v1/challenge' + (qs.length ? '?' + qs.join('&') : '');
       getAuth().then(function (a) {

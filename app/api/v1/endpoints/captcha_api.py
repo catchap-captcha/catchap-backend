@@ -113,6 +113,8 @@ def _credit_student(db: Session, student: StudentProfile, meta: dict, correct: b
     subject = str(meta.get("subj") or "")
     replay = bool(meta.get("rp"))
     qid = meta.get("qid")
+    # 전체학습 주간 챕터 플레이면 오늘의퀴즈(습관)를 건드리지 않는다(학습·습관 분리).
+    is_chapter = meta.get("chapter") is not None
 
     principal = Principal(kind="student", id=student.id, role="student", student=student)
 
@@ -141,10 +143,12 @@ def _credit_student(db: Session, student: StudentProfile, meta: dict, correct: b
     answered = answered_before + 1
     attempt_req = AttemptCreate(
         subject=subject,
+        chapter_no=meta.get("chapter"),
         result="correct" if correct else "incorrect",
         score=20 if correct else 0,  # 5문 기준 100점 만점 (game-answer와 동일)
         completed=answered >= EDU_SESSION_TOTAL and not replay,
         replay=replay,
+        daily=not is_chapter,  # 챕터 플레이는 오늘의퀴즈 done/연속도전 미갱신
         behavior=None,  # 행동데이터는 record_behavior(edu-api)로 이미 적재 — 이중 기록 방지
     )
     saved = save_attempt(attempt_req, principal, db)
@@ -177,6 +181,8 @@ def challenge(
     subject: str | None = None,  # edu 전용 과목 오버라이드 (?subject=수학) — 1st-party 인앱 임베드용
     day: int | None = None,  # edu·생활: 커리큘럼 일차 문항 (미래 일차는 잠금 에러)
     replay: bool = False,  # edu: 복습 세션 — verify 적립 시 코인·퀴즈 상태 미반영
+    chapter: int | None = None,  # 전체학습 주간 챕터 — 그 챕터 문항만 + 오늘의퀴즈 미오염
+    stage: int | None = None,  # 챕터 단계(1~5) — 단계 문항 슬라이스
     db: Session = Depends(get_db),
 ):
     _throttle(db, request, "chall", RATE_CHALLENGE_PER_MIN)
@@ -195,7 +201,12 @@ def challenge(
         learning = True
     if day is not None:
         learning = True  # 커리큘럼 일차(생활 인앱)도 학습 세션
-    ch = cs.make_challenge(api.product, eff_subject, day=day, replay=replay, learning=learning)
+    if chapter is not None:
+        learning = True  # 전체학습 주간 챕터도 학습 세션(조작형 대신 실문항)
+    ch = cs.make_challenge(
+        api.product, eff_subject, day=day, replay=replay, learning=learning,
+        chapter=chapter, stage=stage,
+    )
     cs.log_call(db, api, "captcha/challenge", 200)
     db.commit()
     return {"product": api.product, "subject": eff_subject, **ch}
