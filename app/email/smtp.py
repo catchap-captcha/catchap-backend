@@ -53,6 +53,13 @@ def _finalize_html(body_html: str) -> str:
 def _html_to_text(html: str) -> str:
     """HTML을 대략적인 평문으로 변환 (text/plain 대체 파트용 — HTML 버전과 내용이 유사해야 감점이 없다)."""
     text = re.sub(r"(?is)<(script|style).*?</\1>", "", html)
+    # 링크는 '텍스트 (URL)'로 살린다 — 초대 수락처럼 버튼이 본문의 전부인 메일에서
+    # 텍스트 전용 클라이언트가 URL을 아예 못 받는 문제 방지
+    text = re.sub(
+        r'(?is)<a\b[^>]*href="([^"]+)"[^>]*>(.*?)</a>',
+        lambda m: f"{re.sub(r'(?is)<[^>]+>', '', m.group(2)).strip()} ({m.group(1)})",
+        text,
+    )
     text = re.sub(r"(?i)<br\s*/?>", "\n", text)
     text = re.sub(r"(?i)</(p|div|h[1-6]|tr|li)>", "\n", text)
     text = re.sub(r"(?is)<[^>]+>", "", text)
