@@ -183,6 +183,22 @@
         msg = okAns ? '정확히 쏙 넣었어요! 🎯' : '조금 빗나갔어요. 다시 한 번 해볼까요?';
       } else if (lastType === 'trace_path') {
         msg = okAns ? '선을 참 잘 따라 그렸어요! ✍️' : '점선을 따라 천천히 다시 그려볼까요?';
+      } else if (lastType === 'dictation' || lastType === 'type_in') {
+        // 입력형 — 서버가 내려준 정답 문자열 그대로 보여준다
+        msg = okAns
+          ? '정답이에요! 참 잘했어요 🎉'
+          : (typeof res.answer === 'string' && res.answer
+              ? '아쉬워요! 정답은 "' + res.answer + '"' : '아쉬워요! 다시 한 번 생각해봐요.');
+      } else if (lastType === 'crossword') {
+        msg = okAns ? '십자말을 완성했어요! 🎉' : '아쉬워요! 낱말을 다시 살펴볼까요?';
+      } else if (lastType === 'drag_pick') {
+        // 정답 카드 라벨 매핑 (res.answer = {item, zone})
+        var okItem = res.answer && res.answer.item;
+        var okOpt = null;
+        for (var di = 0; di < lastOptions.length; di++) { if (lastOptions[di].id === okItem) okOpt = lastOptions[di]; }
+        msg = okAns
+          ? '정확히 쏙 넣었어요! 🎯'
+          : (okOpt ? '아쉬워요! 정답은 "' + okOpt.text + '"' : '조금 빗나갔어요. 다시 한 번 해볼까요?');
       } else {
         // res.answer: 정답 id(단일) 또는 id 배열(multi) — 서버가 채점 후에만 내려준다(오답 시 없음)
         var ansIds = res.answer === undefined || res.answer === null ? [] : [].concat(res.answer);
@@ -381,6 +397,472 @@
       else { refs.redo.onclick = function () { if (answered) return; doRedo(); redoCount += 1; }; refs.submit.onclick = doSubmit; }
     }
 
+    // ── 카드 드래그(drag_pick) — 원본(과학·수학): 카드 여러 장 중 알맞은 것을 타겟에 끌어놓기.
+    //    제출 {item: 카드id, x, y} → 서버가 아이템 일치 + 드롭 존 거리로 채점.
+    function renderDragPick(d, token) {
+      var area = h('div');
+      css(area, { position: 'relative', width: '100%', height: '300px', background: '#FFFAF4',
+        border: '2px dashed #F0E4D8', borderRadius: '14px', overflow: 'hidden', touchAction: 'none' });
+      var ring = h('div');
+      css(ring, { position: 'absolute', width: '92px', height: '92px', border: '3px dashed #FFB8A8',
+        borderRadius: '50%', transform: 'translate(-50%,-50%)', pointerEvents: 'none',
+        left: (d.zone.cx * 100) + '%', top: (d.zone.cy * 100) + '%' });
+      var tgt = h('div'); tgt.textContent = (d.target && d.target.e) || '🎯';
+      css(tgt, { position: 'absolute', fontSize: '44px', transform: 'translate(-50%,-50%)', pointerEvents: 'none',
+        left: (d.zone.cx * 100) + '%', top: (d.zone.cy * 100) + '%' });
+      area.appendChild(ring); area.appendChild(tgt);
+      if (d.target && d.target.label) {
+        var tl = h('div'); tl.textContent = d.target.label;
+        css(tl, { position: 'absolute', fontSize: '11px', fontWeight: '700', color: '#B7A68F',
+          transform: 'translate(-50%,0)', left: (d.zone.cx * 100) + '%',
+          top: 'calc(' + (d.zone.cy * 100) + '% + 50px)', pointerEvents: 'none' });
+        area.appendChild(tl);
+      }
+      var dropAt = null, els = {};
+      function norm(e) {
+        var r = area.getBoundingClientRect();
+        return { x: Math.max(0, Math.min(1, (e.clientX - r.left) / r.width)),
+                 y: Math.max(0, Math.min(1, (e.clientY - r.top) / r.height)) };
+      }
+      // 카드들을 아래쪽에 가로로 배치 — 각자 드래그 가능
+      var n = d.items.length;
+      d.items.forEach(function (it, i) {
+        var card = h('div');
+        var em = h('span'); em.textContent = it.e || '';
+        css(em, { display: 'block', fontSize: '34px', lineHeight: '1' });
+        card.appendChild(em);
+        if (it.label) {
+          var lb = h('span'); lb.textContent = it.label;
+          css(lb, { display: 'block', fontSize: '11px', fontWeight: '700', color: '#6B6157', marginTop: '2px' });
+          card.appendChild(lb);
+        }
+        var sx = (i + 1) / (n + 1), sy = 0.82;
+        css(card, { position: 'absolute', textAlign: 'center', transform: 'translate(-50%,-50%)',
+          left: (sx * 100) + '%', top: (sy * 100) + '%', cursor: 'grab', userSelect: 'none', touchAction: 'none',
+          padding: '6px 8px', background: '#fff', border: '2px solid #F0E4D8', borderRadius: '12px' });
+        var dragging = false;
+        card.addEventListener('pointerdown', function (e) {
+          if (answered) return;
+          dragging = true; card.setPointerCapture(e.pointerId);
+          card.style.cursor = 'grabbing'; card.style.zIndex = '5'; e.preventDefault();
+        });
+        card.addEventListener('pointermove', function (e) {
+          if (!dragging) return;
+          var p = norm(e);
+          card.style.left = (p.x * 100) + '%'; card.style.top = (p.y * 100) + '%';
+        });
+        card.addEventListener('pointerup', function (e) {
+          if (!dragging || answered) return;
+          dragging = false; card.style.cursor = 'grab'; card.style.zIndex = '1';
+          var p = norm(e);
+          dropAt = { item: it.id, x: Math.round(p.x * 1000) / 1000, y: Math.round(p.y * 1000) / 1000 };
+          if (footerOn) footerState(true, true);
+          else verify(token, dropAt);
+        });
+        els[it.id] = { el: card, sx: sx, sy: sy };
+        area.appendChild(card);
+      });
+      body.appendChild(area);
+      if (d.hint) hintLine(d.hint);
+      if (footerOn) {
+        pendingRedo = function () {
+          dropAt = null;
+          d.items.forEach(function (it) { var s = els[it.id];
+            s.el.style.left = (s.sx * 100) + '%'; s.el.style.top = (s.sy * 100) + '%'; });
+          footerState(false, false);
+        };
+        pendingSubmit = function () { if (dropAt) verify(token, dropAt); };
+      }
+    }
+
+    // ── 입력형(dictation/type_in) — 원본(국어): 받아쓰기는 TTS로 듣고, 높임말은 밑줄
+    //    낱말을 보고 타이핑. 제출 문자열 → 서버 trim 정확 일치.
+    function renderTyping(d, token) {
+      if (d.type === 'dictation') {
+        var canSpeak = typeof window.speechSynthesis !== 'undefined';
+        var played = false;
+        var sp = h('button'); sp.textContent = '🔊 듣기';
+        css(sp, { display: 'block', margin: '0 auto 16px', padding: '13px 26px', fontSize: '17px', fontWeight: '800',
+          border: 'none', borderRadius: '30px', background: canSpeak ? C : '#D8CBBB', color: '#fff',
+          cursor: canSpeak ? 'pointer' : 'not-allowed' });
+        sp.onclick = function () {
+          if (!canSpeak) return;
+          try {
+            window.speechSynthesis.cancel();
+            var u = new SpeechSynthesisUtterance(d.tts);
+            u.lang = 'ko-KR'; u.rate = 0.9;
+            window.speechSynthesis.speak(u);
+            played = true; sp.textContent = '🔊 다시 듣기';
+          } catch (e) {}
+        };
+        body.appendChild(sp);
+        if (!canSpeak) {
+          var warn = h('div'); warn.textContent = '이 브라우저에서는 음성 듣기를 지원하지 않아요.';
+          css(warn, { textAlign: 'center', fontSize: '12px', color: '#C25', marginBottom: '10px' });
+          body.appendChild(warn);
+        }
+      } else {
+        // type_in(높임말): 원문 문장 + 밑줄 강조 낱말 (textContent — 뱅크 문자열 그대로)
+        var sent = h('div');
+        sent.appendChild(document.createTextNode(d.before || ''));
+        var hi = h('span'); hi.textContent = d.highlight || '';
+        css(hi, { color: '#E2574C', borderBottom: '3px solid #E2574C', fontWeight: '800' });
+        sent.appendChild(hi);
+        sent.appendChild(document.createTextNode(d.after || ''));
+        css(sent, { fontSize: '17px', fontWeight: '700', color: '#3A3226', lineHeight: '1.8',
+          background: '#fff', border: '2px solid #F0E4D8', borderRadius: '14px',
+          padding: '14px 18px', maxWidth: '440px', margin: '0 auto 16px' });
+        body.appendChild(sent);
+      }
+      var input = h('input');
+      input.type = 'text';
+      input.placeholder = d.type === 'dictation' ? '들은 문장을 그대로 입력해요' : '알맞은 표현을 입력해요';
+      css(input, { display: 'block', width: '100%', maxWidth: '420px', margin: '0 auto', boxSizing: 'border-box',
+        fontFamily: 'inherit', fontSize: '16px', fontWeight: '600', padding: '13px 15px',
+        borderRadius: '13px', border: '2px solid #F0E4D8', color: '#3A3226', outline: 'none' });
+      input.addEventListener('input', function () {
+        if (footerOn) { var v = input.value.trim(); footerState(v.length > 0, v.length > 0); }
+      });
+      input.addEventListener('keydown', function (e) {
+        if (e.key === 'Enter' && input.value.trim()) {
+          if (footerOn) { if (pendingSubmit) pendingSubmit(); }
+          else verify(token, input.value);
+        }
+      });
+      body.appendChild(input);
+      if (d.hint) hintLine(d.hint);
+      function subT() { var v = input.value; if (v.trim()) verify(token, v); }
+      if (footerOn) {
+        pendingRedo = function () { input.value = ''; footerState(false, false); };
+        pendingSubmit = subT;
+      } else {
+        var tb = h('button'); tb.textContent = '확인'; css(tb, btnStyle(C, '#fff'));
+        tb.onclick = subT; body.appendChild(tb);
+      }
+    }
+
+    // ── 문장부호(punct) — 원본(국어): 어절 사이 자리(동그라미)를 모두 탭. 제출 [gap...]
+    function renderPunct(d, token) {
+      var picked = {};
+      var gapEls = {};
+      var line = h('div');
+      css(line, { display: 'flex', flexWrap: 'wrap', alignItems: 'center', justifyContent: 'center',
+        gap: '4px', maxWidth: '480px', margin: '0 auto 8px' });
+      (d.tokens || []).forEach(function (w, i) {
+        var word = h('span'); word.textContent = w;
+        css(word, { fontSize: '17px', fontWeight: '700', color: '#3A3226' });
+        line.appendChild(word);
+        if ((d.gaps || []).indexOf(i) !== -1) {
+          var g = h('button'); g.textContent = '_';
+          css(g, { width: '28px', height: '28px', margin: '0 3px', borderRadius: '50%',
+            border: '2px solid #F0E4D8', background: '#fff', color: '#B7A68F',
+            fontSize: '15px', fontWeight: '800', cursor: 'pointer', lineHeight: '1', padding: '0' });
+          g.onclick = function () {
+            if (answered) return;
+            picked[i] = !picked[i];
+            g.textContent = picked[i] ? '✓' : '_';
+            g.style.borderColor = picked[i] ? C : '#F0E4D8';
+            g.style.background = picked[i] ? '#FFF0EE' : '#fff';
+            g.style.color = picked[i] ? C : '#B7A68F';
+            if (footerOn) {
+              var pn = Object.keys(picked).filter(function (k) { return picked[k]; }).length;
+              footerState(pn > 0, pn > 0);
+            }
+          };
+          gapEls[i] = g;
+          line.appendChild(g);
+        }
+      });
+      body.appendChild(line);
+      if (d.hint) hintLine(d.hint);
+      function subG() {
+        var ans = Object.keys(picked).filter(function (k) { return picked[k]; });
+        if (ans.length) verify(token, ans);
+      }
+      if (footerOn) {
+        pendingRedo = function () {
+          picked = {};
+          Object.keys(gapEls).forEach(function (k) { var g = gapEls[k];
+            g.textContent = '_'; g.style.borderColor = '#F0E4D8'; g.style.background = '#fff'; g.style.color = '#B7A68F'; });
+          footerState(false, false);
+        };
+        pendingSubmit = subG;
+      } else {
+        var gb = h('button'); gb.textContent = '확인'; css(gb, btnStyle(C, '#fff'));
+        gb.onclick = subG; body.appendChild(gb);
+      }
+    }
+
+    // ── 십자말(crossword) — 원본(국어): 격자 셀 탭으로 낱말 선택 → 음절 타일로 채우기.
+    //    낱말 정답은 서버에만 있어 즉시 판정 대신 전부 채우면 제출({w0:"낱말",...} match 채점).
+    function renderCrossword(d, token) {
+      var CELL = 40;
+      var wordCells = [], cellOwner = {}, startNo = {};
+      (d.words || []).forEach(function (w, wi) {
+        var cells = [];
+        for (var k = 0; k < w.len; k++) {
+          var r = w.dir === 'down' ? w.row + k : w.row;
+          var c = w.dir === 'across' ? w.col + k : w.col;
+          var key = r + ',' + c;
+          cells.push(key);
+          (cellOwner[key] = cellOwner[key] || []).push(wi);
+        }
+        wordCells.push(cells);
+        startNo[w.row + ',' + w.col] = w.no;
+      });
+      var filled = {}, lockedCells = {}, active = null;
+      if (d.reveal) { Object.keys(d.reveal).forEach(function (k) { filled[k] = d.reveal[k]; lockedCells[k] = true; }); }
+      var bank = (d.tiles || []).map(function (t, i) { return { id: i, letter: t }; });
+      var cellEls = {}, clue = null, tray = null;
+
+      var grid = h('div');
+      css(grid, { display: 'grid',
+        gridTemplateColumns: 'repeat(' + d.size + ',' + CELL + 'px)',
+        gridTemplateRows: 'repeat(' + d.size + ',' + CELL + 'px)',
+        gap: '4px', justifyContent: 'center', margin: '0 auto 14px' });
+      for (var gi = 0; gi < d.size * d.size; gi++) {
+        (function (gi) {
+          var r = Math.floor(gi / d.size), c = gi % d.size, key = r + ',' + c;
+          if (!cellOwner[key]) { var sp = h('div'); css(sp, { width: CELL + 'px', height: CELL + 'px' }); grid.appendChild(sp); return; }
+          var cell = h('button');
+          css(cell, { position: 'relative', width: CELL + 'px', height: CELL + 'px', fontFamily: 'inherit',
+            fontSize: '17px', fontWeight: '800', borderRadius: '8px', border: '2px solid #F0E4D8',
+            background: '#fff', color: '#3A3226', cursor: 'pointer', padding: '0' });
+          if (startNo[key] !== undefined) {
+            var no = h('span'); no.textContent = startNo[key];
+            css(no, { position: 'absolute', top: '1px', left: '4px', fontSize: '9px', fontWeight: '700', color: '#B7A68F' });
+            cell.appendChild(no);
+          }
+          var ch = h('span'); ch.textContent = filled[key] || '';
+          css(ch, { display: 'block' });
+          cell.appendChild(ch);
+          cell.onclick = function () {
+            if (answered) return;
+            var owners = cellOwner[key] || [];
+            if (!owners.length) return;
+            active = owners[0];
+            paint();
+          };
+          cellEls[key] = { el: cell, ch: ch };
+          grid.appendChild(cell);
+        })(gi);
+      }
+      body.appendChild(grid);
+
+      clue = h('div');
+      css(clue, { maxWidth: '380px', margin: '0 auto 12px', textAlign: 'left', background: '#F5ECF1',
+        border: '2px solid #A65B8C', borderRadius: '14px', padding: '10px 14px', display: 'none' });
+      body.appendChild(clue);
+
+      tray = h('div');
+      css(tray, { display: 'flex', flexWrap: 'wrap', gap: '8px', justifyContent: 'center', maxWidth: '400px', margin: '0 auto 12px' });
+      body.appendChild(tray);
+
+      var clearBtn = h('button'); clearBtn.textContent = '지우기';
+      css(clearBtn, { display: 'block', margin: '0 auto', padding: '8px 20px', borderRadius: '20px',
+        border: '2px solid #F0E4D8', background: '#fff', color: '#8A8070', fontWeight: '800', fontSize: '13px', cursor: 'pointer' });
+      clearBtn.onclick = function () {
+        if (answered || active == null) return;
+        wordCells[active].forEach(function (key) {
+          if (lockedCells[key] || !(key in filled)) return;
+          // 다른 낱말이 완성 상태로 쓰는 셀이라도 서버 채점 전이라 완성 여부를 모름 → 전부 반환
+          bank.push({ id: bank.length ? bank[bank.length - 1].id + 1 : 0, letter: filled[key] });
+          delete filled[key];
+        });
+        paint();
+      };
+      body.appendChild(clearBtn);
+      if (d.hint) hintLine(d.hint);
+
+      function assembled() {
+        var out = {};
+        for (var wi = 0; wi < wordCells.length; wi++) {
+          var s = '';
+          for (var k = 0; k < wordCells[wi].length; k++) {
+            var key = wordCells[wi][k];
+            if (!(key in filled)) return null; // 미완성
+            s += filled[key];
+          }
+          out['w' + wi] = s;
+        }
+        return out;
+      }
+      function paint() {
+        Object.keys(cellEls).forEach(function (key) {
+          var e = cellEls[key];
+          e.ch.textContent = filled[key] || '';
+          var isActive = active != null && (cellOwner[key] || []).indexOf(active) !== -1;
+          e.el.style.borderColor = lockedCells[key] ? '#8E7CC3' : isActive ? '#A65B8C' : '#F0E4D8';
+          e.el.style.background = lockedCells[key] ? '#EDE9F7' : isActive ? '#F5ECF1' : '#fff';
+        });
+        if (active != null && d.words[active]) {
+          var w = d.words[active];
+          clue.style.display = 'block';
+          clue.textContent = '';
+          var cl1 = h('div'); cl1.textContent = w.no + '번 ' + (w.dir === 'across' ? '가로' : '세로');
+          css(cl1, { fontSize: '12px', fontWeight: '800', color: '#A65B8C', marginBottom: '3px' });
+          clue.appendChild(cl1);
+          if (w.cho) {
+            var cl2 = h('div'); cl2.textContent = w.cho;
+            css(cl2, { fontSize: '14px', fontWeight: '800', color: '#3A3226', letterSpacing: '2px', marginBottom: '3px' });
+            clue.appendChild(cl2);
+          }
+          var cl3 = h('div'); cl3.textContent = w.hint;
+          css(cl3, { fontSize: '13.5px', fontWeight: '700', color: '#3A3226' });
+          clue.appendChild(cl3);
+        } else { clue.style.display = 'none'; }
+        tray.innerHTML = '';
+        bank.forEach(function (t) {
+          var tb = h('button'); tb.textContent = t.letter;
+          css(tb, { fontFamily: 'inherit', fontSize: '16px', fontWeight: '800', padding: '8px 14px',
+            borderRadius: '11px', border: '2px solid #F0E4D8', background: '#fff', color: '#3A3226', cursor: 'pointer' });
+          tb.onclick = function () {
+            if (answered || active == null) return;
+            var next = null;
+            for (var k = 0; k < wordCells[active].length; k++) {
+              if (!(wordCells[active][k] in filled)) { next = wordCells[active][k]; break; }
+            }
+            if (next == null) return; // 이 낱말은 다 참
+            filled[next] = t.letter;
+            bank = bank.filter(function (x) { return x.id !== t.id; });
+            paint();
+          };
+          tray.appendChild(tb);
+        });
+        var done = assembled();
+        if (footerOn) footerState(Object.keys(filled).length > Object.keys(lockedCells).length, !!done);
+      }
+      // 첫 낱말 자동 선택
+      if (d.words && d.words.length) active = 0;
+      paint();
+      function subCw() { var a = assembled(); if (a) verify(token, a); }
+      if (footerOn) {
+        pendingRedo = function () {
+          Object.keys(filled).forEach(function (key) {
+            if (lockedCells[key]) return;
+            bank.push({ id: bank.length ? bank[bank.length - 1].id + 1 : 0, letter: filled[key] });
+            delete filled[key];
+          });
+          paint();
+        };
+        pendingSubmit = subCw;
+      } else {
+        var cwb = h('button'); cwb.textContent = '확인'; css(cwb, btnStyle(C, '#fff'));
+        cwb.onclick = subCw; body.appendChild(cwb);
+      }
+    }
+
+    // ── 스와이프(swipe) — 원본(국어 사실·의견): 카드를 좌(의견)/우(사실)로 넘겨 분류.
+    //    버튼 탭도 지원. 제출 '사실'|'의견' → 서버 등호 채점.
+    function renderSwipe(d, token) {
+      var chosen = null;
+      var wrap = h('div'); css(wrap, { position: 'relative', maxWidth: '420px', margin: '0 auto 14px', touchAction: 'pan-y' });
+      var lab = h('div');
+      var labL = h('span'); labL.textContent = '← ' + (d.leftLabel || '의견');
+      css(labL, { color: '#A65B8C', fontWeight: '800' });
+      var labR = h('span'); labR.textContent = (d.rightLabel || '사실') + ' →';
+      css(labR, { float: 'right', color: '#3E7CA6', fontWeight: '800' });
+      lab.appendChild(labL); lab.appendChild(labR);
+      css(lab, { fontSize: '13px', marginBottom: '8px' });
+      wrap.appendChild(lab);
+      var card = h('div'); card.textContent = d.card;
+      css(card, { background: '#fff', border: '2px solid #F0E4D8', borderRadius: '18px', padding: '26px 20px',
+        fontSize: '16.5px', fontWeight: '700', color: '#3A3226', lineHeight: '1.7', textAlign: 'center',
+        cursor: 'grab', userSelect: 'none', touchAction: 'none', transition: 'transform 0.15s',
+        boxShadow: '0 10px 24px -14px rgba(120,90,70,0.35)' });
+      wrap.appendChild(card);
+      body.appendChild(wrap);
+      var row = h('div'); css(row, { display: 'flex', gap: '10px', justifyContent: 'center', maxWidth: '420px', margin: '0 auto' });
+      function mkBtn(label, color, bg) {
+        var b = h('button'); b.textContent = label;
+        css(b, { flex: '1', maxWidth: '160px', padding: '12px', borderRadius: '13px', border: '2px solid ' + color,
+          background: bg, color: color, fontWeight: '800', fontSize: '15px', cursor: 'pointer' });
+        return b;
+      }
+      var leftBtn = mkBtn(d.leftLabel || '의견', '#A65B8C', '#F5ECF1');
+      var rightBtn = mkBtn(d.rightLabel || '사실', '#3E7CA6', '#E8F1F7');
+      row.appendChild(leftBtn); row.appendChild(rightBtn);
+      body.appendChild(row);
+      if (d.hint) hintLine(d.hint);
+      function choose(side) {
+        if (answered) return;
+        chosen = side;
+        var isL = side === (d.leftLabel || '의견');
+        card.style.transform = 'translateX(' + (isL ? -46 : 46) + 'px) rotate(' + (isL ? -4 : 4) + 'deg)';
+        card.style.borderColor = isL ? '#A65B8C' : '#3E7CA6';
+        leftBtn.style.opacity = isL ? '1' : '0.45';
+        rightBtn.style.opacity = isL ? '0.45' : '1';
+        if (footerOn) footerState(true, true);
+        else verify(token, chosen);
+      }
+      leftBtn.onclick = function () { choose(d.leftLabel || '의견'); };
+      rightBtn.onclick = function () { choose(d.rightLabel || '사실'); };
+      // 스와이프 제스처
+      var startX = null, dragging = false;
+      card.addEventListener('pointerdown', function (e) {
+        if (answered) return;
+        dragging = true; startX = e.clientX; card.setPointerCapture(e.pointerId);
+        card.style.transition = 'none'; e.preventDefault();
+      });
+      card.addEventListener('pointermove', function (e) {
+        if (!dragging) return;
+        var dx = e.clientX - startX;
+        card.style.transform = 'translateX(' + dx + 'px) rotate(' + (dx / 18) + 'deg)';
+      });
+      card.addEventListener('pointerup', function (e) {
+        if (!dragging) return;
+        dragging = false; card.style.transition = 'transform 0.15s';
+        var dx = e.clientX - startX;
+        if (dx > 90) choose(d.rightLabel || '사실');
+        else if (dx < -90) choose(d.leftLabel || '의견');
+        else card.style.transform = 'none';
+      });
+      if (footerOn) {
+        pendingRedo = function () {
+          chosen = null; card.style.transform = 'none'; card.style.borderColor = '#F0E4D8';
+          leftBtn.style.opacity = '1'; rightBtn.style.opacity = '1';
+          footerState(false, false);
+        };
+        pendingSubmit = function () { if (chosen != null) verify(token, chosen); };
+      }
+    }
+
+    // ── 장면 클릭(position) — 원본(과학·수학): 장면 SVG의 부위(data-region)를 탭.
+    //    제출 regionId → 서버 등호 채점. scene_svg는 서버 뱅크의 신뢰된 마크업.
+    function renderPosition(d, token) {
+      var sel = null;
+      var holder = h('div');
+      css(holder, { maxWidth: '440px', margin: '0 auto 10px', textAlign: 'center' });
+      holder.innerHTML = d.scene_svg || '';
+      var svgEl = holder.querySelector('svg');
+      if (svgEl) { svgEl.style.maxWidth = '100%'; svgEl.style.height = 'auto'; }
+      var regions = holder.querySelectorAll('[data-region]');
+      Array.prototype.forEach.call(regions, function (g) {
+        g.style.cursor = 'pointer';
+        g.addEventListener('click', function () {
+          if (answered) return;
+          sel = g.getAttribute('data-region');
+          Array.prototype.forEach.call(regions, function (g2) {
+            g2.style.opacity = g2 === g ? '1' : '0.55';
+            g2.style.outline = 'none';
+          });
+          g.style.opacity = '1';
+          if (footerOn) footerState(true, true);
+          else verify(token, sel);
+        });
+      });
+      body.appendChild(holder);
+      if (d.hint) hintLine(d.hint);
+      if (footerOn) {
+        pendingRedo = function () {
+          sel = null;
+          Array.prototype.forEach.call(regions, function (g2) { g2.style.opacity = '1'; });
+          footerState(false, false);
+        };
+        pendingSubmit = function () { if (sel != null) verify(token, sel); };
+      }
+    }
+
     function render(d) {
       body.innerHTML = '';
       // retries는 리셋하지 않는다 — 캡차 오답 재발급을 건너 누적돼야 행동데이터
@@ -391,7 +873,8 @@
       footerOn = full && product === 'edu';
       if (footerOn) {
         ensureFooter(); footerReset();
-        redoBtn.textContent = d.type === 'trace_path' ? '다시 그리기' : '다시 고르기';
+        redoBtn.textContent = d.type === 'trace_path' ? '다시 그리기'
+          : (d.type === 'dictation' || d.type === 'type_in') ? '다시 쓰기' : '다시 고르기';
         nextBtn.textContent = '다음 문제 →';
       }
       if (footer) footer.style.display = footerOn ? 'flex' : 'none';
@@ -644,6 +1127,23 @@
         if (footerOn) { pendingRedo = function () { placed = {}; zSel = null; pzPaint(); }; pendingSubmit = subPz; }
         else { var pzb = h('button'); pzb.textContent = '확인'; css(pzb, btnStyle(C, '#fff')); pzb.onclick = subPz; body.appendChild(pzb); }
         if (d.hint) hintLine(d.hint);
+      } else if (d.type === 'drag_pick') {
+        // 원본 카드 드래그(과학·수학) — 피드백에 카드 라벨을 쓰도록 lastOptions 매핑
+        lastOptions = (d.items || []).map(function (it) { return { id: it.id, text: it.label || it.e }; });
+        renderDragPick(d, token);
+      } else if (d.type === 'dictation' || d.type === 'type_in') {
+        renderTyping(d, token);
+      } else if (d.type === 'punct') {
+        renderPunct(d, token);
+      } else if (d.type === 'crossword') {
+        renderCrossword(d, token);
+      } else if (d.type === 'swipe') {
+        lastOptions = [{ id: d.leftLabel || '의견', text: d.leftLabel || '의견' },
+                       { id: d.rightLabel || '사실', text: d.rightLabel || '사실' }];
+        renderSwipe(d, token);
+      } else if (d.type === 'position') {
+        lastOptions = (d.regions || []).map(function (r) { return { id: r.id, text: r.name }; });
+        renderPosition(d, token);
       } else {
         // single / arithmetic / listen — 보기 중 하나 선택
         // 풋터 모드: 클릭은 '선택'만(테두리 강조), 제출은 풋터의 다음 문제 버튼이 담당

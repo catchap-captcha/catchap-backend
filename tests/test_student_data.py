@@ -384,19 +384,19 @@ def test_game_session_korean(client, db, seed_org):
         LearningAttempt.student_id == seed_org["student"].id, LearningAttempt.subject == "국어"
     ).count() >= 1
 
-    # 사실·의견(multi): 부분 선택 → 오답, 의견 전체(순서 무관) → 정답
-    mq = next(q for q in KOREAN_FULL if q["type"] == "multi" and len(q["answer"]) > 1)
-    partial = client.post(
-        "/api/v1/students/me/game-answer",
-        json={"question_id": mq["id"], "subject": "국어", "option_ids": mq["answer"][:1]},
-        headers=auth(token),
-    )
-    ok_full = client.post(
-        "/api/v1/students/me/game-answer",
-        json={"question_id": mq["id"], "subject": "국어", "option_ids": list(reversed(mq["answer"]))},
-        headers=auth(token),
-    )
-    assert (partial.json()["correct"], ok_full.json()["correct"]) == (False, True)
+    # 문장 부호(punct — 원본 자리탭 복원): 위젯 경로(verify) select_all 채점.
+    # 부분 선택 → 오답, 정답 자리 전부(순서 무관) → 정답. (국어 multi는 원본 복원으로 소멸 —
+    # multi 집합 채점 자체는 test_game_answer_multi_and_scoping(과학)이 커버)
+    from app.services import captcha_service as cs
+
+    pq = next(q for q in KOREAN_FULL if q["type"] == "punct" and len(q["answer"]) > 1)
+    ch1 = cs._wrap_bank_question("국어", pq, {"subj": "국어"})
+    assert "answer" not in ch1 and ch1["type"] == "punct" and ch1["tokens"]
+    partial = cs.verify_challenge(db, ch1["challenge_token"], pq["answer"][:1])
+    assert partial["success"] is False
+    ch2 = cs._wrap_bank_question("국어", pq, {"subj": "국어"})
+    ok_full = cs.verify_challenge(db, ch2["challenge_token"], list(reversed(pq["answer"])))
+    assert ok_full["success"] is True
 
 
 def test_game_answer_multi_and_scoping(client, db, seed_org):

@@ -529,7 +529,11 @@ def _grade_trace(answer, template: list) -> bool:
 _WIDGET_RENDER_FIELDS = ("options", "left", "right", "bins", "items", "cards", "zones",
                          "reference", "mapStyle", "compass", "start", "layout", "audio",
                          "template", "glyph", "character", "dest", "dangers",
-                         "flag", "cols", "rows", "slots", "pieces")
+                         "flag", "cols", "rows", "slots", "pieces",
+                         # 원본 유형 복원 — 국어(받아쓰기 tts·높임말 입력·문장부호 자리탭·십자말)
+                         # 과학/수학(카드 드래그 target·장면 클릭 scene_svg/regions)
+                         "tts", "before", "highlight", "after", "tokens", "gaps", "markLabel",
+                         "size", "words", "tiles", "level", "reveal", "target", "scene_svg", "regions")
 
 
 def _in_box(px: float, py: float, box: dict, pad: float = 0.0) -> bool:
@@ -589,6 +593,34 @@ def _wrap_bank_question(subject: str, q: dict, meta: dict) -> dict:
         # 길찾기 — 위젯이 경로 궤적 제출, 끝점 dest 도달 + 위험존 회피로 채점.
         # dest/dangers는 화면에 보이는 요소라 노출 정상(정답 좌표가 아님).
         return _wrap("route", {"dest": q["dest"], "dangers": q.get("dangers", [])}, public, meta)
+    if t in ("dictation", "type_in"):
+        # 원본 입력형(국어 받아쓰기·높임말) — 위젯이 타이핑 문자열 제출, 서버 trim 정확 일치.
+        # 받아쓰기는 tts(들려줄 문장)가 public에 필요해 정답이 페이로드에 포함된다 —
+        # 원본(클라이언트 TTS+채점)과 동일한 트레이드오프로, 학습용 문항이라 수용한다.
+        return _wrap("text", q["answer"], public, meta)
+    if t == "punct":
+        # 문장부호 — 원본과 동일하게 어절 사이 자리(gap)를 모두 탭. 집합 일치 채점.
+        return _wrap("select_all", sorted(q["answer"]), public, meta)
+    if t == "crossword":
+        # 십자말 — 위젯이 {w0: "낱말", ...} 제출, 딕셔너리 정확 일치. 낱말 정답은
+        # 토큰에만 서명(public words에는 길이·힌트·초성만 노출).
+        return _wrap("match", dict(q["answer"]), public, meta)
+    if t == "swipe":
+        # 사실·의견 스와이프 — 원본처럼 문장 1개를 발급 시점에 뽑아 카드로 낸다.
+        # 정답 태그는 토큰에만 서명. (뱅크 1문항 = 문장 풀, 발급마다 다른 문장)
+        st = random.choice(q["statements"])
+        public = {**public, "card": st["text"], "leftLabel": "의견", "rightLabel": "사실"}
+        return _wrap("single", st["tag"], public, meta)
+    if t == "drag":
+        # 카드 드래그(과학·수학) — 원본처럼 카드 여러 장 중 알맞은 것을 타겟에 끌어다 놓기.
+        # 위젯이 {item, x, y} 제출 → 아이템 일치 + 드롭 존 거리로 채점.
+        zone = {"cx": round(random.uniform(0.62, 0.85), 3),
+                "cy": round(random.uniform(0.25, 0.5), 3), "r": DROP_ZONE_R}
+        public = {**public, "type": "drag_pick", "zone": zone}
+        return _wrap("drag_pick", {"item": q["answer"], "zone": zone}, public, meta)
+    if t == "position":
+        # 장면 클릭(과학·수학) — 원본 장면 SVG의 data-region 부위를 탭. 등호 비교.
+        return _wrap("single", q["answer"], public, meta)
     # single·place·listen: 단일 값 등호 비교
     return _wrap("single", q["answer"], public, meta)
 
@@ -703,6 +735,17 @@ def verify_challenge(db: Session, challenge_token: str, answer) -> dict:
     elif kind == "route":
         # 길찾기 — 끝점이 도착지 + 위험존 미통과
         ok = _grade_route(answer, target.get("dest", {}), target.get("dangers", [])) if isinstance(target, dict) else False
+    elif kind == "text":
+        # 입력형(받아쓰기·높임말) — trim 후 정확 일치. 받아쓰기는 내부 띄어쓰기가 채점
+        # 대상이므로 내부 공백은 정규화하지 않는다. 비-str 입력은 오답(500 방지).
+        ok = isinstance(answer, str) and answer.strip() == str(target).strip() and bool(answer.strip())
+    elif kind == "drag_pick":
+        # 카드 드래그 — 알맞은 카드(item id) + 드롭 지점이 존 안. 거리는 행동데이터 기록.
+        sub = answer if isinstance(answer, dict) else {}
+        tgt = target if isinstance(target, dict) else {}
+        in_zone, dist = _grade_drop(sub, tgt.get("zone", {}))
+        extra["drop_distance_norm"] = dist
+        ok = in_zone and str(sub.get("item")) == str(tgt.get("item"))
     else:  # single
         ok = str(answer) == str(target)
     if not ok:

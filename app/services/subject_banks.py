@@ -61,7 +61,12 @@ def playable_pool(subject: str) -> list[dict]:
 _RENDER_FIELDS = ("options", "left", "right", "bins", "items", "cards", "zones",
                   "reference", "mapStyle", "compass", "start", "layout", "audio",
                   "template", "glyph", "character", "dest", "dangers",
-                  "flag", "cols", "rows", "slots", "pieces")
+                  "flag", "cols", "rows", "slots", "pieces",
+                  # 원본 유형 복원 렌더 필드 — 정답 미포함인 것만.
+                  # (dictation의 tts=정답 문장, swipe의 statements=태그 포함 → 여기 제외.
+                  #  챌린지 발급 경로(captcha_service)만 tts를 내려준다.)
+                  "tokens", "gaps", "markLabel", "before", "highlight", "after",
+                  "size", "words", "tiles", "level", "reveal", "target", "scene_svg", "regions")
 
 
 def public_question(q: dict) -> dict:
