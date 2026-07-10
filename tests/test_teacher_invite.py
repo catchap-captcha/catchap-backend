@@ -56,9 +56,14 @@ def test_teacher_invite_success_path(client, db, seed_org):
     inv = db.query(Invitation).filter(Invitation.email == "newteacher@test.dev").first()
     assert inv is not None and inv.status == "pending"
     assert inv.teacher_code and inv.teacher_code.startswith("T-")
-    # 선발급 교사코드 멤버십 (user_id=NULL, pending)
+    # 선발급 교사코드 멤버십(pending). 이름을 넣으면 표시용 placeholder User(pending)를
+    # 만들어 이름을 보관한다(add_teacher와 동일 패턴). 직책(position)엔 이름이 섞이지 않는다.
     m = db.query(Membership).filter(Membership.teacher_code == inv.teacher_code).first()
-    assert m is not None and m.user_id is None and m.status == "pending"
+    assert m is not None and m.status == "pending"
+    assert m.position is None
+    assert m.user_id is not None
+    ph = db.get(User, m.user_id)
+    assert ph is not None and ph.status == "pending" and ph.name == "김새샘"
 
     # 토큰 원문은 메일로만 가므로, 서비스로 새 초대를 만들어 GET /auth/invite/{token} 성공 경로 검증
     from app.services import invite_service
@@ -68,6 +73,7 @@ def test_teacher_invite_success_path(client, db, seed_org):
         organization_id=org_id,
         inviter_id=m.id,
         email="second@test.dev",
+        name="이둘째",
         role="teacher",
     )
     db.commit()
@@ -78,6 +84,89 @@ def test_teacher_invite_success_path(client, db, seed_org):
     assert body["organization_id"] == org_id
     assert body["email"] == "second@test.dev"
     assert body["teacher_code"].startswith("T-")
+    # 초대 시 입력한 이름이 프리필로 반환돼 가입화면 이름칸이 자동 입력된다
+    assert body["name"] == "이둘째"
+
+
+def test_invite_register_skips_email_code_and_shows_role(client, db, seed_org):
+    """초대 링크로 온 교사는 이메일 인증코드 없이 가입되고(초대 토큰이 이메일 소유 증명),
+    교사 목록에 이름과 역할('교사'/'학년부장')이 바르게 뜬다. 이름이 역할칸에 새지 않는다."""
+    from app.services import invite_service
+
+    _make_org_admin(db, seed_org)
+    admin_token = _login(client, "principal@test.dev")
+    org_id = seed_org["org"].id
+
+    # 1) 일반 교사 초대 → 초대 토큰으로 이메일 코드 없이 가입
+    raw = invite_service.create_teacher_invite(
+        db, organization_id=org_id, inviter_id="x",
+        email="claim@test.dev", name="박클레임", role="teacher",
+    )
+    db.commit()
+    inv = db.query(Invitation).filter(Invitation.email == "claim@test.dev").first()
+    res = client.post(
+        "/api/v1/auth/register/teacher",
+        json={
+            "name": "박클레임", "email": "claim@test.dev", "password": "Teacher!234",
+            "organization_id": org_id, "teacher_code": inv.teacher_code,
+            "invite_token": raw,  # email_code 생략
+        },
+    )
+    assert res.status_code == 200, res.text
+    claimed = db.query(User).filter(User.email == "claim@test.dev").first()
+    assert claimed is not None and claimed.status == "active" and claimed.role == "teacher"
+
+    # 2) 잘못된/없는 초대 토큰이면 이메일 코드가 필요해 실패한다(우회는 유효 토큰 한정)
+    raw2 = invite_service.create_teacher_invite(
+        db, organization_id=org_id, inviter_id="x",
+        email="nocode@test.dev", name="무코드", role="teacher",
+    )
+    db.commit()
+    inv2 = db.query(Invitation).filter(Invitation.email == "nocode@test.dev").first()
+    bad = client.post(
+        "/api/v1/auth/register/teacher",
+        json={
+            "name": "무코드", "email": "nocode@test.dev", "password": "Teacher!234",
+            "organization_id": org_id, "teacher_code": inv2.teacher_code,
+            # invite_token 없음, email_code 없음 → 인증코드 검사에서 실패해야 함
+        },
+    )
+    assert bad.status_code != 200
+
+    # 3) 교사 목록: 가입한 교사는 이름·역할 '교사', 미가입 초대 교사도 이름이 보인다
+    lst = client.get(f"/api/v1/orgs/{org_id}/teachers", headers=auth(admin_token))
+    assert lst.status_code == 200, lst.text
+    rows = {r["name"]: r for r in lst.json()}
+    assert "박클레임" in rows and rows["박클레임"]["role"] == "교사"
+    assert rows["박클레임"]["status"] == "active"
+    assert "무코드" in rows  # 미가입(초대 대기)이어도 이름이 뜬다
+    assert rows["무코드"]["role"] == "교사"  # 이름이 역할칸에 새지 않는다
+
+
+def test_grade_head_invite_role_label(client, db, seed_org):
+    """학년부장으로 초대·가입하면 목록 역할이 '학년부장'으로 뜬다(이름이 아님)."""
+    from app.services import invite_service
+
+    _make_org_admin(db, seed_org)
+    admin_token = _login(client, "principal@test.dev")
+    org_id = seed_org["org"].id
+    raw = invite_service.create_teacher_invite(
+        db, organization_id=org_id, inviter_id="x",
+        email="gh@test.dev", name="정부장", role="grade_head",
+    )
+    db.commit()
+    inv = db.query(Invitation).filter(Invitation.email == "gh@test.dev").first()
+    res = client.post(
+        "/api/v1/auth/register/teacher",
+        json={
+            "name": "정부장", "email": "gh@test.dev", "password": "Teacher!234",
+            "organization_id": org_id, "teacher_code": inv.teacher_code, "invite_token": raw,
+        },
+    )
+    assert res.status_code == 200, res.text
+    lst = client.get(f"/api/v1/orgs/{org_id}/teachers", headers=auth(admin_token))
+    rows = {r["name"]: r for r in lst.json()}
+    assert "정부장" in rows and rows["정부장"]["role"] == "학년부장"
 
 
 def test_teacher_reset_student_password(client, db, seed_org):

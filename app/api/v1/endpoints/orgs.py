@@ -673,13 +673,22 @@ def _teacher_row(
             .first()
         )
     design = next((t for t in D.ORG_TEACHERS if user and t["name"] == user.name), None)
+    # 역할 표기: 학년부장은 담당 학년까지, 그 외엔 관리자가 배정한 직책(담임/교과/보조)이 있으면
+    # 그 값, 없으면(초대 가입 직후·미배정) 시스템 역할 그대로 '교사'.
+    # (이름은 항상 placeholder User에 보관 — position은 직책 전용이라 이름이 섞이지 않는다.)
+    if m.role == "grade_head":
+        role_label = (f"{m.managed_grade}학년 " if m.managed_grade else "") + "학년부장"
+    elif m.position:
+        role_label = m.position
+    else:
+        role_label = "교사"
     return {
         "id": m.id,
         "user_id": m.user_id,
         "name": user.name if user else "미등록",
         "email": user.email if user else None,
         "cls": cls.name if cls else (design["cls"] if design else None),
-        "role": m.position or "담임",
+        "role": role_label,
         "code": m.teacher_code,
         "years": m.career_years or 0,
         "status": "active" if m.status == "active" else "pending",

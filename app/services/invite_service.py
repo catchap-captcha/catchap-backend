@@ -12,9 +12,9 @@ from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
-from app.core.security import generate_token, sha256_hash
+from app.core.security import generate_token, hash_password, sha256_hash
 from app.email.smtp import render_template, send_email
-from app.models import Institution, Invitation, Membership, Organization
+from app.models import Institution, Invitation, Membership, Organization, User
 
 settings = get_settings()
 
@@ -52,17 +52,33 @@ def create_teacher_invite(
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="기관을 찾을 수 없습니다.")
 
     code = _generate_teacher_code(db)
-    db.add(
-        Membership(
-            user_id=None,
-            organization_id=organization_id,
-            role=role,
-            status="pending",
-            teacher_code=code,
-            position=name,
-            invited_by=inviter_id,
-        )
+    membership = Membership(
+        user_id=None,
+        organization_id=organization_id,
+        role=role,
+        status="pending",
+        teacher_code=code,
+        position=None,  # 직책(담임/교과)은 가입 후 관리자가 배정 — 초대엔 비워 둔다
+        invited_by=inviter_id,
     )
+    db.add(membership)
+    db.flush()
+    # 표시용 이름/이메일은 pending User 자리로 보관(가입 시 클레임). add_teacher와 동일 패턴이라
+    # 교사 목록에서 초대 대기 교사도 이름이 보이고, position에 이름이 섞이지 않는다.
+    if name and name.strip():
+        existing_user = db.query(User).filter(User.email == email).first()
+        if existing_user is None:
+            placeholder = User(
+                email=email,
+                password_hash=hash_password(generate_token()[:32]),
+                name=name.strip(),
+                role="teacher",
+                status="pending",
+                organization_id=organization_id,
+            )
+            db.add(placeholder)
+            db.flush()
+            membership.user_id = placeholder.id
     raw = generate_token()
     db.add(
         Invitation(
@@ -89,6 +105,32 @@ def create_teacher_invite(
     return raw
 
 
+def check_invite_token(
+    db: Session,
+    raw_token: str | None,
+    *,
+    email: str,
+    organization_id: str,
+    teacher_code: str,
+) -> bool:
+    """가입 시 넘어온 초대 토큰이 (이메일·기관·교사코드)와 일치하는 유효한 초대인지 확인.
+    True면 초대 메일 수신으로 이메일 소유가 증명된 것이라 별도 이메일 인증코드를 생략할 수 있다."""
+    if not raw_token:
+        return False
+    inv = (
+        db.query(Invitation)
+        .filter(Invitation.token_hash == sha256_hash(raw_token))
+        .first()
+    )
+    if inv is None or inv.status != "pending" or inv.expires_at < datetime.now():
+        return False
+    return (
+        inv.email == email.strip().lower()
+        and inv.organization_id == organization_id
+        and (inv.teacher_code or "") == (teacher_code or "").strip().upper()
+    )
+
+
 def get_invite(db: Session, raw_token: str) -> dict:
     """초대 토큰 검증 → 가입 프리필용 정보 반환. 만료/사용됨이면 4xx."""
     inv = db.query(Invitation).filter(Invitation.token_hash == sha256_hash(raw_token)).first()
@@ -98,7 +140,8 @@ def get_invite(db: Session, raw_token: str) -> dict:
         raise HTTPException(status.HTTP_410_GONE, detail="이미 사용되었거나 취소된 초대예요.")
     if inv.expires_at < datetime.now():
         raise HTTPException(status.HTTP_410_GONE, detail="초대 링크가 만료됐어요. 다시 요청해 주세요.")
-    # 선발급 교사코드가 이미 가입에 사용됐으면(user_id 클레임됨) 사용 완료로 간주
+    # 초대 대기 교사는 이름 표시용 placeholder User(status=pending)를 미리 둔다.
+    # 그 계정이 실제 가입으로 활성화(active)됐으면 초대는 사용 완료로 간주한다.
     m = (
         db.query(Membership)
         .filter(Membership.teacher_code == inv.teacher_code)
@@ -106,7 +149,8 @@ def get_invite(db: Session, raw_token: str) -> dict:
         if inv.teacher_code
         else None
     )
-    if m is not None and m.user_id is not None:
+    placeholder = db.get(User, m.user_id) if (m and m.user_id) else None
+    if placeholder is not None and placeholder.status != "pending":
         raise HTTPException(status.HTTP_410_GONE, detail="이미 가입에 사용된 초대예요.")
 
     org = db.get(Organization, inv.organization_id)
@@ -123,6 +167,8 @@ def get_invite(db: Session, raw_token: str) -> dict:
         "email": inv.email,
         "role": inv.role,
         "teacher_code": inv.teacher_code,
+        # 초대 시 관리자가 입력한 교사 이름(선택) — 가입화면 이름칸 자동 입력용.
+        "name": (placeholder.name if placeholder else None),
         "inst_type": inst.inst_type if inst else "",
         "sido": inst.sido if inst else "",
         "sigungu": inst.sigungu if inst else "",

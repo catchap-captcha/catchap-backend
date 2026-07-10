@@ -485,7 +485,19 @@ def register_teacher(db: Session, req: s.RegisterTeacherRequest) -> User:
     if dup.first() is not None:
         raise HTTPException(status.HTTP_409_CONFLICT, detail="이미 가입된 이메일입니다.")
 
-    _consume_verified_code(db, email, req.email_code, "signup")
+    # 초대 링크로 가입하면 초대 메일 수신으로 이메일 소유가 이미 증명됐으므로 인증코드를 생략한다.
+    # 그 외(코드로 직접 가입)에는 종전대로 인증된 이메일 코드를 1회 소비한다.
+    from app.services import invite_service
+
+    invited = invite_service.check_invite_token(
+        db,
+        req.invite_token,
+        email=email,
+        organization_id=req.organization_id,
+        teacher_code=req.teacher_code,
+    )
+    if not invited:
+        _consume_verified_code(db, email, req.email_code, "signup")
     if placeholder is not None:
         placeholder.email = email
         placeholder.password_hash = hash_password(req.password)
@@ -507,6 +519,8 @@ def register_teacher(db: Session, req: s.RegisterTeacherRequest) -> User:
         db.add(user)
         db.flush()
         membership.user_id = user.id
+    # position(담임/교과 등 담당 직책)은 초대는 None, 직접추가는 관리자가 지정한 값 그대로 둔다.
+    # (초대는 placeholder User에 이름을 보관하므로 position에 이름이 섞이지 않는다.)
     membership.status = "active"
     membership.joined_at = _now()
     # 초대 시 예약된 담당 반이 있으면 가입 시점에 자동 배정(담임/보조)

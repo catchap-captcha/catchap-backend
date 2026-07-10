@@ -58,9 +58,11 @@ class RegisterTeacherRequest(BaseModel):
     name: str
     email: EmailStr
     password: str = Field(min_length=8)
-    email_code: str
+    # 초대 링크로 가입하면 invite_token이 이메일 소유를 이미 증명하므로 코드 생략 가능
+    email_code: str = ""
     organization_id: str
     teacher_code: str
+    invite_token: str | None = None
 
 
 class RegisterStudentRequest(BaseModel):
