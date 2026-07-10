@@ -263,3 +263,46 @@ def test_org_admin_self_service_scoped_to_purchase(client, db, seed_org):
                      json={"role": "teacher", "email": "t1@test.dev", "password": "Password123!"}
                      ).json()["access_token"]
     assert client.get(f"/api/v1/orgs/{org.id}/api-keys", headers=auth(tt)).status_code == 403
+
+
+def test_verify_rejects_cross_subject_token(client, db, seed_org):
+    """외부 판매 키는 발급 과목 외 챌린지 토큰을 verify할 수 없다.
+
+    1st-party(국어) 키가 낸 국어 토큰을, 외부 판매 수학 키가 verify해서 구매 안 한
+    국어 과목의 채점·행동데이터 수집을 하는 것을 막는다(토큰 유출 대비 심층 방어).
+    """
+    org = seed_org["org"]
+    _, pro = _plans(db)
+    db.add(Subscription(organization_id=org.id, plan_id=pro.id, status="active"))
+    db.commit()
+    tok = _ops(client, db)
+
+    # 1st-party 국어 키로 국어 챌린지 발급 → 국어 토큰 확보
+    fp = client.post("/api/v1/ops/api-keys",
+                     json={"organization_id": org.id, "product": "edu", "subject": "국어",
+                           "first_party": True},
+                     headers=auth(tok)).json()["site_key"]
+    ch = client.post("/api/v1/captcha/v1/challenge",
+                     headers={"X-Site-Key": fp}).json()
+    assert ch["subject"] == "국어"
+    kor_token = ch["challenge_token"]
+
+    # 외부 판매 수학 키
+    ext_math = client.post("/api/v1/ops/api-keys",
+                           json={"organization_id": org.id, "product": "edu", "subject": "수학"},
+                           headers=auth(tok)).json()["site_key"]
+
+    # 외부 수학 키로 국어 토큰 verify 시도 → 403 (구매 과목 밖)
+    r = client.post("/api/v1/captcha/v1/verify",
+                    json={"challenge_token": kor_token, "answer": "x"},
+                    headers={"X-Site-Key": ext_math})
+    assert r.status_code == 403, r.text
+
+    # 같은 과목(수학) 외부 키는 자기 수학 토큰을 정상 verify
+    ch2 = client.post("/api/v1/captcha/v1/challenge",
+                      headers={"X-Site-Key": ext_math}).json()
+    assert ch2["subject"] == "수학"
+    r2 = client.post("/api/v1/captcha/v1/verify",
+                     json={"challenge_token": ch2["challenge_token"], "answer": "x"},
+                     headers={"X-Site-Key": ext_math})
+    assert r2.status_code == 200, r2.text

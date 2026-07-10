@@ -654,6 +654,17 @@ def _edu_challenge(
     return _wrap_bank_question(subject, q, meta)
 
 
+def peek_subject(challenge_token: str) -> str | None:
+    """토큰을 소비하지 않고 서명된 과목(subj)만 확인 — verify 스코프 검사용.
+
+    외부 판매 키가 구매 안 한 과목의 챌린지 토큰을 verify하려는 것을 막을 때,
+    실제 채점(verify_challenge, 토큰 소비)에 앞서 과목을 미리 본다. 서명 검증에
+    실패하면(위조·만료) None을 반환하고, 채점 단계에서 400으로 걸린다.
+    """
+    data = _unsign(challenge_token)
+    return data.get("subj") if data else None
+
+
 def verify_challenge(db: Session, challenge_token: str, answer) -> dict:
     """제출 답 서버 채점 → 통과 시 verdict 토큰(1회용) 발급.
 

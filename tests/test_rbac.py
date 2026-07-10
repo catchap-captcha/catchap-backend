@@ -146,3 +146,87 @@ def test_parent_only_linked_children(client, db, seed_org):
         ).status_code
         == 409
     )
+
+
+def test_parent_child_limit(client, db, seed_org):
+    """학부모당 자녀 연결은 최대 2명 — 3번째는 409로 거부된다."""
+    from datetime import datetime
+
+    from app.core.security import hash_password
+    from app.models import StudentProfile, User
+    from app.services import onboarding_service
+
+    parent = User(
+        email="p2@test.dev",
+        password_hash=hash_password("Password123!"),
+        name="상한테스트학부모",
+        role="parent",
+        email_verified_at=datetime.utcnow(),
+    )
+    db.add(parent)
+    # 자녀 후보 3명 생성
+    kids = []
+    for i in range(3):
+        kid = StudentProfile(
+            organization_id=seed_org["org"].id,
+            student_login_id=f"cap0{i}",
+            student_code=f"CAT-90{i}0",
+            password_hash=hash_password("1234"),
+            nickname=f"자녀{i}",
+        )
+        db.add(kid)
+        kids.append(kid)
+    db.commit()
+
+    token = client.post(
+        "/api/v1/auth/login",
+        json={"role": "parent", "email": "p2@test.dev", "password": "Password123!"},
+    ).json()["access_token"]
+
+    def link(kid):
+        code = onboarding_service.issue_parent_invite(
+            db, student_id=kid.id, organization_id=seed_org["org"].id
+        )
+        return client.post(
+            "/api/v1/parents/me/children/link-invite",
+            json={"invite_code": code},
+            headers=auth(token),
+        )
+
+    assert link(kids[0]).status_code == 200
+    assert link(kids[1]).status_code == 200  # 2명까지 OK
+    third = link(kids[2])
+    assert third.status_code == 409  # 3번째 거부
+    assert "최대 2명" in third.json()["detail"]
+
+
+def test_ops_cannot_access_org_scoped_data(client, db, seed_org):
+    """운영자(ops)는 기관 스코프 API(학생 명단·기관 대시보드)에 접근하지 못한다 — 아동 PII 분리.
+
+    운영자는 /ops/* 콘솔의 익명·집계 데이터만 보고, 학생 실명·나이가 노출되는
+    /orgs/{org_id}/* 는 기관 관리자/학년부장에게만 허용된다.
+    """
+    from datetime import datetime
+
+    from app.core.security import hash_password
+    from app.models import User
+
+    ops = User(
+        email="ops-rbac@test.dev",
+        password_hash=hash_password("Password123!"),
+        name="운영자",
+        role="ops",
+        status="active",
+        email_verified_at=datetime.utcnow(),
+    )
+    db.add(ops)
+    db.commit()
+    token = client.post(
+        "/api/v1/auth/ops-login",
+        json={"email": "ops-rbac@test.dev", "password": "Password123!"},
+    ).json()["access_token"]
+    oid = seed_org["org"].id
+    assert client.get(f"/api/v1/orgs/{oid}/roster", headers=auth(token)).status_code == 403
+    assert client.get(f"/api/v1/orgs/{oid}/dashboard", headers=auth(token)).status_code == 403
+    # 운영자 콘솔(익명 집계)은 계속 접근 가능
+    assert client.get("/api/v1/ops/orgs", headers=auth(token)).status_code == 200

@@ -22,6 +22,8 @@ class User(Base, UUIDPk, Timestamps):
     email_verified_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     two_factor_enabled: Mapped[bool] = mapped_column(default=False)
+    # 임시 비번(기관 승인 발급/관리자 초기화)으로 로그인 시 True → 첫 로그인에서 강제 변경
+    must_change_password: Mapped[bool] = mapped_column(default=False)
     organization_id: Mapped[str | None] = mapped_column(
         CHAR(36), index=True, nullable=True
     )  # 주 소속 기관 (멀티 소속은 memberships)

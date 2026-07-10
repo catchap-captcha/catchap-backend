@@ -110,9 +110,15 @@ def change_password(
     db: Session = Depends(get_db),
 ):
     target = principal.student if principal.kind == "student" else principal.user
-    if target is None or not verify_password(req.current_password, target.password_hash):
+    if target is None:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="현재 비밀번호가 일치하지 않습니다.")
+    forced = bool(getattr(target, "must_change_password", False))
+    # 강제 변경(임시 비번 첫 로그인)은 방금 그 비번으로 인증했으므로 현재 비번 재확인을 생략한다.
+    if not forced and not verify_password(req.current_password or "", target.password_hash):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="현재 비밀번호가 일치하지 않습니다.")
     target.password_hash = hash_password(req.new_password)
+    if hasattr(target, "must_change_password"):
+        target.must_change_password = False  # 변경 완료 → 게이트 해제
     audit(
         db,
         action="settings.change_password",

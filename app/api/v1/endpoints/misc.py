@@ -81,19 +81,63 @@ def student_chat(
     }
 
 
+def _batchim(word: str) -> bool:
+    ch = ord(word[-1]) if word else 0
+    return 0xAC00 <= ch <= 0xD7A3 and (ch - 0xAC00) % 28 > 0
+
+
+def _live_parent_intro(db: Session, child: StudentProfile) -> str | None:
+    """자녀 실집계 기반 인사말 — 정적 산문의 하드코딩 수치(89% 등)가
+    학부모 홈 KPI(28일 실집계)와 어긋나지 않게 한다. 시도 없으면 None."""
+    from datetime import date, timedelta
+
+    from app.services import aggregate
+
+    today = date.today()
+    rows = aggregate.attempts(db, student_ids=[child.id], since=today - timedelta(days=28))
+    if not rows:
+        return None
+    ws = today - timedelta(days=today.weekday())
+    week_n = sum(1 for r in rows if r.created_at and r.created_at.date() >= ws)
+    acc = round(sum(1 for r in rows if r.result == "correct") / len(rows) * 100)
+    by_sub: dict[str, list] = {}
+    for r in rows:
+        by_sub.setdefault(r.subject, []).append(r)
+    subs = {
+        s: round(sum(1 for r in g if r.result == "correct") / len(g) * 100)
+        for s, g in by_sub.items()
+        if len(g) >= 3
+    }
+    nm = child.nickname + ("이는" if _batchim(child.nickname) else "는")
+    intro = (
+        f"안녕하세요! 이번 주 {nm} 총 {week_n}회 학습했고, "
+        f"최근 4주 평균 정답률은 {acc}%예요."
+    )
+    if subs:
+        best = max(subs, key=subs.get)
+        intro += f" 특히 {best}({subs[best]}%)에서 꾸준함이 돋보여요."
+        weak = min(subs, key=subs.get)
+        if weak != best and subs[weak] < 80:
+            j = "은" if _batchim(weak) else "는"
+            intro += f" {weak}({subs[weak]}%){j} 함께 조금 더 연습하면 좋겠어요."
+    intro += " 궁금한 점을 물어보세요!"
+    return intro
+
+
 @router.get("/ai/parent-chat/intro")
 def parent_chat_intro(
     child_id: str,
     principal: Principal = Depends(require_parent),
     db: Session = Depends(get_db),
 ):
-    """학부모 상담 AI 첫 인사 — 자녀별 intro 문구 (stat_blobs 수정 가능)."""
+    """학부모 상담 AI 첫 인사 — 실집계 기반, 시도 없으면 자녀별 preset (stat_blobs 수정 가능)."""
     check_parent_child(db, principal.id, child_id)
     child = db.get(StudentProfile, child_id)
     if child is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="자녀 정보를 찾을 수 없습니다.")
     preset = D.PARENT_AI_ANSWERS.get(child.nickname, D.PARENT_AI_ANSWERS["하은"])
-    return {"intro": preset["intro"], "suggestions": list(preset["answers"].keys())}
+    intro = _live_parent_intro(db, child) or preset["intro"]
+    return {"intro": intro, "suggestions": list(preset["answers"].keys())}
 
 
 @router.post("/ai/parent-chat")
@@ -122,7 +166,7 @@ def parent_chat(
         )
     return {
         "reply": reply,
-        "intro": preset["intro"],
+        "intro": _live_parent_intro(db, child) or preset["intro"],
         "suggestions": list(preset["answers"].keys()),
     }
 

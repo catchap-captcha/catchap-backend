@@ -1,5 +1,6 @@
 """교사 API — 담당 학급 범위만 (require_teacher)."""
 
+import secrets
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -7,6 +8,7 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.core.permissions import Principal, require_teacher
+from app.core.security import hash_password
 from app.db.session import get_db
 from app.models import (
     ClassRoom,
@@ -24,7 +26,7 @@ from app.schemas.teacher import (
     FamilyMessageCreate,
     TeacherProfileUpdate,
 )
-from app.services import aggregate
+from app.services import aggregate, auth_service
 from app.services.aggregate import fb
 from app.services.stats import D  # DB(stat_blobs) 우선, design_data fallback
 from app.utils.helpers import audit, status_key, status_label, student_display_name, summary_acc
@@ -175,6 +177,45 @@ def my_class_students(
         "students": [_student_row(s, summaries.get(s.id), real.get(s.id)) for s in students],
         "directory_codes": [d["code"] for d in D.CLASS_DIRECTORY],
     }
+
+
+@router.post("/class/students/{student_id}/reset-password")
+def reset_class_student_password(
+    student_id: str,
+    principal: Principal = Depends(require_teacher),
+    db: Session = Depends(get_db),
+):
+    """담임 교사가 자기 반 학생의 비밀번호를 초기화 — 임시 비번 발급 + 기존 세션 폐기 + 강제 변경.
+
+    담당 반(담임/보조 담임) 학생만 초기화할 수 있고, 교장(org_admin)은 할 수 없다.
+    학생은 다음 로그인 시 강제로 새 비밀번호를 정하게 된다(must_change_password).
+    """
+    if principal.role == "org_admin":
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN, detail="학생 비밀번호 초기화는 담임 교사만 할 수 있어요."
+        )
+    cls = _my_class(db, principal)  # 담임(teacher_id)/보조(assistant_teacher_id)로 배정된 반
+    student = db.get(StudentProfile, student_id)
+    if (
+        student is None
+        or student.class_id != cls.id
+        or student.status == "disabled"
+    ):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail="담당 반 학생이 아니에요.")
+    temp = f"cat-{secrets.randbelow(9000) + 1000}"
+    student.password_hash = hash_password(temp)
+    student.must_change_password = True  # 첫 로그인 시 새 비번 설정 강제 (전역 ForcePasswordGate)
+    auth_service.logout(db, student.id)  # 기존 refresh 토큰 폐기 → 모든 기기 로그아웃
+    audit(
+        db,
+        action="student.password_reset",
+        actor_user_id=principal.id,
+        organization_id=cls.organization_id,
+        target_type="student",
+        target_id=student.id,
+    )
+    db.commit()
+    return {"ok": True, "temp_password": temp}  # 임시 비번은 1회 노출
 
 
 @router.post("/class/students")
