@@ -249,6 +249,16 @@ def verify(
     _throttle(db, request, "verify", RATE_VERIFY_PER_MIN)
     api = _key(db, x_site_key)
     _origin_guard(db, request, api)
+    # 과목 스코프 심층 방어: 외부 판매 키(first_party=False)는 발급 과목의 토큰만 verify한다.
+    # challenge 게이트가 이미 과목을 강제하지만, 1st-party 토큰이 유출돼도 외부 키로 구매
+    # 안 한 과목의 채점·행동데이터 수집에 재사용되지 못하게 verify에서도 다시 막는다.
+    if api.product == "edu" and not api.first_party:
+        tok_subj = cs.peek_subject(req.challenge_token)
+        if tok_subj and tok_subj != api.subject:
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                detail="이 키로는 다른 과목의 챌린지를 검증할 수 없어요.",
+            )
     result = cs.verify_challenge(db, req.challenge_token, req.answer)
     meta = result.pop("meta", {})  # 발급 토큰에 서명된 문항 메타 — 클라이언트 응답에는 내리지 않음
     # 교육형 API는 통과/실패보다 '행동데이터 수집'이 목적 — 정답 여부와 무관하게 적재
