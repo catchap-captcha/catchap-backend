@@ -51,3 +51,5 @@ class Invitation(Base, UUIDPk, Timestamps):
     expires_at: Mapped[datetime] = mapped_column(DateTime)
     accepted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     status: Mapped[str] = mapped_column(String(20), default="pending")
+    # 초대 시 선발급한 교사 개별코드(T-xxxx) — accept 시 가입화면에 프리필된다
+    teacher_code: Mapped[str | None] = mapped_column(String(20), nullable=True)

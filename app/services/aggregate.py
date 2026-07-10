@@ -662,7 +662,11 @@ def analytics(
     fetch_since = min(start - timedelta(days=span), date.today() - timedelta(days=14))
     all_rows = attempts(db, student_ids=ids, since=fetch_since, until=end)
     rows = [r for r in all_rows if r.created_at.date() >= start]
-    prev_rows = [r for r in all_rows if r.created_at.date() < start]
+    # 전기간 비교 창은 원래 정의([start-span, start)) 유지 — fetch 하한 확장(14일 보장)이
+    # kAccDelta/과목 delta/학생 trend 계산에 기간 밖 시도를 섞지 않게 한다.
+    prev_rows = [
+        r for r in all_rows if start - timedelta(days=span) <= r.created_at.date() < start
+    ]
     if not rows:
         return None
     filtered = [r for r in rows if r.subject == subject] if subject else rows
