@@ -581,3 +581,66 @@ def test_grade_ranking_incorrect_no_speed_points(client, db, seed_org):
     assert me_row["score"] == 0  # 오답만 → 정답률/속도 0, 완주(6과목)도 아님 → 0점
 
 
+
+
+def test_all_subjects_sticker_awarded_once(client, db, seed_org):
+    """6과목 완주 스티커: 마지막 과목 done 순간 스티커+코인 지급, 하루 1회 멱등, 복습 미지급."""
+    from app.models import StudentProfile
+
+    token = _student_token(client, seed_org)
+    subjects = ["국어", "영어", "수학", "과학", "사회", "생활"]
+    before = db.get(StudentProfile, seed_org["student"].id).coins
+
+    last_res = None
+    for subj in subjects:
+        last_res = client.post(
+            "/api/v1/learning/attempts",
+            json={"subject": subj, "result": "correct", "score": 100, "completed": True},
+            headers=auth(token),
+        ).json()
+    # 여섯 번째 과목 완료 응답에 스티커+보너스 코인이 실린다
+    assert last_res["sticker_awarded"] is True
+    assert last_res["sticker_coins"] > 0
+    # 앞선 5개 응답에는 없었을 것 — 대신 다시 완료해도 중복 지급이 없는지 확인
+    again = client.post(
+        "/api/v1/learning/attempts",
+        json={"subject": "국어", "result": "correct", "score": 100, "completed": True},
+        headers=auth(token),
+    ).json()
+    assert again["sticker_awarded"] is False and again["sticker_coins"] == 0
+
+    db.expire_all()
+    after = db.get(StudentProfile, seed_org["student"].id).coins
+    # 학습 보상 + 스티커 보너스가 실제 잔액에 반영 (스티커 보너스는 정확히 1회)
+    assert after - before >= last_res["sticker_coins"]
+
+    # 결과 API에 오늘의 스티커 표시
+    res = client.get("/api/v1/students/me/result?subject=국어", headers=auth(token)).json()
+    assert res["sticker_today"] is True
+
+
+def test_chapter_history_before_cut(client, db, seed_org):
+    """챕터 지난 기록: chapter_no 스코프 집계 + before(이번 세션 시작) 이전만."""
+    token = _student_token(client, seed_org)
+    # 3챕터 기록: 정답 1 + 오답 1 → 50%
+    for result in ("correct", "incorrect"):
+        client.post(
+            "/api/v1/learning/attempts",
+            json={"subject": "수학", "result": result, "score": 0, "chapter_no": 3},
+            headers=auth(token),
+        )
+    r = client.get(
+        "/api/v1/students/me/chapter-history?subject=수학&chapter=3", headers=auth(token)
+    ).json()
+    assert r["total"] == 2 and r["accuracy"] == 50
+    # before=과거 시각 → 그 이전 기록 없음 → accuracy null
+    r2 = client.get(
+        "/api/v1/students/me/chapter-history?subject=수학&chapter=3&before=2000-01-01T00:00:00",
+        headers=auth(token),
+    ).json()
+    assert r2["total"] == 0 and r2["accuracy"] is None
+    # 다른 챕터는 집계에 안 섞임
+    r3 = client.get(
+        "/api/v1/students/me/chapter-history?subject=수학&chapter=4", headers=auth(token)
+    ).json()
+    assert r3["total"] == 0

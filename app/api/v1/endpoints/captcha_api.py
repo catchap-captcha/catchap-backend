@@ -204,6 +204,9 @@ def _credit_student(db: Session, student: StudentProfile, meta: dict, correct: b
         "replay": replay,
         "coins_earned": saved.get("coins_earned", 0),
         "coins": saved.get("coins"),
+        # 6과목 완주 스티커 — 이 문항 적립으로 오늘 전 과목 done이 된 순간 함께 지급됨
+        "sticker_awarded": saved.get("sticker_awarded", False),
+        "sticker_coins": saved.get("sticker_coins", 0),
     }
 
 

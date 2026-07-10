@@ -43,6 +43,7 @@ from app.utils.helpers import date_label
 router = APIRouter(tags=["students"])
 
 DAILY_LEARNING_COIN_CAP = 300  # 하루 학습 보상 코인 총량 상한(자기신고 파밍 방지)
+ALL_SUBJECTS_STICKER_COINS = 30  # 6과목 완주 스티커와 함께 주는 보너스 코인(하루 1회, 자정 초기화)
 
 
 def _me(principal: Principal) -> StudentProfile:
@@ -1155,6 +1156,8 @@ def save_attempt(
 
     # 일일 잠금 규칙: 오늘의퀴즈 상태는 '오늘' 것만 갱신 가능(미래 날짜 미리 완료 불가 —
     # quiz_date는 항상 서버의 오늘). 복습(replay)은 상태를 건드리지 않는다(전날 다시풀기는 기록만).
+    sticker_awarded = False
+    sticker_coins = 0
     if not req.replay and req.daily:
         quiz = (
             db.query(DailyQuizStatus)
@@ -1174,9 +1177,56 @@ def save_attempt(
         # 오답으로는 done이 될 수 없다(오답 반복으로 랭킹 만점 방지). 이미 done이면 유지.
         completed_ok = req.completed and req.result == "correct"
         quiz.status = "done" if completed_ok else ("progress" if quiz.status != "done" else "done")
+
+        # 6과목 완주 스티커: 오늘 전 과목이 done이 되는 순간 스티커 + 코인을 함께 지급.
+        # daily_rewards(UNIQUE) 멱등 — 하루 1회. reward_date=오늘이라 자정에 자동 초기화.
+        # SAVEPOINT(begin_nested)로 중복 지급 충돌만 되돌린다(rollback이 시도 기록을 날리지 않게).
+        if completed_ok:
+            db.flush()  # 방금 done 승격을 카운트에 반영
+            done_today = (
+                db.query(func.count(DailyQuizStatus.id))
+                .filter(
+                    DailyQuizStatus.student_id == me.id,
+                    DailyQuizStatus.quiz_date == date.today(),
+                    DailyQuizStatus.status == "done",
+                    DailyQuizStatus.subject.in_(D.SUBJECT_ORDER),
+                )
+                .scalar()
+                or 0
+            )
+            if done_today >= len(D.SUBJECT_ORDER):
+                from sqlalchemy.exc import IntegrityError
+
+                from app.models import DailyReward
+
+                try:
+                    with db.begin_nested():
+                        db.add(
+                            DailyReward(
+                                student_id=me.id, kind="all_subjects_sticker",
+                                reward_date=date.today(), amount=ALL_SUBJECTS_STICKER_COINS,
+                            )
+                        )
+                        db.flush()
+                    sticker_awarded = True
+                    sticker_coins = ALL_SUBJECTS_STICKER_COINS
+                    db.query(StudentProfile).filter(StudentProfile.id == me.id).update(
+                        {StudentProfile.coins: StudentProfile.coins + sticker_coins},
+                        synchronize_session=False,
+                    )
+                    db.add(
+                        CoinTransaction(
+                            student_id=me.id, amount=sticker_coins, reason="6과목 완주 스티커 보너스"
+                        )
+                    )
+                except IntegrityError:
+                    pass  # 오늘 이미 지급 — 스킵(시도 기록은 SAVEPOINT 밖이라 안전)
     db.commit()
     db.refresh(me)  # 원자적 코인 증가 후 최신 잔액으로 응답
-    return {"ok": True, "attempt_id": attempt.id, "coins_earned": coins_earned, "coins": me.coins}
+    return {
+        "ok": True, "attempt_id": attempt.id, "coins_earned": coins_earned, "coins": me.coins,
+        "sticker_awarded": sticker_awarded, "sticker_coins": sticker_coins,
+    }
 
 
 # ---------------------------------------------------------------- 실전 게임 세션 (과목별 문제은행 — subject_banks)
@@ -1617,6 +1667,19 @@ def result(
         ).all()
     }
     done_set = (done_today or set()) | {key}
+    # 오늘의 스티커(6과목 완주) — daily_rewards 장부 기준. 자정이 지나면 자동으로 미획득.
+    from app.models import DailyReward
+
+    sticker_today = (
+        db.query(DailyReward)
+        .filter(
+            DailyReward.student_id == me.id,
+            DailyReward.kind == "all_subjects_sticker",
+            DailyReward.reward_date == date.today(),
+        )
+        .first()
+        is not None
+    )
     return {
         "subject": key,
         "nickname": me.nickname,
@@ -1628,8 +1691,52 @@ def result(
         "today_done": sorted(done_set, key=D.SUBJECT_ORDER.index),
         "subject_order": D.SUBJECT_ORDER,
         "all_done_today": done_set >= set(D.SUBJECT_ORDER),
+        "sticker_today": sticker_today,
         # 오늘 이 과목 시도가 없어 점수·정답 수치가 디자인(데모)값이면 demo=True
         "demo": not res_agg,
+    }
+
+
+@router.get("/students/me/chapter-history")
+def chapter_history(
+    subject: str = Query(...),
+    chapter: int = Query(ge=1),
+    before: str | None = Query(default=None),  # ISO 시각 — 이번 세션 시작 이전 기록만(비교용)
+    principal: Principal = Depends(require_student),
+    db: Session = Depends(get_db),
+):
+    """이 챕터의 지난 기록(정답률) — 결과 화면 '지난 기록 vs 이번' 비교용.
+
+    before(이번 세션 시작 시각)를 주면 그 이전 시도만 집계해, 방금 푼 세션이
+    '지난 기록'에 섞이지 않는다. 기록이 없으면 accuracy=null.
+    """
+    me = _me(principal)
+    if subject not in D.SUBJECT_ORDER:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="알 수 없는 과목입니다.")
+    q = db.query(
+        func.count(LearningAttempt.id),
+        func.coalesce(func.sum(case((LearningAttempt.result == "correct", 1), else_=0)), 0),
+    ).filter(
+        LearningAttempt.student_id == me.id,
+        LearningAttempt.subject == subject,
+        LearningAttempt.chapter_no == chapter,
+    )
+    if before:
+        try:
+            dt = datetime.fromisoformat(before.replace("Z", "+00:00"))
+            # created_at은 서버 로컬(naive)로 저장 — tz 포함 입력(UTC 등)은 로컬로 변환해 비교.
+            # naive 비교로 두면 KST 오전 기록이 UTC 컷보다 '미래'가 돼 오늘 기록이 통째로 잘린다.
+            cut = dt.astimezone().replace(tzinfo=None) if dt.tzinfo is not None else dt
+            q = q.filter(LearningAttempt.created_at < cut)
+        except ValueError:
+            pass  # 형식 오류는 무시하고 전체 기록으로
+    total, correct = q.one()
+    total = int(total or 0)
+    return {
+        "subject": subject,
+        "chapter": chapter,
+        "total": total,
+        "accuracy": round(int(correct or 0) / total * 100) if total else None,
     }
 
 
