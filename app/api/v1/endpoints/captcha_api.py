@@ -148,6 +148,25 @@ def _credit_student(db: Session, student: StudentProfile, meta: dict, correct: b
     qid = meta.get("qid")
     # 전체학습 주간 챕터 플레이면 오늘의퀴즈(습관)를 건드리지 않는다(학습·습관 분리).
     is_chapter = meta.get("chapter") is not None
+    # 챕터 복습은 서버가 판정한다 — 이미 완주한 단계(stages_done 이상)의 재플레이는
+    # 클라이언트가 replay 플래그를 빼고 보내도 미적립. (day 경로의 서버 is_replay 판정과 동형 —
+    # 안 막으면 완주 챕터를 일반 모드로 다시 열어 코인을 재적립하는 파밍 루트가 생긴다)
+    if is_chapter and not replay:
+        stage_meta = meta.get("stage")
+        if isinstance(stage_meta, int):
+            from app.models import ChapterProgress
+
+            cp = (
+                db.query(ChapterProgress)
+                .filter(
+                    ChapterProgress.student_id == student.id,
+                    ChapterProgress.subject == subject,
+                    ChapterProgress.chapter_no == meta.get("chapter"),
+                )
+                .first()
+            )
+            if cp is not None and stage_meta <= (cp.stages_done or 0):
+                replay = True
 
     principal = Principal(kind="student", id=student.id, role="student", student=student)
 

@@ -1642,6 +1642,9 @@ def game_answer(
         "hint": q.get("explain") or q["hint"],
         "coins_earned": saved.get("coins_earned", 0),
         "stages_done": stages_done,
+        # 6과목 완주 스티커 — 이 문항 적립으로 지급된 순간을 프론트가 놓치지 않게(위젯 경로와 동일)
+        "sticker_awarded": saved.get("sticker_awarded", False),
+        "sticker_coins": saved.get("sticker_coins", 0),
     }
 
 

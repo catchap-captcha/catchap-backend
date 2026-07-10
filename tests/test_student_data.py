@@ -644,3 +644,27 @@ def test_chapter_history_before_cut(client, db, seed_org):
         "/api/v1/students/me/chapter-history?subject=수학&chapter=4", headers=auth(token)
     ).json()
     assert r3["total"] == 0
+
+
+def test_chapter_replay_server_side_no_coin_farming(client, db, seed_org):
+    """완주한 챕터 단계를 클라가 replay 플래그 없이 재플레이해도 서버가 복습으로 판정 → 코인 미적립."""
+    from app.api.v1.endpoints.captcha_api import _credit_student
+    from app.models import ChapterProgress, StudentProfile
+
+    student = seed_org["student"]
+    # 수학 1챕터를 3단계까지 완주한 상태로 세팅
+    db.add(ChapterProgress(student_id=student.id, subject="수학", chapter_no=1, stages_done=3))
+    db.commit()
+    before = db.get(StudentProfile, student.id).coins
+
+    # 이미 완주한 2단계를 replay 플래그 없이(rp 없음) 정답 제출 → 서버가 복습 판정
+    s1 = _credit_student(db, student, {"subj": "수학", "chapter": 1, "stage": 2}, True, "o1")
+    db.commit()
+    assert s1["replay"] is True and s1["coins_earned"] == 0
+    db.expire_all()
+    assert db.get(StudentProfile, student.id).coins == before  # 코인 재적립 없음
+
+    # 미완주 4단계는 정상 적립 경로(복습 아님)
+    s2 = _credit_student(db, student, {"subj": "수학", "chapter": 1, "stage": 4}, True, "o1")
+    db.commit()
+    assert s2["replay"] is False and s2["coins_earned"] > 0
