@@ -8,7 +8,9 @@ from app.db.base import Base
 import app.models  # noqa: F401 — 모든 모델을 metadata에 등록
 
 config = context.config
-config.set_main_option("sqlalchemy.url", get_settings().DATABASE_URL)
+# DATABASE_URL의 % (예: 비밀번호 URL 인코딩 %40)를 configparser 보간에서 보호하려면 %%로 이스케이프.
+# 안 하면 alembic 실행 시 "invalid interpolation syntax" 로 죽는다.
+config.set_main_option("sqlalchemy.url", get_settings().DATABASE_URL.replace("%", "%%"))
 
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
