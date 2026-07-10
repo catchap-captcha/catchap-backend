@@ -1389,11 +1389,12 @@ def _site_status_payload(db: Session, org_id: str) -> dict:
         "message": "모든 서비스 정상 작동 중",
         "site_key": masked,
         "domain": site.domain if site else None,
-        # 이번 달 로그가 하나라도 있으면 실집계 (오늘 0건도 실데이터), 없으면 D 유지
-        "calls_today": today_n if month_n else 3912,
-        "calls_month": month_n if month_n else 86540,
-        "error_rate": fb(error_rate, "0.3%"),
-        "avg_latency_ms": fb(avg_latency, 142),
+        # 실집계만 반환 — 사용 이력이 없는 신규 기관에 데모 수치(3912/86540/0.3%/142ms)를
+        # 보여주지 않는다. 값이 없으면 0/None으로, 프론트가 빈/0으로 렌더한다.
+        "calls_today": today_n,
+        "calls_month": month_n,
+        "error_rate": error_rate,
+        "avg_latency_ms": avg_latency,
         "active_keys": active_keys,
         # 과목별 이번 달 교육형 호출 — 대시보드 과목별 사용량 위젯
         "subject_usage": aggregate.subject_usage_this_month(db, org_id),
