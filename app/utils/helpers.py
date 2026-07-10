@@ -47,6 +47,28 @@ def status_key(label: str) -> str:
     return STATUS_KEY.get(label, label)
 
 
+def student_display_name(s, code_full_name: dict) -> str:
+    """교사/기관 화면 표시 이름 — teacher/orgs 엔드포인트 공용(복붙 금지).
+
+    학교 입력 실명 최우선(학생이 닉네임을 바꿔도 교사는 실명으로 식별/검색 가능),
+    없으면 디자인의 '성 포함 표기' 매핑(code_full_name=D.CODE_FULL_NAME), 마지막 닉네임.
+    닉네임이 매핑과 어긋나면 DB 닉네임 우선 → 이름 변경이 화면에 반영된다.
+    """
+    if s.real_name:
+        return s.real_name
+    full = code_full_name.get(s.student_code)
+    if full and s.nickname and s.nickname in full:
+        return full
+    return s.nickname
+
+
+def summary_acc(summary) -> int:
+    """LearningSummary → 정답률(%) — teacher/orgs 엔드포인트 공용(복붙 금지)."""
+    if summary is None or not summary.total_count:
+        return 0
+    return round(summary.correct_count / summary.total_count * 100)
+
+
 def audit(
     db: Session,
     *,

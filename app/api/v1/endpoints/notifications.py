@@ -43,7 +43,9 @@ def list_notifications(
 def mark_all_read(
     principal: Principal = Depends(get_current_principal), db: Session = Depends(get_db)
 ):
-    now = datetime.utcnow()
+    # created_at(로컬 naive)과 같은 응답에 나가는 값 — utcnow로 찍으면 '읽은 시각'이
+    # '생성 시각'보다 9시간 이른 것처럼 보인다. 로컬 저장 규약으로 통일.
+    now = datetime.now()
     updated = 0
     for n in _query(db, principal).filter(Notification.read_at.is_(None)).all():
         n.read_at = now
@@ -62,6 +64,6 @@ def mark_read(
     if n is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="알림을 찾을 수 없습니다.")
     if n.read_at is None:
-        n.read_at = datetime.utcnow()
+        n.read_at = datetime.now()  # created_at 로컬 규약과 통일
         db.commit()
     return {"ok": True}

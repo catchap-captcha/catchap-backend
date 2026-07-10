@@ -40,6 +40,12 @@ _BY_ID: dict[str, dict[str, dict]] = {
     subject: {q["id"]: q for q in bank} for subject, bank in BANKS.items()
 }
 
+# playable 풀도 임포트 시 1회 구축 — 챕터 API가 요청당 수십 번 호출하므로 매번 은행
+# 전체를 재스캔하지 않는다. 반환 리스트는 공유 객체이니 호출부에서 수정 금지(슬라이싱만).
+_PLAYABLE: dict[str, list[dict]] = {
+    subject: [q for q in bank if q["playable"]] for subject, bank in BANKS.items()
+}
+
 
 def get_question(subject: str, qid: str) -> dict | None:
     """과목 스코프 문항 조회 — 타 과목 문항 id로 교차 제출하는 위조를 차단한다."""
@@ -47,7 +53,7 @@ def get_question(subject: str, qid: str) -> dict | None:
 
 
 def playable_pool(subject: str) -> list[dict]:
-    return [q for q in BANKS.get(subject, []) if q["playable"]]
+    return _PLAYABLE.get(subject, [])
 
 
 # 조작형 렌더 필드 — 정답(answer)이 아닌 표시 데이터만. right/cards/items는 추출 단계에서

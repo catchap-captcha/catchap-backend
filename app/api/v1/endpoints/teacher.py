@@ -3,6 +3,7 @@
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.core.permissions import Principal, require_teacher
@@ -26,7 +27,7 @@ from app.schemas.teacher import (
 from app.services import aggregate
 from app.services.aggregate import fb
 from app.services.stats import D  # DB(stat_blobs) 우선, design_data fallback
-from app.utils.helpers import audit, status_key, status_label
+from app.utils.helpers import audit, status_key, status_label, student_display_name, summary_acc
 
 router = APIRouter(prefix="/teacher", tags=["teacher"])
 
@@ -77,24 +78,12 @@ def _week_summaries(db: Session, org_id: str) -> dict[str, LearningSummary]:
 
 
 def _acc(summary: LearningSummary | None) -> int:
-    if summary is None or not summary.total_count:
-        return 0
-    return round(summary.correct_count / summary.total_count * 100)
+    return summary_acc(summary)
 
 
 def _display_name(s: StudentProfile) -> str:
-    """교사/기관 화면 표시용 이름.
-
-    실명 컬럼이 없어 디자인의 '성 포함 표기' 매핑을 쓰되, 닉네임이 바뀌면
-    (매핑과 어긋나면) DB 닉네임을 우선한다 → 이름 변경이 화면에 반영된다.
-    """
-    # 학교 입력 실명 최우선 — 학생이 닉네임을 바꿔도 교사는 실명으로 식별/검색 가능
-    if s.real_name:
-        return s.real_name
-    full = D.CODE_FULL_NAME.get(s.student_code)
-    if full and s.nickname and s.nickname in full:
-        return full
-    return s.nickname
+    """교사 화면 표시 이름 — 공용 로직(helpers.student_display_name) 사용."""
+    return student_display_name(s, D.CODE_FULL_NAME)
 
 
 def _student_row(
@@ -381,13 +370,20 @@ def all_students(
                 "demo": m is None,
             }
         )
-    # 담당 교사 (classes.teacher_id → users)
+    # 담당 교사 (classes.teacher_id → users) — 학급 수만큼 개별 조회하지 않게 배치 로드
+    active_tids = {
+        c.teacher_id for c in classes.values() if c.status == "active" and c.teacher_id
+    }
+    users_by_id = {
+        u.id: u
+        for u in db.query(User).filter(User.id.in_(active_tids or [""])).all()
+    }
     teacher_by_key: dict[str, str] = {}
     for c in classes.values():
         if c.status != "active" or not c.teacher_id:
             continue
         g, cn = _class_gc(c)
-        u = db.get(User, c.teacher_id)
+        u = users_by_id.get(c.teacher_id)
         if u is not None:
             teacher_by_key[f"{g}-{cn}"] = u.name
 
@@ -498,9 +494,20 @@ def family_messages(
         .all()
     )
     students_by_id = {s.id: s for s in students}
+    # 반을 옮긴 수신자 등 명단 밖 학생도 개별 조회 대신 한 번에 배치 로드
+    missing_ids = {m.student_id for m in sent_rows if m.student_id not in students_by_id}
+    if missing_ids:
+        students_by_id.update(
+            {
+                s.id: s
+                for s in db.query(StudentProfile)
+                .filter(StudentProfile.id.in_(missing_ids))
+                .all()
+            }
+        )
     sent = []
     for m in sent_rows:
-        target = students_by_id.get(m.student_id) or db.get(StudentProfile, m.student_id)
+        target = students_by_id.get(m.student_id)
         full_name = _display_name(target) if target else ""
         design = D.FAMILY_PARENTS.get(full_name, {}) if target else {}
         sent.append(
@@ -523,9 +530,16 @@ def send_family_message(
     db: Session = Depends(get_db),
 ):
     cls = _my_class(db, principal)
+    # 수신 학생을 한 번에 로드해 검증 — 다건 발송 시 학생 수만큼 조회하지 않는다
+    students_by_id = {
+        s.id: s
+        for s in db.query(StudentProfile)
+        .filter(StudentProfile.id.in_(req.student_ids or [""]))
+        .all()
+    }
     created = []
     for sid in req.student_ids:
-        student = db.get(StudentProfile, sid)
+        student = students_by_id.get(sid)
         if student is None or student.class_id != cls.id:
             raise HTTPException(status.HTTP_404_NOT_FOUND, detail="우리 반 학생이 아닙니다.")
         msg = FamilyMessage(
@@ -617,13 +631,19 @@ def my_classes(principal: Principal = Depends(require_teacher), db: Session = De
         .order_by(ClassRoom.name)
         .all()
     )
+    # 학급별 학생 수 — 반마다 COUNT 하지 않고 GROUP BY 한 번으로 집계
+    counts = dict(
+        db.query(StudentProfile.class_id, func.count(StudentProfile.id))
+        .filter(
+            StudentProfile.class_id.in_([c.id for c in rows] or [""]),
+            StudentProfile.status != "disabled",
+        )
+        .group_by(StudentProfile.class_id)
+        .all()
+    )
     out = []
     for i, c in enumerate(rows):
-        count = (
-            db.query(StudentProfile)
-            .filter(StudentProfile.class_id == c.id, StudentProfile.status != "disabled")
-            .count()
-        )
+        count = int(counts.get(c.id, 0))
         design = {"1-2반": ("담임", "학생 22명 · 숫자·한글 학습"), "1-3반": ("수학 전담", "학생 24명 · 숫자 놀이터")}
         role, caption = design.get(c.name, ("담임" if i == 0 else "교과", f"학생 {count}명"))
         out.append(

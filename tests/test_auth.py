@@ -1,10 +1,18 @@
 from tests.conftest import get_email_code
 
 
-def login(client, role, email, password):
-    return client.post(
-        "/api/v1/auth/login", json={"role": role, "email": email, "password": password}
-    )
+def login(client, role, email, password, captcha_token=None):
+    payload = {"role": role, "email": email, "password": password}
+    if captcha_token is not None:
+        payload["captcha_token"] = captcha_token
+    return client.post("/api/v1/auth/login", json=payload)
+
+
+def forest_token():
+    """캡차 요구 상태를 통과하기 위한 유효한 메인 캡차(forest) 토큰 — 단일사용."""
+    from app.services import forest_captcha as fc
+
+    return fc.service.issue_token()
 
 
 def test_login_success_and_me(client, db, seed_org):
@@ -36,12 +44,18 @@ def test_captcha_required_after_five_fails(client, seed_org):
     assert res5.status_code == 401
     assert res5.json()["detail"]["captcha_required"] is True
 
-    # 6번째도 계속 요구
+    # 6번째도 계속 요구 — 캡차 토큰 없인 자격 검증 자체가 막힌다(카운트는 안 올라감)
     res6 = login(client, "teacher", "t1@test.dev", "wrong")
     assert res6.json()["detail"]["captcha_required"] is True
 
-    # 성공하면 리셋 → 이후 1회 실패는 캡차 불필요
-    assert login(client, "teacher", "t1@test.dev", "Password123!").status_code == 200
+    # 캡차 요구 상태에서는 올바른 비밀번호도 토큰 없이는 거부된다 (로그인 게이트)
+    blocked = login(client, "teacher", "t1@test.dev", "Password123!")
+    assert blocked.status_code == 401
+    assert blocked.json()["detail"]["captcha_required"] is True
+
+    # 캡차 통과 토큰과 함께 성공하면 리셋 → 이후 1회 실패는 캡차 불필요
+    ok = login(client, "teacher", "t1@test.dev", "Password123!", captcha_token=forest_token())
+    assert ok.status_code == 200
     res_after = login(client, "teacher", "t1@test.dev", "wrong")
     assert res_after.json()["detail"]["captcha_required"] is False
 
@@ -54,9 +68,19 @@ def test_student_captcha_counter(client, seed_org):
             json={"student_login_id": "stu01", "password": "wrong"},
         )
     assert res.json()["detail"]["captcha_required"] is True
-    ok = client.post(
+    # 캡차 요구 상태 — 올바른 비밀번호도 토큰 없이는 거부, 토큰과 함께면 성공(리셋)
+    blocked = client.post(
         "/api/v1/auth/student-login",
         json={"student_login_id": "stu01", "password": "1234"},
+    )
+    assert blocked.status_code == 401
+    ok = client.post(
+        "/api/v1/auth/student-login",
+        json={
+            "student_login_id": "stu01",
+            "password": "1234",
+            "captcha_token": forest_token(),
+        },
     )
     assert ok.status_code == 200
 

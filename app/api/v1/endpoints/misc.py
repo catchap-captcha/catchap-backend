@@ -1,6 +1,6 @@
 """기타 API — 문의(무인증), AI 챗 stub, CAPTCHA 챌린지 stub."""
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.orm import Session
 
 from app.core.permissions import Principal, check_parent_child, require_parent, require_student
@@ -90,6 +90,8 @@ def parent_chat_intro(
     """학부모 상담 AI 첫 인사 — 자녀별 intro 문구 (stat_blobs 수정 가능)."""
     check_parent_child(db, principal.id, child_id)
     child = db.get(StudentProfile, child_id)
+    if child is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="자녀 정보를 찾을 수 없습니다.")
     preset = D.PARENT_AI_ANSWERS.get(child.nickname, D.PARENT_AI_ANSWERS["하은"])
     return {"intro": preset["intro"], "suggestions": list(preset["answers"].keys())}
 
@@ -103,6 +105,8 @@ def parent_chat(
     """학부모 상담 AI stub — 자녀별 답변 세트 (추후 LLM 연동)."""
     check_parent_child(db, principal.id, req.child_id)
     child = db.get(StudentProfile, req.child_id)
+    if child is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="자녀 정보를 찾을 수 없습니다.")
     preset = D.PARENT_AI_ANSWERS.get(child.nickname, D.PARENT_AI_ANSWERS["하은"])
     message = req.message.strip()
     reply = preset["answers"].get(message)

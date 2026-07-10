@@ -356,7 +356,7 @@ def download_report(
         ReportDownloadLog(
             report_id=report.id,
             user_id=principal.id,
-            downloaded_at=datetime.utcnow(),
+            downloaded_at=datetime.now(),  # created_at 로컬 저장 규약과 통일
             ip_address=request.client.host if request.client else None,
         )
     )

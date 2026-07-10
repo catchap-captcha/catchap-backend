@@ -8,6 +8,7 @@
 """
 
 from datetime import date
+from functools import lru_cache
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
@@ -38,6 +39,13 @@ RATE_VALIDATE_PER_MIN = 240
 _AUDIO_DIR = Path(__file__).resolve().parents[3] / "static" / "audio"  # app/static/audio
 
 
+@lru_cache(maxsize=128)
+def _audio_bytes(name: str) -> bytes | None:
+    """오디오 파일 프로세스당 1회 읽기 — 화이트리스트 파일만 캐시되므로 크기 유한."""
+    path = _AUDIO_DIR / name
+    return path.read_bytes() if path.exists() else None
+
+
 @router.get("/audio/{name}")
 def audio(name: str):
     """듣기 문항 오디오(.m4a) 서빙. 파일명은 불투명(snd-NN)이라 정답 단어를 노출하지 않는다.
@@ -46,11 +54,11 @@ def audio(name: str):
 
     if name not in AUDIO_FILES:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="not found")
-    path = _AUDIO_DIR / name
-    if not path.exists():
+    content = _audio_bytes(name)
+    if content is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="not found")
     return Response(
-        content=path.read_bytes(),
+        content=content,
         media_type="audio/mp4",
         headers={"Access-Control-Allow-Origin": "*", "Cache-Control": "public, max-age=86400"},
     )
@@ -59,16 +67,23 @@ def audio(name: str):
 _FLAG_DIR = Path(__file__).resolve().parents[3] / "static" / "flags"  # app/static/flags
 
 
+@lru_cache(maxsize=512)
+def _flag_bytes(code: str) -> bytes | None:
+    """국기 SVG 프로세스당 1회 읽기 — 2글자 코드만 오므로 키 공간 유한."""
+    path = _FLAG_DIR / f"{code}.svg"
+    return path.read_bytes() if path.exists() else None
+
+
 @router.get("/flag/{code}")
 def flag(code: str):
     """국기 조각 맞추기 문항용 국기 SVG 서빙. 화이트리스트(2글자 국가코드) 밖은 404."""
     if not code.isalpha() or len(code) != 2:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="not found")
-    path = _FLAG_DIR / f"{code.lower()}.svg"
-    if not path.exists():
+    content = _flag_bytes(code.lower())
+    if content is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="not found")
     return Response(
-        content=path.read_bytes(),
+        content=content,
         media_type="image/svg+xml",
         headers={"Access-Control-Allow-Origin": "*", "Cache-Control": "public, max-age=86400"},
     )

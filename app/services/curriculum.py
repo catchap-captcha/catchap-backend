@@ -42,8 +42,15 @@ def date_for_index(idx: int) -> date:
     return ANCHOR + timedelta(days=idx)
 
 
+# 주제→문항 인덱스는 임포트 시 1회 구축 — curriculum_window가 요청당 창 길이(약 11일)만큼
+# 호출하므로 매번 은행 전체(275문항)를 재스캔하지 않는다. 반환 리스트는 공유 객체(수정 금지).
+_TOPIC_QUESTIONS: dict[str, list[dict]] = {}
+for _q in life_bank.LIFE_FULL:
+    _TOPIC_QUESTIONS.setdefault(_q["topic"], []).append(_q)
+
+
 def _topic_questions(topic: str) -> list[dict]:
-    return [q for q in life_bank.LIFE_FULL if q["topic"] == topic]
+    return _TOPIC_QUESTIONS.get(topic, [])
 
 
 def day_status(idx: int, today_idx: int) -> str:

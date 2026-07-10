@@ -5,7 +5,7 @@ from datetime import date, datetime, time, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel as _GBaseModel
-from sqlalchemy import func
+from sqlalchemy import case, func
 from sqlalchemy.orm import Session
 
 from app.core.permissions import Principal, require_student
@@ -1092,22 +1092,19 @@ def save_attempt(
         )
         db.add(prog)
     prog.questions_done = (prog.questions_done or 0) + 1
-    prev_total = (
-        db.query(func.count(LearningAttempt.id))
-        .filter(LearningAttempt.student_id == me.id, LearningAttempt.subject == req.subject)
-        .scalar()
-        or 0
-    )
-    prev_correct = (
-        db.query(func.count(LearningAttempt.id))
-        .filter(
-            LearningAttempt.student_id == me.id,
-            LearningAttempt.subject == req.subject,
-            LearningAttempt.result == "correct",
+    # 전체/정답 수를 COUNT 두 번 대신 한 번의 집계로 조회 — 모든 문제풀이마다 도는 핫패스
+    prev_total, prev_correct = (
+        db.query(
+            func.count(LearningAttempt.id),
+            func.coalesce(
+                func.sum(case((LearningAttempt.result == "correct", 1), else_=0)), 0
+            ),
         )
-        .scalar()
-        or 0
+        .filter(LearningAttempt.student_id == me.id, LearningAttempt.subject == req.subject)
+        .one()
     )
+    prev_total = int(prev_total or 0)
+    prev_correct = int(prev_correct or 0)
     total = prev_total + 1
     correct = prev_correct + (1 if req.result == "correct" else 0)
     prog.accuracy = round(correct / total * 100, 1)

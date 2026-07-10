@@ -55,7 +55,7 @@ class _RegisterStudentsReq(_BaseModel):
     names: list[str] | None = None  # 학생 실명(슬롯 순서대로, 교사·기관 화면 전용)
     genders: list[str | None] | None = None  # 성별(슬롯 순서대로, 선생님 입력 — 아이가 안 고름)
 from app.services.stats import D  # DB(stat_blobs) 우선, design_data fallback
-from app.utils.helpers import audit, parse_grade
+from app.utils.helpers import audit, parse_grade, student_display_name, summary_acc
 
 router = APIRouter(prefix="/orgs", tags=["orgs"])
 
@@ -303,18 +303,9 @@ def classes(
     if scope_grade is not None:
         rows = [c for c in rows if _class_grade(c) == scope_grade]
     design = {c["name"]: c for c in D.ORG_CLASSES}
-    # 학급별 실제 학생 수 (student_profiles.class_id 기준)
-    counts = dict(
-        db.query(StudentProfile.class_id, func.count(StudentProfile.id))
-        .filter(
-            StudentProfile.organization_id == org_id,
-            StudentProfile.class_id.isnot(None),
-            StudentProfile.status != "disabled",
-        )
-        .group_by(StudentProfile.class_id)
-        .all()
-    )
-    # 학급별 실 정답률: 반 학생들의 28일 정답률 평균(learning_attempts 실집계). 없으면 디자인 폴백.
+    # 학급별 학생 수·명단(정답률 평균용)을 한 번의 조회로 함께 구성 — 같은 테이블 이중 스캔 방지.
+    # 실 정답률: 반 학생들의 28일 정답률 평균(learning_attempts 실집계). 없으면 디자인 폴백.
+    counts: dict[str, int] = {}
     cls_students: dict[str, list[str]] = {}
     for sid, cid in (
         db.query(StudentProfile.id, StudentProfile.class_id)
@@ -325,6 +316,7 @@ def classes(
         )
         .all()
     ):
+        counts[cid] = counts.get(cid, 0) + 1
         cls_students.setdefault(cid, []).append(sid)
     metrics = aggregate.student_roster_metrics(db, [s for lst in cls_students.values() for s in lst])
 
@@ -332,11 +324,18 @@ def classes(
         accs = [metrics[s]["acc"] for s in cls_students.get(cid, []) if s in metrics]
         return round(sum(accs) / len(accs)) if accs else None
 
+    # 담임·보조 담임 사용자 — 반마다 개별 조회하지 않고 배치 로드
+    staff_ids = {c.teacher_id for c in rows if c.teacher_id} | {
+        c.assistant_teacher_id for c in rows if c.assistant_teacher_id
+    }
+    staff_by_id = {
+        u.id: u for u in db.query(User).filter(User.id.in_(staff_ids or [""])).all()
+    }
     out = []
     for c in rows:
         d = design.get(c.name, {})
-        teacher_user = db.get(User, c.teacher_id) if c.teacher_id else None
-        assistant_user = db.get(User, c.assistant_teacher_id) if c.assistant_teacher_id else None
+        teacher_user = staff_by_id.get(c.teacher_id) if c.teacher_id else None
+        assistant_user = staff_by_id.get(c.assistant_teacher_id) if c.assistant_teacher_id else None
         real_count = int(counts.get(c.id, 0))
         real_acc = _class_acc(c.id)  # 실플레이 학생이 있으면 실정답률
         acc = real_acc if real_acc is not None else d.get("acc", 0)
@@ -469,19 +468,12 @@ def dissolve_class(
 
 
 def _acc_pct(summary) -> int:
-    if summary is None or not summary.total_count:
-        return 0
-    return round(summary.correct_count / summary.total_count * 100)
+    return summary_acc(summary)
 
 
 def _roster_display_name(s: StudentProfile) -> str:
-    """기관 화면 표시 이름: 실명 최우선(닉네임 변경 무관), 없으면 디자인 매핑/닉네임."""
-    if s.real_name:
-        return s.real_name
-    full = D.CODE_FULL_NAME.get(s.student_code)
-    if full and s.nickname and s.nickname in full:
-        return full
-    return s.nickname
+    """기관 화면 표시 이름 — 공용 로직(helpers.student_display_name) 사용."""
+    return student_display_name(s, D.CODE_FULL_NAME)
 
 
 @router.get("/{org_id}/roster")
@@ -651,21 +643,34 @@ def _link_assistant(
     cls.assistant_teacher_id = user_id
 
 
-def _teacher_row(db: Session, m: Membership) -> dict:
-    user = db.get(User, m.user_id) if m.user_id else None
+def _teacher_row(
+    db: Session,
+    m: Membership,
+    users_by_id: dict[str, User] | None = None,
+    cls_by_user: dict[str, ClassRoom] | None = None,
+) -> dict:
+    """교사 행 1개. 목록처럼 여러 행을 만들 때는 users_by_id/cls_by_user를 미리 만들어
+    넘겨 행마다 개별 조회(N+1)하지 않는다. 단건 응답(add/update)은 db 조회 폴백."""
+    if m.user_id:
+        user = users_by_id.get(m.user_id) if users_by_id is not None else db.get(User, m.user_id)
+    else:
+        user = None
     # 담당 학급: 담임(teacher_id) 또는 보조(assistant_teacher_id) 어느 쪽으로든 연결된 반
-    cls = (
-        db.query(ClassRoom)
-        .filter(
-            ClassRoom.status == "active",
-            (ClassRoom.teacher_id == m.user_id)
-            | (ClassRoom.assistant_teacher_id == m.user_id),
+    if not m.user_id:
+        cls = None
+    elif cls_by_user is not None:
+        cls = cls_by_user.get(m.user_id)
+    else:
+        cls = (
+            db.query(ClassRoom)
+            .filter(
+                ClassRoom.status == "active",
+                (ClassRoom.teacher_id == m.user_id)
+                | (ClassRoom.assistant_teacher_id == m.user_id),
+            )
+            .order_by(ClassRoom.name)
+            .first()
         )
-        .order_by(ClassRoom.name)
-        .first()
-        if m.user_id
-        else None
-    )
     design = next((t for t in D.ORG_TEACHERS if user and t["name"] == user.name), None)
     return {
         "id": m.id,
@@ -703,7 +708,26 @@ def teachers(
         .order_by(Membership.created_at)
         .all()
     )
-    out = [_teacher_row(db, m) for m in rows]
+    # 행마다 사용자·학급을 조회하지 않도록(N+1) 배치 프리페치
+    uids = {m.user_id for m in rows if m.user_id}
+    users_by_id = {
+        u.id: u for u in db.query(User).filter(User.id.in_(uids or [""])).all()
+    }
+    cls_by_user: dict[str, ClassRoom] = {}
+    for c in (
+        db.query(ClassRoom)
+        .filter(
+            ClassRoom.status == "active",
+            ClassRoom.teacher_id.in_(uids or [""])
+            | ClassRoom.assistant_teacher_id.in_(uids or [""]),
+        )
+        .order_by(ClassRoom.name)
+        .all()
+    ):
+        for uid in (c.teacher_id, c.assistant_teacher_id):
+            if uid in uids and uid not in cls_by_user:
+                cls_by_user[uid] = c
+    out = [_teacher_row(db, m, users_by_id, cls_by_user) for m in rows]
     if scope_grade is not None:
         # 담당 학년 학급을 맡은 교사 + 담당 학년으로 지정된 학년부장만
         out = [

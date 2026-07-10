@@ -71,14 +71,29 @@ def dashboard(principal: Principal = Depends(require_ops), db: Session = Depends
 @router.get("/orgs")
 def orgs(principal: Principal = Depends(require_ops), db: Session = Depends(get_db)):
     rows = db.query(Organization).order_by(Organization.created_at).all()
-    return [_org_admin_row(db, o) for o in rows]
+    # 기관마다 학생 수 COUNT를 따로 날리지 않고 GROUP BY 한 번으로 집계
+    counts = dict(
+        db.query(StudentProfile.organization_id, func.count(StudentProfile.id))
+        .filter(StudentProfile.status != "disabled")
+        .group_by(StudentProfile.organization_id)
+        .all()
+    )
+    return [_org_admin_row(db, o, student_count=int(counts.get(o.id, 0))) for o in rows]
 
 
 # ---------------------------------------------------------------- 기관 등록/수정/삭제 (운영자)
 # 운영자 콘솔은 기관 '엔티티'만 관리한다. 학생 명단·실명 등 기관 내부 데이터는
 # 여기서 다루지 않으며(아동 PII 분리), 그건 기관 관리자/학년부장의 /orgs/* 콘솔 몫이다.
-def _org_admin_row(db: Session, o: Organization) -> dict:
-    """운영자 기관 목록/상세 행 — 기관 메타 + 학생 수(집계값만, PII 아님)."""
+def _org_admin_row(db: Session, o: Organization, student_count: int | None = None) -> dict:
+    """운영자 기관 목록/상세 행 — 기관 메타 + 학생 수(집계값만, PII 아님).
+
+    목록처럼 여러 행을 만들 때는 student_count를 미리 집계해 넘겨 기관마다 COUNT하지 않는다."""
+    if student_count is None:
+        student_count = (
+            db.query(StudentProfile)
+            .filter(StudentProfile.organization_id == o.id, StudentProfile.status != "disabled")
+            .count()
+        )
     return {
         "id": o.id,
         "name": o.name,
@@ -90,9 +105,7 @@ def _org_admin_row(db: Session, o: Organization) -> dict:
         "address": o.address,
         "business_number": o.business_number,
         "edu_subjects": list(o.edu_subjects or []),  # 구매한 교육형 과목(발급 허용 범위)
-        "students": db.query(StudentProfile)
-        .filter(StudentProfile.organization_id == o.id, StudentProfile.status != "disabled")
-        .count(),
+        "students": student_count,
         "created_at": o.created_at.isoformat() if o.created_at else None,
     }
 

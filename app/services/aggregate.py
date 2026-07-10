@@ -25,6 +25,7 @@ from app.models import (
     StudentProfile,
 )
 from app.services.stats import D
+from app.utils.helpers import student_display_name
 
 
 def fb(value: Any, default: Any) -> Any:
@@ -220,7 +221,9 @@ def student_roster_metrics(
 def _rel_time(dt: datetime | None) -> str:
     if dt is None:
         return ""
-    now = datetime.utcnow()
+    # created_at은 로컬 naive(datetime.now) 저장 규약 — utcnow와 비교하면 KST에서
+    # 항상 '방금 전'이 되고, 아침 시간대엔 '-1일 전'까지 나온다(자정 경계 밀림).
+    now = datetime.now()
     if dt.date() == now.date():
         mins = max(0, int((now - dt).total_seconds() // 60))
         if mins < 30:
@@ -233,10 +236,9 @@ def _rel_time(dt: datetime | None) -> str:
 
 
 def _display_name(s: StudentProfile) -> str:
-    full = D.CODE_FULL_NAME.get(s.student_code)
-    if full and s.nickname and s.nickname in full:
-        return full
-    return s.nickname
+    # 공용 로직(helpers.student_display_name) — 실명 최우선. 예전 복사본엔 실명 분기가
+    # 빠져 있어 분석 화면만 명단과 다른 이름(닉네임)이 보였다.
+    return student_display_name(s, D.CODE_FULL_NAME)
 
 
 # estimated_reason → 화면 라벨/색/태그 (텍스트는 디자인 어휘 유지)

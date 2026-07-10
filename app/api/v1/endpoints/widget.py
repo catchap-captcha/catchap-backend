@@ -5,6 +5,7 @@
 
 import html
 import re
+from functools import lru_cache
 from pathlib import Path
 
 from fastapi import APIRouter
@@ -28,10 +29,17 @@ _DEMO_CSP = (
 _API_RE = re.compile(r"^/[A-Za-z0-9_/\-]{1,64}$")
 
 
+@lru_cache(maxsize=1)
+def _widget_js_source() -> str:
+    """위젯 JS는 배포 단위로만 바뀌므로 프로세스당 1회만 디스크에서 읽는다."""
+    return (_STATIC / "catchap-widget.js").read_text(encoding="utf-8")
+
+
 @router.get("/catchap-widget.js")
 def widget_js():
-    js = (_STATIC / "catchap-widget.js").read_text(encoding="utf-8")
-    return Response(content=js, media_type="application/javascript", headers=_CORS)
+    return Response(
+        content=_widget_js_source(), media_type="application/javascript", headers=_CORS
+    )
 
 
 @router.get("/demo", response_class=HTMLResponse)

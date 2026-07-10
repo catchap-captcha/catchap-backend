@@ -8,6 +8,7 @@
 (services/forest_captcha.py). 자사 로그인 페이지(동일 출처)용이라 공개 CORS(/captcha/v1)와 분리한다.
 """
 
+from functools import lru_cache
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
@@ -84,15 +85,27 @@ def target_image(challenge_id: str):
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="challenge_not_found_or_expired")
     if rec.animal not in fc.ANIMALS or not (0 <= rec.target_direction < fc.DIRECTIONS):
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="asset_not_found")
-    path = (_ANIMALS_DIR / rec.animal / f"dir{rec.target_direction}.png").resolve()
-    base = _ANIMALS_DIR.resolve()
-    if base not in path.parents or not path.exists():
+    content = _animal_frame(rec.animal, rec.target_direction)
+    if content is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="asset_not_found")
     return Response(
-        content=path.read_bytes(),
+        content=content,
         media_type="image/png",
         headers={"Cache-Control": "no-store"},
     )
+
+
+@lru_cache(maxsize=None)
+def _animal_frame(animal: str, direction: int) -> bytes | None:
+    """포즈 PNG 프로세스당 1회 읽기 — 키는 화이트리스트(ANIMALS×8방향)라 유한.
+
+    no-store는 클라이언트/중간 캐시용 지시고, 서버 인메모리 보관은 정답 노출과 무관하다.
+    """
+    path = (_ANIMALS_DIR / animal / f"dir{direction}.png").resolve()
+    base = _ANIMALS_DIR.resolve()
+    if base not in path.parents or not path.exists():
+        return None
+    return path.read_bytes()
 
 
 # ---------------------------------------------------------------- 3) 검증
