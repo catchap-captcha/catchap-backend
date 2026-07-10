@@ -5,7 +5,7 @@
 - 교사(teacher): 담당 학급 범위
 - 학부모: 승인된 연결 자녀만
 - 학생: 본인 데이터만
-- 운영자(ops): 운영 API만
+- 운영자(ops): 운영 API(/ops/*)만 — 기관 스코프 데이터(학생 명단·실명 등)에는 접근 불가
 principal 은 (kind, id) — kind: 'user' | 'student'
 """
 
@@ -82,17 +82,21 @@ require_student = require_roles("student")
 require_parent = require_roles("parent")
 # 학년부장은 교사 권한도 포함(자기 학급 조회 등)
 require_teacher = require_roles("teacher", "grade_head", "org_admin")
-# 학년/반/교사 관리: 학년부장(자기 학년) + 교장 + 운영자
-require_grade_head = require_roles("grade_head", "org_admin", "ops")
-# 기관 전체 관리(교장 전용): 학년부장은 제외
-require_org_admin = require_roles("org_admin", "ops")
+# 학년/반/교사 관리: 학년부장(자기 학년) + 교장. 운영자는 기관 데이터에 접근하지 않는다.
+require_grade_head = require_roles("grade_head", "org_admin")
+# 기관 전체 관리(교장 전용): 학년부장·운영자는 제외
+require_org_admin = require_roles("org_admin")
 require_ops = require_roles("ops")
 
 
 def check_org_scope(principal: Principal, organization_id: str) -> None:
-    """운영자는 전체, 그 외에는 자기 기관만."""
-    if principal.role == "ops":
-        return
+    """자기 기관만 접근 허용.
+
+    운영자(ops)는 기관 스코프 데이터(학생 명단·실명·나이 등)에 접근하지 않는다.
+    운영자는 /ops/* 콘솔의 익명·집계 데이터만 보며, 아동 PII는 기관 관리자/학년부장에게만
+    노출된다. (require_org_admin/require_grade_head에서 ops를 제외했으므로 ops는 이 함수에
+    도달하지 못하지만, 향후 실수로 role 번들에 ops가 다시 추가되더라도 여기서 막는다.)
+    """
     if principal.organization_id != organization_id:
         raise HTTPException(status.HTTP_403_FORBIDDEN, detail="기관 접근 권한이 없습니다.")
 
@@ -116,12 +120,12 @@ def managed_grade(db: Session, principal: Principal) -> int | None:
 def check_grade_scope(db: Session, principal: Principal, organization_id: str, grade: int | None) -> None:
     """학년 단위 접근 검사.
 
-    - ops/org_admin: 기관 범위만 맞으면 전체 학년 허용 (교장은 전 학년)
+    - org_admin: 기관 범위만 맞으면 전체 학년 허용 (교장은 전 학년)
     - grade_head: 자기 담당 학년(grade)일 때만 허용
-    - 그 외: 거부
+    - 그 외(ops 포함): 거부
     """
     check_org_scope(principal, organization_id)
-    if principal.role in ("ops", "org_admin"):
+    if principal.role == "org_admin":
         return
     if principal.role == "grade_head":
         mg = managed_grade(db, principal)

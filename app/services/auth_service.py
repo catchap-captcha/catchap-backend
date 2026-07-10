@@ -1,3 +1,4 @@
+import re
 import secrets
 from datetime import datetime, timedelta, timezone
 
@@ -20,6 +21,7 @@ from app.models import (
     Organization,
     OrgRegistrationRequest,
     RefreshToken,
+    StudentJoinCode,
     StudentProfile,
     Subscription,
     User,
@@ -516,16 +518,58 @@ def register_teacher(db: Session, req: s.RegisterTeacherRequest) -> User:
 
 
 def student_id_available(db: Session, login_id: str) -> bool:
-    """학생 아이디 전역 중복 확인 (전 기관 대상)"""
+    """학생 아이디 전역 중복 확인 (전 기관 대상).
+
+    이미 가입한 학생(student_profiles)뿐 아니라 아직 미사용인 가입 코드에 예약된
+    아이디(student_join_codes.login_id)와도 겹치면 안 된다 — 활성화 시점 충돌 방지.
+    """
     login_id = login_id.strip()
     if len(login_id) < 3:
         return False
-    return (
-        db.query(StudentProfile)
-        .filter(StudentProfile.student_login_id == login_id)
-        .first()
-        is None
+    used_by_student = (
+        db.query(StudentProfile).filter(StudentProfile.student_login_id == login_id).first()
     )
+    reserved_by_code = (
+        db.query(StudentJoinCode).filter(StudentJoinCode.login_id == login_id).first()
+    )
+    return used_by_student is None and reserved_by_code is None
+
+
+def suggest_student_ids(db: Session, requested: str, n: int = 4) -> list[str]:
+    """중복된 아이디에 대해 사용 가능한 대안을 추천 — 아이가 중복으로 여러 번 막히지 않도록.
+
+    요청 아이디의 어간(끝 숫자 제거)에 작은 번호를 붙여 이미 쓰인 것과 겹치지 않는 후보를 만든다.
+    이미 쓰인 아이디는 어간 prefix LIKE 한 번으로 모아 파이썬에서 걸러 쿼리 수를 최소화한다.
+    """
+    requested = (requested or "").strip().lower()
+    if len(requested) < 2:
+        return []
+    stem = re.sub(r"\d+$", "", requested) or requested  # 끝 숫자 제거한 어간
+    stem = stem[:20]
+    if len(stem) < 2:
+        return []
+    like = stem + "%"
+    taken: set[str] = set()
+    for (lid,) in (
+        db.query(StudentProfile.student_login_id)
+        .filter(StudentProfile.student_login_id.like(like))
+        .all()
+    ):
+        if lid:
+            taken.add(lid.strip().lower())
+    for (lid,) in (
+        db.query(StudentJoinCode.login_id).filter(StudentJoinCode.login_id.like(like)).all()
+    ):
+        if lid:
+            taken.add(lid.strip().lower())
+    out: list[str] = []
+    i = 1
+    while len(out) < n and i <= 200:
+        cand = f"{stem}{i}"
+        if len(cand) >= 3 and cand not in taken:
+            out.append(cand)
+        i += 1
+    return out
 
 
 def register_student(db: Session, req: s.RegisterStudentRequest) -> StudentProfile:
@@ -589,7 +633,9 @@ def register_org(db: Session, req: s.RegisterOrgRequest) -> Organization:
         ):
             raise HTTPException(status.HTTP_409_CONFLICT, detail="이미 등록된 고유번호입니다.")
 
-    _consume_verified_code(db, email, req.email_code, "signup")
+    # 신청 단계 이메일 인증은 선택 — 코드를 함께 보냈을 때만 소비(검증). 신청서 흐름에선 생략.
+    if req.email_code:
+        _consume_verified_code(db, email, req.email_code, "signup")
 
     request = OrgRegistrationRequest(
         org_name=req.org_name,
@@ -623,14 +669,19 @@ def register_org(db: Session, req: s.RegisterOrgRequest) -> Organization:
     # 신청서는 pending 유지 — 승인 시 approved로 전환
     request.organization_id = org.id
 
+    # 신청서 흐름: 관리자 계정은 만들되 로그인 불가(pending) 상태로 둔다.
+    # 비번을 함께 받았으면(검증 흐름) 그대로 쓰고, 아니면 사용 불가한 임시 해시를 넣는다.
+    # email_verified_at 이 None 이면 '자격증명 미발급' 표식 — 승인 시 임시 비번을 발급한다.
+    has_password = bool(req.password)
     admin = User(
         email=email,
-        password_hash=hash_password(req.password),
+        password_hash=hash_password(req.password if has_password else secrets.token_urlsafe(24)),
         name=req.contact_name,
         phone=req.contact_phone,
         role="org_admin",
+        status="pending",
         organization_id=org.id,
-        email_verified_at=_now(),
+        email_verified_at=_now() if has_password else None,
     )
     db.add(admin)
     db.flush()
@@ -769,4 +820,5 @@ def get_me(db: Session, principal) -> s.MeResponse:
         organization_id=user.organization_id,
         organization_name=org.name if org else None,
         managed_grade=managed_grade,
+        must_change_password=bool(getattr(user, "must_change_password", False)),
     )

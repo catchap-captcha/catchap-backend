@@ -105,12 +105,23 @@ def generate_join_codes(
     return out
 
 
-def activate_student(db: Session, code: str, nickname: str, password: str) -> tuple[StudentProfile, StudentJoinCode]:
-    """가입 코드로 학생 계정 활성화 — 별명·비밀번호만 정하면 완료(이메일 없음)."""
+def activate_student(
+    db: Session, code: str, student_login_id: str, nickname: str, password: str
+) -> tuple[StudentProfile, StudentJoinCode]:
+    """가입 코드로 학생 계정 활성화 — 학생이 로그인 아이디·별명·비밀번호를 정하면 완료(이메일 없음).
+
+    로그인 아이디는 학생이 직접 입력하고, 전역 유일해야 한다(가입한 학생·미사용 코드 예약분 모두와
+    겹치면 안 됨). 중복 확인과 활성화 사이에 선점될 수 있어 여기서 다시 검증한다.
+    """
     code = (code or "").strip().upper()
+    student_login_id = (student_login_id or "").strip()
     nickname = (nickname or "").strip()
-    if not code or not nickname or not password:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="코드·별명·비밀번호를 입력해 주세요.")
+    if not code or not student_login_id or not nickname or not password:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST, detail="코드·아이디·별명·비밀번호를 입력해 주세요."
+        )
+    if len(student_login_id) < 3:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="아이디는 3자 이상이어야 해요.")
     row = (
         db.query(StudentJoinCode)
         .filter(StudentJoinCode.code_hash == sha256_hash(code))
@@ -123,10 +134,24 @@ def activate_student(db: Session, code: str, nickname: str, password: str) -> tu
     if row.expires_at and row.expires_at < _now():
         raise HTTPException(status.HTTP_410_GONE, detail="코드가 만료됐어요. 선생님께 새 코드를 받아 주세요.")
 
+    # 학생이 고른 아이디 전역 유일성 재검증 (자기 코드에 예약된 아이디는 제외)
+    taken = (
+        db.query(StudentProfile)
+        .filter(StudentProfile.student_login_id == student_login_id)
+        .first()
+        or db.query(StudentJoinCode)
+        .filter(StudentJoinCode.login_id == student_login_id, StudentJoinCode.id != row.id)
+        .first()
+    )
+    if taken:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, detail="이미 사용 중인 아이디예요. 다른 아이디를 골라 주세요."
+        )
+
     profile = StudentProfile(
         organization_id=row.organization_id,
         class_id=row.class_id,
-        student_login_id=row.login_id,  # 학교 발급·전역 유일
+        student_login_id=student_login_id,  # 학생이 직접 정함(전역 유일)
         student_code=_unique_student_code(db),
         password_hash=hash_password(password),
         nickname=nickname,  # 자유 중복 허용
@@ -138,6 +163,7 @@ def activate_student(db: Session, code: str, nickname: str, password: str) -> tu
     db.flush()
     row.used_at = _now()
     row.student_id = profile.id
+    row.login_id = student_login_id  # 기록 일관성 — 학생이 고른 아이디로 갱신(교사 화면 반영)
     db.commit()
     return profile, row
 

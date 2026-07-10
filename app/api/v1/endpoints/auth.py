@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from app.core.permissions import Principal, get_current_principal
@@ -15,9 +15,12 @@ def _client_ip(request: Request) -> str:
 
 
 class ActivateStudentRequest(BaseModel):
-    code: str
-    nickname: str
-    password: str
+    code: str = Field(min_length=1, max_length=40)
+    # 학생이 직접 정하는 로그인 아이디 (전역 유일). 컬럼이 String(50)이라 상한을 두어
+    # 초과 입력이 DB DataError(500)로 새지 않고 422로 정직히 거부되게 한다.
+    student_login_id: str = Field(min_length=3, max_length=50)
+    nickname: str = Field(min_length=1, max_length=50)
+    password: str = Field(min_length=1, max_length=200)
 
 
 @router.post("/activate-student", response_model=s.TokenPair)
@@ -34,7 +37,7 @@ def activate_student(
     auth_service._check_locked(db, ident)
     try:
         profile, _ = onboarding_service.activate_student(
-            db, req.code, req.nickname, req.password
+            db, req.code, req.student_login_id, req.nickname, req.password
         )
     except HTTPException as e:
         if e.status_code in (404, 409, 410):  # 코드 오류·만료·재사용 = 실패로 집계
@@ -88,8 +91,12 @@ def send_email_code(req: s.EmailSendRequest, request: Request, db: Session = Dep
 
 @router.post("/check-student-id")
 def check_student_id(req: s.CheckStudentIdRequest, db: Session = Depends(get_db)):
-    """학생 아이디 전역 중복 확인 — 회원가입 '중복 확인' 버튼"""
-    return {"available": auth_service.student_id_available(db, req.student_login_id)}
+    """학생 아이디 전역 중복 확인 — 중복이면 사용 가능한 추천 아이디를 함께 반환."""
+    available = auth_service.student_id_available(db, req.student_login_id)
+    suggestions = (
+        [] if available else auth_service.suggest_student_ids(db, req.student_login_id)
+    )
+    return {"available": available, "suggestions": suggestions}
 
 
 @router.post("/email/verify")

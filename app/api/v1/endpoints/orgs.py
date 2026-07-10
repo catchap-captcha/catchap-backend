@@ -1534,6 +1534,23 @@ def _student_in_org(db: Session, org_id: str, student_id: str) -> StudentProfile
     return st
 
 
+def _active_homeroom(db: Session, cls: ClassRoom | None) -> User | None:
+    """반의 '살아있는' 담임/보조 담임 사용자 — 없으면 None (교장 비상 초기화 가능 판단용).
+
+    active 인 교사만 '실제로 초기화할 수 있는 담임'으로 본다. pending(가입 미완)·disabled
+    교사는 로그인해 초기화할 수 없으므로 담임 없는 반과 같이 취급 → 교장 비상 초기화 허용.
+    """
+    if cls is None:
+        return None
+    for tid in (cls.teacher_id, cls.assistant_teacher_id):
+        if not tid:
+            continue
+        u = db.get(User, tid)
+        if u is not None and u.status == "active":
+            return u
+    return None
+
+
 @router.post("/{org_id}/students/{student_id}/reset-password")
 def reset_student_password(
     org_id: str,
@@ -1541,15 +1558,41 @@ def reset_student_password(
     principal: Principal = Depends(require_org_admin),
     db: Session = Depends(get_db),
 ):
-    """(정책 변경) 학생 비밀번호 초기화는 담임 교사만 — 교장(org_admin)은 할 수 없다.
+    """학생 비밀번호 초기화 — 원칙은 담임 교사, 교장(org_admin)은 '담임 없는 반'만 비상 초기화.
 
-    담임이 자기 반 학생을 `POST /teacher/class/students/{id}/reset-password`로 초기화한다.
-    이 경로는 교장 전용이었으나, "담당 선생님만 초기화" 정책으로 차단한다.
+    평상시엔 담임이 `POST /teacher/class/students/{id}/reset-password`로 초기화한다.
+    담임/보조 담임이 배정되지 않은(또는 비활성화된) 반의 학생은 아무도 초기화할 수
+    없어 학생이 비번을 잊으면 갇힌다 → 교장이 비상 fallback으로만 초기화할 수 있다.
+    담임이 살아있는 반이면 교장은 403(담임에게 요청). 모든 초기화는 감사에 남는다.
     """
-    raise HTTPException(
-        status.HTTP_403_FORBIDDEN,
-        detail="학생 비밀번호 초기화는 담임 교사만 할 수 있어요. 담당 선생님에게 요청해 주세요.",
+    check_org_scope(principal, org_id)
+    student = _student_in_org(db, org_id, student_id)
+    if student.status == "disabled":
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="학생을 찾을 수 없습니다.")
+    cls = db.get(ClassRoom, student.class_id) if student.class_id else None
+    homeroom = _active_homeroom(db, cls)
+    if homeroom is not None:
+        # 담임이 살아있는 반 — 교장은 초기화 불가, 담임에게 요청
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            detail=f"이 학생은 담임({homeroom.name}) 선생님만 초기화할 수 있어요. 담당 선생님에게 요청해 주세요.",
+        )
+    # 담임 없는 반(미배정/결원) — 교장 비상 초기화
+    temp = f"cat-{_secrets.randbelow(9000) + 1000}"
+    student.password_hash = _hash_password(temp)
+    student.must_change_password = True  # 첫 로그인 시 강제 변경 (전역 ForcePasswordGate)
+    _auth_service.logout(db, student.id)  # 기존 세션 폐기 → 모든 기기 로그아웃
+    audit(
+        db,
+        action="student.password_reset",
+        actor_user_id=principal.id,
+        organization_id=org_id,
+        target_type="student",
+        target_id=student.id,
+        after={"by": "org_admin_fallback", "class_id": student.class_id},  # 담임 아닌 교장 비상 초기화 표시
     )
+    db.commit()
+    return {"ok": True, "temp_password": temp, "fallback": True}  # 임시 비번 1회 노출
 
 
 @router.get("/{org_id}/students/{student_id}/parent-links")

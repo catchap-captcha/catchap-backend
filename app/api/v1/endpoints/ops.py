@@ -629,8 +629,48 @@ def system(principal: Principal = Depends(require_ops)):
 
 
 @router.get("/logs")
-def logs(principal: Principal = Depends(require_ops), db: Session = Depends(get_db)):
-    rows = db.query(AuditLog).order_by(AuditLog.created_at.desc()).limit(50).all()
+def logs(
+    action: str | None = None,
+    organization_id: str | None = None,
+    date_from: str | None = None,  # 'YYYY-MM-DD' (해당일 00:00 포함)
+    date_to: str | None = None,  # 'YYYY-MM-DD' (해당일 끝까지 포함)
+    page: int = 1,
+    page_size: int = 50,
+    principal: Principal = Depends(require_ops),
+    db: Session = Depends(get_db),
+):
+    """운영 감사로그 — 기관/행동/기간 필터 + 페이지네이션(실무 수준).
+
+    운영자는 지원·보안·컴플라이언스 목적으로 여러 기관 활동을 교차 조회하되,
+    아동 실명은 익명 코드로만 본다. 필터 없이 최근 50건만 보던 전역 피드에서
+    기관별·행동별·기간별로 좁혀 볼 수 있도록 확장했다.
+    """
+    from datetime import date as _date, datetime as _dt, time as _time, timedelta as _td
+
+    page = max(1, page)
+    page_size = max(1, min(200, page_size))
+
+    q = db.query(AuditLog)
+    if action:
+        q = q.filter(AuditLog.action == action)
+    if organization_id:
+        q = q.filter(AuditLog.organization_id == organization_id)
+    # 기간: date_from 00:00 이상, date_to 다음날 00:00 미만(그날 끝까지 포함). 잘못된 형식은 무시.
+    try:
+        if date_from:
+            q = q.filter(AuditLog.created_at >= _dt.combine(_date.fromisoformat(date_from), _time.min))
+        if date_to:
+            q = q.filter(AuditLog.created_at < _dt.combine(_date.fromisoformat(date_to) + _td(days=1), _time.min))
+    except ValueError:
+        pass
+
+    total = q.count()
+    rows = (
+        q.order_by(AuditLog.created_at.desc())
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+        .all()
+    )
     # 실행자/기관을 사람이 읽을 수 있게 — '누가·언제·무엇을'의 '누가'가 UUID면 감사 로그 목적 미달
     actor_ids = {log.actor_user_id for log in rows if log.actor_user_id}
     org_ids = {log.organization_id for log in rows if log.organization_id}
@@ -708,7 +748,7 @@ def logs(principal: Principal = Depends(require_ops), db: Session = Depends(get_
             "answers": answers,
         }
 
-    return [
+    items = [
         {
             "id": log.id,
             "action": log.action,
@@ -724,6 +764,27 @@ def logs(principal: Principal = Depends(require_ops), db: Session = Depends(get_
         }
         for log in rows
     ]
+
+    # 필터 드롭다운용 facet — 현재 페이지가 아니라 감사로그 전체에서 뽑는다(전역 선택지).
+    action_facet = sorted(a for (a,) in db.query(AuditLog.action).distinct().all() if a)
+    org_id_facet = [o for (o,) in db.query(AuditLog.organization_id).distinct().all() if o]
+    facet_orgs = {
+        o.id: o.name
+        for o in db.query(Organization).filter(Organization.id.in_(org_id_facet or [""])).all()
+    }
+    org_facet = sorted(
+        ({"id": oid, "name": facet_orgs.get(oid, oid)} for oid in org_id_facet),
+        key=lambda x: x["name"],
+    )
+
+    return {
+        "items": items,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "actions": action_facet,  # 행동 필터 선택지
+        "orgs": org_facet,  # 기관 필터 선택지 (id·이름)
+    }
 
 
 @router.get("/ai-models")

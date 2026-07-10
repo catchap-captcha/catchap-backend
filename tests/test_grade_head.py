@@ -256,7 +256,12 @@ def test_real_name_flow(client, db, seed_org):
 
     act = client.post(
         "/api/v1/auth/activate-student",
-        json={"code": issued[0]["join_code"], "nickname": "반짝이", "password": "pw12345"},
+        json={
+            "code": issued[0]["join_code"],
+            "student_login_id": "banjjak1",
+            "nickname": "반짝이",
+            "password": "pw12345",
+        },
     )
     assert act.status_code == 200, act.text
 
@@ -304,7 +309,12 @@ def test_register_by_label_binds_real_class(client, db, seed_org):
 
     act = client.post(
         "/api/v1/auth/activate-student",
-        json={"code": join_code, "nickname": "신입이", "password": "newpass123"},
+        json={
+            "code": join_code,
+            "student_login_id": "newbie1",
+            "nickname": "신입이",
+            "password": "newpass123",
+        },
     )
     assert act.status_code == 200, act.text
     db.expire_all()

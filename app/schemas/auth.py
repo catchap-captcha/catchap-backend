@@ -1,4 +1,4 @@
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr, Field, field_validator
 
 
 class TokenPair(BaseModel):
@@ -81,10 +81,28 @@ class RegisterOrgRequest(BaseModel):
     contact_name: str
     contact_email: EmailStr
     contact_phone: str | None = None
-    password: str = Field(min_length=8)
-    email_code: str
+    # 기관 등록은 '신청서'다 — 신청 단계에선 비밀번호·이메일 인증을 받지 않는다.
+    # 관리자 계정 자격증명은 운영자 승인 시 발급된다(ops.approve_request → 임시 비번 1회 노출).
+    # 프론트 신청 폼은 빈 문자열("")을 보내므로 빈 값은 None으로 정규화한다.
+    password: str | None = None
+    email_code: str | None = None
     expected_students: str | None = None
     plan_interest: str | None = None
+
+    @field_validator("password", "email_code", "business_number", mode="before")
+    @classmethod
+    def _blank_to_none(cls, v):
+        if isinstance(v, str) and not v.strip():
+            return None
+        return v
+
+    @field_validator("password")
+    @classmethod
+    def _password_min_len(cls, v):
+        # 비번을 함께 받는 검증 흐름에서만 최소 길이를 강제(신청서 흐름은 None이라 통과).
+        if v is not None and len(v) < 8:
+            raise ValueError("비밀번호는 8자 이상이어야 합니다.")
+        return v
 
 
 class PasswordResetRequest(BaseModel):
