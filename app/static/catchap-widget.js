@@ -1063,21 +1063,52 @@
         else { var sbtn = h('button'); sbtn.textContent = '확인'; css(sbtn, btnStyle(C, '#fff')); sbtn.onclick = subS; body.appendChild(sbtn); }
         if (d.hint) hintLine(d.hint);
       } else if (d.type === 'order') {
-        // 순서: 카드를 순서대로 탭 → 번호 배지. 제출 [cardId,...]
-        var oSeq = [], oEls = {};
-        var oRow = h('div'); css(oRow, { display: 'flex', flexWrap: 'wrap', gap: '8px', justifyContent: 'center', maxWidth: '480px', margin: '0 auto' });
+        // 순서(원본 방식): 아래 카드를 순서대로 누르면 위 칸에 하나씩 '배치'된다. 채운 칸을
+        // 다시 누르면 그 카드를 빼고 뒤를 당긴다. 전부 채워야 제출([cardId,...] 칸 순서).
+        var oSeq = [];
+        function byId(id) { return d.cards.filter(function (c) { return c.id === id; })[0]; }
+        var slotWrap = h('div');
+        css(slotWrap, { display: 'flex', flexWrap: 'wrap', gap: '8px', justifyContent: 'center',
+          minHeight: '30px', padding: '14px 12px', marginBottom: '14px', maxWidth: '480px',
+          marginLeft: 'auto', marginRight: 'auto', border: '2px dashed #E3D6C6', borderRadius: '14px',
+          background: '#FFFAF4', alignItems: 'center' });
+        var trayWrap = h('div');
+        css(trayWrap, { display: 'flex', flexWrap: 'wrap', gap: '8px', justifyContent: 'center', maxWidth: '480px', margin: '0 auto' });
         function oPaint() {
-          d.cards.forEach(function (c) { var e = oEls[c.id]; var pos = oSeq.indexOf(c.id);
-            e.style.borderColor = pos >= 0 ? C : '#F0E4D8'; e.style.background = pos >= 0 ? '#FFF0EE' : '#fff';
-            e.firstChild.textContent = pos >= 0 ? (pos + 1) + '. ' + c.text : c.text; });
-          if (footerOn) footerState(oSeq.length > 0, oSeq.length > 0);
+          slotWrap.textContent = '';
+          if (oSeq.length === 0) {
+            var ph = h('span'); ph.textContent = '아래 카드를 순서대로 눌러 배치해요';
+            css(ph, { color: '#B7A68F', fontSize: '13px', fontWeight: '700' });
+            slotWrap.appendChild(ph);
+          }
+          oSeq.forEach(function (id, i) {
+            var c = byId(id); if (!c) return;
+            var s = h('button');
+            var badge = h('span'); badge.textContent = (i + 1);
+            css(badge, { display: 'inline-block', minWidth: '18px', height: '18px', borderRadius: '9px',
+              background: C, color: '#fff', fontSize: '11px', fontWeight: '800', lineHeight: '18px',
+              textAlign: 'center', marginRight: '6px' });
+            s.appendChild(badge); s.appendChild(document.createTextNode(c.text));
+            css(s, { padding: '10px 14px', border: '2px solid ' + C, borderRadius: '12px',
+              background: '#FFF0EE', cursor: 'pointer', fontSize: '15px', fontWeight: '700', color: '#3A3226' });
+            s.onclick = function () { if (answered) return; oSeq.splice(i, 1); oPaint(); };
+            slotWrap.appendChild(s);
+          });
+          trayWrap.textContent = '';
+          d.cards.forEach(function (c) {
+            if (oSeq.indexOf(c.id) !== -1) return; // 이미 배치된 카드는 트레이에서 숨김
+            var e = h('button'); e.textContent = c.text;
+            css(e, { padding: '12px 16px', border: '2px solid #F0E4D8', borderRadius: '12px',
+              background: '#fff', cursor: 'pointer', fontSize: '15px', fontWeight: '700', color: '#3A3226' });
+            e.onclick = function () { if (answered) return; oSeq.push(c.id); oPaint(); };
+            trayWrap.appendChild(e);
+          });
+          var done = oSeq.length === d.cards.length;
+          if (footerOn) footerState(oSeq.length > 0, done);
         }
-        d.cards.forEach(function (c) { var e = h('button'); var sp = h('span'); sp.textContent = c.text; e.appendChild(sp);
-          css(e, { padding: '12px 16px', border: '2px solid #F0E4D8', borderRadius: '12px', background: '#fff', cursor: 'pointer', fontSize: '15px', fontWeight: '700', color: '#3A3226' });
-          e.onclick = function () { if (answered) return; var at = oSeq.indexOf(c.id); if (at >= 0) oSeq.splice(at, 1); else oSeq.push(c.id); oPaint(); };
-          oEls[c.id] = e; oRow.appendChild(e); });
-        body.appendChild(oRow);
-        function subO() { if (oSeq.length) verify(token, oSeq.slice()); }
+        body.appendChild(slotWrap); body.appendChild(trayWrap);
+        oPaint();
+        function subO() { if (oSeq.length === d.cards.length) verify(token, oSeq.slice()); }
         if (footerOn) { pendingRedo = function () { oSeq = []; oPaint(); }; pendingSubmit = subO; }
         else { var obtn = h('button'); obtn.textContent = '확인'; css(obtn, btnStyle(C, '#fff')); obtn.onclick = subO; body.appendChild(obtn); }
         if (d.hint) hintLine(d.hint);
