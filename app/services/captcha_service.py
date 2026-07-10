@@ -528,13 +528,22 @@ def _grade_trace(answer, template: list) -> bool:
 # 조작형 문항의 표시 필드(정답 아님) — verify에서 위젯이 렌더할 데이터. 추출 단계에서
 # right/cards/items는 이미 셔플되어 정답 순서를 노출하지 않는다.
 _WIDGET_RENDER_FIELDS = ("options", "left", "right", "bins", "items", "cards", "zones",
-                         "reference", "mapStyle", "compass", "start", "layout", "audio",
+                         "reference", "mapStyle", "compass", "start", "layout", "audio", "mapRef",
                          "template", "glyph", "character", "dest", "dangers",
-                         "flag", "cols", "rows", "slots", "pieces",
+                         "flag", "cols", "rows", "slots", "pieces", "prefilled", "preview",
                          # 원본 유형 복원 — 국어(받아쓰기 tts·높임말 입력·문장부호 자리탭·십자말)
                          # 과학/수학(카드 드래그 target·장면 클릭 scene_svg/regions)
                          "tts", "before", "highlight", "after", "tokens", "gaps", "markLabel",
                          "size", "words", "tiles", "level", "reveal", "target", "scene_svg", "regions",
+                         "sentence",  # 영문법 빈칸 문장(표시용) — 정답은 options/answer에만
+                         "image", "meaning",  # 원본 그림(이모지)·한국어 뜻 힌트 (영어 08/09 등)
+                         # 원본 프레이밍(표시용) — 상황 지문·담기 상자 라벨·폰 화면 제목/스타일·안내 화살문구
+                         "scenario", "boxLabel", "boxHint", "screenTitle", "screenStyle", "arrow", "placeCount",
+                         # 메모리 카드게임(미리보기·시간제한)·연속듣기·듣기 재생제한/라벨
+                         "previewMs", "timeLimitMs", "audios", "showLabel", "plays",
+                         "guideStyle", "showExample",  # 따라쓰기 가이드 5단계(원본 03)
+                         "paragraph", "readFirst",  # 국어 중심생각 — 지문 읽기 2단계(원본 흐름)
+
                          # 수학 교체판 — figure(문제 위 도형 SVG, 표시용). answers는 정답이라 미노출.
                          "figure")
 
@@ -545,7 +554,7 @@ def _normalize_answer(v) -> str:
     공백·쉼표·괄호·원문자·흔한 단위를 제거해 '75'와 '75도', '4시간25분'과
     '4시간 25분'을 같게 본다. (뱅크 answers에 변형이 있어도 방어적으로 정규화)
     """
-    s = str(v).strip().lower()
+    s = str(v).replace("﻿", "").strip().lower()  # 원본 JS \s는 ZWNBSP도 공백으로 봄
     s = re.sub(r"<[^>]*>", "", s)
     for a, b in zip("①②③④⑤⑥⑦⑧⑨⑩", ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10"]):
         s = s.replace(a, b)
@@ -561,14 +570,22 @@ def _in_box(px: float, py: float, box: dict, pad: float = 0.0) -> bool:
             and box["y"] - pad <= py <= box["y"] + box["h"] + pad)
 
 
-def _grade_route(answer, dest: dict, dangers: list) -> bool:
-    """길찾기 채점 — 그린 경로가 (1) 도착 지점에서 끝나고 (2) 어떤 위험존도 지나지 않는다.
+ROUTE_START_R = 0.20  # 경로 첫 점이 시작 핀(캐릭터)에서 이 반경 안이어야 함(정규화 좌표)
 
-    시작점 근처에서 출발해 도착 상자 안에서 끝나야 하며, 경로 어느 점도 위험존을 통과하면 실패.
+
+def _grade_route(answer, dest: dict, dangers: list, start: dict | None = None) -> bool:
+    """길찾기 채점 — 그린 경로가 (1) 시작점(캐릭터)에서 출발해 (2) 도착 지점에서 끝나고
+    (3) 어떤 위험존도 지나지 않는다.
+
+    원본은 캐릭터 토큰을 끌어 경로가 반드시 시작점에서 출발한다. 위젯이 선 그리기로 바뀌며
+    이 제약이 사라져 도착지 옆에서 짧게 그려도 통과하던 것을 시작점 근접 검사로 되살린다.
     """
     pts = _clean_xy_points(answer, 600)
     if len(pts) < TRACE_MIN_USER_POINTS:
         return False
+    if start and start.get("x") is not None and start.get("y") is not None:
+        if math.dist((pts[0][0], pts[0][1]), (start["x"], start["y"])) > ROUTE_START_R:
+            return False
     if not _in_box(pts[-1][0], pts[-1][1], dest):
         return False
     for (px, py) in pts:
@@ -597,11 +614,36 @@ def _wrap_bank_question(subject: str, q: dict, meta: dict) -> dict:
     t = q["type"]
     if t == "multi":
         return _wrap("select_all", sorted(q["answer"]), public, meta)
-    if t in ("connect", "sort", "puzzle"):
-        # 매핑 채점 — {leftId:rightId}/{itemId:binId}/{slotId:pieceId} 딕셔너리 정확 비교
+    if t == "puzzle":
+        # 국기 완성 — {slotId:pieceId} 딕셔너리 비교. 단, 같은 색·모양이라 구분 불가한 조각
+        # (equivalentGroups)은 서로 바꿔 놓아도 정답(억울한 오답 방지). eqg는 토큰에만 서명.
+        # 미리 채운 칸(prefilled)은 위젯이 함께 제출하므로 채점 대상(target)에 포함한다
+        # (빠진 조각 넣기 단계). prefilled는 이미 public에 노출된 값이라 정답 유출 아님.
+        ans = {**q.get("prefilled", {}), **dict(q["answer"])}
+        m = {**meta, "eqg": q["equivalentGroups"]} if q.get("equivalentGroups") else meta
+        return _wrap("match", ans, public, m)
+    if t in ("connect", "sort"):
+        # 매핑 채점 — {leftId:rightId}/{itemId:binId} 딕셔너리 정확 비교.
+        # placeCount(방해 항목이 트레이에 남는 분류)는 표시용으로 이미 public에 노출됨.
         return _wrap("match", dict(q["answer"]), public, meta)
+    if t == "memory":
+        # 카드 뒤집기 기억 게임(영어 07) — 짝 확인은 pair_check(미소비 오라클, 원본 /match와
+        # 동일 설계), 최종 제출은 {imageCardId: wordCardId} 매핑 정확 비교.
+        # mem 플래그를 서명해 pair_check가 memory 토큰만 받게 한다 — connect/sort도 같은
+        # kind(match)라서, 플래그 없이는 /pair가 그 유형들의 정답 오라클이 돼 버린다.
+        return _wrap("match", dict(q["answer"]), public, {**meta, "mem": 1})
+    if t == "listen_seq":
+        # 연속 듣기(영어 02 sequence) — 오디오 순서대로 그림 탭, [optionId,...] 순서 비교.
+        public = {**public, "slotCount": len(q["answer"])}
+        return _wrap("sequence", list(q["answer"]), public, meta)
     if t == "order":
-        # 순서 채점 — 위젯이 [cardId,...] 제출, 서버가 리스트 정확 비교
+        # 순서 채점 — 위젯이 [cardId,...] 제출, 서버가 리스트 정확 비교.
+        # slotCount(정답 길이)를 노출해 방해 카드가 섞인 문항에서 위젯이 슬롯 수만큼만
+        # 채우면 제출하게 한다(방해카드 강제 배치로 정답 불가 버그 수정).
+        public = {**public, "slotCount": len(q["answer"])}
+        if q.get("cyclic"):
+            # 순환 순서(달 위상·물의 순환) — 어느 지점에서 시작해도 방향만 맞으면 정답.
+            return _wrap("sequence", list(q["answer"]), public, {**meta, "cy": 1})
         return _wrap("sequence", list(q["answer"]), public, meta)
     if t == "trace":
         # 따라쓰기 — 위젯 trace_path 렌더러가 궤적 제출, _grade_trace로 채점.
@@ -611,7 +653,7 @@ def _wrap_bank_question(subject: str, q: dict, meta: dict) -> dict:
     if t == "route":
         # 길찾기 — 위젯이 경로 궤적 제출, 끝점 dest 도달 + 위험존 회피로 채점.
         # dest/dangers는 화면에 보이는 요소라 노출 정상(정답 좌표가 아님).
-        return _wrap("route", {"dest": q["dest"], "dangers": q.get("dangers", [])}, public, meta)
+        return _wrap("route", {"dest": q["dest"], "dangers": q.get("dangers", []), "start": q.get("start")}, public, meta)
     if t in ("dictation", "type_in"):
         # 원본 입력형(국어 받아쓰기·높임말) — 위젯이 타이핑 문자열 제출, 서버 trim 정확 일치.
         # 받아쓰기는 tts(들려줄 문장)가 public에 필요해 정답이 페이로드에 포함된다 —
@@ -709,6 +751,27 @@ def _edu_challenge(
     return _wrap_bank_question(subject, q, meta)
 
 
+def pair_check(challenge_token: str, a, b) -> dict:
+    """메모리 카드게임 짝 확인 — 토큰을 소비하지 않는 판정 오라클(원본 07 /match와 동일 설계).
+
+    서명된 match 타겟에서 (a,b)가 짝이면 {match, left(그림), right(단어)}를 준다.
+    방향은 정규화해 위젯이 최종 제출 매핑({imageId: wordId})을 쌓게 한다. 봇이 전 쌍을
+    열거(n²)할 수 있는 것도 원본과 동일한 트레이드오프 — 학습용 문항이라 수용한다.
+    """
+    data = _unsign(challenge_token)
+    # 메모리 게임 토큰(mem 서명)만 허용 — connect/sort 등 다른 match 유형의 정답 오라클로
+    # 오용되는 것을 막는다(원본도 /match는 memory 전용이었다).
+    if data is None or data.get("k") != "match" or not data.get("mem"):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="만료됐거나 잘못된 챌린지예요.")
+    tgt = {str(k): str(v) for k, v in (data.get("a") or {}).items()}
+    a, b = str(a), str(b)
+    if tgt.get(a) == b:
+        return {"match": True, "left": a, "right": b}
+    if tgt.get(b) == a:
+        return {"match": True, "left": b, "right": a}
+    return {"match": False}
+
+
 def peek_subject(challenge_token: str) -> str | None:
     """토큰을 소비하지 않고 서명된 과목(subj)만 확인 — verify 스코프 검사용.
 
@@ -740,14 +803,35 @@ def verify_challenge(db: Session, challenge_token: str, answer) -> dict:
         picked = sorted(str(x) for x in answer) if isinstance(answer, (list, tuple)) else []
         ok = len(picked) > 0 and picked == sorted(str(x) for x in target)
     elif kind == "match":
-        # connect/sort — {leftId:rightId}/{itemId:binId} 딕셔너리 정확 일치.
+        # connect/sort/puzzle — {leftId:rightId}/{itemId:binId}/{slotId:pieceId} 딕셔너리 일치.
         # 비-dict 입력(위조·정수)은 조용히 오답 처리(500 방지). 부분 정답 없음.
         sub = {str(k): str(v) for k, v in answer.items()} if isinstance(answer, dict) else {}
-        ok = bool(target) and sub == {str(k): str(v) for k, v in target.items()}
+        tgt = {str(k): str(v) for k, v in target.items()}
+        eqg = data.get("eqg")
+        if eqg:
+            # 국기퍼즐 동치 그룹 — 같은 그룹의 조각은 서로 바꿔 놓아도 정답으로 본다.
+            rep: dict = {}
+            for gi, grp in enumerate(eqg):
+                for pid in grp:
+                    rep[str(pid)] = "g%d" % gi
+
+            def _canon(pid):
+                return rep.get(str(pid), "p:" + str(pid))
+
+            # 원본과 동일하게 같은 조각을 두 칸에 넣는 부정 제출은 오답(조각 중복 금지)
+            no_dup = len(set(sub.values())) == len(sub)
+            ok = bool(tgt) and no_dup and set(sub) == set(tgt) and all(_canon(sub.get(k)) == _canon(tgt[k]) for k in tgt)
+        else:
+            ok = bool(target) and sub == tgt
     elif kind == "sequence":
         # order — [cardId,...] 순서 정확 일치. 비-list 입력은 오답.
         seq = [str(x) for x in answer] if isinstance(answer, (list, tuple)) else []
-        ok = len(seq) > 0 and seq == [str(x) for x in target]
+        tgt = [str(x) for x in target]
+        ok = len(seq) > 0 and seq == tgt
+        if not ok and data.get("cy") and tgt and len(seq) == len(tgt):
+            # 순환 순서 — 어느 지점에서 시작해도 같은 방향(회전)이면 정답. (달 위상·물의 순환)
+            doubled = tgt + tgt
+            ok = any(doubled[i:i + len(tgt)] == seq for i in range(len(tgt)))
     elif kind == "drop":
         # 끌어다 놓기 — 드롭 지점 거리로 채점. 거리는 서버 진실값으로 행동 데이터에 기록
         ok, dist = _grade_drop(answer, target)
@@ -757,7 +841,7 @@ def verify_challenge(db: Session, challenge_token: str, answer) -> dict:
         ok = _grade_trace(answer, target)
     elif kind == "route":
         # 길찾기 — 끝점이 도착지 + 위험존 미통과
-        ok = _grade_route(answer, target.get("dest", {}), target.get("dangers", [])) if isinstance(target, dict) else False
+        ok = _grade_route(answer, target.get("dest", {}), target.get("dangers", []), target.get("start")) if isinstance(target, dict) else False
     elif kind == "text":
         # 입력형(받아쓰기·높임말) — trim 후 정확 일치. 받아쓰기는 내부 띄어쓰기가 채점
         # 대상이므로 내부 공백은 정규화하지 않는다. 비-str 입력은 오답(500 방지).

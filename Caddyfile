@@ -1,0 +1,5 @@
+# 백엔드 VM — api.catchap5.com 자동 HTTPS(Let's Encrypt) → api 컨테이너로 프록시
+api.catchap5.com {
+	reverse_proxy api:8000
+	encode gzip
+}

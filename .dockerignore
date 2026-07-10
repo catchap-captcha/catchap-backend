@@ -1,0 +1,17 @@
+# 시크릿·개발 산출물을 이미지에서 제외 (COPY . . 시 비밀번호·수천 파일 유입 방지)
+.env
+.env.*
+.venv/
+venv/
+.git/
+.gitignore
+.claude/
+__pycache__/
+**/__pycache__/
+*.pyc
+.pytest_cache/
+tests/
+.mypy_cache/
+.ruff_cache/
+*.md
+scripts/

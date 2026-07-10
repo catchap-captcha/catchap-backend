@@ -7,6 +7,7 @@
 교육형도 같은 경로에 product='edu' 키를 쓰면 동작 (키에 과목이 박혀 있음).
 """
 
+import re
 from datetime import date
 from functools import lru_cache
 from pathlib import Path
@@ -85,6 +86,32 @@ def flag(code: str):
     return Response(
         content=content,
         media_type="image/svg+xml",
+        headers={"Access-Control-Allow-Origin": "*", "Cache-Control": "public, max-age=86400"},
+    )
+
+
+_IMG_DIR = Path(__file__).resolve().parents[3] / "static" / "captcha-img"  # app/static/captcha-img
+_IMG_RE = re.compile(r"^(symbols|cpr|aed)/[a-z0-9-]+\.png$")
+
+
+@lru_cache(maxsize=256)
+def _img_bytes(rel: str) -> bytes | None:
+    path = _IMG_DIR / rel
+    return path.read_bytes() if path.exists() else None
+
+
+@router.get("/img/{folder}/{name}")
+def captcha_img(folder: str, name: str):
+    """문항 이미지(지도기호·CPR/AED 사진) 서빙 — 정규식 화이트리스트 밖은 404(경로조작 차단)."""
+    rel = f"{folder}/{name}"
+    if not _IMG_RE.match(rel):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="not found")
+    content = _img_bytes(rel)
+    if content is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="not found")
+    return Response(
+        content=content,
+        media_type="image/png",
         headers={"Access-Control-Allow-Origin": "*", "Cache-Control": "public, max-age=86400"},
     )
 
@@ -315,6 +342,29 @@ def verify(
     cs.log_call(db, api, "captcha/verify", 200 if result["success"] else 400)
     db.commit()
     return result
+
+
+class _PairReq(BaseModel):
+    challenge_token: str
+    a: str
+    b: str
+
+
+@router.post("/pair")
+def pair(
+    req: _PairReq,
+    request: Request,
+    x_site_key: str | None = Header(default=None),
+    db: Session = Depends(get_db),
+):
+    """메모리 카드게임(영어 07) 짝 확인 — 토큰 미소비 판정. 원본 /match 설계 이식.
+
+    verify와 동일 스로틀을 태워 전 쌍 열거(n²) 봇의 속도를 원본 수준으로 제한한다.
+    """
+    _throttle(db, request, "verify", RATE_VERIFY_PER_MIN)
+    api = _key(db, x_site_key)
+    _origin_guard(db, request, api)
+    return cs.pair_check(req.challenge_token, req.a, req.b)
 
 
 class _ValidateReq(BaseModel):

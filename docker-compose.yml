@@ -1,0 +1,28 @@
+# 백엔드 VM(210.109.52.124)용 — FastAPI 컨테이너 + Caddy(자동 HTTPS 종단, api.catchap5.com)
+# 실행: docker compose up -d --build   (같은 폴더에 .env.production, Caddyfile 필요)
+services:
+  api:
+    build: .
+    image: catchap-backend:latest
+    env_file: .env.production          # 시크릿·설정 주입(이미지엔 안 굽음)
+    restart: unless-stopped
+    expose:
+      - "8000"                          # Caddy만 접근(호스트 공개 X)
+    # DB는 별도 VM(사설 10.0.1.168) — compose가 DB를 띄우지 않는다.
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"                       # Let's Encrypt 자동 발급/갱신
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - api
+
+volumes:
+  caddy_data:
+  caddy_config:
