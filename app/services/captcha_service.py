@@ -245,7 +245,10 @@ def assert_entitled(db: Session, api: ApiKey) -> Plan | None:
 def _usage_this_month(db: Session, org_id: str) -> int:
     # 과금/quota 단위는 'challenge 발급 1건 = 1'. verify·validate 로그까지 세면
     # 한 번의 통과가 3건으로 부풀어 quota가 3배로 왜곡된다 → challenge만 집계한다.
-    now = datetime.utcnow()
+    # created_at은 로컬(datetime.now)로 저장되므로 월초도 로컬 기준으로 잡는다.
+    # utcnow로 잡으면 로컬 새 달 첫 ~9시간(KST) 동안 전월이 포함돼 quota가 과다
+    # 차단되고, 로컬 월초로 리셋되는 대시보드 집계(aggregate.*_this_month)와도 어긋난다.
+    now = datetime.now()
     start = datetime(now.year, now.month, 1)
     return (
         db.query(func.count(ApiUsageLog.id))
