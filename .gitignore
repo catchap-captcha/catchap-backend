@@ -13,3 +13,6 @@ __pycache__/
 
 # 로그
 *.log
+
+# Claude Code working dir (worktrees, jobs)
+.claude/

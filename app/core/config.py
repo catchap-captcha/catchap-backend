@@ -1,4 +1,5 @@
 from functools import lru_cache
+from pathlib import Path
 
 from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -6,9 +7,15 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # 프로덕션에서 절대 쓰면 안 되는 개발용 기본값
 _INSECURE_JWT_DEFAULT = "dev-only-secret-change-me"
 
+# .env는 실행 디렉터리와 무관하게 절대경로로 로드한다. (config.py = catchap-backend/app/core/,
+# parents[2] = catchap-backend/) — 서버를 다른 폴더에서 띄워도 SMTP 등 설정이 비지 않게.
+_ENV_FILE = Path(__file__).resolve().parents[2] / ".env"
+
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_file=str(_ENV_FILE), env_file_encoding="utf-8", extra="ignore"
+    )
 
     # Database
     DATABASE_URL: str = (
@@ -28,6 +35,8 @@ class Settings(BaseSettings):
     SMTP_APP_PASSWORD: str = ""
     MAIL_FROM: str = ""
     MAIL_FROM_NAME: str = "CatChap"
+    # 회신 주소(Reply-To). 비우면 헤더를 안 붙임. 발신전용 처리 시 no-reply 주소를 넣는다.
+    MAIL_REPLY_TO: str = ""
 
     # URLs / CORS
     FRONTEND_URL: str = "http://localhost:5173"

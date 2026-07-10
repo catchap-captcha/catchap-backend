@@ -439,12 +439,28 @@ def badges(principal: Principal = Depends(require_student), db: Session = Depend
         sb.badge_id: sb
         for sb in db.query(StudentBadge).filter(StudentBadge.student_id == me.id).all()
     }
+    # 연속 학습 배지(불꽃 학습왕)는 홈/기록과 같은 실 streak으로 —
+    # 디자인 상수 "12/14일"이 남아 화면 간 연속 일수가 갈리던 원인
+    streak_rows = (
+        db.query(LearningAttempt)
+        .filter(
+            LearningAttempt.student_id == me.id,
+            LearningAttempt.created_at
+            >= datetime.combine(date.today() - timedelta(days=60), time.min),
+        )
+        .all()
+    )
+    live_streak = aggregate._streak_days({r.created_at.date() for r in streak_rows if r.created_at})
     out = []
     for b in all_badges:
         sb = mine.get(b.id)
         earned = bool(sb and sb.earned_at)
+        progress = sb.progress if sb else 0.0
         if earned:
             foot = _earned_foot(sb.earned_at)
+        elif b.name == "불꽃 학습왕":
+            foot = f"{min(live_streak, 14)}/14일"
+            progress = round(min(live_streak / 14, 1.0), 3)
         else:
             # 도전 중 문구는 디자인 카피 유지 (단, 디자인이 '획득'으로 표기한 항목은 제외)
             state = D.BADGE_STATE.get(b.name, {})
@@ -458,7 +474,7 @@ def badges(principal: Principal = Depends(require_student), db: Session = Depend
                 "color": b.color,
                 "earned": earned,
                 "locked": not earned,
-                "progress": (sb.progress if sb else 0.0),
+                "progress": progress,
                 "foot": foot,
             }
         )
@@ -604,7 +620,21 @@ def daily_quiz(
         )
         .all()
     )
-    if week_rows:
+    # 연속 일수는 학생 홈/기록과 같은 정의(60일 이력에서 오늘·어제부터 과거로 역산)를 쓴다 —
+    # 주간 스트립 안에서만 역산하면 주 경계에서 연속이 끊겨(금~월 연속 4일이 1일)
+    # 화면 간 수치가 갈렸다
+    hist_rows = (
+        db.query(LearningAttempt)
+        .filter(
+            LearningAttempt.student_id == me.id,
+            LearningAttempt.created_at >= datetime.combine(today - timedelta(days=60), time.min),
+        )
+        .all()
+    )
+    hist_days = {r.created_at.date() for r in hist_rows if r.created_at}
+    if week_rows or hist_days:
+        # 실데이터가 있으면 주간 스트립도 실데이터로 — 디자인 폴백(월~목 done)을 섞으면
+        # "이번 주 4일 했는데 연속 0일" 같은 표시 모순이 생긴다
         days_done = {r.created_at.date().weekday() for r in week_rows if r.created_at}
         week = []
         for i, label in enumerate(["월", "화", "수", "목", "금", "토", "일"]):
@@ -612,16 +642,10 @@ def daily_quiz(
             if i == today.weekday():
                 day["today"] = True
             week.append(day)
+        streak = aggregate._streak_days(hist_days)
     else:
         week = D.DAILY_QUIZ_WEEK
-    # 연속 도전 = 오늘(오늘 아직이면 어제)부터 역방향으로 연속 완료한 일수.
-    # (월요일부터 정방향으로 세면 월요일을 안 한 주엔 화·수·목 다 해도 0으로 끊기던 버그 해소)
-    _ti = today.weekday()
-    _i = _ti if (0 <= _ti < len(week) and week[_ti].get("done")) else _ti - 1
-    streak = 0
-    while 0 <= _i < len(week) and week[_i].get("done"):
-        streak += 1
-        _i -= 1
+        streak = sum(1 for day in week if day.get("done"))
 
     return {
         "quizzes": quizzes,

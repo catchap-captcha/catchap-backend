@@ -505,18 +505,13 @@ def teacher_dashboard(db: Session, students: Sequence[StudentProfile]) -> dict |
     today_done = len({r.student_id for r in rows if r.created_at.date() == today})
     total = len(students) or 1
     acc = _acc(week_rows)
-    by_student: dict[str, list[LearningAttempt]] = {}
-    for r in recent_rows:
-        by_student.setdefault(r.student_id, []).append(r)
-    low = {
-        sid: _acc(g) or 0 for sid, g in by_student.items() if len(g) >= 5 and (_acc(g) or 0) < 70
-    }
     kpis = {
         "today_done": today_done,
         "today_done_pct": f"{round(today_done / total * 100)}%",
         "avg_accuracy": fb(acc, _acc(rows) or 0),
         "avg_accuracy_delta": _delta_str(acc, _acc(prev_week_rows)),
-        "need_help": len(low),
+        # 분석(kHelp)·attention과 같은 단일 정의(_need_help)
+        "need_help": _need_help(rows) or 0,
     }
 
     # 요일별 참여 학생 수 (이번 주)
@@ -551,8 +546,34 @@ def teacher_dashboard(db: Session, students: Sequence[StudentProfile]) -> dict |
     return {"kpis": kpis, "bar_data": bar_data, "game_bars": game_bars, "attention": attention}
 
 
+def _need_help(rows: Sequence[LearningAttempt]) -> int | None:
+    """도움 필요 학생 수 — 단일 정의: 최근 14일 · 시도≥5 · 정답률<70.
+
+    14일 창에 시도가 하나도 없으면 None (호출부가 디자인값 유지).
+    대시보드 need_help / 분석 kHelp / attention 게이트가 모두 이 정의를 쓴다.
+    """
+    cutoff = date.today() - timedelta(days=14)
+    recent = [r for r in rows if r.created_at and r.created_at.date() >= cutoff]
+    if not recent:
+        return None
+    by_student: dict[str, list[LearningAttempt]] = {}
+    for r in recent:
+        by_student.setdefault(r.student_id, []).append(r)
+    return sum(1 for g in by_student.values() if len(g) >= 5 and (_acc(g) or 0) < 70)
+
+
+def need_help_count(db: Session, students: Sequence[StudentProfile]) -> int | None:
+    """엔드포인트용 — 학급 학생들의 14일 창 도움 필요 수 (시도 없으면 None)."""
+    ids = [s.id for s in students]
+    rows = attempts(db, student_ids=ids, since=date.today() - timedelta(days=14))
+    return _need_help(rows)
+
+
 def _attention(students: Sequence[StudentProfile], rows: Sequence[LearningAttempt]) -> list[dict]:
-    """최근 정답률 낮은 학생 top3 — estimated_reason 최빈값을 태그로."""
+    """도움 필요 학생 목록 — KPI(need_help)와 동일 기준(시도≥5·정답률<70)으로 게이트.
+
+    기준이 다르면 대시보드 KPI "1명" 옆에 카드 3명이 떠서 서로 모순돼 보인다.
+    """
     by_student: dict[str, list[LearningAttempt]] = {}
     for r in rows:
         by_student.setdefault(r.student_id, []).append(r)
@@ -562,7 +583,10 @@ def _attention(students: Sequence[StudentProfile], rows: Sequence[LearningAttemp
         s = students_by_id.get(sid)
         if s is None or len(g) < 5:
             continue
-        scored.append((_acc(g) or 0, s, g))
+        a = _acc(g) or 0
+        if a >= 70:
+            continue
+        scored.append((a, s, g))
     scored.sort(key=lambda t: t[0])
     out = []
     for acc, s, g in scored[:3]:
@@ -633,7 +657,10 @@ def analytics(
     ids = [s.id for s in students]
     buckets, start, end = _period_buckets(period, axis_len)
     span = (end - start).days
-    all_rows = attempts(db, student_ids=ids, since=start - timedelta(days=span), until=end)
+    # kHelp(14일 단일 정의) 계산분까지 포함하도록 fetch 하한 보장 — 주 초(월요일)처럼
+    # 기간 창이 14일보다 짧을 때도 도움필요 수가 대시보드와 같게 나온다.
+    fetch_since = min(start - timedelta(days=span), date.today() - timedelta(days=14))
+    all_rows = attempts(db, student_ids=ids, since=fetch_since, until=end)
     rows = [r for r in all_rows if r.created_at.date() >= start]
     prev_rows = [r for r in all_rows if r.created_at.date() < start]
     if not rows:
@@ -648,7 +675,9 @@ def analytics(
     by_student: dict[str, list[LearningAttempt]] = {}
     for r in rows:
         by_student.setdefault(r.student_id, []).append(r)
-    help_n = sum(1 for g in by_student.values() if len(g) >= 5 and (_acc(g) or 0) < 70)
+    # 도움 필요 수는 기간 탭과 무관하게 대시보드와 같은 창(최근 14일)으로 —
+    # 화면마다 1명/2명으로 갈리지 않게 단일 정의(14일·시도≥5·정답률<70)를 쓴다
+    help_n = _need_help(all_rows) or 0
 
     # 과목별 total/pct/correct (+ 전기간 대비 delta)
     subjects = []
@@ -1047,12 +1076,16 @@ def org_analytics_extras(db: Session, org_id: str, start: date, end: date) -> di
 
 # ---------------------------------------------------------------- 학부모
 def parent_week_kpis(db: Session, child: StudentProfile) -> list[dict] | None:
-    """이번 주 자녀 KPI 4종 (+ 전주 대비 delta) — 시도 없으면 None."""
+    """이번 주 자녀 KPI 4종 (+ 전주 대비 delta) — 시도 없으면 None.
+
+    '평균 정답률'만은 최근 28일 창 — 자녀 목록(_child_row)·교사 우리반과 같은
+    표준 창을 써서, 같은 아이의 정답률이 화면마다 다르게 보이지 않게 한다.
+    """
     today = date.today()
     ws = _week_start(today)
-    rows = attempts(db, student_ids=[child.id], since=ws - timedelta(weeks=1))
+    rows = attempts(db, student_ids=[child.id], since=today - timedelta(days=56))
     cur = [r for r in rows if r.created_at.date() >= ws]
-    prev = [r for r in rows if r.created_at.date() < ws]
+    prev = [r for r in rows if ws - timedelta(weeks=1) <= r.created_at.date() < ws]
     if not cur:
         return None
 
@@ -1060,7 +1093,13 @@ def parent_week_kpis(db: Session, child: StudentProfile) -> list[dict] | None:
         d = c - p
         return f"{'+' if d >= 0 else ''}{d}{unit}"
 
-    acc_c, acc_p = _acc(cur) or 0, _acc(prev)
+    acc28 = [r for r in rows if r.created_at.date() >= today - timedelta(days=28)]
+    acc28_prev = [
+        r
+        for r in rows
+        if today - timedelta(days=56) <= r.created_at.date() < today - timedelta(days=28)
+    ]
+    acc_c, acc_p = _acc(acc28) or 0, _acc(acc28_prev)
     t_c = round(sum(r.solve_time_ms for r in cur) / len(cur) / 1000)
     t_p = round(sum(r.solve_time_ms for r in prev) / len(prev) / 1000) if prev else None
     badges_c = (

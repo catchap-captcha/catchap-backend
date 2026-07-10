@@ -18,6 +18,14 @@ class TeacherCreate(BaseModel):
     teacher_code: str = Field(min_length=1, max_length=20)  # T-xxxx
 
 
+class TeacherInviteCreate(BaseModel):
+    """교사 초대링크 발송 — 이메일로 초대, 클릭 시 기관·교사코드 프리필."""
+
+    email: EmailStr
+    name: str | None = Field(default=None, max_length=100)
+    role: str = Field(default="teacher", pattern="^(teacher|grade_head)$")
+
+
 class TeacherUpdate(BaseModel):
     name: str | None = Field(default=None, max_length=100)
     email: EmailStr | None = None

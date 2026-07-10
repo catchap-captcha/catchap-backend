@@ -488,3 +488,96 @@ def test_curriculum_lock_and_replay(client, db, seed_org):
     past = client.get(f"/api/v1/students/me/game-session?subject=생활&day={today - 3}", headers=auth(token)).json()
     if past["available"]:
         assert past["is_replay"] is True
+
+def test_grade_ranking_score_formula(client, db, seed_org):
+    """랭킹 산식(0708): 정답률·풀이속도 + 6과목 완주 보너스 + 연속 완주 보너스 + 상위3 코인."""
+    import datetime as _dt
+
+    from app.core.security import hash_password
+    from app.models import ClassRoom, DailyQuizStatus, LearningAttempt, StudentProfile
+
+    org_id = seed_org["org"].id
+    me_id = seed_org["student"].id
+    subjects = ["국어", "영어", "수학", "과학", "사회", "생활"]
+
+    # 같은 학년 다른 반 친구 (grade=1인 1-9반) — 학년 풀에 포함돼야 함
+    other_cls = ClassRoom(organization_id=org_id, name="1-9반", grade=1, status="active")
+    db.add(other_cls)
+    db.flush()
+    mate = StudentProfile(
+        organization_id=org_id,
+        class_id=other_cls.id,
+        student_login_id="stu02",
+        student_code="CAT-2222",
+        password_hash=hash_password("1234"),
+        nickname="친구닉",
+        coins=999,  # 코인은 더 많지만 — 랭킹은 코인이 아니라 정답률·완주 점수
+    )
+    db.add(mate)
+    db.flush()
+
+    yesterday = date.today() - _dt.timedelta(days=1)
+    # 어제·오늘 모두 6과목 완주 + 각 과목 1문항 정답을 2초(=속도만점)에 풀었다고 기록.
+    for day in (yesterday, date.today()):
+        created = _dt.datetime.combine(day, _dt.time(9, 0))
+        for subj in subjects:
+            db.add(DailyQuizStatus(student_id=me_id, quiz_date=day, subject=subj, status="done"))
+            db.add(
+                LearningAttempt(
+                    organization_id=org_id,
+                    student_id=me_id,
+                    subject=subj,
+                    result="correct",
+                    solve_time_ms=2000,  # <=4000 → 속도 만점 5
+                    created_at=created,
+                )
+            )
+    db.commit()
+
+    token = _student_token(client, seed_org)
+    res = client.get("/api/v1/students/me/class-ranking", headers=auth(token))
+    assert res.status_code == 200
+    body = res.json()
+    assert body["class_size"] == 2  # 다른 반이어도 같은 학년이면 풀에 포함
+    assert body["grade"] == 1
+    names = [r["name"] for r in body["board"]]
+    assert "친구닉" in names  # 닉네임만 노출
+    me_row = next(r for r in body["board"] if r["me"])
+    # 하루당: 6과목 × (정답률10 + 속도5) + 완주보너스30 = 120. 이틀 = 240.
+    # 연속 보너스: 오늘의 전날(어제)도 6과목 완주 → +10. 총 250.
+    assert me_row["score"] == 250, body
+    assert me_row["rank"] == 1  # 코인 999인 친구보다 위 (정답률·완주 기반 점수)
+    # 1위 보너스 코인 30 지급 (하루 1회)
+    assert body["bonus_coins"] == 30
+    res2 = client.get("/api/v1/students/me/class-ranking", headers=auth(token))
+    assert res2.json()["bonus_coins"] == 0  # 같은 날 중복 지급 없음
+
+
+
+def test_grade_ranking_incorrect_no_speed_points(client, db, seed_org):
+    """오답은 정답률·속도 점수를 못 받는다 — 빠른 찍기로 점수 위조 불가."""
+    import datetime as _dt
+
+    from app.models import DailyQuizStatus, LearningAttempt, StudentProfile
+
+    org_id = seed_org["org"].id
+    me_id = seed_org["student"].id
+    created = _dt.datetime.combine(date.today(), _dt.time(9, 0))
+    # 국어만 완료 처리했지만 시도는 전부 오답(1ms) — 정답률 0%, 속도 0점.
+    db.add(DailyQuizStatus(student_id=me_id, quiz_date=date.today(), subject="국어", status="done"))
+    for _ in range(3):
+        db.add(
+            LearningAttempt(
+                organization_id=org_id, student_id=me_id, subject="국어",
+                result="incorrect", solve_time_ms=1, created_at=created,
+            )
+        )
+    db.commit()
+    _ = db.get(StudentProfile, me_id)
+
+    token = _student_token(client, seed_org)
+    body = client.get("/api/v1/students/me/class-ranking", headers=auth(token)).json()
+    me_row = next(r for r in body["board"] if r["me"])
+    assert me_row["score"] == 0  # 오답만 → 정답률/속도 0, 완주(6과목)도 아님 → 0점
+
+

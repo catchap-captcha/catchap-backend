@@ -40,9 +40,10 @@ from app.schemas.org import (
     CaptchaSettingsUpdate,
     OrgUpdate,
     TeacherCreate,
+    TeacherInviteCreate,
     TeacherUpdate,
 )
-from app.services import aggregate, onboarding_service
+from app.services import aggregate, invite_service, onboarding_service
 from app.services import auth_service as _auth_service
 from app.services.aggregate import fb
 from pydantic import BaseModel as _BaseModel
@@ -808,6 +809,37 @@ def add_teacher(
     )
     db.commit()
     return {"ok": True, "teacher": _teacher_row(db, membership)}
+
+
+@router.post("/{org_id}/teacher-invites")
+def invite_teacher(
+    org_id: str,
+    req: TeacherInviteCreate,
+    principal: Principal = Depends(require_grade_head),
+    db: Session = Depends(get_db),
+):
+    """교사 초대링크 발송 — 교사코드 선발급 + 이메일 발송. 링크 클릭 시 가입화면에 기관·코드 프리필."""
+    check_org_scope(principal, org_id)
+    invite_service.create_teacher_invite(
+        db,
+        organization_id=org_id,
+        inviter_id=principal.id,
+        email=req.email,
+        name=req.name,
+        role=req.role,
+    )
+    audit(
+        db,
+        action="org.teacher_invite",
+        actor_user_id=principal.id,
+        organization_id=org_id,
+        target_type="invitation",
+        target_id=None,
+        after={"email": req.email, "role": req.role},
+    )
+    db.commit()
+    # 토큰은 메일로만 전달 — 응답에 노출하지 않는다.
+    return {"ok": True, "email": req.email}
 
 
 @router.patch("/{org_id}/teachers/{teacher_id}")

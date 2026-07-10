@@ -259,7 +259,8 @@ def test_parent_summary_kpis_reflect_attempts(client, db, seed_org):
     kpis = {k["label"]: k for k in summary["kpis"]}
     assert kpis["이번 주 학습 횟수"]["value"] == "6회"
     assert kpis["이번 주 학습 횟수"]["delta"] == "+4회"  # 지난주 2회 대비
-    assert kpis["평균 정답률"]["value"] == "67%"  # 4/6
+    # 평균 정답률은 28일 표준 창 — 자녀 목록·교사 우리반과 동일 정의 (6정답/8시도)
+    assert kpis["평균 정답률"]["value"] == "75%"
     names = [s["name"] for s in summary["strengths"]]
     assert names[0] == "국어"  # 국어 100% > 수학
 
@@ -356,7 +357,10 @@ def test_dehardcoded_student_fields(client, db, seed_org):
     badges = client.get("/api/v1/students/me/badges", headers=auth(token)).json()
     assert badges["recent"]["name"] == "첫 걸음"
     assert badges["next"]["name"] == "불꽃 학습왕"
-    assert badges["next"]["progress"] > 0.8
+    # 연속 학습 배지 진행도는 저장값(12/14)이 아니라 실 streak/14 —
+    # 홈·기록·데일리퀴즈와 같은 정의. 오늘 시도만 있으므로 1/14.
+    assert badges["next"]["current"] == 1 and badges["next"]["total"] == 14
+    assert 0 < badges["next"]["progress"] < 0.2
     assert badges["level"] == seed_org["student"].level
 
     # 오늘의퀴즈/추천: NAV 코인 칩 + 주간 도전 실집계

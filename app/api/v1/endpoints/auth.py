@@ -5,7 +5,7 @@ from sqlalchemy.orm import Session
 from app.core.permissions import Principal, get_current_principal
 from app.db.session import get_db
 from app.schemas import auth as s
-from app.services import auth_service, onboarding_service
+from app.services import auth_service, invite_service, onboarding_service
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -163,3 +163,10 @@ def verify_teacher_code(
     # 교사 개별코드 열거 완화 — IP 기준 시도 상한
     auth_service.rate_limit(db, f"verifyteacherip:{_client_ip(request)}", limit=40)
     return {"valid": auth_service.verify_teacher_code(db, req.organization_id, req.code)}
+
+
+@router.get("/invite/{token}")
+def get_invite(token: str, request: Request, db: Session = Depends(get_db)):
+    """교사 초대링크 검증 → 가입화면 프리필용 기관·교사코드 반환. 토큰이 곧 인증(무인증)."""
+    auth_service.rate_limit(db, f"inviteip:{_client_ip(request)}", limit=60)
+    return invite_service.get_invite(db, token)
