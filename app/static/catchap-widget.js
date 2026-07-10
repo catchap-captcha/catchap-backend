@@ -183,12 +183,13 @@
         msg = okAns ? '정확히 쏙 넣었어요! 🎯' : '조금 빗나갔어요. 다시 한 번 해볼까요?';
       } else if (lastType === 'trace_path') {
         msg = okAns ? '선을 참 잘 따라 그렸어요! ✍️' : '점선을 따라 천천히 다시 그려볼까요?';
-      } else if (lastType === 'dictation' || lastType === 'type_in') {
-        // 입력형 — 서버가 내려준 정답 문자열 그대로 보여준다
+      } else if (lastType === 'dictation' || lastType === 'type_in' || lastType === 'input') {
+        // 입력형 — 서버가 내려준 정답을 보여준다(input은 정답 목록 → 첫 번째)
+        var ansStr = typeof res.answer === 'string' ? res.answer
+          : (Array.isArray(res.answer) && res.answer.length ? String(res.answer[0]) : '');
         msg = okAns
           ? '정답이에요! 참 잘했어요 🎉'
-          : (typeof res.answer === 'string' && res.answer
-              ? '아쉬워요! 정답은 "' + res.answer + '"' : '아쉬워요! 다시 한 번 생각해봐요.');
+          : (ansStr ? '아쉬워요! 정답은 "' + ansStr + '"' : '아쉬워요! 다시 한 번 생각해봐요.');
       } else if (lastType === 'crossword') {
         msg = okAns ? '십자말을 완성했어요! 🎉' : '아쉬워요! 낱말을 다시 살펴볼까요?';
       } else if (lastType === 'drag_pick') {
@@ -501,7 +502,7 @@
           css(warn, { textAlign: 'center', fontSize: '12px', color: '#C25', marginBottom: '10px' });
           body.appendChild(warn);
         }
-      } else {
+      } else if (d.type === 'type_in') {
         // type_in(높임말): 원문 문장 + 밑줄 강조 낱말 (textContent — 뱅크 문자열 그대로)
         var sent = h('div');
         sent.appendChild(document.createTextNode(d.before || ''));
@@ -514,9 +515,12 @@
           padding: '14px 18px', maxWidth: '440px', margin: '0 auto 16px' });
         body.appendChild(sent);
       }
+      // d.type === 'input'(수학 직접입력): 프롬프트/도형은 render() 공통부가 이미 표시 — 입력창만.
       var input = h('input');
       input.type = 'text';
-      input.placeholder = d.type === 'dictation' ? '들은 문장을 그대로 입력해요' : '알맞은 표현을 입력해요';
+      input.autocomplete = 'off';
+      input.placeholder = d.type === 'dictation' ? '들은 문장을 그대로 입력해요'
+        : d.type === 'input' ? '답을 입력해요' : '알맞은 표현을 입력해요';
       css(input, { display: 'block', width: '100%', maxWidth: '420px', margin: '0 auto', boxSizing: 'border-box',
         fontFamily: 'inherit', fontSize: '16px', fontWeight: '600', padding: '13px 15px',
         borderRadius: '13px', border: '2px solid #F0E4D8', color: '#3A3226', outline: 'none' });
@@ -874,7 +878,7 @@
       if (footerOn) {
         ensureFooter(); footerReset();
         redoBtn.textContent = d.type === 'trace_path' ? '다시 그리기'
-          : (d.type === 'dictation' || d.type === 'type_in') ? '다시 쓰기' : '다시 고르기';
+          : (d.type === 'dictation' || d.type === 'type_in' || d.type === 'input') ? '다시 쓰기' : '다시 고르기';
         nextBtn.textContent = '다음 문제 →';
       }
       if (footer) footer.style.display = footerOn ? 'flex' : 'none';
@@ -884,6 +888,16 @@
         ? { fontWeight: '800', fontSize: '21px', color: '#3A3226', marginBottom: '20px', textAlign: 'center' }
         : { fontWeight: '800', fontSize: '15px', color: '#3A3226', marginBottom: '12px' });
       body.appendChild(prompt);
+
+      // figure(문제 위 도형 그림) — 서버 뱅크의 신뢰된 SVG 마크업. 모든 유형 공통.
+      if (d.figure) {
+        var fig = h('div');
+        css(fig, { textAlign: 'center', margin: '0 auto 18px', maxWidth: '100%', overflowX: 'auto' });
+        fig.innerHTML = d.figure;
+        var fsvg = fig.querySelector('svg');
+        if (fsvg) { fsvg.style.maxWidth = '100%'; fsvg.style.height = 'auto'; }
+        body.appendChild(fig);
+      }
 
       // 조작형 공용: 표준 보기 셀 버튼
       function optCell(text) {
@@ -1131,7 +1145,7 @@
         // 원본 카드 드래그(과학·수학) — 피드백에 카드 라벨을 쓰도록 lastOptions 매핑
         lastOptions = (d.items || []).map(function (it) { return { id: it.id, text: it.label || it.e }; });
         renderDragPick(d, token);
-      } else if (d.type === 'dictation' || d.type === 'type_in') {
+      } else if (d.type === 'dictation' || d.type === 'type_in' || d.type === 'input') {
         renderTyping(d, token);
       } else if (d.type === 'punct') {
         renderPunct(d, token);

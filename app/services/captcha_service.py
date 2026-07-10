@@ -15,6 +15,7 @@ import base64
 import hashlib
 import json
 import math
+import re
 import secrets
 import time
 from datetime import datetime
@@ -533,7 +534,25 @@ _WIDGET_RENDER_FIELDS = ("options", "left", "right", "bins", "items", "cards", "
                          # 원본 유형 복원 — 국어(받아쓰기 tts·높임말 입력·문장부호 자리탭·십자말)
                          # 과학/수학(카드 드래그 target·장면 클릭 scene_svg/regions)
                          "tts", "before", "highlight", "after", "tokens", "gaps", "markLabel",
-                         "size", "words", "tiles", "level", "reveal", "target", "scene_svg", "regions")
+                         "size", "words", "tiles", "level", "reveal", "target", "scene_svg", "regions",
+                         # 수학 교체판 — figure(문제 위 도형 SVG, 표시용). answers는 정답이라 미노출.
+                         "figure")
+
+
+def _normalize_answer(v) -> str:
+    """수학 입력형(input) 정답 정규화 — 원본 normalizeAnswer 이식.
+
+    공백·쉼표·괄호·원문자·흔한 단위를 제거해 '75'와 '75도', '4시간25분'과
+    '4시간 25분'을 같게 본다. (뱅크 answers에 변형이 있어도 방어적으로 정규화)
+    """
+    s = str(v).strip().lower()
+    s = re.sub(r"<[^>]*>", "", s)
+    for a, b in zip("①②③④⑤⑥⑦⑧⑨⑩", ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10"]):
+        s = s.replace(a, b)
+    s = re.sub(r"[()\[\]{},]", "", s)
+    s = re.sub(r"\s+", "", s)
+    s = re.sub(r"(도|°|쪽|명|개|자루|분|번|살|마리|그루|원|회|cm|㎝|m|㎖|ml|l|kg|㎏|㎠)", "", s)
+    return s
 
 
 def _in_box(px: float, py: float, box: dict, pad: float = 0.0) -> bool:
@@ -598,6 +617,10 @@ def _wrap_bank_question(subject: str, q: dict, meta: dict) -> dict:
         # 받아쓰기는 tts(들려줄 문장)가 public에 필요해 정답이 페이로드에 포함된다 —
         # 원본(클라이언트 TTS+채점)과 동일한 트레이드오프로, 학습용 문항이라 수용한다.
         return _wrap("text", q["answer"], public, meta)
+    if t == "input":
+        # 수학 직접 입력 — 위젯이 타이핑 문자열 제출, 정규화 후 answers 중 하나와 일치.
+        # 정답(answers)은 토큰에만 서명(public 미포함) → 봇이 정답을 못 본다.
+        return _wrap("input", list(q["answers"]), public, meta)
     if t == "punct":
         # 문장부호 — 원본과 동일하게 어절 사이 자리(gap)를 모두 탭. 집합 일치 채점.
         return _wrap("select_all", sorted(q["answer"]), public, meta)
@@ -739,6 +762,10 @@ def verify_challenge(db: Session, challenge_token: str, answer) -> dict:
         # 입력형(받아쓰기·높임말) — trim 후 정확 일치. 받아쓰기는 내부 띄어쓰기가 채점
         # 대상이므로 내부 공백은 정규화하지 않는다. 비-str 입력은 오답(500 방지).
         ok = isinstance(answer, str) and answer.strip() == str(target).strip() and bool(answer.strip())
+    elif kind == "input":
+        # 수학 직접 입력 — 정규화(공백·쉼표·단위 제거) 후 정답 목록 중 하나와 일치.
+        norm = _normalize_answer(answer) if isinstance(answer, str) else ""
+        ok = bool(norm) and norm in {_normalize_answer(a) for a in (target or [])}
     elif kind == "drag_pick":
         # 카드 드래그 — 알맞은 카드(item id) + 드롭 지점이 존 안. 거리는 행동데이터 기록.
         sub = answer if isinstance(answer, dict) else {}

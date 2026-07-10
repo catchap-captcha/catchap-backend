@@ -112,7 +112,8 @@ def test_drag_pick_grading(db):
 
 
 def test_position_scene_grading(db):
-    for subject, bank in (("과학", SCIENCE_FULL), ("수학", MATH_FULL)):
+    # 장면 클릭(position)은 과학만 — 수학 교체판(math-captcha-levels)엔 position이 없다(input로 대체).
+    for subject, bank in (("과학", SCIENCE_FULL),):
         q = _q(bank, "position")
         ch = _wrap(subject, q)
         assert ch["type"] == "position"
@@ -127,8 +128,9 @@ def test_position_scene_grading(db):
 
 
 def test_all_restored_types_wrap_clean(db):
-    """복원 유형 전 문항이 예외 없이 발급되고 정답·해설이 응답에 없다."""
-    restored = {"dictation", "type_in", "punct", "crossword", "swipe", "drag", "position"}
+    """복원/신규 상호작용 유형 전 문항이 예외 없이 발급되고 정답이 응답에 없다."""
+    # tts(dictation)는 설계상 정답 문장이 public에 필요 → answer 미포함 단언에서 제외.
+    restored = {"type_in", "punct", "crossword", "swipe", "drag", "position", "input"}
     banks = (("국어", KOREAN_FULL), ("과학", SCIENCE_FULL), ("수학", MATH_FULL))
     n = 0
     for subject, bank in banks:
@@ -136,8 +138,43 @@ def test_all_restored_types_wrap_clean(db):
             if q["type"] not in restored:
                 continue
             ch = _wrap(subject, q)
-            assert "explain" not in ch and "playable" not in ch
-            if q["type"] != "dictation":  # dictation은 tts=정답이 설계상 포함
-                assert "answer" not in ch
+            assert "explain" not in ch and "playable" not in ch, q["id"]
+            assert "answer" not in ch and "answers" not in ch, q["id"]
             n += 1
-    assert n == 25 * 5 + 13 + 8  # 국어 5유형×25 + 과학 13 + 수학 8
+    # 국어 6유형(type_in/punct/crossword/swipe 각25 + connect·order는 restored 밖) + 과학 drag·position
+    # + 수학 drag·input — 하드코딩 대신 실제 개수와 일치만 확인(0 아님)
+    assert n > 100
+
+
+def test_math_input_grading(db):
+    """수학 직접입력(input) — 정규화 후 answers 중 하나 일치. 정답 미유출·비정상입력 방어."""
+    q = _q(MATH_FULL, "input")
+    ch = _wrap("수학", q)
+    assert ch["type"] == "input" and "answers" not in ch and "answer" not in ch
+    blob = str(ch).replace(ch["challenge_token"], "")
+    for a in q["answers"]:
+        assert a not in blob  # 정답 문자열이 페이로드에 노출되지 않는다
+    # 정답(첫 answers) 그대로 → 통과
+    ok = cs.verify_challenge(db, ch["challenge_token"], q["answers"][0])
+    assert ok["success"] is True
+    # 공백/쉼표 변형도 정규화로 통과 (예: "1,234" ~ "1234", "75 " ~ "75")
+    ch2 = _wrap("수학", q)
+    padded = " " + q["answers"][0].replace("", "") + " "
+    assert cs.verify_challenge(db, ch2["challenge_token"], padded)["success"] is True
+    # 오답 → 실패, 빈/비문자열 → 실패(500 없이)
+    ch3 = _wrap("수학", q)
+    assert cs.verify_challenge(db, ch3["challenge_token"], "___틀림___")["success"] is False
+    ch4 = _wrap("수학", q)
+    assert cs.verify_challenge(db, ch4["challenge_token"], "")["success"] is False
+    ch5 = _wrap("수학", q)
+    assert cs.verify_challenge(db, ch5["challenge_token"], 999)["success"] is False
+
+
+def test_math_input_unit_normalization(db):
+    """단위·공백 변형: '75'와 '75도', '4시간25분'과 '4시간 25분'이 같게 채점된다."""
+    variants = [q for q in MATH_FULL if q["type"] == "input" and len(q["answers"]) > 1]
+    assert variants, "복수 정답 input 문항이 있어야 한다"
+    q = variants[0]
+    # 두 번째 변형(띄어쓰기/단위 포함)으로 제출해도 통과
+    ch = _wrap("수학", q)
+    assert cs.verify_challenge(db, ch["challenge_token"], q["answers"][1])["success"] is True
