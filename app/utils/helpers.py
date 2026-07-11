@@ -1,7 +1,7 @@
 """엔드포인트 공용 헬퍼 (감사 로그, 상태 라벨, 날짜 라벨)."""
 
 import re
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 
 from sqlalchemy.orm import Session
 
@@ -22,6 +22,18 @@ def today() -> date:
 def now() -> datetime:
     """앱 전역 '지금' (로컬 시각, created_at 저장 규약과 일치)."""
     return datetime.now()
+
+
+def utc_to_local(dt: datetime | None) -> datetime | None:
+    """UTC-naive 저장값(코드/토큰 만료류)을 로컬(KST) 벽시계로 변환.
+
+    만료류는 UTC로 저장·비교되지만(자기 정합), 응답으로 내보낼 땐 created_at 등
+    다른 시각과 같은 로컬(KST) 벽시계여야 프론트 표시가 9시간 어긋나지 않는다.
+    사용자 노출 직렬화 직전에만 사용할 것 — 저장/비교에 쓰면 규약이 깨진다.
+    """
+    if dt is None:
+        return None
+    return dt.replace(tzinfo=timezone.utc).astimezone().replace(tzinfo=None)
 
 # 반 이름 맨 앞의 학년 숫자 ("1-2반", "1학년 2반", "3반" → 1/1/3)
 _GRADE_RE = re.compile(r"^\s*(\d+)")

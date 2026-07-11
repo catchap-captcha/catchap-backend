@@ -195,7 +195,8 @@ def login(db: Session, req: s.LoginRequest) -> s.TokenPair:
         raise HTTPException(status.HTTP_403_FORBIDDEN, detail="이메일 인증이 완료되지 않았습니다.")
     _assert_org_approved(db, user)  # 기관 승인 게이트 (ops 승인 전 로그인 차단)
     _reset_fails(db, identifier)
-    user.last_login_at = _now()
+    # last_login_at은 사용자 노출 시각 → created_at과 같은 로컬(KST) 규약. _now()는 토큰용 UTC.
+    user.last_login_at = datetime.now()
     db.commit()
     return issue_tokens(db, user.id, user.role, "user")
 
@@ -250,7 +251,7 @@ def ops_login(db: Session, req: s.LoginRequest) -> s.TokenPair:
     if user.status == "disabled":
         raise HTTPException(status.HTTP_403_FORBIDDEN, detail="비활성화된 계정입니다.")
     _reset_fails(db, identifier)
-    user.last_login_at = _now()
+    user.last_login_at = datetime.now()  # 사용자 노출 시각 → 로컬(KST) 규약
     db.commit()
     return issue_tokens(db, user.id, user.role, "user")
 
@@ -300,7 +301,7 @@ def student_login(db: Session, req: s.StudentLoginRequest) -> s.TokenPair:
 
     student = matched[0]
     _reset_fails(db, identifier)
-    student.last_login_at = _now()
+    student.last_login_at = datetime.now()  # 사용자 노출 시각 → 로컬(KST) 규약
     db.commit()
     return issue_tokens(db, student.id, "student", "student")
 

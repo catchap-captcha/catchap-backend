@@ -404,5 +404,15 @@ def link_invite(
             ),
         )
     )
+    # 감사 — 학부모가 아동 학습데이터 접근권을 얻는 민감 행위. 해제(parent.child_unlink)와 대칭.
+    audit(
+        db,
+        action="parent.child_link",
+        actor_user_id=principal.id,
+        organization_id=link.organization_id,
+        target_type="parent_student_link",
+        target_id=link.student_id,
+        after={"via": "invite_code"},
+    )
     db.commit()
     return {"ok": True, "student_id": link.student_id}

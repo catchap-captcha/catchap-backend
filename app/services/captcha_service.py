@@ -283,7 +283,8 @@ def log_call(
             endpoint=endpoint, method="POST", status_code=status_code, latency_ms=latency_ms,
         )
     )
-    api.last_used_at = datetime.utcnow()
+    # created_at(로컬=KST)과 같은 규약 — utcnow면 같은 응답에서 발급일과 9시간 어긋난다
+    api.last_used_at = datetime.now()
 
 
 # ── 챌린지 생성 ────────────────────────────────────────────────

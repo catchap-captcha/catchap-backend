@@ -57,7 +57,7 @@ class _RegisterStudentsReq(_BaseModel):
     names: list[str] | None = None  # 학생 실명(슬롯 순서대로, 교사·기관 화면 전용)
     genders: list[str | None] | None = None  # 성별(슬롯 순서대로, 선생님 입력 — 아이가 안 고름)
 from app.services.stats import D  # DB(stat_blobs) 우선, design_data fallback
-from app.utils.helpers import audit, parse_grade, student_display_name, summary_acc
+from app.utils.helpers import audit, parse_grade, student_display_name, summary_acc, utc_to_local
 
 router = APIRouter(prefix="/orgs", tags=["orgs"])
 
@@ -109,7 +109,10 @@ def _org_row(db: Session, org: Organization) -> dict:
         "business_number": org.business_number,
         "admin": admin.name if admin else None,
         "tax_email": D.ORG_TAX_EMAIL,  # organizations 컬럼 없음 — stat_blobs(D)
-        "code_expires_at": org.code_expires_at.isoformat() if org.code_expires_at else None,
+        # 만료는 UTC 저장 — 사용자 노출은 KST 벽시계로 변환(다른 시각들과 규약 통일)
+        "code_expires_at": (
+            utc_to_local(org.code_expires_at).isoformat() if org.code_expires_at else None
+        ),
         "code_remain_days": (
             max(0, (org.code_expires_at - datetime.utcnow()).days) if org.code_expires_at else None
         ),
@@ -197,7 +200,7 @@ def rotate_org_code(
     return {
         "ok": True,
         "code": org.code,
-        "code_expires_at": org.code_expires_at.isoformat(),
+        "code_expires_at": utc_to_local(org.code_expires_at).isoformat(),  # 노출은 KST
         "code_remain_days": 365,
     }
 
@@ -2039,3 +2042,117 @@ def org_rotate_secret(
     )
     db.commit()
     return {"ok": True, "site_key": k.site_key, "secret_key": secret}
+
+
+# ---------------------------------------------------------------- 기관 활동 기록 (자기 기관 스코프)
+@router.get("/{org_id}/audit-logs")
+def org_audit_logs(
+    org_id: str,
+    action: str | None = None,
+    date_from: str | None = None,  # 'YYYY-MM-DD' (해당일 00:00 포함)
+    date_to: str | None = None,  # 'YYYY-MM-DD' (해당일 끝까지 포함)
+    page: int = 1,
+    page_size: int = 50,
+    principal: Principal = Depends(require_org_admin),
+    db: Session = Depends(get_db),
+):
+    """기관 활동 기록 — 교장/기관 관리자가 자기 기관 것만 본다.
+
+    운영 감사로그(GET /ops/logs)와 달리:
+    - 자기 organization_id로 스코프 고정 (타 기관 조회 불가)
+    - 운영자(ops) 내부 행위는 제외 — 기관 화면엔 기관 구성원(관리자·교사·학부모·학생)의
+      행동만 보인다. 요금제 변경·비번 재발급 같은 운영 조치는 운영 콘솔 몫.
+    - 학생 실행자는 ops 콘솔과 동일 규칙의 익명 코드("학생 XXXXXX")로만 표시.
+    """
+    import hashlib as _hashlib
+    from datetime import date as _date, datetime as _dt, time as _time, timedelta as _td
+
+    from sqlalchemy import or_ as _or
+
+    from app.core.config import get_settings as _get_settings
+    from app.models import AuditLog
+
+    check_org_scope(principal, org_id)
+
+    page = max(1, page)
+    page_size = max(1, min(200, page_size))
+
+    q = db.query(AuditLog).filter(AuditLog.organization_id == org_id)
+    if action:
+        q = q.filter(AuditLog.action == action)
+    try:
+        if date_from:
+            q = q.filter(AuditLog.created_at >= _dt.combine(_date.fromisoformat(date_from), _time.min))
+        if date_to:
+            q = q.filter(AuditLog.created_at < _dt.combine(_date.fromisoformat(date_to) + _td(days=1), _time.min))
+    except ValueError:
+        pass
+
+    # 운영자 내부 행위 제외 — actor가 ops 역할인 로그는 기관에 노출하지 않는다.
+    # (actor 없음/학생 actor는 User에 없으므로 유지된다)
+    ops_ids = [uid for (uid,) in db.query(User.id).filter(User.role == "ops").all()]
+    if ops_ids:
+        q = q.filter(_or(AuditLog.actor_user_id.is_(None), AuditLog.actor_user_id.notin_(ops_ids)))
+
+    total = q.count()
+    rows = (
+        q.order_by(AuditLog.created_at.desc())
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+        .all()
+    )
+
+    actor_ids = {log.actor_user_id for log in rows if log.actor_user_id}
+    users = {u.id: u for u in db.query(User).filter(User.id.in_(list(actor_ids) or [""]))}
+    students = {
+        s.id: s
+        for s in db.query(StudentProfile).filter(StudentProfile.id.in_(list(actor_ids) or [""]))
+    }
+    _salt = _get_settings().JWT_SECRET_KEY
+
+    def _actor(log) -> str | None:
+        aid = log.actor_user_id
+        if not aid:
+            return None
+        u = users.get(aid)
+        if u is not None:
+            role = {
+                "org_admin": "기관 관리자", "grade_head": "학년부장",
+                "teacher": "교사", "parent": "학부모",
+            }.get(u.role, u.role)
+            return f"{u.name} ({role})"
+        s = students.get(aid)
+        if s is not None:
+            # ops 콘솔과 동일 salt·규칙 — 두 콘솔에서 같은 학생이 같은 코드로 보인다.
+            code = _hashlib.sha256(f"{_salt}:{s.id}".encode()).hexdigest()[:6].upper()
+            return f"학생 {code}"
+        return None
+
+    items = [
+        {
+            "id": log.id,
+            "action": log.action,
+            "actor_name": _actor(log),
+            "actor_email": (users[log.actor_user_id].email if log.actor_user_id in users else None),
+            "target_type": log.target_type,
+            "target_id": log.target_id,
+            "created_at": log.created_at.isoformat() if log.created_at else None,
+        }
+        for log in rows
+    ]
+
+    # 필터 선택지 — 자기 기관에 실제 존재하는 action만 (ops 행위 제외 조건 동일 적용)
+    facet_q = db.query(AuditLog.action).filter(AuditLog.organization_id == org_id)
+    if ops_ids:
+        facet_q = facet_q.filter(
+            _or(AuditLog.actor_user_id.is_(None), AuditLog.actor_user_id.notin_(ops_ids))
+        )
+    action_facet = sorted(a for (a,) in facet_q.distinct().all() if a)
+
+    return {
+        "items": items,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "actions": action_facet,
+    }

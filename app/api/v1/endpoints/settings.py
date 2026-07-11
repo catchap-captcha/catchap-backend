@@ -92,7 +92,7 @@ def save_settings(
     audit(
         db,
         action="settings.update",
-        actor_user_id=principal.id if principal.kind == "user" else None,
+        actor_user_id=principal.id,  # 학생 self-service도 actor 기록(ops 조회는 익명코드 표시)
         organization_id=principal.organization_id,
         target_type="user_setting",
         target_id=subject_id,
@@ -122,7 +122,7 @@ def change_password(
     audit(
         db,
         action="settings.change_password",
-        actor_user_id=principal.id if principal.kind == "user" else None,
+        actor_user_id=principal.id,  # 학생 self-service도 actor 기록(ops 조회는 익명코드 표시)
         organization_id=principal.organization_id,
         target_type=principal.kind,
         target_id=principal.id,
@@ -160,7 +160,8 @@ def export_data(
 ):
     row = _get_row(db, principal)
     payload: dict = {
-        "exported_at": datetime.utcnow().isoformat(),
+        # KST(컨테이너 TZ) 벽시계 — created_at 등 다른 사용자 노출 시각과 동일 규약
+        "exported_at": datetime.now().isoformat(),
         "subject_type": principal.kind,
         "settings": row.settings if row else {},
     }
@@ -217,7 +218,7 @@ def delete_account(
     audit(
         db,
         action="settings.account_delete",
-        actor_user_id=principal.id if principal.kind == "user" else None,
+        actor_user_id=principal.id,  # 학생 self-service도 actor 기록(ops 조회는 익명코드 표시)
         organization_id=principal.organization_id,
         target_type=principal.kind,
         target_id=principal.id,

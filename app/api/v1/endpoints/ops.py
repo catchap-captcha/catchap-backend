@@ -1577,7 +1577,7 @@ def behavior_export(
     )
     db.commit()
 
-    stamp = datetime.utcnow().strftime("%Y%m%d")
+    stamp = datetime.now().strftime("%Y%m%d")  # KST 날짜 — utcnow면 한국 자정~09시에 전날로 찍힘
     fname = f"catchap_behavior_{mode}_{stamp}.{fmt}"
     if fmt == "json":
         return {
