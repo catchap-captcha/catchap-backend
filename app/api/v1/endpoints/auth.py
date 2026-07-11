@@ -144,6 +144,16 @@ def password_reset_confirm(req: s.PasswordResetConfirm, db: Session = Depends(ge
     return {"ok": True}
 
 
+@router.post("/verify-join-code")
+def verify_join_code(
+    req: s.JoinCodeVerifyRequest, request: Request, db: Session = Depends(get_db)
+):
+    """학생 가입 코드를 소비하지 않고 상태만 확인 — 아이디/비번 입력 전에 먼저 막기.
+    저엔트로피 코드 열거 완화를 위해 IP 기준 시도 상한."""
+    auth_service.rate_limit(db, f"verifyjoinip:{_client_ip(request)}", limit=40)
+    return onboarding_service.check_join_code(db, req.code)
+
+
 @router.post("/verify-org-code")
 def verify_org_code(
     req: s.OrgCodeVerifyRequest, request: Request, db: Session = Depends(get_db)

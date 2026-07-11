@@ -379,6 +379,48 @@ def test_register_without_genders_leaves_none(client, db, seed_org):
     assert r.json()["issued"][0]["gender"] is None
 
 
+def test_verify_join_code_does_not_consume_and_blocks_used(client, db, seed_org):
+    """가입 코드 미리검증: 소비하지 않고 상태만 반환. 없는 코드/이미 쓴 코드를 아이디 입력 전에 막는다."""
+    org = seed_org["org"]
+    _org_admin(db, org)
+    admin = _login(client, "principal@test.dev")
+
+    r = client.post(
+        f"/api/v1/orgs/{org.id}/students/register",
+        json={"count": 1, "class_label": "5-1반", "names": ["코드검증"]},
+        headers=auth(admin),
+    )
+    assert r.status_code == 200, r.text
+    join_code = r.json()["issued"][0]["join_code"]
+
+    # 1) 유효한 미사용 코드 → valid, 그리고 코드가 소비되지 않아야 한다(used_at None 유지)
+    v1 = client.post("/api/v1/auth/verify-join-code", json={"code": join_code})
+    assert v1.status_code == 200, v1.text
+    assert v1.json() == {"valid": True, "reason": "ok"}
+
+    from app.models import StudentJoinCode
+    from app.core.security import sha256_hash
+
+    row = db.query(StudentJoinCode).filter(
+        StudentJoinCode.code_hash == sha256_hash(join_code.strip().upper())
+    ).first()
+    db.refresh(row)
+    assert row.used_at is None  # 미리검증이 코드를 쓰지 않았다
+
+    # 2) 없는 코드 → not_found
+    vbad = client.post("/api/v1/auth/verify-join-code", json={"code": "JOIN-ZZZZ-9999"})
+    assert vbad.status_code == 200 and vbad.json()["reason"] == "not_found"
+
+    # 3) 실제 가입(활성화)해서 코드 소비 → 다시 검증하면 used 로 막힌다
+    act = client.post(
+        "/api/v1/auth/activate-student",
+        json={"code": join_code, "student_login_id": "codechk1", "nickname": "검증이", "password": "pass1234"},
+    )
+    assert act.status_code == 200, act.text
+    v2 = client.post("/api/v1/auth/verify-join-code", json={"code": join_code})
+    assert v2.json() == {"valid": False, "reason": "used"}
+
+
 def test_grade_head_cannot_use_org_admin_only(client, db, seed_org):
     org = seed_org["org"]
     _org_admin(db, org)

@@ -105,6 +105,27 @@ def generate_join_codes(
     return out
 
 
+def check_join_code(db: Session, code: str) -> dict:
+    """가입 코드를 소비하지 않고 상태만 확인(아이디/비번 입력 전에 먼저 막기 위함).
+    reason: ok | empty | not_found | used | expired.
+    activate_student의 판정과 동일해야 최종 제출에서 다른 결과가 나오지 않는다."""
+    code = (code or "").strip().upper()
+    if not code:
+        return {"valid": False, "reason": "empty"}
+    row = (
+        db.query(StudentJoinCode)
+        .filter(StudentJoinCode.code_hash == sha256_hash(code))
+        .first()
+    )
+    if row is None:
+        return {"valid": False, "reason": "not_found"}
+    if row.used_at is not None:
+        return {"valid": False, "reason": "used"}
+    if row.expires_at and row.expires_at < _now():
+        return {"valid": False, "reason": "expired"}
+    return {"valid": True, "reason": "ok"}
+
+
 def activate_student(
     db: Session, code: str, student_login_id: str, nickname: str, password: str
 ) -> tuple[StudentProfile, StudentJoinCode]:

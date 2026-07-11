@@ -122,6 +122,10 @@ class OrgCodeVerifyRequest(BaseModel):
     code: str
 
 
+class JoinCodeVerifyRequest(BaseModel):
+    code: str
+
+
 class MeStudent(BaseModel):
     student_login_id: str
     student_code: str
