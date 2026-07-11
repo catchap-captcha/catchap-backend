@@ -196,3 +196,46 @@ def test_ops_list_pagination_and_backcompat(client, db, seed_org):
     # registration-requests 페이지 응답엔 탭 배지 counts
     r2 = client.get("/api/v1/ops/registration-requests", params={"page": 1}, headers=headers)
     assert set(r2.json()["counts"]) == {"pending", "approved", "rejected"}
+
+
+def test_ops_ai_model_crud_reflects_in_org_console(client, db, seed_org):
+    """운영자 모델 등록/수정이 기관 콘솔 AI 모델 화면에 그대로 반영 + 감사 기록"""
+    from app.models import AuditLog
+
+    _mk_user(db, None, "aiops@test.dev", "ops", "운영자")
+    _mk_user(db, seed_org["org"].id, "aiadmin@test.dev", "org_admin", "김교장")
+    ops_token = client.post(
+        "/api/v1/auth/ops-login",
+        json={"email": "aiops@test.dev", "password": "Password123!"},
+    ).json()["access_token"]
+
+    # 등록
+    r = client.post(
+        "/api/v1/ops/ai-models",
+        json={"category": "행동 판정", "name": "KidGuard", "provider": "CatChap",
+              "version": "v0.1", "status": "베타", "description": "아동 보정 봇 판정"},
+        headers=auth(ops_token),
+    )
+    assert r.status_code == 200, r.text
+    mid = r.json()["id"]
+
+    # 수정 (상태 정상 승격)
+    r2 = client.patch(
+        f"/api/v1/ops/ai-models/{mid}",
+        json={"category": "행동 판정", "name": "KidGuard", "provider": "CatChap",
+              "version": "v0.2", "status": "정상", "description": "아동 보정 봇 판정"},
+        headers=auth(ops_token),
+    )
+    assert r2.status_code == 200 and r2.json()["version"] == "v0.2"
+
+    # 기관 콘솔 화면에 반영되는지
+    admin_token = _login(client, "org_admin", "aiadmin@test.dev")
+    org_view = client.get(
+        f"/api/v1/orgs/{seed_org['org'].id}/ai-models", headers=auth(admin_token)
+    ).json()
+    mine = [m for m in org_view["models"] if m["id"] == mid]
+    assert mine and mine[0]["version"] == "v0.2" and mine[0]["status"] == "정상"
+
+    # 감사 기록
+    actions = {a for (a,) in db.query(AuditLog.action).all()}
+    assert {"ops.ai_model_create", "ops.ai_model_update"} <= actions

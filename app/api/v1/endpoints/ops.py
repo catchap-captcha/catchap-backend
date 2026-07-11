@@ -5,7 +5,7 @@ import hashlib
 import io
 import secrets
 from collections import defaultdict
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from html import escape
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -1006,20 +1006,89 @@ def logs(
     }
 
 
+def _model_row(m: ModelVersion) -> dict:
+    return {
+        "id": m.id,
+        "category": m.category,
+        "name": m.name,
+        "provider": m.provider,
+        "version": m.version,
+        "status": m.status,
+        "description": m.description,
+        "updated_on": m.updated_on,
+    }
+
+
 @router.get("/ai-models")
 def ai_models(principal: Principal = Depends(require_ops), db: Session = Depends(get_db)):
+    """모델 레지스트리 — 이 목록이 각 기관 콘솔 'AI 모델' 화면에 그대로 노출된다."""
     rows = db.query(ModelVersion).order_by(ModelVersion.created_at).all()
-    return [
-        {
-            "id": m.id,
-            "category": m.category,
-            "name": m.name,
-            "provider": m.provider,
-            "version": m.version,
-            "status": m.status,
-        }
-        for m in rows
-    ]
+    return [_model_row(m) for m in rows]
+
+
+class _ModelUpsertReq(BaseModel):
+    category: str = Field(min_length=1, max_length=60)
+    name: str = Field(min_length=1, max_length=100)
+    provider: str = Field(min_length=1, max_length=60)
+    version: str = Field(min_length=1, max_length=30)
+    status: str = Field(pattern="^(정상|베타|점검|중단)$")
+    description: str | None = Field(default=None, max_length=2000)
+
+
+@router.post("/ai-models")
+def ai_model_create(
+    req: _ModelUpsertReq,
+    principal: Principal = Depends(require_ops),
+    db: Session = Depends(get_db),
+):
+    """모델 등록 — 기관 콘솔에 즉시 노출되므로 감사에 남긴다."""
+    m = ModelVersion(
+        category=req.category, name=req.name, provider=req.provider,
+        version=req.version, status=req.status, description=req.description,
+        updated_on=date.today().isoformat(),  # KST 날짜 — 기관 화면 '업데이트' 표기
+    )
+    db.add(m)
+    db.flush()
+    db.add(
+        AuditLog(
+            actor_user_id=principal.id, organization_id=None,
+            action="ops.ai_model_create", target_type="model_version", target_id=m.id,
+            after_json={"name": req.name, "version": req.version, "status": req.status},
+        )
+    )
+    db.commit()
+    return {"ok": True, **_model_row(m)}
+
+
+@router.patch("/ai-models/{model_id}")
+def ai_model_update(
+    model_id: str,
+    req: _ModelUpsertReq,
+    principal: Principal = Depends(require_ops),
+    db: Session = Depends(get_db),
+):
+    """모델 정보 수정(이름/버전/상태/설명) — 기관 콘솔 표시가 바로 바뀐다."""
+    m = db.get(ModelVersion, model_id)
+    if m is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="모델을 찾을 수 없습니다.")
+    before = {"name": m.name, "version": m.version, "status": m.status}
+    m.category = req.category
+    m.name = req.name
+    m.provider = req.provider
+    m.version = req.version
+    m.status = req.status
+    m.description = req.description
+    m.updated_on = date.today().isoformat()
+    db.add(
+        AuditLog(
+            actor_user_id=principal.id, organization_id=None,
+            action="ops.ai_model_update", target_type="model_version", target_id=m.id,
+            before_json=before,
+            after_json={"name": req.name, "version": req.version, "status": req.status},
+        )
+    )
+    db.commit()
+    return {"ok": True, **_model_row(m)}
 
 
 # ---------------------------------------------------------------- 기관 가입 승인
