@@ -536,7 +536,8 @@ def roster(
                 "id": s.id,
                 "name": _roster_display_name(s),
                 "nickname": s.nickname,
-                "login_id": s.student_login_id,  # 학교 발급 로그인 아이디(학생관리 표시용)
+                # 로그인 아이디(자격증명)는 기관 관리자 화면에 노출하지 않는다(데이터 최소화).
+                # 동명이인 구분은 학생 코드(code)로 — 로그인 아이디가 아니라 식별 번호.
                 "age": s.age,
                 "gender": s.gender,
                 "cls": cls_name,
@@ -578,7 +579,7 @@ def roster(
                 "id": f"jc-{jc.id}",
                 "name": jc.real_name or "(이름 미입력)",
                 "nickname": None,
-                "login_id": jc.login_id,
+                # 로그인 아이디는 기관 화면에 노출 안 함(데이터 최소화)
                 "age": None,
                 "gender": jc.gender,
                 "cls": pc_cls,
