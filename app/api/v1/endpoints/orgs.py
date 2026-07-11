@@ -1661,12 +1661,16 @@ def reissue_student_join_code(
 def issue_invite(
     org_id: str,
     student_id: str,
-    principal: Principal = Depends(require_org_admin),
+    principal: Principal = Depends(require_grade_head),
     db: Session = Depends(get_db),
 ):
-    """학생 1명 귀속 학부모 초대 코드 발급(고엔트로피·만료·2회 허용)."""
+    """학생 1명 귀속 학부모 초대 코드 발급(고엔트로피·만료·2회 허용).
+    교장=전체 학생, 학년부장=자기 담당 학년 학생만. (담임은 교사앱 /teacher 경로로 자기 반 학생)"""
     check_org_scope(principal, org_id)
-    _student_in_org(db, org_id, student_id)  # 타 기관 학생 대상 코드 발급 차단(크로스테넌트 IDOR)
+    st = _student_in_org(db, org_id, student_id)  # 타 기관 학생 대상 발급 차단(크로스테넌트 IDOR)
+    # 학년부장은 담당 학년 학생만 — 학생의 반 학년으로 판정(반 미배정이면 학년부장은 fail-closed)
+    cls = db.get(ClassRoom, st.class_id) if st.class_id else None
+    check_grade_scope(db, principal, org_id, _class_grade(cls) if cls else None)
     code = onboarding_service.issue_parent_invite(
         db, student_id=student_id, organization_id=org_id, created_by=principal.id
     )

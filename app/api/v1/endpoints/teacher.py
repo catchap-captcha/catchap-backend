@@ -218,6 +218,35 @@ def reset_class_student_password(
     return {"ok": True, "temp_password": temp}  # 임시 비번은 1회 노출
 
 
+@router.post("/class/students/{student_id}/invite-code")
+def issue_class_parent_invite(
+    student_id: str,
+    principal: Principal = Depends(require_teacher),
+    db: Session = Depends(get_db),
+):
+    """담임/보조 교사가 자기 반 학생의 학부모 초대 코드를 발급(고엔트로피·만료·2회 허용).
+    자기 담당 반 학생만 — 다른 반 학생은 403. 코드 원문은 이 응답에서만 1회 노출."""
+    from app.services import onboarding_service
+
+    cls = _my_class(db, principal)  # 담임(teacher_id)/보조(assistant_teacher_id) 배정 반
+    student = db.get(StudentProfile, student_id)
+    if student is None or student.class_id != cls.id or student.status == "disabled":
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail="담당 반 학생이 아니에요.")
+    code = onboarding_service.issue_parent_invite(
+        db, student_id=student_id, organization_id=cls.organization_id, created_by=principal.id
+    )
+    audit(
+        db,
+        action="student.parent_invite",
+        actor_user_id=principal.id,
+        organization_id=cls.organization_id,
+        target_type="student",
+        target_id=student.id,
+    )
+    db.commit()
+    return {"ok": True, "invite_code": code}
+
+
 @router.post("/class/students")
 def add_student_by_code(
     req: AddStudentByCode,
