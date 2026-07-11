@@ -1289,6 +1289,28 @@ def behavior_overview(
             for k, n in db.query(col, func.count(BehaviorSummary.id)).group_by(col).all()
         }
 
+    # 시간대(0~23시) 분포 — 최근 7일, created_at은 KST라 그대로 시(hour) 추출.
+    # 봇 트래픽은 특정 시각(특히 심야)에 몰리는 경향 — 아동 트래픽과 갈라지는 축.
+    hourly = [0] * 24
+    for (ca,) in (
+        db.query(BehaviorSummary.created_at)
+        .filter(BehaviorSummary.created_at >= week_ago)
+        .all()
+    ):
+        if ca is not None:
+            hourly[ca.hour] += 1
+
+    # 풀이시간 히스토그램 — 사람/봇 군집이 갈라지는 분포 축. 경계(ms): 아동 보정
+    # 스코어링 임계값(800/1500/3000)과 정렬해 구간별 위험 의미가 읽히게 한다.
+    solve_edges = [0, 800, 1500, 3000, 5000, 10000, 30000]
+    solve_hist = [0] * (len(solve_edges))  # 마지막 칸 = 30s 초과
+    for (ms,) in db.query(BehaviorSummary.solve_time_ms).all():
+        v = ms or 0
+        for i in range(len(solve_edges) - 1, -1, -1):
+            if v >= solve_edges[i]:
+                solve_hist[i] += 1
+                break
+
     return {
         "total": total,
         "week_count": week_count,
@@ -1297,6 +1319,12 @@ def behavior_overview(
         "by_result": _group_counts(BehaviorSummary.interaction_result),
         "by_risk": _group_counts(BehaviorSummary.risk_level),
         "by_dataset": _group_counts(BehaviorSummary.dataset_status),
+        "by_label": _group_counts(BehaviorSummary.sample_label),  # organic|bot|human
+        "hourly_week": hourly,  # 최근 7일 KST 시간대(0~23시)별 수집 건수
+        "solve_hist": {  # 풀이시간 분포 (구간 시작 ms → 건수)
+            "edges_ms": solve_edges,
+            "counts": solve_hist,
+        },
         "comparison": [
             _behavior_group_metrics(db, "child", BehaviorSummary.student_id.isnot(None)),
             _behavior_group_metrics(db, "anonymous", BehaviorSummary.student_id.is_(None)),
@@ -1334,12 +1362,17 @@ def behavior_records(
     risk: str | None = None,  # low|review|elevated
     group: str | None = None,  # student|anonymous
     dataset: str | None = None,  # candidate|included|excluded
+    label: str | None = None,  # organic|bot|human (지도학습 라벨)
+    date_from: str | None = None,  # 'YYYY-MM-DD' KST (해당일 00:00 포함)
+    date_to: str | None = None,  # 'YYYY-MM-DD' KST (해당일 끝까지 포함)
     limit: int = 50,
     offset: int = 0,
     principal: Principal = Depends(require_ops),
     db: Session = Depends(get_db),
 ):
     """행동 데이터 레코드 목록 (필터 + 페이지네이션, 최신순)."""
+    from datetime import date as _date, time as _time
+
     q = db.query(BehaviorSummary)
     if source:
         q = q.filter(BehaviorSummary.source_type == source)
@@ -1355,6 +1388,22 @@ def behavior_records(
         q = q.filter(BehaviorSummary.student_id.is_(None))
     if dataset:
         q = q.filter(BehaviorSummary.dataset_status == dataset)
+    if label:
+        q = q.filter(BehaviorSummary.sample_label == label)
+    # 기간 — created_at은 로컬(KST) naive라 날짜 경계도 로컬 자정. 잘못된 형식은 무시.
+    try:
+        if date_from:
+            q = q.filter(
+                BehaviorSummary.created_at
+                >= datetime.combine(_date.fromisoformat(date_from), _time.min)
+            )
+        if date_to:
+            q = q.filter(
+                BehaviorSummary.created_at
+                < datetime.combine(_date.fromisoformat(date_to) + timedelta(days=1), _time.min)
+            )
+    except ValueError:
+        pass
 
     total = q.count()
     limit = max(1, min(200, limit))
@@ -1464,6 +1513,10 @@ def behavior_export(
     fmt: str = "csv",  # csv | json
     dataset: str = "included",  # dataset_status 필터: included(큐레이션됨) | candidate | all
     source_type: str | None = None,
+    risk: str | None = None,  # low|review|elevated
+    result_filter: str | None = None,  # pass|fail
+    date_from: str | None = None,  # 'YYYY-MM-DD' KST
+    date_to: str | None = None,
     principal: Principal = Depends(require_ops),
     db: Session = Depends(get_db),
 ):
@@ -1486,6 +1539,28 @@ def behavior_export(
         q = q.filter(BehaviorSummary.dataset_status == dataset)
     if source_type:
         q = q.filter(BehaviorSummary.source_type == source_type)
+    # 콘솔 필터와 동일 축의 내보내기 축소 — 위험도/결과/기간
+    if risk in ("low", "review", "elevated"):
+        q = q.filter(BehaviorSummary.risk_level == risk)
+    if result_filter == "pass":
+        q = q.filter(BehaviorSummary.interaction_result.in_(_BEHAVIOR_PASS))
+    elif result_filter == "fail":
+        q = q.filter(BehaviorSummary.interaction_result.in_(_BEHAVIOR_FAIL))
+    try:
+        from datetime import date as _date, time as _time
+
+        if date_from:
+            q = q.filter(
+                BehaviorSummary.created_at
+                >= datetime.combine(_date.fromisoformat(date_from), _time.min)
+            )
+        if date_to:
+            q = q.filter(
+                BehaviorSummary.created_at
+                < datetime.combine(_date.fromisoformat(date_to) + timedelta(days=1), _time.min)
+            )
+    except ValueError:
+        pass
     rows = q.all()
 
     sids = {r.student_id for r in rows}
@@ -1636,3 +1711,71 @@ def behavior_mark_dataset(
     )
     db.commit()
     return {"ok": True, "dataset_status": r.dataset_status}
+
+
+class _SampleLabelReq(BaseModel):
+    sample_label: str = Field(pattern="^(organic|bot|human)$")
+    ids: list[str] = Field(min_length=1, max_length=500)
+
+
+@router.patch("/behavior/records/label")
+def behavior_mark_label(
+    req: _SampleLabelReq,
+    principal: Principal = Depends(require_ops),
+    db: Session = Depends(get_db),
+):
+    """레코드의 지도학습 라벨(sample_label) 일괄 변경 — bot/human 정답표 수동 큐레이션.
+
+    organic(미검증)→human/bot 검토 확정용. 다중 선택 일괄 처리(최대 500건),
+    변경된 행만 감사 로그 1건으로 묶어 남긴다(행별 로그는 500건 노이즈).
+    """
+    rows = db.query(BehaviorSummary).filter(BehaviorSummary.id.in_(req.ids)).all()
+    changed = [r for r in rows if r.sample_label != req.sample_label]
+    for r in changed:
+        r.sample_label = req.sample_label
+    if changed:
+        db.add(
+            AuditLog(
+                actor_user_id=principal.id,
+                organization_id=None,  # 여러 기관에 걸칠 수 있음
+                action="behavior.label_mark",
+                target_type="behavior_summary",
+                target_id=None,
+                after_json={"to": req.sample_label, "count": len(changed),
+                            "ids": [r.id for r in changed][:50]},  # 근거 표본
+            )
+        )
+        db.commit()
+    return {"ok": True, "requested": len(req.ids), "changed": len(changed)}
+
+
+class _RedteamReq(BaseModel):
+    count: int = Field(default=50, ge=1, le=500)
+    seed: int | None = None
+
+
+@router.post("/behavior/redteam")
+def behavior_redteam_generate(
+    req: _RedteamReq,
+    principal: Principal = Depends(require_ops),
+    db: Session = Depends(get_db),
+):
+    """레드팀 합성 봇 트래픽 생성 — 지도학습 음성 클래스(sample_label='bot') 확보.
+
+    격리된 sentinel org에 적재되어 고객 집계엔 안 잡히고 학습셋 콘솔에서만 보인다.
+    """
+    from app.services.redteam import inject_bot_behaviors
+
+    created = inject_bot_behaviors(db, req.count, seed=req.seed)
+    db.add(
+        AuditLog(
+            actor_user_id=principal.id,
+            organization_id=None,
+            action="behavior.redteam_generate",
+            target_type="behavior_summary",
+            target_id=None,
+            after_json={"count": created, "label": "bot"},
+        )
+    )
+    db.commit()
+    return {"ok": True, "created": created}

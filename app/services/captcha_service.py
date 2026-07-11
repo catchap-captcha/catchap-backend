@@ -929,23 +929,118 @@ def _trace_metrics(trace: dict) -> dict:
     w = trace["box_w"] or 1
     h = trace["box_h"] or 1
     path = 0.0
+    move_path = 0.0  # 이동 구간(gap 미만)의 거리만 — avg_speed 분자
     move_ms = 0
     pauses = 0
     for i in range(1, len(pts)):
         t0, x0, y0 = pts[i - 1]
         t1, x1, y1 = pts[i]
         dt = t1 - t0
-        path += math.hypot((x1 - x0) * w, (y1 - y0) * h)
+        d = math.hypot((x1 - x0) * w, (y1 - y0) * h)
+        path += d
         if dt >= TRACE_PAUSE_GAP_MS:
             pauses += 1
         else:
             move_ms += dt
+            # gap 구간의 거리는 속도에서 제외 — 멀리 떨어진 두 탭 사이 '비행'(시간은
+            # gap으로 빠지고 거리만 남음)이 avg_speed를 부풀리던 왜곡 수정(0710 재검토)
+            move_path += d
     return {
         "path_length": round(min(PATH_LENGTH_CAP, path), 1),
-        "avg_speed": round(min(AVG_SPEED_CAP, path / move_ms), 3) if move_ms > 0 else 0.0,
+        "avg_speed": round(min(AVG_SPEED_CAP, move_path / move_ms), 3) if move_ms > 0 else 0.0,
         "pause_count": min(1000, pauses),
         "duration_ms": max(0, int(pts[-1][0] - pts[0][0])),
     }
+
+
+# ---- 아동 보정 위험 스코어링 상수 ----
+# 오탐(아이→봇) 비용이 크므로 보수적으로 잡는다. 값은 실데이터 검증 전 시작값 —
+# 리뷰 큐에서 실아동 분포를 보며 조정한다. 느림·오답·멈춤 많음은 아이의 정상 행동이라
+# 신호로 쓰지 않는다(봇 신호는 '너무 빠름·너무 곧음·너무 균일'뿐).
+RISK_IMPOSSIBLE_MS = 800  # 이보다 빨리 정답 = 아이에게 물리적으로 불가능한 즉답
+RISK_FAST_MS = 1500  # 이보다 빨리 정답 = 빠르지만 불가능하진 않음(약신호)
+RISK_MOVE_MIN_PX = 40.0  # 이보다 작은 변위는 직진/순간이동 판정 제외(탭·미세 이동)
+RISK_JITTER_MIN_PX = 3.0  # 직선에서 최대 이탈이 이 미만 = 손떨림 없는 기계 직선
+RISK_SPEED_PX_MS = 10.0  # 이동 구간 평균 속도가 이보다 크면 사람 포인터 상식 밖
+RISK_TELEPORT_MS = 400  # 이 시간 넘게 크게 움직였는데 점 ≤3개 = 순간이동(합성 궤적)
+
+
+def _behavior_risk_level(
+    *,
+    solve_time_ms: int,
+    correct: bool,
+    trace: dict | None,
+    metrics: dict | None,
+    input_type: str,
+) -> str:
+    """행동 1건의 자동 위험 판정 (low|review|elevated) — 아동 보정 규칙.
+
+    elevated는 강신호 2개 이상이 겹칠 때만(즉시 차단용이 아니라 사람 검토 큐 근거),
+    강신호 1개·약신호 1개 이상은 review(표본 검토)까지만 — 아동 서비스라 오탐이
+    미탐보다 비싸다. retry_count는 넣지 않는다: 재시도 많음은 봇이 아니라
+    '어려워하는 아이'(학습 신호, 도움필요 지표의 몫)다.
+    """
+    strong = 0
+    weak = 0
+
+    # 즉답 정답 — 0은 미계측이라 제외. 800ms 미만은 강신호, 1500ms 미만은 약신호.
+    if correct and 0 < solve_time_ms < RISK_IMPOSSIBLE_MS:
+        strong += 1
+    elif correct and 0 < solve_time_ms < RISK_FAST_MS:
+        weak += 1
+
+    if trace and metrics:
+        pts = trace["points"]
+        w = trace["box_w"] or 1
+        h = trace["box_h"] or 1
+        sx, sy = pts[0][1] * w, pts[0][2] * h
+        ex, ey = pts[-1][1] * w, pts[-1][2] * h
+        disp = math.hypot(ex - sx, ey - sy)  # 시작→끝 변위
+        # 강신호: 기계 직선 — '경로비'가 아니라 '직선에서의 최대 수직이탈'로 판정한다.
+        # 드래그 과제는 원래 경로가 곧아 경로비 기준은 자신 있는 아이도 걸리지만(0710
+        # skeptic 재현), 사람 손은 픽셀 단위 떨림이 있어 이탈이 0에 붙지 못한다.
+        # 중간 점이 없으면(≤3점) 이탈 계산이 무의미 — 그 영역은 순간이동 신호의 몫.
+        if len(pts) >= 4 and disp >= RISK_MOVE_MIN_PX:
+            maxdev = 0.0
+            mid_travel = False  # 시작·끝에서 떨어진 '진짜 이동 중' 샘플이 있는가
+            for p in pts[1:-1]:
+                px, py = p[1] * w, p[2] * h
+                # 점-직선(시작→끝) 수직 거리
+                maxdev = max(maxdev, abs((ex - sx) * (sy - py) - (sx - px) * (ey - sy)) / disp)
+                if (
+                    math.hypot(px - sx, py - sy) >= RISK_MOVE_MIN_PX / 2
+                    and math.hypot(px - ex, py - ey) >= RISK_MOVE_MIN_PX / 2
+                ):
+                    mid_travel = True
+            # 중간점이 전부 양 끝 위치에 붙어 있으면(예: 떨어진 두 지점을 각각 탭)
+            # '경로'가 없어 직선 판정이 무의미 — 아이의 두 번 탭이 우연히 일직선일 때
+            # 기계 직선으로 오탐하지 않는다(0712 회귀 테스트가 재현).
+            if maxdev < RISK_JITTER_MIN_PX and mid_travel:
+                strong += 1
+        # 강신호: 사람 포인터 상식 밖의 평균 속도(이동 구간 기준 — gap 왜곡은 _trace_metrics에서 제거)
+        if metrics["avg_speed"] > RISK_SPEED_PX_MS:
+            strong += 1
+        # 강신호: 순간이동 — 크게 움직였는데 중간 샘플이 없다. 수집기는 down/up을 무조건
+        # 기록하고 move를 16ms로 스로틀하므로, 40px 이상 움직이면 중간 점이 반드시 남는다.
+        # 변위 0의 '지긋한 탭홀드'는 정상 아동 입력이라 걸지 않는다(0710 skeptic 재현).
+        if (
+            metrics["duration_ms"] > RISK_TELEPORT_MS
+            and len(pts) <= 3
+            and disp >= RISK_MOVE_MIN_PX
+        ):
+            strong += 1
+        # 약신호: 멈춤 0 + 빠른 완료 — 아이는 보통 중간에 멈칫한다
+        if metrics["pause_count"] == 0 and 0 < solve_time_ms < 3000:
+            weak += 1
+
+    # input_type=unknown은 신호로 쓰지 않는다 — 메타데이터 공백이지 행동 이상이 아니다.
+    # (실측: 구형 클라이언트 데이터 97%가 unknown이라 단독 약신호로 두면 리뷰 큐가 범람)
+
+    if strong >= 2:
+        return "elevated"
+    if strong == 1 or weak >= 1:
+        return "review"
+    return "low"
 
 
 def record_behavior_event(
@@ -956,11 +1051,15 @@ def record_behavior_event(
     source_type: str,
     behavior: dict | None,
     correct: bool,
+    sample_label: str = "organic",
 ) -> None:
     """행동 이벤트 1건 적재 (+원시 궤적) — 인앱 게임('game')과 교육형 API('edu-api') 공용.
 
     궤적(trace)이 있으면 요약 지표는 서버가 궤적에서 직접 계산하고 원본을
     behavior_traces에 함께 남긴다. commit은 호출자 책임.
+
+    sample_label: 실트래픽은 기본 'organic'(미검증). 레드팀 봇 주입만 'bot'을 명시해
+    지도학습 음성 클래스를 만든다(그 외 값은 방어적으로 organic 처리).
     """
     from app.core.security import new_uuid
     from app.models import BehaviorSummary, BehaviorTrace
@@ -986,6 +1085,8 @@ def record_behavior_event(
     input_type = str(b.get("input_type") or "unknown").lower()
     if input_type not in ("mouse", "touch", "pen"):
         input_type = "unknown"
+    solve_ms = min(3_600_000, max(0, _i("solve_time_ms")))
+    label = sample_label if sample_label in ("organic", "bot", "human") else "organic"
     bid = new_uuid()
     db.add(
         BehaviorSummary(
@@ -994,8 +1095,14 @@ def record_behavior_event(
             student_id=student_id,
             source_type=source_type,
             input_type=input_type,
-            # sample_label은 모델 기본값 'organic'(실트래픽·미검증) — 봇 주입 시에만 명시 설정.
-            solve_time_ms=min(3_600_000, max(0, _i("solve_time_ms"))),
+            # 적재 시점 자동 위험 판정 — 콘솔 위험 필터/리뷰 큐의 근거(이전엔 전부 low 고정)
+            risk_level=_behavior_risk_level(
+                solve_time_ms=solve_ms, correct=correct, trace=trace, metrics=m,
+                input_type=input_type,
+            ),
+            # 실트래픽은 'organic'(미검증), 레드팀 봇 주입만 'bot' — 지도학습 정답표
+            sample_label=label,
+            solve_time_ms=solve_ms,
             # 자기신고 값도 상한 — 통계(그룹 평균) 부풀리기 차단
             path_length=m["path_length"] if m else min(PATH_LENGTH_CAP, max(0.0, _f("path_length"))),
             avg_speed=m["avg_speed"] if m else min(AVG_SPEED_CAP, max(0.0, _f("avg_speed"))),
