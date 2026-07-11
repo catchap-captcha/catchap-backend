@@ -28,6 +28,7 @@ from app.models import (
     PaymentMethod,
     Plan,
     Site,
+    StudentJoinCode,
     StudentProfile,
     Subscription,
     User,
@@ -548,6 +549,50 @@ def roster(
                 "demo": s.id not in real,
             }
         )
+    # 미가입(코드 발급했지만 아직 활성화 안 함) 학생도 '가입 대기'로 명단에 포함한다.
+    # StudentProfile은 활성화(코드 소비) 시 생성되므로, 그 전에는 StudentJoinCode(used_at=None)만 존재.
+    # 이게 없으면 코드만 발급하고 아직 안 들어온 학생이 명단에 안 보여 '가입 대기 0'으로 뜬다.
+    pending_codes = (
+        db.query(StudentJoinCode)
+        .filter(
+            StudentJoinCode.organization_id == org_id,
+            StudentJoinCode.used_at.is_(None),
+        )
+        .order_by(StudentJoinCode.created_at)
+        .all()
+    )
+    for jc in pending_codes:
+        pc_cls = class_names.get(jc.class_id) if jc.class_id else jc.class_label
+        pc_grade = (
+            grade_by_class.get(jc.class_id)
+            if jc.class_id and jc.class_id in grade_by_class
+            else (parse_grade(pc_cls) if pc_cls else None)
+        )
+        if scope_grade is not None and pc_grade != scope_grade:
+            continue
+        if cls and pc_cls != cls:
+            continue
+        out.append(
+            {
+                # 활성화 전이라 학생 엔드포인트 대상이 아님 — 'jc-' 접두사로 프론트가 학생 액션을 가드한다.
+                "id": f"jc-{jc.id}",
+                "name": jc.real_name or "(이름 미입력)",
+                "nickname": None,
+                "login_id": jc.login_id,
+                "age": None,
+                "gender": jc.gender,
+                "cls": pc_cls,
+                # 코드 원문은 hash만 저장돼 재열람 불가 — 발급 시 1회 확인. 대기 상태만 표시한다.
+                "code": None,
+                "status": "pending",
+                "link": False,
+                "acc": 0,
+                "risk": "낮음",
+                "demo": False,
+                "pending_signup": True,
+            }
+        )
+
     if scope_grade is None:
         total = (
             db.query(StudentProfile)

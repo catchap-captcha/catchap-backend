@@ -421,6 +421,33 @@ def test_verify_join_code_does_not_consume_and_blocks_used(client, db, seed_org)
     assert v2.json() == {"valid": False, "reason": "used"}
 
 
+def test_roster_includes_pending_signup_codes(client, db, seed_org):
+    """코드만 발급하고 아직 가입 안 한 학생도 명단에 '가입 대기'로 나온다(실명 표시).
+    이게 없으면 '가입 대기 0'으로 떠 미가입 학생이 안 보인다."""
+    org = seed_org["org"]
+    _org_admin(db, org)
+    admin = _login(client, "principal@test.dev")
+
+    r = client.post(
+        f"/api/v1/orgs/{org.id}/students/register",
+        json={"count": 2, "class_label": "6-1반", "names": ["대기학생A", "대기학생B"],
+              "genders": ["male", "female"]},
+        headers=auth(admin),
+    )
+    assert r.status_code == 200, r.text
+
+    roster = client.get(f"/api/v1/orgs/{org.id}/roster", headers=auth(admin)).json()
+    students = roster["students"] if isinstance(roster, dict) else roster
+    pending = [s for s in students if s.get("status") == "pending"]
+    names = {s["name"] for s in pending}
+    assert "대기학생A" in names and "대기학생B" in names  # 실명으로 표시
+    # 대기 학생은 아직 프로필이 없어 pending_signup 플래그로 구분
+    assert all(s.get("pending_signup") for s in pending)
+    # 성별도 실려온다(선생님 입력)
+    a = next(s for s in pending if s["name"] == "대기학생A")
+    assert a["gender"] == "male"
+
+
 def test_grade_head_cannot_use_org_admin_only(client, db, seed_org):
     org = seed_org["org"]
     _org_admin(db, org)
