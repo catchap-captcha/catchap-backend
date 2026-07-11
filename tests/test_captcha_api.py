@@ -230,6 +230,35 @@ def test_subject_scope_enforced_for_external_key(client, db, seed_org):
     assert ch2.json()["subject"] == "수학"  # 1st-party는 전환 허용
 
 
+def test_ops_reset_operator_password(client, db, seed_org):
+    """운영자 임시 비번 재설정 — 새 임시비번 반환·비번 해시 변경·must_change_password=True. 비운영자 대상은 404."""
+    from app.models import User
+    from app.core.security import verify_password
+
+    tok = _ops(client, db)
+    created = client.post("/api/v1/ops/operators",
+                          json={"name": "리셋대상", "email": "reset-op@t.dev"}, headers=auth(tok)).json()
+    op_id = created["id"]
+    old_temp = created["temp_password"]
+
+    r = client.post(f"/api/v1/ops/operators/{op_id}/reset-password", headers=auth(tok))
+    assert r.status_code == 200, r.text
+    new_temp = r.json()["temp_password"]
+    assert new_temp and new_temp != old_temp
+    assert r.json()["email"] == "reset-op@t.dev"
+
+    db.expire_all()
+    op = db.get(User, op_id)
+    assert op.must_change_password is True
+    assert verify_password(new_temp, op.password_hash)       # 새 임시비번으로 인증됨
+    assert not verify_password(old_temp, op.password_hash)   # 옛 비번은 무효
+
+    # 운영자가 아닌 대상 → 404
+    bad = client.post("/api/v1/ops/operators/00000000-0000-0000-0000-000000000000/reset-password",
+                      headers=auth(tok))
+    assert bad.status_code == 404
+
+
 def test_assert_entitled_bypasses_first_party(db, seed_org):
     """1st-party(인앱 dogfooding) 키는 기관 요금제와 무관하게 통과한다.
     학교가 Basic/무플랜이어도 학생 인앱 학습이 '교육형 API를 쓸 수 없어요'(402)로 막히면 안 된다.

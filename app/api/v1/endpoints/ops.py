@@ -450,6 +450,58 @@ def create_operator(
     }
 
 
+@router.post("/operators/{op_id}/reset-password")
+def reset_operator_password(
+    op_id: str,
+    principal: Principal = Depends(require_ops),
+    db: Session = Depends(get_db),
+):
+    """운영자 임시 비밀번호 재설정 — 새 임시 비번을 본인 이메일로 통보하고 첫 로그인 시 변경 강제.
+    기존 세션(리프레시 토큰)은 즉시 폐기해 옛 비번 세션이 남지 않게 한다."""
+    from app.services import auth_service
+
+    op = db.get(User, op_id)
+    if op is None or op.role != "ops":
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="운영자를 찾을 수 없습니다.")
+    temp_password = secrets.token_urlsafe(9)
+    op.password_hash = hash_password(temp_password)
+    op.must_change_password = True  # 첫 로그인 시 새 비번 강제
+    auth_service.logout(db, op.id)  # 기존 모든 세션 폐기
+    db.flush()
+    pw = escape(temp_password)
+    html = (
+        "<div style='font-family:sans-serif;line-height:1.7;color:#333'>"
+        f"<p>{escape(op.name or '운영자')}님, 안녕하세요. CatChap 운영팀입니다.</p>"
+        "<p>운영자 계정의 <b>임시 비밀번호가 재설정</b>되었습니다.</p>"
+        "<div style='margin:16px 0;padding:14px 16px;background:#f1ecff;border-radius:10px'>"
+        f"<b>로그인 이메일</b><br>{escape(op.email)}<br><br><b>임시 비밀번호</b><br>"
+        f"<span style='font-size:18px;font-weight:700;color:#7a5bd6;letter-spacing:1px'>{pw}</span></div>"
+        "<p>운영자 전용 로그인 화면(주소창에 /ops/login 직접 입력)에서 접속하고, "
+        "첫 로그인 후 <b>새 비밀번호로 변경</b>해 주세요.</p><p>감사합니다. 🐾</p></div>"
+    )
+    sent = send_email(
+        db, to_email=op.email, subject="[CatChap] 운영자 임시 비밀번호 재설정", html=html, user_id=op.id
+    )
+    email_status = "dry_run" if not get_settings().smtp_enabled else ("sent" if sent else "failed")
+    db.add(
+        AuditLog(
+            actor_user_id=principal.id,
+            action="ops.operator_password_reset",
+            target_type="user",
+            target_id=op.id,
+            after_json={"email": op.email, "email_status": email_status},
+        )
+    )
+    db.commit()
+    return {
+        "ok": True,
+        "name": op.name,
+        "email": op.email,
+        "temp_password": temp_password,  # 이메일 실패/dry-run 시 수동 전달용 (1회 노출)
+        "email_status": email_status,
+    }
+
+
 @router.patch("/operators/{op_id}")
 def update_operator(
     op_id: str,
