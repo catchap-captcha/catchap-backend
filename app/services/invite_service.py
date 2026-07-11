@@ -42,6 +42,7 @@ def create_teacher_invite(
     email: str,
     name: str | None = None,
     role: str = "teacher",
+    class_name: str | None = None,
 ) -> str:
     """교사코드 선발급 + 초대 레코드 생성 + 초대 메일 발송. 원문 토큰을 반환(호출부가 필요 시 사용)."""
     email = email.strip().lower()
@@ -59,6 +60,8 @@ def create_teacher_invite(
         status="pending",
         teacher_code=code,
         position=None,  # 직책(담임/교과)은 가입 후 관리자가 배정 — 초대엔 비워 둔다
+        # 미리 담당 학급을 지정하면 예약 → 가입(코드 클레임) 시 그 반의 담임으로 자동 배정
+        pending_class=(class_name.strip() if class_name and class_name.strip() else None),
         invited_by=inviter_id,
     )
     db.add(membership)

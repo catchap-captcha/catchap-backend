@@ -732,7 +732,8 @@ def _teacher_row(
         "user_id": m.user_id,
         "name": user.name if user else "미등록",
         "email": user.email if user else None,
-        "cls": cls.name if cls else (design["cls"] if design else None),
+        # 실제 연결된 반이 없으면(미가입 초대 교사) 예약된 담당 반(pending_class)을 보여준다.
+        "cls": cls.name if cls else (m.pending_class or (design["cls"] if design else None)),
         "role": role_label,
         "code": m.teacher_code,
         "years": m.career_years or 0,
@@ -881,6 +882,7 @@ def invite_teacher(
         email=req.email,
         name=req.name,
         role=req.role,
+        class_name=req.class_name,
     )
     audit(
         db,
@@ -889,7 +891,7 @@ def invite_teacher(
         organization_id=org_id,
         target_type="invitation",
         target_id=None,
-        after={"email": req.email, "role": req.role},
+        after={"email": req.email, "role": req.role, "class": req.class_name},
     )
     db.commit()
     # 토큰은 메일로만 전달 — 응답에 노출하지 않는다.

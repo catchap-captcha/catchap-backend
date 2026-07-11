@@ -88,6 +88,37 @@ def test_teacher_invite_success_path(client, db, seed_org):
     assert body["name"] == "이둘째"
 
 
+def test_invite_with_class_auto_assigns_on_register(client, db, seed_org):
+    """초대 시 담당 학급을 미리 지정하면 pending_class로 예약되고, 가입 시 그 반 담임으로 자동 배정된다."""
+    from app.services import invite_service
+    from app.models import ClassRoom, User
+
+    _make_org_admin(db, seed_org)
+    org_id = seed_org["org"].id
+
+    raw = invite_service.create_teacher_invite(
+        db, organization_id=org_id, inviter_id="x",
+        email="pre@test.dev", name="예약담임", role="teacher", class_name="3-7반",
+    )
+    db.commit()
+    inv = db.query(Invitation).filter(Invitation.email == "pre@test.dev").first()
+    m = db.query(Membership).filter(Membership.teacher_code == inv.teacher_code).first()
+    assert m.pending_class == "3-7반"  # 예약됨
+
+    res = client.post(
+        "/api/v1/auth/register/teacher",
+        json={"name": "예약담임", "email": "pre@test.dev", "password": "Teacher!234",
+              "organization_id": org_id, "teacher_code": inv.teacher_code, "invite_token": raw},
+    )
+    assert res.status_code == 200, res.text
+    db.expire_all()
+    u = db.query(User).filter(User.email == "pre@test.dev").first()
+    cls = db.query(ClassRoom).filter(ClassRoom.organization_id == org_id, ClassRoom.name == "3-7반").first()
+    assert cls is not None and cls.teacher_id == u.id  # 가입 즉시 담임 배정
+    db.refresh(m)
+    assert m.pending_class is None  # 배정 후 예약 비움
+
+
 def test_invite_register_skips_email_code_and_shows_role(client, db, seed_org):
     """초대 링크로 온 교사는 이메일 인증코드 없이 가입되고(초대 토큰이 이메일 소유 증명),
     교사 목록에 이름과 역할('교사'/'학년부장')이 바르게 뜬다. 이름이 역할칸에 새지 않는다."""

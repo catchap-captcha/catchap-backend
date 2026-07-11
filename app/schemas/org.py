@@ -24,6 +24,8 @@ class TeacherInviteCreate(BaseModel):
     email: EmailStr
     name: str | None = Field(default=None, max_length=100)
     role: str = Field(default="teacher", pattern="^(teacher|grade_head)$")
+    # 미리 담당 학급 배정(선택) — 가입(코드 클레임) 시 이 반의 담임으로 자동 배정된다.
+    class_name: str | None = Field(default=None, max_length=50)
 
 
 class TeacherUpdate(BaseModel):
