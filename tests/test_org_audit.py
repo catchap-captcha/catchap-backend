@@ -158,9 +158,11 @@ def test_ops_system_health_is_measured_not_stub(client, db, seed_org):
     assert {"db", "captcha-engine", "smtp", "disk", "ai-server"} <= set(names)
     # DB는 실측 왕복 — ok에 양수 레이턴시 (예전 스텁은 상수 6)
     assert names["db"]["status"] == "ok" and names["db"]["latency_ms"] >= 1
-    # 캡차 엔진은 실제 문항 수를 detail로
-    assert names["captcha-engine"]["status"] in ("ok", "degraded")
-    assert "문항" in (names["captcha-engine"]["detail"] or "")
+    # 캡차 엔진은 실제 로드된 문항 수 — 0문항이면 키 조회 버그(과목명은 한국어)
+    assert names["captcha-engine"]["status"] == "ok", names["captcha-engine"]
+    import re
+    m = re.search(r"출제 가능 (\d+)문항", names["captcha-engine"]["detail"] or "")
+    assert m and int(m.group(1)) > 0, names["captcha-engine"]["detail"]
     # SMTP 미설정(테스트 env)은 dry-run으로 정직하게
     assert names["smtp"]["status"] in ("ok", "degraded", "dry-run")
     assert body["checked_at"]

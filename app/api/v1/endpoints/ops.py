@@ -751,7 +751,8 @@ def system(principal: Principal = Depends(require_ops), db: Session = Depends(ge
     # 캡차 엔진 — 문제은행이 실제로 로드돼 출제 가능한지
     t0 = _time.perf_counter()
     try:
-        subjects = ["korean", "math", "english", "science", "social", "life"]
+        # 은행 레지스트리 키는 한국어 과목명(subject_banks.BANKS) — 영어 키로 조회하면 전부 0
+        subjects = sorted(subject_banks.LIVE_SUBJECTS)
         counts = {s: len(subject_banks.playable_pool(s)) for s in subjects}
         total_playable = sum(counts.values())
         empty = [s for s, n in counts.items() if n == 0]
