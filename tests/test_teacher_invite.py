@@ -169,6 +169,19 @@ def test_grade_head_invite_role_label(client, db, seed_org):
     assert "정부장" in rows and rows["정부장"]["role"] == "학년부장"
 
 
+def test_teacher_issues_parent_invite_for_own_class(client, db, seed_org):
+    """담임이 자기 반 학생의 학부모 초대 코드를 발급할 수 있다(코드 원문 1회 반환)."""
+    tok = _login(client, "t1@test.dev")
+    sid = seed_org["student"].id
+    r = client.post(f"/api/v1/teacher/class/students/{sid}/invite-code", headers=auth(tok))
+    assert r.status_code == 200, r.text
+    assert r.json()["invite_code"].startswith("LINK-")
+    # 존재하지 않는/타 반 학생 → 403
+    bad = client.post("/api/v1/teacher/class/students/00000000-0000-0000-0000-000000000000/invite-code",
+                      headers=auth(tok))
+    assert bad.status_code == 403
+
+
 def test_teacher_reset_student_password(client, db, seed_org):
     """담임은 자기 반 학생 비번 초기화 가능(임시비번+강제변경), 교장은 403."""
     token = _login(client, "t1@test.dev")

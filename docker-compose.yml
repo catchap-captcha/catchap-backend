@@ -5,6 +5,8 @@ services:
     build: .
     image: catchap-backend:latest
     env_file: .env.production          # 시크릿·설정 주입(이미지엔 안 굽음)
+    environment:
+      TZ: Asia/Seoul                   # 컨테이너 시간을 KST로 — created_at·감사로그가 로컬 기준
     restart: unless-stopped
     expose:
       - "8000"                          # Caddy만 접근(호스트 공개 X)

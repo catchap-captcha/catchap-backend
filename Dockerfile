@@ -5,9 +5,17 @@ FROM python:3.12-slim
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONIOENCODING=utf-8 \
-    PIP_NO_CACHE_DIR=1
+    PIP_NO_CACHE_DIR=1 \
+    TZ=Asia/Seoul
 
 WORKDIR /app
+
+# 타임존을 한국(KST)으로 고정 — 앱이 datetime.now()(naive 로컬)로 created_at·감사로그·
+# '오늘/이번 주' 집계를 잡는데, 컨테이너 기본(UTC)이면 9시간 어긋난다. tzdata 설치 후 KST 고정.
+RUN apt-get update && apt-get install -y --no-install-recommends tzdata \
+    && ln -sf /usr/share/zoneinfo/Asia/Seoul /etc/localtime \
+    && echo "Asia/Seoul" > /etc/timezone \
+    && rm -rf /var/lib/apt/lists/*
 
 # 1) 의존성 먼저 설치(레이어 캐시) — requirements 변경 시에만 재설치
 COPY requirements.txt ./
