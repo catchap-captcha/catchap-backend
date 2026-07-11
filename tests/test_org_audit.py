@@ -139,3 +139,28 @@ def test_parent_child_link_is_audited(client, db, seed_org):
     assert row.actor_user_id == parent.id  # 행위자 = 학부모 (대상 오귀속 금지)
     assert row.organization_id == org.id
     assert row.target_id == student.id
+
+
+def test_ops_system_health_is_measured_not_stub(client, db, seed_org):
+    """/ops/system이 하드코딩 스텁이 아니라 실측을 반환하는지"""
+    ops = _mk_user(db, None, "sysops@test.dev", "ops", "운영자")
+    assert ops is not None
+    res = client.post(
+        "/api/v1/auth/ops-login",
+        json={"email": "sysops@test.dev", "password": "Password123!"},
+    )
+    token = res.json()["access_token"]
+    r = client.get("/api/v1/ops/system", headers=auth(token))
+    assert r.status_code == 200, r.text
+    body = r.json()
+    names = {s["name"]: s for s in body["services"]}
+    # 필수 서비스 카드
+    assert {"db", "captcha-engine", "smtp", "disk", "ai-server"} <= set(names)
+    # DB는 실측 왕복 — ok에 양수 레이턴시 (예전 스텁은 상수 6)
+    assert names["db"]["status"] == "ok" and names["db"]["latency_ms"] >= 1
+    # 캡차 엔진은 실제 문항 수를 detail로
+    assert names["captcha-engine"]["status"] in ("ok", "degraded")
+    assert "문항" in (names["captcha-engine"]["detail"] or "")
+    # SMTP 미설정(테스트 env)은 dry-run으로 정직하게
+    assert names["smtp"]["status"] in ("ok", "degraded", "dry-run")
+    assert body["checked_at"]

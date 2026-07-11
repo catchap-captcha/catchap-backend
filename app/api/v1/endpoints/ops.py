@@ -716,14 +716,102 @@ def resolve_inquiry(
 
 
 @router.get("/system")
-def system(principal: Principal = Depends(require_ops)):
+def system(principal: Principal = Depends(require_ops), db: Session = Depends(get_db)):
+    """시스템 상태 — 전부 실측. 가짜 상수를 반환하던 스텁을 재구현(0712).
+
+    - db: SELECT 1 왕복 실측(ms)
+    - captcha-engine: 인프로세스 문제은행 로드 확인 — 6과목 playable 문항 수
+    - smtp: 설정 여부 + 최근 24시간 발송 성공/실패 실집계(email_logs)
+    - disk: 컨테이너 루트 사용률
+    - ai-server: 배포 보류 상태를 정직하게 표시(설정 자체가 없음)
+    """
+    import shutil
+    import time as _time
+
+    from sqlalchemy import text as _text
+
+    from app.models import EmailLog
+    from app.services import subject_banks
+
+    services: list[dict] = []
+
+    # DB — 실제 왕복시간
+    t0 = _time.perf_counter()
+    try:
+        db.execute(_text("SELECT 1"))
+        services.append({
+            "name": "db", "status": "ok",
+            "latency_ms": max(1, int((_time.perf_counter() - t0) * 1000)),
+            "detail": "SELECT 1 왕복",
+        })
+    except Exception as e:  # noqa: BLE001 — 상태 보고가 목적, 어떤 예외든 error로
+        services.append({"name": "db", "status": "error", "latency_ms": None,
+                         "detail": type(e).__name__})
+
+    # 캡차 엔진 — 문제은행이 실제로 로드돼 출제 가능한지
+    t0 = _time.perf_counter()
+    try:
+        subjects = ["korean", "math", "english", "science", "social", "life"]
+        counts = {s: len(subject_banks.playable_pool(s)) for s in subjects}
+        total_playable = sum(counts.values())
+        empty = [s for s, n in counts.items() if n == 0]
+        services.append({
+            "name": "captcha-engine",
+            "status": "ok" if not empty else "degraded",
+            "latency_ms": max(1, int((_time.perf_counter() - t0) * 1000)),
+            "detail": f"출제 가능 {total_playable}문항"
+                      + (f" · 빈 과목: {', '.join(empty)}" if empty else " · 6과목 정상"),
+        })
+    except Exception as e:  # noqa: BLE001
+        services.append({"name": "captcha-engine", "status": "error", "latency_ms": None,
+                         "detail": type(e).__name__})
+
+    # SMTP — 설정 여부 + 최근 24시간 발송 결과 실집계
+    smtp_on = get_settings().smtp_enabled
+    day_ago = datetime.now() - timedelta(hours=24)
+    mail_counts = {
+        (st or "unknown"): int(n)
+        for st, n in db.query(EmailLog.status, func.count(EmailLog.id))
+        .filter(EmailLog.created_at >= day_ago)
+        .group_by(EmailLog.status)
+        .all()
+    }
+    failed = mail_counts.get("failed", 0)
+    services.append({
+        "name": "smtp",
+        "status": ("degraded" if failed else "ok") if smtp_on else "dry-run",
+        "latency_ms": None,
+        "detail": (
+            f"24시간: 발송 {mail_counts.get('sent', 0)} · 실패 {failed}"
+            if smtp_on
+            else "미설정 — 메일이 실발송되지 않음(dry-run)"
+        ),
+    })
+
+    # 디스크 — 컨테이너 루트 사용률
+    try:
+        du = shutil.disk_usage("/")
+        pct = round(du.used / du.total * 100, 1)
+        services.append({
+            "name": "disk",
+            "status": "ok" if pct < 85 else "degraded",
+            "latency_ms": None,
+            "detail": f"사용 {pct}% ({du.used // 1024**3}GB / {du.total // 1024**3}GB)",
+        })
+    except OSError:
+        services.append({"name": "disk", "status": "error", "latency_ms": None, "detail": None})
+
+    # AI 서버 — 배포 보류 중(엔드포인트 설정 자체가 없음)을 정직하게 표시
+    services.append({
+        "name": "ai-server",
+        "status": "not_deployed",
+        "latency_ms": None,
+        "detail": "행동 판정 모델 미배포 — 학습셋 구축 단계",
+    })
+
     return {
-        "services": [
-            {"name": "api", "status": "ok", "latency_ms": 42},
-            {"name": "db", "status": "ok", "latency_ms": 6},
-            {"name": "captcha-engine", "status": "stub", "latency_ms": 0},
-            {"name": "smtp", "status": "dry-run", "latency_ms": 0},
-        ]
+        "services": services,
+        "checked_at": datetime.now().isoformat(),  # KST(컨테이너 TZ) — 다른 시각과 동일 규약
     }
 
 
