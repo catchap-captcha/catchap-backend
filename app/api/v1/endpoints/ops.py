@@ -63,8 +63,28 @@ def dashboard(principal: Principal = Depends(require_ops), db: Session = Depends
         "active_api_keys": db.query(ApiKey).filter(ApiKey.status == "active").count(),
         "open_inquiries": db.query(Inquiry).filter(Inquiry.status == "received").count(),
         "audit_logs": db.query(AuditLog).count(),
-        "api_calls_today": 3912,
-        "error_rate": "0.3%",
+        # 실측 — ApiUsageLog는 로컬(KST) created_at이므로 자정 경계도 로컬로
+        **_api_calls_today(db),
+    }
+
+
+def _api_calls_today(db: Session) -> dict:
+    day_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    total = (
+        db.query(func.count(ApiUsageLog.id))
+        .filter(ApiUsageLog.created_at >= day_start)
+        .scalar()
+        or 0
+    )
+    errors = (
+        db.query(func.count(ApiUsageLog.id))
+        .filter(ApiUsageLog.created_at >= day_start, ApiUsageLog.status_code >= 500)
+        .scalar()
+        or 0
+    )
+    return {
+        "api_calls_today": int(total),
+        "error_rate": f"{(errors / total * 100):.1f}%" if total else "0%",
     }
 
 
@@ -85,7 +105,8 @@ def orgs(
             | Organization.contact_email.like(like)
         )
     total = q.count()
-    q = q.order_by(Organization.created_at)
+    # 최신 기관 먼저 — 방금 만든 기관이 마지막 페이지로 숨지 않게(페이지네이션 전환 후 확인성)
+    q = q.order_by(Organization.created_at.desc())
     if page is not None:
         page = max(1, page)
         page_size = max(1, min(200, page_size))
@@ -210,7 +231,7 @@ def ops_create_org(
         role="org_admin",
         status="active",
         organization_id=org.id,
-        email_verified_at=_now(),
+        email_verified_at=datetime.now(),  # 사용자 기록 시각 — 로컬(KST) 규약
         must_change_password=True,  # 첫 로그인 시 새 비번 강제 (운영자·승인 발급과 통일)
     )
     db.add(admin)
@@ -221,7 +242,7 @@ def ops_create_org(
             organization_id=org.id,
             role="org_admin",
             status="active",
-            joined_at=_now(),
+            joined_at=datetime.now(),  # 사용자 기록 시각 — 로컬(KST) 규약
         )
     )
     # 기본 요금제(Basic) 연결 — 키 발급·요금제 게이팅이 동작하도록.
@@ -439,7 +460,7 @@ def create_operator(
         name=req.name,
         role="ops",
         status="active",
-        email_verified_at=_now(),
+        email_verified_at=datetime.now(),  # 사용자 기록 시각 — 로컬(KST) 규약
         must_change_password=True,  # 첫 로그인 시 새 비번 강제 (전역 ForcePasswordGate)
     )
     db.add(op)
@@ -809,9 +830,13 @@ def system(principal: Principal = Depends(require_ops), db: Session = Depends(ge
         .all()
     }
     failed = mail_counts.get("failed", 0)
+    sent_ok = mail_counts.get("sent", 0)
+    # 실패 1건(예: 문의자 이메일 오타)으로 전체 '주의'가 되면 과민 — 우리 발송 계통
+    # 장애로 볼 신호(실패 5건 이상, 또는 실패가 있는데 성공이 0)일 때만 degraded.
+    smtp_bad = failed >= 5 or (failed > 0 and sent_ok == 0)
     services.append({
         "name": "smtp",
-        "status": ("degraded" if failed else "ok") if smtp_on else "dry-run",
+        "status": ("degraded" if smtp_bad else "ok") if smtp_on else "dry-run",
         "latency_ms": None,
         "detail": (
             f"24시간: 발송 {mail_counts.get('sent', 0)} · 실패 {failed}"
@@ -1174,7 +1199,7 @@ def approve_request(
     if r.status != "pending":
         raise HTTPException(status.HTTP_409_CONFLICT, detail=f"이미 처리된 신청입니다({r.status}).")
     r.status = "approved"
-    r.approved_at = _now()
+    r.approved_at = datetime.now()  # 승인 시각은 화면 노출 — 로컬(KST) 규약
     # 승인 시 관리자 계정 자격증명 발급 — 신청 단계엔 비번이 없다(신청서 흐름).
     # email_verified_at 이 None 인 org_admin = 미발급 계정 → 임시 비번 발급 + active 전환.
     # 임시 비번은 이 응답에서만 1회 노출된다(이후 조회 불가) — 운영자가 담당자에게 전달.
@@ -1198,7 +1223,7 @@ def approve_request(
             if u.email_verified_at is None:  # 신청서 흐름으로 만든 미발급 계정
                 temp_password = secrets.token_urlsafe(9)
                 u.password_hash = hash_password(temp_password)
-                u.email_verified_at = _now()  # 운영자 승인으로 이메일 소유 확인 갈음
+                u.email_verified_at = datetime.now()  # 운영자 승인으로 이메일 소유 확인 갈음(KST)
                 u.must_change_password = True  # 임시 비번 첫 로그인 시 강제 변경
                 issued_admins.append(
                     {"email": u.email, "temp_password": temp_password, "organization_id": org.id}
@@ -1379,7 +1404,8 @@ def ops_list_api_keys(
         q = q.offset((page - 1) * page_size).limit(page_size)
     rows = q.all()
     # 키별 이번 달 challenge 호출 수(전 기관 한 번에)
-    first = _now().replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    # created_at은 로컬(KST) — UTC 월초로 자르면 한국 월초 첫 9시간에 전월이 섞인다
+    first = datetime.now().replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     usage = dict(
         db.query(ApiUsageLog.api_key_id, func.count(ApiUsageLog.id))
         .filter(
@@ -1393,7 +1419,16 @@ def ops_list_api_keys(
     items = [_apikey_row(db, k, usage.get(k.id, 0)) for k in rows]
     if page is None:
         return items  # 하위호환
-    return {"items": items, "total": total, "page": page, "page_size": page_size}
+    active_total = (
+        db.query(func.count(ApiKey.id)).filter(ApiKey.status == "active").scalar() or 0
+    )
+    return {
+        "items": items,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "active_total": int(active_total),  # 헤더 요약용 — 전체 활성 키 수(필터 무관)
+    }
 
 
 @router.post("/api-keys")
