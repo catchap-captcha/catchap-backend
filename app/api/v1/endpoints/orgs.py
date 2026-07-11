@@ -487,17 +487,17 @@ def roster(
 ):
     check_org_scope(principal, org_id)
     scope_grade = _scope_grade(db, principal)  # 학년부장이면 자기 학년 학생만
-    # 학급 배정된 기관 학생 전체 — 실테이블(student_profiles/classes) 기준
-    students = (
-        db.query(StudentProfile)
-        .filter(
-            StudentProfile.organization_id == org_id,
-            StudentProfile.class_id.isnot(None),
-            StudentProfile.status != "disabled",
-        )
-        .order_by(StudentProfile.student_code)
-        .all()
+    # 기관 학생 명단 — 실테이블(student_profiles/classes) 기준.
+    # 교장(scope_grade=None)은 '미배정'(학급에서 빠진, class_id=None) 학생도 봐야 다시 배정할 수 있다.
+    # (학급 '삭제'는 계정 삭제가 아니라 class_id=None 언링크일 뿐 → 안 보이면 학생이 사라진 것처럼 보인다)
+    # 학년부장은 학년 판단이 안 되는 미배정 학생을 볼 수 없으므로 배정된 학생만.
+    _students_q = db.query(StudentProfile).filter(
+        StudentProfile.organization_id == org_id,
+        StudentProfile.status != "disabled",
     )
+    if scope_grade is not None:
+        _students_q = _students_q.filter(StudentProfile.class_id.isnot(None))
+    students = _students_q.order_by(StudentProfile.student_code).all()
     all_classes = db.query(ClassRoom).filter(ClassRoom.organization_id == org_id).all()
     class_names = {c.id: c.name for c in all_classes}
     grade_by_class = {c.id: _class_grade(c) for c in all_classes}

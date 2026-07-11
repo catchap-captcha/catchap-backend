@@ -507,6 +507,24 @@ def test_one_homeroom_per_class_enforced(client, db, seed_org):
     assert c.status_code == 200, c.text
 
 
+def test_roster_shows_unassigned_students_to_principal(client, db, seed_org):
+    """학급에서 빠진(class_id=None) 학생도 교장 명단에 '미배정'으로 보인다 — 다시 배정할 수 있게.
+    (교사의 '학급에서 제외'는 계정 삭제가 아니라 언링크라, 안 보이면 학생이 사라진 것처럼 됨)"""
+    org = seed_org["org"]
+    _org_admin(db, org)
+    admin = _login(client, "principal@test.dev")
+
+    # seed 학생을 학급에서 뺀다(언링크) — 계정은 그대로
+    seed_org["student"].class_id = None
+    db.commit()
+
+    roster = client.get(f"/api/v1/orgs/{org.id}/roster", headers=auth(admin)).json()
+    students = roster["students"] if isinstance(roster, dict) else roster
+    row = next((s for s in students if s["id"] == seed_org["student"].id), None)
+    assert row is not None, "미배정 학생이 교장 명단에 보여야 함"
+    assert not row["cls"]  # 담당 반 없음(미배정)
+
+
 def test_grade_head_cannot_use_org_admin_only(client, db, seed_org):
     org = seed_org["org"]
     _org_admin(db, org)
