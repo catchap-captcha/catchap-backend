@@ -69,8 +69,28 @@ def dashboard(principal: Principal = Depends(require_ops), db: Session = Depends
 
 
 @router.get("/orgs")
-def orgs(principal: Principal = Depends(require_ops), db: Session = Depends(get_db)):
-    rows = db.query(Organization).order_by(Organization.created_at).all()
+def orgs(
+    search: str | None = None,  # 기관명/코드/담당 이메일 부분일치
+    page: int | None = None,  # 없으면 기존 배열(하위호환 — 키 발급 모달 드롭다운 등), 있으면 페이지 응답
+    page_size: int = 50,
+    principal: Principal = Depends(require_ops),
+    db: Session = Depends(get_db),
+):
+    q = db.query(Organization)
+    if search:
+        like = f"%{search.strip()}%"
+        q = q.filter(
+            Organization.name.like(like)
+            | Organization.code.like(like)
+            | Organization.contact_email.like(like)
+        )
+    total = q.count()
+    q = q.order_by(Organization.created_at)
+    if page is not None:
+        page = max(1, page)
+        page_size = max(1, min(200, page_size))
+        q = q.offset((page - 1) * page_size).limit(page_size)
+    rows = q.all()
     # 기관마다 학생 수 COUNT를 따로 날리지 않고 GROUP BY 한 번으로 집계
     counts = dict(
         db.query(StudentProfile.organization_id, func.count(StudentProfile.id))
@@ -78,7 +98,18 @@ def orgs(principal: Principal = Depends(require_ops), db: Session = Depends(get_
         .group_by(StudentProfile.organization_id)
         .all()
     )
-    return [_org_admin_row(db, o, student_count=int(counts.get(o.id, 0))) for o in rows]
+    items = [_org_admin_row(db, o, student_count=int(counts.get(o.id, 0))) for o in rows]
+    if page is None:
+        return items  # 하위호환 — 기존 소비처는 배열을 기대한다
+    return {
+        "items": items,
+        "total": total,  # 검색 조건 반영된 건수 (페이지 계산용)
+        "page": page,
+        "page_size": page_size,
+        # 헤더 요약용 전체 집계 — 검색과 무관한 전체 기준
+        "total_all": db.query(func.count(Organization.id)).scalar() or 0,
+        "total_students": int(sum(counts.values())),
+    }
 
 
 # ---------------------------------------------------------------- 기관 등록/수정/삭제 (운영자)
@@ -1020,14 +1051,45 @@ def _req_row(r: OrgRegistrationRequest, db: Session) -> dict:
 @router.get("/registration-requests")
 def registration_requests(
     status_filter: str | None = None,
+    page: int | None = None,  # 없으면 기존 배열(하위호환), 있으면 페이지 응답 + 탭 배지 counts
+    page_size: int = 50,
     principal: Principal = Depends(require_ops),
     db: Session = Depends(get_db),
 ):
-    """기관 가입 신청 목록 (status_filter: pending|approved|rejected, 없으면 전체)."""
-    q = db.query(OrgRegistrationRequest).order_by(OrgRegistrationRequest.created_at.desc())
+    """기관 가입 신청 목록 (status_filter: pending|approved|rejected, 없으면 전체).
+
+    신청은 승인/거절 후에도 기록이 남아 단조 증가 — 페이지 응답에는 탭 배지용
+    상태별 counts(전체 기준, status_filter 미반영)를 함께 준다.
+    """
+    base = db.query(OrgRegistrationRequest)
+    q = base.order_by(OrgRegistrationRequest.created_at.desc())
     if status_filter:
         q = q.filter(OrgRegistrationRequest.status == status_filter)
-    return [_req_row(r, db) for r in q.all()]
+    if page is None:
+        return [_req_row(r, db) for r in q.all()]  # 하위호환
+    counts = {
+        (st or "unknown"): int(n)
+        for st, n in base.with_entities(
+            OrgRegistrationRequest.status, func.count(OrgRegistrationRequest.id)
+        )
+        .group_by(OrgRegistrationRequest.status)
+        .all()
+    }
+    total = q.count()
+    page = max(1, page)
+    page_size = max(1, min(200, page_size))
+    rows = q.offset((page - 1) * page_size).limit(page_size).all()
+    return {
+        "items": [_req_row(r, db) for r in rows],
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "counts": {
+            "pending": counts.get("pending", 0),
+            "approved": counts.get("approved", 0),
+            "rejected": counts.get("rejected", 0),
+        },
+    }
 
 
 @router.post("/registration-requests/{request_id}/approve")
@@ -1230,8 +1292,23 @@ def ops_plans(principal: Principal = Depends(require_ops), db: Session = Depends
 
 
 @router.get("/api-keys")
-def ops_list_api_keys(principal: Principal = Depends(require_ops), db: Session = Depends(get_db)):
-    rows = db.query(ApiKey).filter(ApiKey.status != "deleted").order_by(ApiKey.created_at.desc()).all()
+def ops_list_api_keys(
+    organization_id: str | None = None,
+    page: int | None = None,  # 없으면 기존 배열(하위호환), 있으면 페이지 응답
+    page_size: int = 50,
+    principal: Principal = Depends(require_ops),
+    db: Session = Depends(get_db),
+):
+    q = db.query(ApiKey).filter(ApiKey.status != "deleted")
+    if organization_id:
+        q = q.filter(ApiKey.organization_id == organization_id)
+    total = q.count()
+    q = q.order_by(ApiKey.created_at.desc())
+    if page is not None:
+        page = max(1, page)
+        page_size = max(1, min(200, page_size))
+        q = q.offset((page - 1) * page_size).limit(page_size)
+    rows = q.all()
     # 키별 이번 달 challenge 호출 수(전 기관 한 번에)
     first = _now().replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     usage = dict(
@@ -1244,7 +1321,10 @@ def ops_list_api_keys(principal: Principal = Depends(require_ops), db: Session =
         .group_by(ApiUsageLog.api_key_id)
         .all()
     )
-    return [_apikey_row(db, k, usage.get(k.id, 0)) for k in rows]
+    items = [_apikey_row(db, k, usage.get(k.id, 0)) for k in rows]
+    if page is None:
+        return items  # 하위호환
+    return {"items": items, "total": total, "page": page, "page_size": page_size}
 
 
 @router.post("/api-keys")

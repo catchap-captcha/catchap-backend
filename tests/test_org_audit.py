@@ -166,3 +166,33 @@ def test_ops_system_health_is_measured_not_stub(client, db, seed_org):
     # SMTP 미설정(테스트 env)은 dry-run으로 정직하게
     assert names["smtp"]["status"] in ("ok", "degraded", "dry-run")
     assert body["checked_at"]
+
+
+def test_ops_list_pagination_and_backcompat(client, db, seed_org):
+    """orgs/api-keys/registration-requests — page 없으면 배열(하위호환), 있으면 페이지 응답"""
+    _mk_user(db, None, "listops@test.dev", "ops", "운영자")
+    res = client.post(
+        "/api/v1/auth/ops-login",
+        json={"email": "listops@test.dev", "password": "Password123!"},
+    )
+    headers = auth(res.json()["access_token"])
+
+    for path in ("/api/v1/ops/orgs", "/api/v1/ops/api-keys", "/api/v1/ops/registration-requests"):
+        legacy = client.get(path, headers=headers)
+        assert legacy.status_code == 200, (path, legacy.text)
+        assert isinstance(legacy.json(), list), f"{path}: page 없으면 배열이어야 한다(하위호환)"
+
+        paged = client.get(path, params={"page": 1, "page_size": 10}, headers=headers)
+        body = paged.json()
+        assert isinstance(body, dict) and "items" in body and "total" in body, path
+        assert body["page"] == 1
+
+    # orgs 검색 + 전체 집계 필드
+    r = client.get("/api/v1/ops/orgs", params={"page": 1, "search": "테스트초등"}, headers=headers)
+    b = r.json()
+    assert b["total"] == 1 and b["items"][0]["name"] == "테스트초등학교"
+    assert b["total_all"] >= 1 and "total_students" in b
+
+    # registration-requests 페이지 응답엔 탭 배지 counts
+    r2 = client.get("/api/v1/ops/registration-requests", params={"page": 1}, headers=headers)
+    assert set(r2.json()["counts"]) == {"pending", "approved", "rejected"}
