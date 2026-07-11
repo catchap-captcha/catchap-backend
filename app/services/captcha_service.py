@@ -1127,14 +1127,38 @@ def record_behavior_event(
         )
 
 
-def record_behavior(db: Session, api: ApiKey, behavior: dict | None, correct: bool) -> None:
+def record_behavior(
+    db: Session,
+    api: ApiKey,
+    behavior: dict | None,
+    correct: bool,
+    verified_student=None,
+) -> None:
     """교육형 API — 학습 중 수집된 행동데이터를 behavior_summaries에 적재.
 
     통과/실패가 목적이 아니라 이 데이터 수집이 목적. student_id는 외부 임베드 시 None(익명).
+
+    verified_student: verify 라우트가 학생 JWT로 이미 검증한 학생(StudentProfile).
+    인앱(1st-party) 풀이의 본인 귀속 경로 — 이게 없으면 아래 자기신고 검증 규칙만 적용된다.
+    (기존엔 JWT 검증 학생도 '키 기관 일치' 재검증에 걸렸다: 1st-party 키의 기관은 CatChap,
+    학생은 학교 소속이라 항상 불일치 → 인앱 학생 트래픽 전부가 익명으로 적재되던 버그.)
     """
     from app.models import StudentProfile
 
     b = behavior or {}
+
+    if verified_student is not None:
+        # 서버가 JWT로 검증한 신원 — 기관은 학생의 소속 학교로 기록해야
+        # 기관별 집계·학년밴드가 실제 소속과 맞는다.
+        record_behavior_event(
+            db,
+            organization_id=verified_student.organization_id or api.organization_id,
+            student_id=verified_student.id,
+            source_type="edu-api",
+            behavior=b,
+            correct=correct,
+        )
+        return
 
     # 클라이언트가 보낸 student_id는 신뢰하지 않는다 — 공개 site_key만으로 verify를 호출할 수
     # 있어, 위조 student_id가 아동/익명 통계(아동용 캡차 학습셋 근거)를 오염시킬 수 있다.

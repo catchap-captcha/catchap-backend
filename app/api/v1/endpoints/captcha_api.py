@@ -332,10 +332,12 @@ def verify(
         # 끌어다 놓기의 드롭 거리는 서버 채점값을 기록 (클라이언트 자기신고 대체)
         if "drop_distance_norm" in result:
             behavior = {**(behavior or {}), "drop_distance_norm": result["drop_distance_norm"]}
-        if student is not None:
-            # 인증 학생의 행동데이터는 본인 귀속 (record_behavior가 기관 일치를 재검증)
-            behavior = {**(behavior or {}), "student_id": student.id}
-        cs.record_behavior(db, api, behavior, bool(result.get("success")))
+        # 인증 학생의 행동데이터는 본인 귀속 — JWT로 검증된 신원을 명시 전달.
+        # (behavior dict에 student_id를 실어 보내던 방식은 record_behavior의
+        #  '키 기관 일치' 재검증에 걸려 인앱(1st-party) 학생이 전부 익명 적재되던 버그)
+        cs.record_behavior(
+            db, api, behavior, bool(result.get("success")), verified_student=student
+        )
         # 인앱(인증 학생) 풀이는 학습기록으로 적립 — 코인·진도·오늘의퀴즈 (실전 모드 대체)
         if student is not None and meta.get("subj"):
             result["session"] = _credit_student(db, student, meta, bool(result.get("success")), req.answer)

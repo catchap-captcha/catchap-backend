@@ -1728,9 +1728,14 @@ def behavior_mark_label(
 
     organic(미검증)→human/bot 검토 확정용. 다중 선택 일괄 처리(최대 500건),
     변경된 행만 감사 로그 1건으로 묶어 남긴다(행별 로그는 500건 노이즈).
+
+    'bot' 라벨은 확정이며 되돌릴 수 없다 — 레드팀 주입·자동화 확정분이 사람 라벨로
+    뒤집히면 지도학습 정답표가 오염된다. bot 행은 어떤 값으로도 재라벨을 거부하고
+    응답의 locked로 건수를 알려준다(콘솔이 안내).
     """
     rows = db.query(BehaviorSummary).filter(BehaviorSummary.id.in_(req.ids)).all()
-    changed = [r for r in rows if r.sample_label != req.sample_label]
+    locked = [r for r in rows if r.sample_label == "bot"]
+    changed = [r for r in rows if r.sample_label != req.sample_label and r.sample_label != "bot"]
     for r in changed:
         r.sample_label = req.sample_label
     if changed:
@@ -1742,11 +1747,17 @@ def behavior_mark_label(
                 target_type="behavior_summary",
                 target_id=None,
                 after_json={"to": req.sample_label, "count": len(changed),
+                            "locked": len(locked),
                             "ids": [r.id for r in changed][:50]},  # 근거 표본
             )
         )
         db.commit()
-    return {"ok": True, "requested": len(req.ids), "changed": len(changed)}
+    return {
+        "ok": True,
+        "requested": len(req.ids),
+        "changed": len(changed),
+        "locked": len(locked),  # bot 확정이라 변경 거부된 행 수
+    }
 
 
 class _RedteamReq(BaseModel):

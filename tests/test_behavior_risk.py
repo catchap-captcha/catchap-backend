@@ -118,3 +118,89 @@ def test_redteam_injects_bots_into_sentinel_org(db, seed_org):
     # 봇다운 패턴이므로 대부분 review 이상으로 잡혀야 한다 (음성 클래스의 의미)
     flagged = [r for r in rows if r.risk_level in ("review", "elevated")]
     assert len(flagged) >= 15, f"봇 20건 중 {len(flagged)}건만 감지 — 스코어링 회귀 의심"
+
+
+def test_verified_student_attribution_first_party(db, seed_org):
+    """인앱(1st-party) 인증 학생은 키 기관이 달라도 본인·학교 기관으로 귀속 — 전부 익명이던 버그 회귀"""
+    from app.models import ApiKey, BehaviorSummary, Organization, Site
+    from app.services.captcha_service import record_behavior
+
+    student = seed_org["student"]
+    platform = Organization(name="CatChap", code="TS-CAT-9000", org_type="플랫폼")
+    db.add(platform)
+    db.flush()
+    site = Site(organization_id=platform.id, name="inapp", domain="app.catchap.dev")
+    db.add(site)
+    db.flush()
+    key = ApiKey(
+        organization_id=platform.id, site_id=site.id, product="edu", subject="math",
+        site_key="sk_test_fp", secret_key_hash="x", first_party=True,
+    )
+    db.add(key)
+    db.commit()
+
+    record_behavior(db, key, {"solve_time_ms": 4000}, True, verified_student=student)
+    db.commit()
+    row = db.query(BehaviorSummary).order_by(BehaviorSummary.created_at.desc()).first()
+    assert row.student_id == student.id  # 익명이 아니라 본인 귀속
+    assert row.organization_id == student.organization_id  # 키 기관(CatChap)이 아니라 학생의 학교
+
+    # 자기신고 경로(3rd-party 위조 방지)는 그대로: 키 기관 불일치 student_id는 익명 처리
+    record_behavior(db, key, {"solve_time_ms": 4000, "student_id": student.id}, True)
+    db.commit()
+    row2 = db.query(BehaviorSummary).order_by(BehaviorSummary.created_at.desc()).first()
+    assert row2.student_id is None
+
+
+def test_bot_label_is_immutable(client, db, seed_org):
+    """bot 라벨은 확정 — 어떤 값으로도 재라벨 불가(locked), 감사에도 근거가 남는다"""
+    from app.models import BehaviorSummary, User
+    from app.core.security import hash_password
+    from app.services.captcha_service import record_behavior_event
+
+    ops = User(
+        email="ops@test.dev", password_hash=hash_password("Password123!"),
+        name="운영자", role="ops",
+        email_verified_at=__import__("datetime").datetime.utcnow(),
+    )
+    db.add(ops)
+    org = seed_org["org"]
+    record_behavior_event(db, organization_id=org.id, student_id=None, source_type="edu-api",
+                          behavior={"solve_time_ms": 5000}, correct=True, sample_label="bot")
+    record_behavior_event(db, organization_id=org.id, student_id=None, source_type="edu-api",
+                          behavior={"solve_time_ms": 5000}, correct=True)  # organic
+    db.commit()
+    rows = db.query(BehaviorSummary).all()
+    bot_id = next(r.id for r in rows if r.sample_label == "bot")
+    org_id = next(r.id for r in rows if r.sample_label == "organic")
+
+    res = client.post(
+        "/api/v1/auth/ops-login",
+        json={"email": "ops@test.dev", "password": "Password123!"},
+    )
+    assert res.status_code == 200, res.text
+    token = res.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    # bot→human 시도: 거부(locked), organic→human은 성공
+    r = client.patch(
+        "/api/v1/ops/behavior/records/label",
+        json={"ids": [bot_id, org_id], "sample_label": "human"},
+        headers=headers,
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["locked"] == 1 and body["changed"] == 1
+    db.expire_all()
+    assert db.get(BehaviorSummary, bot_id).sample_label == "bot"  # 불변
+    assert db.get(BehaviorSummary, org_id).sample_label == "human"
+
+    # bot→organic(미검증 되돌리기)도 거부
+    r2 = client.patch(
+        "/api/v1/ops/behavior/records/label",
+        json={"ids": [bot_id], "sample_label": "organic"},
+        headers=headers,
+    )
+    assert r2.json()["locked"] == 1 and r2.json()["changed"] == 0
+    db.expire_all()
+    assert db.get(BehaviorSummary, bot_id).sample_label == "bot"
