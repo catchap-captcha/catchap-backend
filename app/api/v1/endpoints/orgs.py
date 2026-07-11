@@ -1621,6 +1621,42 @@ def register_students(
     return {"ok": True, "issued": codes}
 
 
+@router.post("/{org_id}/students/join-codes/{code_id}/reissue")
+def reissue_student_join_code(
+    org_id: str,
+    code_id: str,
+    principal: Principal = Depends(require_grade_head),
+    db: Session = Depends(get_db),
+):
+    """미가입(미사용) 학생 가입 코드를 새 코드로 재발급 — 학생이 코드를 잊었을 때.
+    옛 코드는 즉시 무효. 원문은 이 응답에서만 1회 노출. 학년부장은 담당 학년 학생만."""
+    check_org_scope(principal, org_id)
+    scope_grade = _scope_grade(db, principal)
+    jc = db.get(StudentJoinCode, code_id)
+    if jc is None or jc.organization_id != org_id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="가입 코드를 찾을 수 없어요.")
+    if jc.used_at is not None:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, detail="이미 가입에 사용된 코드예요. 재발급이 필요 없어요."
+        )
+    if scope_grade is not None:
+        cls = db.get(ClassRoom, jc.class_id) if jc.class_id else None
+        g = _class_grade(cls) if cls else (parse_grade(jc.class_label) if jc.class_label else None)
+        if g != scope_grade:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, detail="담당 학년 학생이 아니에요.")
+    result = onboarding_service.reissue_join_code(db, jc)
+    audit(
+        db,
+        action="org.student_code_reissue",
+        actor_user_id=principal.id,
+        organization_id=org_id,
+        target_type="join_code",
+        target_id=code_id,
+    )
+    db.commit()
+    return {"ok": True, "issued": [result]}
+
+
 @router.post("/{org_id}/students/{student_id}/invite-code")
 def issue_invite(
     org_id: str,

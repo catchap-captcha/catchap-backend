@@ -448,6 +448,43 @@ def test_roster_includes_pending_signup_codes(client, db, seed_org):
     assert a["gender"] == "male"
 
 
+def test_reissue_join_code_invalidates_old(client, db, seed_org):
+    """미가입 학생 코드 재발급: 새 코드는 유효, 옛 코드는 무효. 이미 쓴 코드는 재발급 거부."""
+    org = seed_org["org"]
+    _org_admin(db, org)
+    admin = _login(client, "principal@test.dev")
+
+    reg = client.post(
+        f"/api/v1/orgs/{org.id}/students/register",
+        json={"count": 1, "class_label": "2-3반", "names": ["잊은학생"]},
+        headers=auth(admin),
+    ).json()
+    old_code = reg["issued"][0]["join_code"]
+
+    # 해당 대기 코드 id 확보(roster의 pending 행 id = 'jc-<id>')
+    roster = client.get(f"/api/v1/orgs/{org.id}/roster", headers=auth(admin)).json()
+    students = roster["students"] if isinstance(roster, dict) else roster
+    pend = next(s for s in students if s.get("status") == "pending" and s["name"] == "잊은학생")
+    code_id = pend["id"][3:]  # 'jc-' 제거
+
+    # 재발급 → 새 코드 수령
+    rr = client.post(f"/api/v1/orgs/{org.id}/students/join-codes/{code_id}/reissue", headers=auth(admin))
+    assert rr.status_code == 200, rr.text
+    new_code = rr.json()["issued"][0]["join_code"]
+    assert new_code != old_code
+
+    # 옛 코드는 이제 무효(not_found), 새 코드는 유효
+    assert client.post("/api/v1/auth/verify-join-code", json={"code": old_code}).json()["reason"] == "not_found"
+    assert client.post("/api/v1/auth/verify-join-code", json={"code": new_code}).json() == {"valid": True, "reason": "ok"}
+
+    # 새 코드로 가입 → 그 뒤엔 재발급 거부(이미 사용됨 409)
+    act = client.post("/api/v1/auth/activate-student",
+                      json={"code": new_code, "student_login_id": "forgot1", "nickname": "잊은이", "password": "pass1234"})
+    assert act.status_code == 200, act.text
+    rr2 = client.post(f"/api/v1/orgs/{org.id}/students/join-codes/{code_id}/reissue", headers=auth(admin))
+    assert rr2.status_code == 409
+
+
 def test_grade_head_cannot_use_org_admin_only(client, db, seed_org):
     org = seed_org["org"]
     _org_admin(db, org)

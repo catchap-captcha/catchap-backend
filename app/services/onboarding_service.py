@@ -105,6 +105,21 @@ def generate_join_codes(
     return out
 
 
+def reissue_join_code(db: Session, jc: StudentJoinCode) -> dict:
+    """미가입(미사용) 학생 코드를 새 코드로 재발급 — 학생이 코드를 잊었을 때.
+    login_id·실명·반·성별은 유지하고 code_hash만 새로 바꾼다(옛 코드는 즉시 무효). 만료 30일 연장.
+    호출부(엔드포인트)에서 소유·권한·미사용 여부를 이미 검증했다고 가정한다. commit은 호출부에서."""
+    raw = f"JOIN-{_seg(4)}-{_seg(4)}"
+    jc.code_hash = sha256_hash(raw)
+    jc.expires_at = _now() + timedelta(days=30)
+    return {
+        "login_id": jc.login_id,
+        "join_code": raw,
+        "class_label": jc.class_label,
+        "real_name": jc.real_name,
+    }
+
+
 def check_join_code(db: Session, code: str) -> dict:
     """가입 코드를 소비하지 않고 상태만 확인(아이디/비번 입력 전에 먼저 막기 위함).
     reason: ok | empty | not_found | used | expired.
