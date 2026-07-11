@@ -322,6 +322,63 @@ def test_register_by_label_binds_real_class(client, db, seed_org):
     assert stu.class_id == cls.id  # 활성화된 학생이 그 반에 배정됨
 
 
+def test_register_with_genders_persists_and_copies_on_activation(client, db, seed_org):
+    """학생 추가 시 성별(이름 순서대로)을 넣으면 슬롯에 저장되고, 활성화 시 학생 프로필로 복사된다.
+    (프론트 학생추가 모달이 보내는 payload 계약 검증 — 이름/성별 정렬)"""
+    org = seed_org["org"]
+    _org_admin(db, org)
+    admin = _login(client, "principal@test.dev")
+
+    r = client.post(
+        f"/api/v1/orgs/{org.id}/students/register",
+        json={
+            "count": 2,
+            "class_label": "3-1반",
+            "names": ["김하은", "박도윤"],
+            "genders": ["female", "male"],  # 이름 순서대로
+        },
+        headers=auth(admin),
+    )
+    assert r.status_code == 200, r.text
+    issued = r.json()["issued"]
+    assert len(issued) == 2
+    # 슬롯에 성별이 이름 순서대로 저장됨
+    by_name = {it.get("real_name"): it for it in issued}
+    assert by_name["김하은"]["gender"] == "female"
+    assert by_name["박도윤"]["gender"] == "male"
+
+    # 활성화하면 학생 프로필 gender로 복사(아이는 못 고름)
+    from app.models import StudentProfile
+
+    act = client.post(
+        "/api/v1/auth/activate-student",
+        json={
+            "code": by_name["김하은"]["join_code"],
+            "student_login_id": "haeun01",
+            "nickname": "하은이",
+            "password": "newpass123",
+        },
+    )
+    assert act.status_code == 200, act.text
+    db.expire_all()
+    stu = db.query(StudentProfile).filter(StudentProfile.nickname == "하은이").first()
+    assert stu is not None and stu.gender == "female"
+
+
+def test_register_without_genders_leaves_none(client, db, seed_org):
+    """성별 미지정(genders 생략)이면 None으로 남는다 — 강제 입력 아님."""
+    org = seed_org["org"]
+    _org_admin(db, org)
+    admin = _login(client, "principal@test.dev")
+    r = client.post(
+        f"/api/v1/orgs/{org.id}/students/register",
+        json={"count": 1, "class_label": "3-2반", "names": ["미정이"]},
+        headers=auth(admin),
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["issued"][0]["gender"] is None
+
+
 def test_grade_head_cannot_use_org_admin_only(client, db, seed_org):
     org = seed_org["org"]
     _org_admin(db, org)
