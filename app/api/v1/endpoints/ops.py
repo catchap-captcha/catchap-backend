@@ -546,17 +546,41 @@ def update_operator(
 @router.get("/inquiries")
 def inquiries(
     status_filter: str | None = None,
+    search: str | None = None,  # 이름/이메일/소속/내용 부분일치
+    page: int = 1,
+    page_size: int = 50,
     principal: Principal = Depends(require_ops),
     db: Session = Depends(get_db),
 ):
     """문의하기 접수 목록 (status_filter: received|resolved, 없으면 전체). 최신순.
 
+    문의는 제출마다 단조 증가하는 테이블 — 전량 반환 대신 서버 페이지네이션+검색.
+    탭 배지용 상태별 건수(counts)는 검색 조건 적용 후 전체 기준으로 함께 반환한다.
     각 문의에 운영자 답변 스레드(replies)를 시간순으로 함께 반환한다.
     """
-    q = db.query(Inquiry).order_by(Inquiry.created_at.desc())
+    page = max(1, page)
+    page_size = max(1, min(200, page_size))
+
+    base = db.query(Inquiry)
+    if search:
+        like = f"%{search.strip()}%"
+        base = base.filter(
+            Inquiry.name.like(like)
+            | Inquiry.email.like(like)
+            | Inquiry.affiliation.like(like)
+            | Inquiry.content.like(like)
+        )
+    counts = {
+        (st if st is not None else "unknown"): int(n)
+        for st, n in base.with_entities(Inquiry.status, func.count(Inquiry.id))
+        .group_by(Inquiry.status)
+        .all()
+    }
+    q = base.order_by(Inquiry.created_at.desc())
     if status_filter:
         q = q.filter(Inquiry.status == status_filter)
-    items = q.all()
+    total = q.count()
+    items = q.offset((page - 1) * page_size).limit(page_size).all()
 
     replies_by_inq: dict[str, list[InquiryReply]] = {}
     ids = [i.id for i in items]
@@ -569,29 +593,39 @@ def inquiries(
         ):
             replies_by_inq.setdefault(rep.inquiry_id, []).append(rep)
 
-    return [
-        {
-            "id": i.id,
-            "inquiry_type": i.inquiry_type,
-            "name": i.name,
-            "affiliation": i.affiliation,
-            "email": i.email,
-            "content": i.content,
-            "status": i.status,
-            "created_at": i.created_at.isoformat() if i.created_at else None,
-            "replies": [
-                {
-                    "id": rep.id,
-                    "body": rep.body,
-                    "answered_by": rep.answered_by,
-                    "email_status": rep.email_status,
-                    "created_at": rep.created_at.isoformat() if rep.created_at else None,
-                }
-                for rep in replies_by_inq.get(i.id, [])
-            ],
-        }
-        for i in items
-    ]
+    return {
+        "items": [
+            {
+                "id": i.id,
+                "inquiry_type": i.inquiry_type,
+                "name": i.name,
+                "affiliation": i.affiliation,
+                "email": i.email,
+                "content": i.content,
+                "status": i.status,
+                "created_at": i.created_at.isoformat() if i.created_at else None,
+                "replies": [
+                    {
+                        "id": rep.id,
+                        "body": rep.body,
+                        "answered_by": rep.answered_by,
+                        "email_status": rep.email_status,
+                        "created_at": rep.created_at.isoformat() if rep.created_at else None,
+                    }
+                    for rep in replies_by_inq.get(i.id, [])
+                ],
+            }
+            for i in items
+        ],
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "counts": {  # 탭 배지용 — 검색 조건 반영, status_filter 미반영(전 탭 공통)
+            "received": counts.get("received", 0),
+            "resolved": counts.get("resolved", 0),
+            "all": sum(counts.values()),
+        },
+    }
 
 
 class InquiryAnswerRequest(BaseModel):
