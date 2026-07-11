@@ -230,6 +230,28 @@ def test_subject_scope_enforced_for_external_key(client, db, seed_org):
     assert ch2.json()["subject"] == "수학"  # 1st-party는 전환 허용
 
 
+def test_assert_entitled_bypasses_first_party(db, seed_org):
+    """1st-party(인앱 dogfooding) 키는 기관 요금제와 무관하게 통과한다.
+    학교가 Basic/무플랜이어도 학생 인앱 학습이 '교육형 API를 쓸 수 없어요'(402)로 막히면 안 된다.
+    (assert_entitled는 ApiKey를 DB조회하지 않고 org_id/product/first_party만 보므로 메모리 객체로 검증)"""
+    import pytest
+    from fastapi import HTTPException
+    from app.models import ApiKey
+    from app.services import captcha_service as cs
+
+    org = seed_org["org"]  # 구독/플랜 없음 → allowed_products = ['captcha']만
+    ext = ApiKey(organization_id=org.id, product="edu", first_party=False)
+    fp = ApiKey(organization_id=org.id, product="edu", first_party=True)
+
+    # 외부(비-first_party) edu 키: 요금제에 edu 없어 402
+    with pytest.raises(HTTPException) as e:
+        cs.assert_entitled(db, ext)
+    assert e.value.status_code == 402
+
+    # 1st-party 키: 같은 무플랜 org라도 게이트 우회(예외 없이 통과)
+    cs.assert_entitled(db, fp)
+
+
 def test_org_admin_self_service_scoped_to_purchase(client, db, seed_org):
     """기관 관리자(교장)는 구매 과목 내에서만 키 발급 — 교사는 접근 불가."""
     org = seed_org["org"]

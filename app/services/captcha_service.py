@@ -226,8 +226,15 @@ def org_entitlements(db: Session, org_id: str) -> dict:
 
 
 def assert_entitled(db: Session, api: ApiKey) -> Plan | None:
-    """이 키의 제품이 기관 요금제로 허용되는지 + 이번 달 quota 확인."""
+    """이 키의 제품이 기관 요금제로 허용되는지 + 이번 달 quota 확인.
+
+    1st-party(우리 앱 자체 소비 = 인앱 학습 dogfooding) 키는 외부 판매 고객이 아니라
+    플랫폼 자체 사용이므로 요금제·quota 게이트를 적용하지 않는다. 이게 없으면 학교가
+    Basic 요금제일 때 학생 인앱 학습이 '교육형 API를 쓸 수 없어요'로 막힌다.
+    """
     plan = plan_for_org(db, api.organization_id)
+    if api.first_party:
+        return plan
     if api.product not in allowed_products(plan):
         raise HTTPException(
             status.HTTP_402_PAYMENT_REQUIRED,
