@@ -660,6 +660,14 @@ def _link_homeroom(
     elif scope_grade is not None and _class_grade(cls) != scope_grade:
         # 이름은 담당 학년으로 보여도 실제 학년(컬럼)이 다르면 거부 (이름/학년 불일치 방어)
         raise HTTPException(status.HTTP_403_FORBIDDEN, detail="담당 학년 반이 아닙니다.")
+    # 담임은 반당 1명 — 이미 다른 (해제 안 된) 담임이 있으면 거부. 같은 교사 재배정·해제된 담임 교체는 허용.
+    if cls.teacher_id and cls.teacher_id != user_id:
+        existing = db.get(User, cls.teacher_id)
+        if existing is not None and existing.status != "disabled":
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                detail=f"{class_name}에는 이미 담임 선생님이 있어요. 먼저 기존 담임을 다른 반으로 옮기거나 해제해 주세요.",
+            )
     cls.teacher_id = user_id
 
 
@@ -875,6 +883,20 @@ def invite_teacher(
 ):
     """교사 초대링크 발송 — 교사코드 선발급 + 이메일 발송. 링크 클릭 시 가입화면에 기관·코드 프리필."""
     check_org_scope(principal, org_id)
+    # 담임으로 미리 배정할 반이 이미 담임이 있으면 예약 자체를 막는다(반당 담임 1명).
+    if req.class_name and req.class_name.strip():
+        cls = (
+            db.query(ClassRoom)
+            .filter(ClassRoom.organization_id == org_id, ClassRoom.name == req.class_name.strip())
+            .first()
+        )
+        if cls and cls.teacher_id:
+            existing = db.get(User, cls.teacher_id)
+            if existing is not None and existing.status != "disabled":
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    detail=f"{req.class_name.strip()}에는 이미 담임 선생님이 있어요. 다른 반을 고르거나 기존 담임을 먼저 옮겨 주세요.",
+                )
     invite_service.create_teacher_invite(
         db,
         organization_id=org_id,

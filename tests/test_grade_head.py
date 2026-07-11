@@ -485,6 +485,28 @@ def test_reissue_join_code_invalidates_old(client, db, seed_org):
     assert rr2.status_code == 409
 
 
+def test_one_homeroom_per_class_enforced(client, db, seed_org):
+    """담임은 반당 1명 — 이미 담임이 있는 반에 다른 교사를 담임으로 배정하면 409."""
+    org = seed_org["org"]
+    _org_admin(db, org)
+    admin = _login(client, "principal@test.dev")
+
+    a = client.post(f"/api/v1/orgs/{org.id}/teachers",
+                    json={"name": "에이샘", "email": "a5@t.dev", "class_name": "5-5반",
+                          "role": "담임", "teacher_code": "T-AAA111"}, headers=auth(admin))
+    assert a.status_code == 200, a.text
+    # 같은 반에 다른 교사를 담임으로 → 거부
+    b = client.post(f"/api/v1/orgs/{org.id}/teachers",
+                    json={"name": "비샘", "email": "b5@t.dev", "class_name": "5-5반",
+                          "role": "담임", "teacher_code": "T-BBB222"}, headers=auth(admin))
+    assert b.status_code == 409, b.text
+    # 보조는 담임과 별개라 허용
+    c = client.post(f"/api/v1/orgs/{org.id}/teachers",
+                    json={"name": "씨샘", "email": "c5@t.dev", "class_name": "5-5반",
+                          "role": "보조", "teacher_code": "T-CCC333"}, headers=auth(admin))
+    assert c.status_code == 200, c.text
+
+
 def test_grade_head_cannot_use_org_admin_only(client, db, seed_org):
     org = seed_org["org"]
     _org_admin(db, org)

@@ -455,6 +455,12 @@ def _assign_pending_class(db: Session, org_id: str, membership: Membership, user
     if membership.position == "보조":
         cls.assistant_teacher_id = user_id
     else:  # 담임(기본)
+        # 담임은 반당 1명 — 가입 시점에 이미 다른(해제 안 된) 담임이 있으면 덮어쓰지 않는다.
+        # (예약한 반을 남이 먼저 맡은 경우) 배정만 건너뛰고 가입은 정상 완료 → 관리자가 정리.
+        if cls.teacher_id and cls.teacher_id != user_id:
+            existing = db.get(User, cls.teacher_id)
+            if existing is not None and existing.status != "disabled":
+                return
         cls.teacher_id = user_id
 
 
