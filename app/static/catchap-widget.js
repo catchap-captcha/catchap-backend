@@ -173,8 +173,57 @@
       trace.push([t, Math.round(x * 1e4) / 1e4, Math.round(y * 1e4) / 1e4]);
     }
     box.addEventListener('pointermove', function (e) { tracePoint(e, false); });
-    box.addEventListener('pointerdown', function (e) { tracePoint(e, true); });
-    box.addEventListener('pointerup', function (e) { tracePoint(e, true); });
+    box.addEventListener('pointerdown', function (e) { tracePoint(e, true); onActivity(); });
+    box.addEventListener('pointerup', function (e) { tracePoint(e, true); onActivity(); });
+    box.addEventListener('keydown', function () { onActivity(); });
+
+    // ── 방치 감지 — 학습시간은 '화면 보며 실제로 푸는 활성 시간'만 센다(승인 2026-07-13).
+    // 탭 이탈(hidden)이면 즉시 타이머 정지, 화면 켠 채 오래 무입력이면 정지 + '아직 있니?'
+    // 게이트로 재확인 후 이어간다. 방치 구간은 solve_time_ms에서 빠져 수학처럼 오래 푸는
+    // 문항은 그대로 세되(활동 중이므로), 자리 비운 시간은 학습시간을 부풀리지 않는다.
+    var IDLE_MS = 3 * 60 * 1000;  // 무입력 이 시간 지나면 방치로 보고 게이트
+    var activeMs = 0, lastResume = 0, tPaused = true, idleTimer = null, idleGate = null;
+    function elapsedActive() { return activeMs + (tPaused ? 0 : Math.max(0, Date.now() - lastResume)); }
+    function timerStart() { activeMs = 0; lastResume = Date.now(); tPaused = false; armIdle(); }
+    function timerPause() { if (!tPaused) { activeMs += Math.max(0, Date.now() - lastResume); tPaused = true; } }
+    function timerResume() { if (tPaused) { lastResume = Date.now(); tPaused = false; } }
+    function armIdle() { if (idleTimer) clearTimeout(idleTimer); idleTimer = (answered || grading) ? null : setTimeout(onIdle, IDLE_MS); }
+    function onActivity() { if (!idleGate && !answered && !grading) armIdle(); }
+    function onIdle() {
+      if (answered || grading || idleGate) return;
+      timerPause();  // 방치 구간 제외
+      try { stopSounds(); } catch (e) {}
+      showIdleGate();
+    }
+    function showIdleGate() {
+      idleGate = h('div');
+      css(idleGate, { position: 'absolute', top: '0', left: '0', right: '0', bottom: '0',
+        display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
+        gap: '12px', textAlign: 'center', padding: '20px', zIndex: '30',
+        background: 'rgba(255,250,244,0.97)', borderRadius: '16px' });
+      var t = h('div'); t.textContent = '🐾 아직 풀고 있니?';
+      css(t, { fontWeight: '800', fontSize: '18px', color: '#3A3226' });
+      var s = h('div'); s.textContent = '잠깐 쉬었나 봐요. 준비되면 눌러서 이어가요!';
+      css(s, { fontSize: '13px', color: '#8A8070' });
+      var b = h('button'); b.textContent = '계속 풀기'; css(b, btnStyle(C, '#fff'));
+      b.onclick = hideIdleGate;
+      idleGate.appendChild(t); idleGate.appendChild(s); idleGate.appendChild(b);
+      if (getComputedStyle(box).position === 'static') box.style.position = 'relative';
+      box.appendChild(idleGate);
+    }
+    function hideIdleGate() {
+      if (idleGate) { try { idleGate.remove(); } catch (e) { if (idleGate.parentNode) idleGate.parentNode.removeChild(idleGate); } idleGate = null; }
+      timerResume(); armIdle();
+    }
+    // document/window 리스너는 mount당 추가 — 위젯이 DOM에서 떨어지면(리마운트) 스테일
+    // 핸들러가 죽은 타이머를 건드리지 않게 box.isConnected로 무력화한다(누수 완화).
+    document.addEventListener('visibilitychange', function () {
+      if (!box.isConnected) return;
+      if (document.hidden) timerPause();
+      else if (!idleGate) { timerResume(); armIdle(); }
+    });
+    window.addEventListener('blur', function () { if (box.isConnected) timerPause(); });
+    window.addEventListener('focus', function () { if (box.isConnected && !idleGate && !document.hidden) { timerResume(); armIdle(); } });
 
     function fail(msg) { body.innerHTML = ''; var p = h('div'); p.textContent = msg || '문제를 불러오지 못했어요.'; css(p, { color: '#C25', fontSize: '13px' }); body.appendChild(p); refreshBtn(); if (footerOn) footerReset(); }
     function refreshBtn() {
@@ -1296,7 +1345,9 @@
       // retries는 리셋하지 않는다 — 캡차 오답 재발급을 건너 누적돼야 행동데이터
       // retry_count가 실제 재시도 횟수를 반영한다(통과 시 위젯 세션 종료로 자연 소멸).
       renderedAt = Date.now(); redoCount = 0; traceReset();
+      if (idleGate) hideIdleGate();  // 새 문항 — 이전 게이트 정리
       lastType = d.type; answered = false; grading = false; renderSeq += 1;
+      timerStart();  // 활성 시간(방치 제외) 계측 — answered 리셋 뒤라야 idle 타이머가 켜진다
       lastOptions = []; // 이전 문항 보기가 새 문항 피드백(정답 텍스트 매칭)에 누출되지 않게
       onAnswered = null;
       footerOn = full && product === 'edu';
@@ -1967,8 +2018,9 @@
       var mySeq = renderSeq; // 응답 도착 시 문항이 이미 바뀌었으면 무시(스테일 응답 가드)
       status.textContent = '확인 중…';
       var rect = box.getBoundingClientRect();
+      timerPause();  // 제출 순간 활성 시간 확정(이후 대기·피드백 시간은 미포함)
       var behavior = {
-        solve_time_ms: Date.now() - renderedAt,
+        solve_time_ms: elapsedActive(),
         retry_count: retries + redoCount, // 캡차 재시도 + 다시 고르기/그리기 횟수
         input_type: inputType || 'unknown', // mouse|touch|pen
         trace: trace.slice(),
