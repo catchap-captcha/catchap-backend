@@ -131,6 +131,13 @@ def _throttle(db: Session, request: Request, kind: str, limit: int) -> None:
     auth_service.rate_limit(db, f"cap{kind}:{_client_ip(request)}", limit=limit, window_seconds=60)
 
 
+def _emit_challenge(db: Session, api: ApiKey, subject: str, ch: dict) -> dict:
+    """챌린지 발급 공통 꼬리 — 사용량 로그 적립·커밋·응답 조립(세 갈래 공통)."""
+    cs.log_call(db, api, "captcha/challenge", 200, subject=subject)
+    db.commit()
+    return {"product": api.product, "subject": subject, **ch}
+
+
 def _origin_guard(db: Session, request: Request, api: ApiKey) -> None:
     cs.assert_origin_allowed(
         db, api, request.headers.get("origin"), request.headers.get("referer")
@@ -313,9 +320,7 @@ def challenge(
             raise HTTPException(status.HTTP_404_NOT_FOUND, detail="플레이할 문항이 없어요.")
         # meta.bank → verify가 코인·오늘의퀴즈를 건드리지 않고 기록·오답노트만 남긴다
         ch = cs._wrap_bank_question(eff_subject, q, {"subj": eff_subject, "bank": True})
-        cs.log_call(db, api, "captcha/challenge", 200, subject=eff_subject)
-        db.commit()
-        return {"product": api.product, "subject": eff_subject, **ch}
+        return _emit_challenge(db, api, eff_subject, ch)
     if (
         chapter is not None and stage is not None
         and api.product == "edu" and api.first_party and eff_subject in cs.EDU_SUBJECTS
@@ -341,16 +346,12 @@ def challenge(
             eff_subject, q,
             {"subj": eff_subject, "rp": bool(replay), "chapter": eff_chapter, "stage": stage, "bank": True},
         )
-        cs.log_call(db, api, "captcha/challenge", 200, subject=eff_subject)
-        db.commit()
-        return {"product": api.product, "subject": eff_subject, **ch}
+        return _emit_challenge(db, api, eff_subject, ch)
     ch = cs.make_challenge(
         api.product, eff_subject, day=day, replay=replay, learning=learning,
         chapter=chapter, stage=stage,
     )
-    cs.log_call(db, api, "captcha/challenge", 200, subject=eff_subject)
-    db.commit()
-    return {"product": api.product, "subject": eff_subject, **ch}
+    return _emit_challenge(db, api, eff_subject, ch)
 
 
 class _VerifyReq(BaseModel):

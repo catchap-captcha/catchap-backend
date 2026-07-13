@@ -18,12 +18,36 @@ capcha_service sw 브랜치 04-forest 이식 + CatChap 보안 하드닝. 프레�
 
 from __future__ import annotations
 
+import random
 import secrets
 import threading
 import time
 import uuid
-from dataclasses import dataclass
+from contextlib import contextmanager
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional
+from dataclasses import dataclass
+
+
+@contextmanager
+def _db_session():
+    """캡차 전용 짧은 세션 — 요청 db와 별개 독립 트랜잭션(멀티워커 공유용). 지연 import로 순환 회피."""
+    from app.db.session import SessionLocal
+
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+def _sliding_hit(rate: Dict[str, List[float]], lock: threading.Lock, key: str, window: int, now: float) -> int:
+    """슬라이딩 윈도우 히트 카운트 — InMemoryStore/DBStore 공용(레이트리밋)."""
+    with lock:
+        hits = [t for t in rate.get(key, []) if t > now - window]
+        hits.append(now)
+        rate[key] = hits
+        return len(hits)
 
 # 프론트 위젯 animal-config.js와 반드시 동기화한다.
 ANIMALS: List[str] = [
@@ -151,12 +175,7 @@ class InMemoryStore(Store):
             self._tokens.pop(token, None)
 
     def hit_rate(self, key: str, window: int, now: float) -> int:
-        """이 키의 최근 window초 히트 수를 1 늘려 반환(레이트리밋용, 슬라이딩 윈도우)."""
-        with self._lock:
-            hits = [t for t in self._rate.get(key, []) if t > now - window]
-            hits.append(now)
-            self._rate[key] = hits
-            return len(hits)
+        return _sliding_hit(self._rate, self._lock, key, window, now)
 
 
 def _challenge_to_payload(rec: ChallengeRecord) -> dict:
@@ -200,95 +219,67 @@ class DBStore(Store):
         self._rate_lock = threading.Lock()
         self._rate: Dict[str, List[float]] = {}
 
-    def _now_dt(self):
-        from datetime import datetime
-        return datetime.now()
+    @staticmethod
+    def _sweep(db) -> None:
+        """만료 행 확률적 청소(2%) — 안 풀린 challenge/token이 쌓이지 않게(ix_captcha_exp)."""
+        if random.random() < 0.02:
+            from app.models import CaptchaStore as CS
+
+            db.query(CS).filter(CS.expires_at < datetime.now()).delete(synchronize_session=False)
 
     def save_challenge(self, rec: ChallengeRecord) -> None:
-        from datetime import datetime, timedelta
-        from app.db.session import SessionLocal
         from app.models import CaptchaStore as CS
 
-        db = SessionLocal()
-        try:
-            db.add(CS(k=rec.challenge_id, kind="challenge",
-                      payload=_challenge_to_payload(rec),
+        with _db_session() as db:
+            db.add(CS(k=rec.challenge_id, kind="challenge", payload=_challenge_to_payload(rec),
                       expires_at=datetime.now() + timedelta(seconds=rec.ttl)))
+            self._sweep(db)
             db.commit()
-        finally:
-            db.close()
 
     def get_challenge(self, cid: str) -> Optional[ChallengeRecord]:
-        from datetime import datetime
-        from app.db.session import SessionLocal
         from app.models import CaptchaStore as CS
 
-        db = SessionLocal()
-        try:
+        with _db_session() as db:
             row = db.query(CS).filter(CS.k == cid, CS.kind == "challenge").first()
             if row is None or row.expires_at < datetime.now():
                 return None
             return _payload_to_challenge(row.payload)
-        finally:
-            db.close()
 
     def delete_challenge(self, cid: str) -> None:
-        from app.db.session import SessionLocal
         from app.models import CaptchaStore as CS
 
-        db = SessionLocal()
-        try:
+        with _db_session() as db:
             db.query(CS).filter(CS.k == cid, CS.kind == "challenge").delete()
             db.commit()
-        finally:
-            db.close()
 
     def save_token(self, rec: TokenRecord) -> None:
-        from datetime import datetime, timedelta
-        from app.db.session import SessionLocal
         from app.models import CaptchaStore as CS
 
-        db = SessionLocal()
-        try:
+        with _db_session() as db:
             db.add(CS(k=rec.token, kind="token", payload={"created_at": rec.created_at},
                       used=rec.used, expires_at=datetime.now() + timedelta(seconds=rec.ttl)))
             db.commit()
-        finally:
-            db.close()
 
     def get_token(self, token: str) -> Optional[TokenRecord]:
-        from datetime import datetime
-        from app.db.session import SessionLocal
         from app.models import CaptchaStore as CS
 
-        db = SessionLocal()
-        try:
+        with _db_session() as db:
             row = db.query(CS).filter(CS.k == token, CS.kind == "token").first()
             if row is None or row.expires_at < datetime.now():
                 return None
             return TokenRecord(token=token, created_at=row.payload.get("created_at", time.time()),
                                used=bool(row.used))
-        finally:
-            db.close()
 
     def delete_token(self, token: str) -> None:
-        from app.db.session import SessionLocal
         from app.models import CaptchaStore as CS
 
-        db = SessionLocal()
-        try:
+        with _db_session() as db:
             db.query(CS).filter(CS.k == token, CS.kind == "token").delete()
             db.commit()
-        finally:
-            db.close()
 
     def hit_rate(self, key: str, window: int, now: float) -> int:
         # 레이트리밋은 워커별 InMemory (봇 완화 목적 — 워커당 카운트로 충분)
-        with self._rate_lock:
-            hits = [t for t in self._rate.get(key, []) if t > now - window]
-            hits.append(now)
-            self._rate[key] = hits
-            return len(hits)
+        return _sliding_hit(self._rate, self._rate_lock, key, window, now)
 
 
 class ForestCaptchaService:

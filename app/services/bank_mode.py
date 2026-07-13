@@ -33,9 +33,8 @@ def _last_results(db: Session, student_id: str, subject: str, ids: list[str]) ->
     return last
 
 
-def split_pool(db: Session, student: StudentProfile | None, subject: str):
-    """은행을 (안 푼, 틀린, 맞춘) 세 그룹으로 분할 — 출제·진도 화면 공용."""
-    ids = [q["id"] for q in subject_banks.playable_pool(subject)]
+def _split_ids(db: Session, student: StudentProfile | None, subject: str, ids: list[str]):
+    """주어진 문항 id들을 (안 푼, 틀린, 맞춘)으로 분할 — 이력 조회는 이 id 집합만 대상."""
     if student is None or not ids:
         return ids, [], []
     last = _last_results(db, student.id, subject, ids)
@@ -45,13 +44,27 @@ def split_pool(db: Session, student: StudentProfile | None, subject: str):
     return unsolved, wrong, correct
 
 
-def pick_question(db: Session, student: StudentProfile | None, subject: str) -> dict | None:
-    """우선순위 출제: 안 푼 → 틀린 → 맞춘. 비로그인(외부)은 전체 랜덤."""
-    unsolved, wrong, correct = split_pool(db, student, subject)
-    for group in (unsolved, wrong, correct):
+def split_pool(db: Session, student: StudentProfile | None, subject: str):
+    """은행 전체를 (안 푼, 틀린, 맞춘)으로 분할 — 진도 화면(progress)용."""
+    ids = [q["id"] for q in subject_banks.playable_pool(subject)]
+    return _split_ids(db, student, subject, ids)
+
+
+def _pick(db: Session, student: StudentProfile | None, subject: str, ids: list[str]) -> dict | None:
+    """id 후보 안에서 우선순위 출제: 안 푼 → 틀린 → 맞춘. 비로그인은 전체 랜덤."""
+    if not ids:
+        return None
+    if student is None:
+        return subject_banks.get_question(subject, random.choice(ids))
+    for group in _split_ids(db, student, subject, ids):
         if group:
             return subject_banks.get_question(subject, random.choice(group))
-    return None
+    return subject_banks.get_question(subject, random.choice(ids))
+
+
+def pick_question(db: Session, student: StudentProfile | None, subject: str) -> dict | None:
+    """우선순위 출제(은행 전체): 안 푼 → 틀린 → 맞춘. 비로그인(외부)은 전체 랜덤."""
+    return _pick(db, student, subject, [q["id"] for q in subject_banks.playable_pool(subject)])
 
 
 def pick_from(
@@ -59,19 +72,9 @@ def pick_from(
 ) -> dict | None:
     """후보 집합(주차 커리큘럼의 10문항 등) 안에서 우선순위 출제 — 안 푼 → 틀린 → 맞춘.
 
-    주차 구조(월요일 잠금)는 유지하면서 그 주 문항 선별만 은행 로직을 쓰는
-    하이브리드(0713 결정)용. 비로그인은 후보 전체 랜덤."""
-    if not candidate_ids:
-        return None
-    if student is None:
-        return subject_banks.get_question(subject, random.choice(candidate_ids))
-    cand = set(candidate_ids)
-    unsolved, wrong, correct = split_pool(db, student, subject)
-    for group in (unsolved, wrong, correct):
-        scoped = [i for i in group if i in cand]
-        if scoped:
-            return subject_banks.get_question(subject, random.choice(scoped))
-    return subject_banks.get_question(subject, random.choice(candidate_ids))
+    주차 구조(월요일 잠금)는 유지하면서 그 주 문항 선별만 은행 로직을 쓰는 하이브리드(0713).
+    이력 조회를 후보 id로만 좁혀(과목 은행 전체가 아니라) 핫패스 IN절·분류 비용을 줄인다."""
+    return _pick(db, student, subject, candidate_ids)
 
 
 def progress(db: Session, student: StudentProfile, subject: str) -> dict:
