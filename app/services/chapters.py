@@ -9,9 +9,18 @@ ChapterProgress(단계 커서) + LearningAttempt(푼 문항 집합) + StudentPro
 저장하므로, 랜덤풀 전환 시에도 마이그레이션 없이 진도를 그릴 수 있다.
 """
 
+import os
 from datetime import date
 
 from app.services import subject_banks
+
+
+def _unlock_all() -> bool:
+    """임시 전체 해제 스위치 — 켜면 달력(월요일) 잠금을 무시하고 모든 챕터를 연다.
+
+    되돌리기: 환경변수 CATCHAP_UNLOCK_ALL_CHAPTERS 를 지우고 백엔드 재기동하면 원상복구.
+    코드 변경/재배포 없이 env 토글만으로 켜고 끌 수 있게 한 임시 조치다(2026-07-13)."""
+    return os.environ.get("CATCHAP_UNLOCK_ALL_CHAPTERS", "").strip().lower() in ("1", "true", "yes", "on")
 
 CHAPTER_SIZE = 10  # 한 챕터 = 10문제
 STAGE_SIZE = 2  # 한 단계 = 2문제
@@ -33,12 +42,16 @@ def max_chapters(subject: str) -> int:
 
 
 def unlocked_count(subject: str, today: date | None = None) -> int:
-    """오늘 기준 열린 챕터 수 = min(max_chapters, 앵커 이후 지난 주 + 1). 최소 1(음수 방지)."""
-    today = today or date.today()
-    weeks = max(0, (today - ANCHOR_MONDAY).days // 7)
+    """오늘 기준 열린 챕터 수 = min(max_chapters, 앵커 이후 지난 주 + 1). 최소 1(음수 방지).
+
+    임시 전체 해제(_unlock_all)가 켜져 있으면 달력 잠금을 무시하고 그 과목의 전 챕터를 연다."""
     mx = max_chapters(subject)
     if mx <= 0:
         return 0
+    if _unlock_all():
+        return mx  # 임시 전체 해제 — 모든 챕터 개방
+    today = today or date.today()
+    weeks = max(0, (today - ANCHOR_MONDAY).days // 7)
     return max(1, min(mx, weeks + 1))
 
 

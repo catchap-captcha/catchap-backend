@@ -30,6 +30,11 @@ router = APIRouter(prefix="/captcha/v1", tags=["captcha-api"])
 # 교육형 인앱 세션 길이 — 오늘의퀴즈는 과목당 이 문항 수를 채우면 완료 신고
 EDU_SESSION_TOTAL = 5
 
+# 문항당 풀이시간 상한(ms) — '넉넉한 백스톱'. 방치 제외는 주로 위젯이 담당한다
+# (탭을 떠나 있으면 카운트 정지 → 화면을 보고 실제로 푸는 시간만 보냄). 이 상한은 화면을
+# 켠 채 오래 자리를 비운 극단만 자른다. 수학처럼 오래 걸리는 문항을 자르지 않도록 넉넉히 둔다.
+SOLVE_TIME_CAP_MS = 15 * 60 * 1000  # 15분
+
 # 공개 엔드포인트 IP 레이트리밋 (분당) — 월 quota와 별개로 버스트/스크래핑 억제.
 # 학교 NAT 뒤 다수 학생을 감안해 넉넉히, 봇 폭주는 막는 수준.
 RATE_CHALLENGE_PER_MIN = 120
@@ -386,9 +391,14 @@ def verify(
     if api.product == "edu":
         student = _optional_student(db, request)
         behavior = req.behavior
+        # 풀이시간 클램프(자기신고 + 방치 시간 포함) — 문항당 SOLVE_TIME_CAP_MS 상한으로 잘라
+        # 학습기록·행동데이터 양쪽이 같은 값을 쓰게 한다(홈 '학습 시간'·속도 통계 팽창 방지).
+        raw_ms = (behavior or {}).get("solve_time_ms")
+        solve_ms = min(SOLVE_TIME_CAP_MS, raw_ms) if isinstance(raw_ms, int) and raw_ms > 0 else 0
+        behavior = {**(behavior or {}), "solve_time_ms": solve_ms}
         # 끌어다 놓기의 드롭 거리는 서버 채점값을 기록 (클라이언트 자기신고 대체)
         if "drop_distance_norm" in result:
-            behavior = {**(behavior or {}), "drop_distance_norm": result["drop_distance_norm"]}
+            behavior = {**behavior, "drop_distance_norm": result["drop_distance_norm"]}
         # 인증 학생의 행동데이터는 본인 귀속 — JWT로 검증된 신원을 명시 전달.
         # (behavior dict에 student_id를 실어 보내던 방식은 record_behavior의
         #  '키 기관 일치' 재검증에 걸려 인앱(1st-party) 학생이 전부 익명 적재되던 버그)
@@ -397,9 +407,6 @@ def verify(
         )
         # 인앱(인증 학생) 풀이는 학습기록으로 적립 — 코인·진도·오늘의퀴즈 (실전 모드 대체)
         if student is not None and meta.get("subj"):
-            # 풀이시간은 자기신고 — 스키마 상한(1시간)과 동일하게 클램프해 통계 오염 방지
-            raw_ms = (req.behavior or {}).get("solve_time_ms")
-            solve_ms = raw_ms if isinstance(raw_ms, int) and 0 <= raw_ms <= 3_600_000 else 0
             result["session"] = _credit_student(
                 db, student, meta, bool(result.get("success")), req.answer, solve_time_ms=solve_ms
             )
