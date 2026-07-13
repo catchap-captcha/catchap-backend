@@ -1,6 +1,6 @@
 """learning_attempts.content_id CHAR(36) → VARCHAR(80) — 뱅크 슬러그 id(최장 49자) 수용
 
-Revision ID: a7b8c9d0e1f2
+Revision ID: c1d2e3f4a5b6
 Revises: f5a6b7c8d9e0
 Create Date: 2026-07-13
 """
@@ -9,7 +9,7 @@ from typing import Sequence, Union
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "a7b8c9d0e1f2"
+revision: str = "c1d2e3f4a5b6"
 down_revision: Union[str, None] = "f5a6b7c8d9e0"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
