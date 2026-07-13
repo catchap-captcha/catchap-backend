@@ -1571,10 +1571,60 @@ def _opt_texts(q: dict, ids: list[str]) -> str:
     return ", ".join(p for p in parts if p)
 
 
-def _record_wrong(db: Session, me: StudentProfile, subject: str, q: dict, picked_ids: list[str], answer_ids: list[str]) -> None:
+def _correct_answer_text(q: dict) -> str:
+    """유형 불문 '정답'을 사람이 읽을 텍스트로 — 오답노트에 전 문제 유형을 담기 위함.
+
+    선택형(single/multi/drag/order/listen…)은 옵션 텍스트, 타이핑형은 정답 문자열,
+    십자말은 정답 낱말, 정답이 좌표·경로·매핑이라 텍스트화가 어려운 유형
+    (route/trace/swipe/sort/connect/memory 등)은 explain(개념)으로 대체한다.
+    """
+    t = q.get("type")
+    a = q.get("answer")
+    # 단일 선택형(answer=옵션 id)
+    if isinstance(a, str) and t not in ("dictation", "type_in"):
+        txt = _opt_texts(q, [a])
+        if txt:
+            return txt
+    # 복수/순서형(answer=id 리스트)
+    if isinstance(a, list):
+        txt = _opt_texts(q, [str(x) for x in a])
+        if txt:
+            return txt
+    # 타이핑형
+    if t in ("dictation", "type_in") and isinstance(a, str):
+        return a
+    if t == "input":
+        ans = q.get("answers")
+        if isinstance(ans, list) and ans:
+            return str(ans[0])
+    # 십자말: answer={슬롯: 낱말} — 값이 실제 정답 낱말
+    if t == "crossword" and isinstance(a, dict):
+        vals = [str(v) for v in a.values() if v]
+        if vals:
+            return ", ".join(vals)
+    # 그 외(route/trace/swipe/sort/connect/memory/puzzle…) → 개념 설명으로 복습 포인트 제공
+    return q.get("explain") or q.get("hint") or "그림과 활동을 다시 살펴봐요"
+
+
+def _student_answer_text(q: dict, student_answer) -> str:
+    """학생이 낸 답을 텍스트로 — 조작형은 정확 재현이 어려워 빈 문자열(문제+정답+개념만 남김)."""
+    t = q.get("type")
+    if student_answer is None:
+        return ""
+    if t in ("dictation", "type_in", "input"):
+        return str(student_answer)[:200]
+    if isinstance(student_answer, str):
+        return _opt_texts(q, [student_answer])  # 옵션 없으면 "" (조작형)
+    if isinstance(student_answer, list):
+        return _opt_texts(q, [str(x) for x in student_answer])
+    return ""  # dict(연결/분류 제출) 등 — 재현 생략
+
+
+def _record_wrong(db: Session, me: StudentProfile, subject: str, q: dict, student_answer) -> None:
     """게임 오답을 오답노트(WrongAnswer)·취약추천(Recommendation)에 실기록.
 
-    같은 문항이 이미 '미복습' 상태로 있으면 중복 저장하지 않는다(반복 오답 누적 방지).
+    전 문제 유형 지원 — 정답은 _correct_answer_text(유형별 렌더), 학생 답은
+    _student_answer_text. 같은 문항이 '미복습' 상태로 있으면 중복 저장하지 않는다.
     복습(replay) 오답은 호출부에서 제외한다.
     """
     from app.services import subject_banks
@@ -1596,8 +1646,8 @@ def _record_wrong(db: Session, me: StudentProfile, subject: str, q: dict, picked
                 subject=subject,
                 category=subject_banks.WRONG_CATEGORY.get(subject, "safe"),  # D.WRONG_TAGS 키
                 question=q["prompt"],
-                my_answer=_opt_texts(q, picked_ids)[:200],
-                correct_answer=_opt_texts(q, answer_ids)[:200],
+                my_answer=_student_answer_text(q, student_answer)[:200],
+                correct_answer=_correct_answer_text(q)[:200],
                 tip=q.get("explain") or q.get("hint"),
                 wrong_date=date.today(),
             )
@@ -1663,7 +1713,8 @@ def game_answer(
 
     # 오답이면 오답노트·취약추천에 실기록 (복습은 제외 — 반복 파밍/중복 누적 방지)
     if not correct and not req.replay:
-        _record_wrong(db, me, req.subject, q, picked_ids, answer_ids)
+        student_ans = req.option_ids if q["type"] == "multi" else req.option_id
+        _record_wrong(db, me, req.subject, q, student_ans)
 
     # 서버 판정 결과를 학습기록으로 저장 (기존 save_attempt와 동일 부수효과: 코인 상한·진도·퀴즈 상태)
     # 챕터 플레이(chapter_no 지정)는 daily=False — 코인·정답률(숙련도)은 반영하되 오늘의퀴즈(습관) 미갱신.

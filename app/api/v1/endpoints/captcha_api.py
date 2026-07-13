@@ -202,22 +202,12 @@ def _credit_student(
 
     principal = Principal(kind="student", id=student.id, role="student", student=student)
 
-    # 뱅크 문항 오답 → 오답노트·취약추천 (동작형 drag/trace는 대상 아님, 복습 제외)
+    # 뱅크 문항 오답 → 오답노트·취약추천 (전 문제 유형 — 정답 텍스트는 _record_wrong가
+    # 유형별로 렌더, route/trace/swipe 등 텍스트 정답 없는 유형은 개념(explain)으로). 복습 제외.
     if qid and not correct and not replay:
         q = subject_banks.get_question(subject, str(qid))
-        # input(정답 목록은 'answers')·route·trace 등 'answer' 키 없는 유형은 오답노트
-        # 스킵 — q["answer"] 직접 접근은 KeyError로 verify 전체를 500내던 실버그.
-        ans = q.get("answer") if q is not None else None
-        if ans is None and q is not None and isinstance(q.get("answers"), list) and q["answers"]:
-            ans = q["answers"][0]
-        if q is not None and ans is not None:
-            if q["type"] == "multi":
-                picked_ids = [str(x) for x in (answer or [])]
-                answer_ids = [str(a) for a in (ans or [])]
-            else:
-                picked_ids = [str(answer)] if answer is not None else []
-                answer_ids = [str(ans)]
-            _record_wrong(db, student, subject, q, picked_ids, answer_ids)
+        if q is not None:
+            _record_wrong(db, student, subject, q, answer)
 
     answered_before = (
         db.query(func.count(LearningAttempt.id))
