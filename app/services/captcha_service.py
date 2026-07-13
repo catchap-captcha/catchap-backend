@@ -738,27 +738,19 @@ def _edu_challenge(
         return {**ch, "topic": detail.get("topic"), "day": day, "is_replay": rp}
 
     meta = {"subj": subject, "rp": bool(replay)}
+    # 합성 조작형(_edu_drag_challenge·_edu_trace_challenge = 랜덤 이모지 드래그·점선 따라그리기)은
+    # '아동 캡차 행동데이터 수집'용이었으나 아직 제품 계획에 없어 비활성화(2026-07-13).
+    # 이제 교육형 출제는 항상 실문항 뱅크에서만 낸다. (뱅크 자체의 조작형 유형 문항 — 따라쓰기·
+    # 연결·순서 등 — 은 _wrap_bank_question 경로라 그대로 유지된다.) 뱅크 없는 과목은 낼
+    # 실문항이 없으므로 404. (합성 생성기 함수는 재사용 대비 남겨두되 호출하지 않는다.)
     if subject not in subject_banks.LIVE_SUBJECTS:
-        # 뱅크 없는 과목은 동작형만 낸다 — '정답 예시' 데모 문항은 폐기
-        # (문제은행 연동 전까지: 데모는 정답이 뻔해 학습기록·코인 적립 대상이 될 수 없음)
-        if random.random() < 0.5:
-            return _edu_drag_challenge(subject, meta)
-        return _edu_trace_challenge(subject, meta)
-    # 외부 임베드(learning=False): 드래그·그리기 궤적이 아동용 캡차 학습셋의 핵심 재료라
-    # 절반은 동작형 문제를 낸다. 1st-party 인앱 학습(learning=True)은 과목 무관 조작형이
-    # 학습 흐름을 깨므로 건너뛰고 실제 문제만 낸다(예: 영어엔 영어 문제만).
-    if not learning:
-        roll = random.random()
-        if roll < 0.25:
-            return _edu_drag_challenge(subject, meta)
-        if roll < 0.5:
-            return _edu_trace_challenge(subject, meta)
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="플레이할 문항이 없어요.")
     # 실문항 뱅크 (생활=ms / 수학·과학=my / 사회=sw / 영어=ms english / 국어=jy — capcha_service 이식)
     pool = subject_banks.playable_pool(subject)
     # 오늘의 퀴즈(인앱 학습): 아직 잠긴 주차의 문항은 내지 않는다 — 전체학습과 같은 달력
     # 잠금(unlocked_count)을 존중해 '열린 챕터 범위'에서만 랜덤 출제한다. 잠금 해제 플래그가
     # 켜지면 unlocked_count가 전 챕터라 전 범위에서 뽑는다(자동 반영). learning=False(외부
-    # 비학습 — 행동데이터 수집용 조작형 출제)는 커리큘럼 진도와 무관하므로 제한하지 않는다.
+    # 판매 임베드)는 구매한 과목 은행 전체를 쓰므로 커리큘럼 달력과 무관하게 제한하지 않는다.
     if learning:
         from app.services import chapters as _ch
 
