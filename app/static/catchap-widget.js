@@ -37,6 +37,47 @@
     document.head.appendChild(st);
   }
 
+  // ── 효과음 (WebAudio 합성 — 오디오 에셋 불필요, 전 과목 공통) ──
+  // 답 제출·버튼 클릭은 항상 사용자 제스처 뒤라 자동재생 정책에 걸리지 않는다.
+  var sfxCtx = null;
+  function sfxContext() {
+    try {
+      var AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) return null;
+      if (!sfxCtx) sfxCtx = new AC();
+      if (sfxCtx.state === 'suspended') sfxCtx.resume();
+      return sfxCtx;
+    } catch (e) { return null; }
+  }
+  function sfxNote(ctx, freq, at, dur, type, peak) {
+    var o = ctx.createOscillator(), g = ctx.createGain();
+    o.type = type; o.frequency.value = freq;
+    g.gain.setValueAtTime(0.0001, at);
+    g.gain.exponentialRampToValueAtTime(peak, at + 0.02);
+    g.gain.exponentialRampToValueAtTime(0.0001, at + dur);
+    o.connect(g); g.connect(ctx.destination);
+    o.start(at); o.stop(at + dur + 0.05);
+  }
+  function playSfx(kind) {
+    var ctx = sfxContext();
+    if (!ctx) return;
+    try {
+      var t = ctx.currentTime + 0.01;
+      if (kind === 'correct') { // 밝은 상행 차임
+        sfxNote(ctx, 659.25, t, 0.14, 'triangle', 0.17);
+        sfxNote(ctx, 1046.5, t + 0.11, 0.24, 'triangle', 0.17);
+      } else if (kind === 'wrong') { // 부드러운 하행(아동용 — 거슬리는 버저 금지)
+        sfxNote(ctx, 392.0, t, 0.16, 'sine', 0.14);
+        sfxNote(ctx, 311.13, t + 0.13, 0.24, 'sine', 0.12);
+      } else if (kind === 'finish') { // 세션 완료 팡파르
+        sfxNote(ctx, 523.25, t, 0.12, 'triangle', 0.15);
+        sfxNote(ctx, 659.25, t + 0.1, 0.12, 'triangle', 0.15);
+        sfxNote(ctx, 783.99, t + 0.2, 0.12, 'triangle', 0.15);
+        sfxNote(ctx, 1046.5, t + 0.3, 0.34, 'triangle', 0.17);
+      }
+    } catch (e) {}
+  }
+
   function api(base, path, key, body, auth) {
     var headers = { 'Content-Type': 'application/json', 'X-Site-Key': key };
     // 인앱(1st-party) 학생 토큰 — 서버가 채점 결과를 학생 학습기록(코인·진도·퀴즈)에 적립
@@ -62,6 +103,10 @@
     var stage = box.getAttribute('data-stage') || '';          // 챕터 단계(1~5)
     var replay = box.getAttribute('data-replay') === '1';      // 복습(코인·퀴즈 상태 미반영)
     var sessionTotal = parseInt(box.getAttribute('data-total') || '0', 10) || 0; // 세션 문항 수
+    // 효과음: 기본 켜짐(외부 임베드). 인앱은 게임 화면이 학생 설정에 따라 직접 재생하므로
+    // data-sfx="0"으로 꺼서 이중 재생을 막는다.
+    var sfxOn = box.getAttribute('data-sfx') !== '0';
+    function sfx(kind) { if (sfxOn) playSfx(kind); }
     if (!key) { box.textContent = 'CatChap: data-site-key 가 필요합니다.'; return; }
 
     // 요청 직전에 항상 유효한 토큰을 얻는다 — 콜백 실패 시 고정 토큰으로 폴백(익명 강등 방지 최선).
@@ -180,6 +225,7 @@
         if (answered) {
           if (sessionDone) {
             // 세션 완료 — 진행은 소비자(게임 화면)가 결정 (결과 화면 이동 등)
+            sfx('finish');
             box.dispatchEvent(new CustomEvent('catchap:finished', { bubbles: true }));
             return;
           }
@@ -200,6 +246,7 @@
     function eduFeedback(res) {
       var fb = h('div');
       var okAns = res.success;
+      sfx(okAns ? 'correct' : 'wrong');
       var msg;
       if (lastType === 'drag_drop') {
         msg = okAns ? '정확히 쏙 넣었어요! 🎯' : '조금 빗나갔어요. 다시 한 번 해볼까요?';
@@ -248,7 +295,7 @@
       next.textContent = sessionDone ? '결과 보기 →' : '다음 문제 →';
       css(next, btnStyle(C, '#fff'));
       next.onclick = sessionDone
-        ? function () { box.dispatchEvent(new CustomEvent('catchap:finished', { bubbles: true })); }
+        ? function () { sfx('finish'); box.dispatchEvent(new CustomEvent('catchap:finished', { bubbles: true })); }
         : load;
       body.appendChild(next);
     }

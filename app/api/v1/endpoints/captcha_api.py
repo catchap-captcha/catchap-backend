@@ -158,7 +158,10 @@ def _optional_student(db: Session, request: Request) -> StudentProfile | None:
     return student
 
 
-def _credit_student(db: Session, student: StudentProfile, meta: dict, correct: bool, answer) -> dict:
+def _credit_student(
+    db: Session, student: StudentProfile, meta: dict, correct: bool, answer,
+    solve_time_ms: int = 0,
+) -> dict:
     """교육형 채점 결과 1건을 학생 학습기록으로 적립 — 실전 모드(game-answer)와 동일 부수효과.
 
     서버 채점 결과만 기록하므로 자기신고 위조가 없다. 오늘 EDU_SESSION_TOTAL번째
@@ -229,6 +232,8 @@ def _credit_student(db: Session, student: StudentProfile, meta: dict, correct: b
         replay=replay,
         daily=not is_chapter,  # 챕터 플레이는 오늘의퀴즈 done/연속도전 미갱신
         behavior=None,  # 행동데이터는 record_behavior(edu-api)로 이미 적재 — 이중 기록 방지
+        # 문항 풀이시간(위젯 실측) — 0이면 학생홈 '학습 시간'·요일별 그래프가 전부 0분이 된다
+        solve_time_ms=solve_time_ms,
     )
     saved = save_attempt(attempt_req, principal, db)
 
@@ -340,7 +345,12 @@ def verify(
         )
         # 인앱(인증 학생) 풀이는 학습기록으로 적립 — 코인·진도·오늘의퀴즈 (실전 모드 대체)
         if student is not None and meta.get("subj"):
-            result["session"] = _credit_student(db, student, meta, bool(result.get("success")), req.answer)
+            # 풀이시간은 자기신고 — 스키마 상한(1시간)과 동일하게 클램프해 통계 오염 방지
+            raw_ms = (req.behavior or {}).get("solve_time_ms")
+            solve_ms = raw_ms if isinstance(raw_ms, int) and 0 <= raw_ms <= 3_600_000 else 0
+            result["session"] = _credit_student(
+                db, student, meta, bool(result.get("success")), req.answer, solve_time_ms=solve_ms
+            )
     cs.log_call(db, api, "captcha/verify", 200 if result["success"] else 400)
     db.commit()
     return result

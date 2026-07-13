@@ -172,21 +172,24 @@ def student_roster_metrics(
     if not ids:
         return {}
     since28 = today - timedelta(days=27)  # 오늘 포함 28일 창
+    week_start = _week_start(today)
 
     solved: dict[str, int] = defaultdict(int)
     dates: dict[str, set[date]] = defaultdict(set)
     acc_n: dict[str, int] = defaultdict(int)
     acc_d: dict[str, int] = defaultdict(int)
+    week_ms: dict[str, int] = defaultdict(int)
     rows = (
         db.query(
             LearningAttempt.student_id,
             LearningAttempt.result,
             func.date(LearningAttempt.created_at),
+            LearningAttempt.solve_time_ms,
         )
         .filter(LearningAttempt.student_id.in_(ids))
         .all()
     )
-    for sid, result, d in rows:
+    for sid, result, d, ms in rows:
         dd = d if isinstance(d, date) else date.fromisoformat(str(d)[:10])
         solved[sid] += 1
         dates[sid].add(dd)
@@ -194,6 +197,8 @@ def student_roster_metrics(
             acc_d[sid] += 1
             if result == "correct":
                 acc_n[sid] += 1
+        if dd >= week_start:
+            week_ms[sid] += ms or 0
 
     done_today = {
         r[0]
@@ -214,6 +219,7 @@ def student_roster_metrics(
             "streak": _streak_days(dates[sid], today),
             "solved": solved[sid],
             "today": "done" if sid in done_today else "none",
+            "week_min": round(week_ms[sid] / 60000),  # 이번 주 학습 시간(분)
         }
     return out
 

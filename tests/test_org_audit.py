@@ -141,6 +141,47 @@ def test_parent_child_link_is_audited(client, db, seed_org):
     assert row.target_id == student.id
 
 
+def test_parent_can_link_more_than_two_children(client, db, seed_org):
+    """자녀 연결 수 상한 제거 회귀 — 3명째 연결도 성공해야 한다(구 2명 409)."""
+    from app.core.security import hash_password
+    from app.models import StudentProfile
+    from app.services import onboarding_service
+
+    org = seed_org["org"]
+    parent = _mk_user(db, None, "many@test.dev", "parent", "다둥이맘")
+    assert parent is not None
+    students = [seed_org["student"]]
+    for i in (2, 3):
+        s = StudentProfile(
+            organization_id=org.id,
+            class_id=seed_org["class"].id,
+            student_login_id=f"stu0{i}x",
+            student_code=f"CAT-222{i}",
+            password_hash=hash_password("1234"),
+            nickname=f"자녀{i}",
+        )
+        db.add(s)
+        db.commit()
+        students.append(s)
+
+    token = _login(client, "parent", "many@test.dev")
+    for s in students:
+        raw = onboarding_service.issue_parent_invite(
+            db, student_id=s.id, organization_id=org.id, created_by=seed_org["teacher"].id
+        )
+        db.commit()
+        res = client.post(
+            "/api/v1/parents/me/children/link-invite",
+            json={"invite_code": raw},
+            headers=auth(token),
+        )
+        assert res.status_code == 200, f"{s.nickname} 연결 실패: {res.text}"
+
+    children = client.get("/api/v1/parents/me/children", headers=auth(token))
+    assert children.status_code == 200
+    assert len(children.json()) >= 3
+
+
 def test_ops_system_health_is_measured_not_stub(client, db, seed_org):
     """/ops/system이 하드코딩 스텁이 아니라 실측을 반환하는지"""
     ops = _mk_user(db, None, "sysops@test.dev", "ops", "운영자")

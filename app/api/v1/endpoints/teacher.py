@@ -434,6 +434,7 @@ def all_students(
                 "code": s.student_code,
                 "acc": m["acc"] if m else 0,
                 "sessions": m["solved"] if m else 0,
+                "week_min": m.get("week_min", 0) if m else 0,  # 이번 주 학습 시간(분)
                 "weak": "",
                 "status": status_label(s.status),
                 # 실플레이 없는 학생 = 데모칸(정답률 0·미활동) — 프론트가 '데모' 라벨

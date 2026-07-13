@@ -149,7 +149,7 @@ def test_parent_only_linked_children(client, db, seed_org):
 
 
 def test_parent_child_limit(client, db, seed_org):
-    """학부모당 자녀 연결은 최대 2명 — 3번째는 409로 거부된다."""
+    """자녀 연결 수 상한 없음(구 2명 상한은 0713 제품 결정으로 제거) — 3명도 전부 연결된다."""
     from datetime import datetime
 
     from app.core.security import hash_password
@@ -194,10 +194,10 @@ def test_parent_child_limit(client, db, seed_org):
         )
 
     assert link(kids[0]).status_code == 200
-    assert link(kids[1]).status_code == 200  # 2명까지 OK
-    third = link(kids[2])
-    assert third.status_code == 409  # 3번째 거부
-    assert "최대 2명" in third.json()["detail"]
+    assert link(kids[1]).status_code == 200
+    assert link(kids[2]).status_code == 200  # 다자녀 — 상한 없이 연결
+    children = client.get("/api/v1/parents/me/children", headers=auth(token))
+    assert children.status_code == 200 and len(children.json()) == 3
 
 
 def test_ops_cannot_access_org_scoped_data(client, db, seed_org):
