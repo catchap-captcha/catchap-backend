@@ -1,7 +1,7 @@
 """메인 캡차(숲속 마을 동물 방향) API — 로그인 게이트 등에서 쓰는 1st-party 캡차.
 
   POST /captcha/forest/challenge     새 문제(정답 미노출)
-  GET  /captcha/forest/{cid}/target  목표 포즈 이미지(불투명 — 방향 index 미노출)
+  GET  /captcha/forest/{cid}/reveal/{object_id}  선택한 오브젝트의 포즈 이미지
   POST /captcha/forest/verify        검증, 성공 시 단일사용 captcha_token
 
 정답(target_object/target_direction)은 서버에서 생성해 서버에만 저장하고 응답에 넣지 않는다
@@ -31,11 +31,20 @@ def _client_ip(request: Request) -> str:
 
 
 # ---------------------------------------------------------------- 스키마 (정답 필드 없음)
+class ObjectPublic(BaseModel):
+    object_id: str
+    animal_id: str
+    animal_name: str
+    image_path: str
+    start_direction: int
+
+
 class ChallengeResponse(BaseModel):
     challenge_id: str
-    animal: str
-    objects: list[str]
-    start_direction: int
+    theme_id: str
+    target_animal: str
+    target_animal_name: str
+    objects: list[ObjectPublic]
     expires_in: int
 
 
@@ -43,6 +52,7 @@ class VerifyRequest(BaseModel):
     challenge_id: str
     selected_object: str
     selected_direction: int = Field(ge=0, le=7)
+    theme_id: str | None = None
     # 선택: 풀이 중 포인터 궤적 — 인앱(학생 토큰) 사용 시에만 봇탐지 학습셋에 적재
     behavior: dict | None = None
 
@@ -65,17 +75,27 @@ def create_challenge(request: Request):
     # 표시용 필드만 반환 — target_object/target_direction은 서버에 남는다.
     return ChallengeResponse(
         challenge_id=rec.challenge_id,
-        animal=rec.animal,
-        objects=fc.OBJECTS,
-        start_direction=rec.start_direction,
+        theme_id=rec.theme_id,
+        target_animal=rec.target_animal,
+        target_animal_name=fc.ANIMAL_NAMES.get(rec.target_animal, rec.target_animal),
+        objects=[
+            ObjectPublic(
+                object_id=obj.object_id,
+                animal_id=obj.animal,
+                animal_name=fc.ANIMAL_NAMES.get(obj.animal, obj.animal),
+                image_path=f"assets/animals/{obj.animal}/dir0.png",
+                start_direction=obj.start_direction,
+            )
+            for obj in rec.objects
+        ],
         expires_in=rec.seconds_left(),
     )
 
 
 # ---------------------------------------------------------------- 2) 목표 포즈 이미지(불투명)
-@router.get("/{challenge_id}/target")
-def target_image(challenge_id: str):
-    """목표 포즈 이미지를 불투명 리소스로 서빙 — URL·페이로드에 방향 index가 없다.
+@router.get("/{challenge_id}/reveal/{object_id}")
+def reveal_image(challenge_id: str, object_id: str):
+    """선택한 오브젝트의 동물 포즈를 서빙하되 방향 index는 노출하지 않는다.
 
     animal/direction은 서버 생성값(사용자 입력 아님)이라 경로조작 불가지만, 화이트리스트·
     경로 이탈 가드를 이중으로 둔다. no-store로 중간 캐시가 정답 이미지를 보관하지 못하게 한다.
@@ -83,9 +103,12 @@ def target_image(challenge_id: str):
     rec = fc.service.get_active_challenge(challenge_id)
     if rec is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="challenge_not_found_or_expired")
-    if rec.animal not in fc.ANIMALS or not (0 <= rec.target_direction < fc.DIRECTIONS):
+    obj = rec.find_object(object_id)
+    if obj is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="object_not_found")
+    if obj.animal not in fc.ANIMALS or not (0 <= obj.heading < fc.DIRECTIONS):
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="asset_not_found")
-    content = _animal_frame(rec.animal, rec.target_direction)
+    content = _animal_frame(obj.animal, obj.heading)
     if content is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="asset_not_found")
     return Response(
@@ -111,7 +134,12 @@ def _animal_frame(animal: str, direction: int) -> bytes | None:
 # ---------------------------------------------------------------- 3) 검증
 @router.post("/verify", response_model=VerifyResponse)
 def verify(req: VerifyRequest, request: Request, db: Session = Depends(get_db)):
-    ok = fc.service.verify(req.challenge_id, req.selected_object, req.selected_direction)
+    ok = fc.service.verify(
+        req.challenge_id,
+        req.selected_object,
+        req.selected_direction,
+        theme_id=req.theme_id,
+    )
 
     # 선택적 행동데이터 적재 — 유효한 학생 토큰이 있을 때만(인앱 사용) 봇탐지 학습셋에 기록.
     # 로그인 게이트(비로그인)에선 귀속할 org/student가 없어 건너뛴다.

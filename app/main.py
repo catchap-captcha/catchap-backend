@@ -20,8 +20,8 @@ _openapi_url = None if settings.is_production else "/openapi.json"
 app = FastAPI(
     title="CatChap API",
     version="0.1.0",
-    description="어린이 교육용 CAPTCHA API 학습 서비스 — 1차: 인증/기관/학습 대시보드. "
-    "메인 CAPTCHA 판별·교육 게임 API는 다음 단계(stub).",
+    description="어린이 교육용 CAPTCHA API 학습 서비스 — 인증/기관/학습 대시보드와 "
+    "숲속 마을 메인 CAPTCHA, 교육형 CAPTCHA API를 제공합니다.",
     docs_url=_docs_url,
     redoc_url=_redoc_url,
     openapi_url=_openapi_url,

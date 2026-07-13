@@ -25,9 +25,27 @@ import uuid
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
-# 프론트 위젯 동물 config와 반드시 동기화(assets/forest/animals/<animal>/dir<0..7>.png).
-ANIMALS: List[str] = ["dog", "rabbit", "chicken", "panda", "capybara"]
+# 프론트 위젯 animal-config.js와 반드시 동기화한다.
+ANIMALS: List[str] = [
+    "dog", "rabbit", "chicken", "panda", "capybara", "cat",
+    "pig", "quokka", "tiger", "sheep", "giraffe",
+]
+ANIMAL_NAMES: Dict[str, str] = {
+    "dog": "강아지",
+    "rabbit": "토끼",
+    "chicken": "닭",
+    "panda": "판다",
+    "capybara": "카피바라",
+    "cat": "고양이",
+    "pig": "돼지",
+    "quokka": "쿼카",
+    "tiger": "호랑이",
+    "sheep": "양",
+    "giraffe": "기린",
+}
+THEME_ID = "forest"
 OBJECTS: List[str] = ["tree", "house", "mushroom"]
+OBJECT_COUNT = len(OBJECTS)
 
 DIRECTIONS = 8  # 8방향 턴테이블(0..7)
 CHALLENGE_TTL_SECONDS = 120
@@ -38,14 +56,23 @@ CHALLENGE_RATE_MAX = 20
 
 
 @dataclass
+class ObjectSpec:
+    object_id: str
+    animal: str
+    start_direction: int
+    # 정답 방향. 공개 challenge 응답에는 절대 포함하지 않는다.
+    heading: int
+
+
+@dataclass
 class ChallengeRecord:
     challenge_id: str
-    animal: str
+    theme_id: str
+    objects: List[ObjectSpec]
     # ---- 정답 — 서버 밖으로 절대 나가면 안 됨 ----
+    target_animal: str
     target_object: str
     target_direction: int
-    # ---- 표시용 ----
-    start_direction: int
     created_at: float
     ttl: int = CHALLENGE_TTL_SECONDS
 
@@ -58,6 +85,9 @@ class ChallengeRecord:
 
     def seconds_left(self, now: Optional[float] = None) -> int:
         return max(0, int(self.expires_at - (now or time.time())))
+
+    def find_object(self, object_id: str) -> Optional[ObjectSpec]:
+        return next((obj for obj in self.objects if obj.object_id == object_id), None)
 
 
 @dataclass
@@ -141,19 +171,35 @@ class ForestCaptchaService:
 
     # ---- 챌린지 생명주기 ----------------------------------------------------
     def create_challenge(self) -> ChallengeRecord:
-        animal = secrets.choice(ANIMALS)
-        target_object = secrets.choice(OBJECTS)
-        target_direction = secrets.randbelow(DIRECTIONS)
-        # 시작 방향을 정답과 다르게 — 최소 1회 회전을 강제
-        start_direction = secrets.randbelow(DIRECTIONS)
-        if start_direction == target_direction:
-            start_direction = (start_direction + 1) % DIRECTIONS
+        """오브젝트 3개에 서로 다른 동물을 숨기고 그중 하나를 목표로 정한다."""
+        pool = ANIMALS.copy()
+        chosen: List[str] = []
+        for _ in range(OBJECT_COUNT):
+            chosen.append(pool.pop(secrets.randbelow(len(pool))))
+
+        objects: List[ObjectSpec] = []
+        for object_id, animal in zip(OBJECTS, chosen):
+            heading = secrets.randbelow(DIRECTIONS)
+            start_direction = secrets.randbelow(DIRECTIONS)
+            if start_direction == heading:
+                start_direction = (start_direction + 1) % DIRECTIONS
+            objects.append(
+                ObjectSpec(
+                    object_id=object_id,
+                    animal=animal,
+                    start_direction=start_direction,
+                    heading=heading,
+                )
+            )
+
+        target = objects[secrets.randbelow(len(objects))]
         rec = ChallengeRecord(
             challenge_id=str(uuid.uuid4()),
-            animal=animal,
-            target_object=target_object,
-            target_direction=target_direction,
-            start_direction=start_direction,
+            theme_id=THEME_ID,
+            objects=objects,
+            target_animal=target.animal,
+            target_object=target.object_id,
+            target_direction=target.heading,
             created_at=time.time(),
         )
         self.store.save_challenge(rec)
@@ -168,19 +214,33 @@ class ForestCaptchaService:
             return None
         return rec
 
-    def verify(self, cid: str, selected_object: str, selected_direction: int) -> bool:
-        """제출 답을 저장된 정답과 비교. 성공·실패 무관 챌린지를 폐기(단일 사용)."""
+    def verify(
+        self,
+        cid: str,
+        selected_object: str,
+        selected_direction: int,
+        theme_id: Optional[str] = None,
+    ) -> bool:
+        """오브젝트에 서버가 배정한 동물과 방향을 검증하고 챌린지를 폐기한다."""
         rec = self.get_active_challenge(cid)
         if rec is None:
+            return False
+        self.store.delete_challenge(cid)  # 성공·실패와 무관하게 단일 사용
+
+        if theme_id is not None and theme_id != rec.theme_id:
+            return False
+        obj = rec.find_object(selected_object)
+        if obj is None:
             return False
         try:
             sel_dir = int(selected_direction)
         except (TypeError, ValueError):
             sel_dir = -1
         correct = (
-            selected_object == rec.target_object and sel_dir == rec.target_direction
+            selected_object == rec.target_object
+            and obj.animal == rec.target_animal
+            and sel_dir == rec.target_direction
         )
-        self.store.delete_challenge(cid)  # 단일 사용: 결과와 무관하게 소진
         return correct
 
     # ---- 캡차 토큰 ----------------------------------------------------------

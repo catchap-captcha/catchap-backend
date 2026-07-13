@@ -21,7 +21,8 @@
 - [x] 테스트 39개: auth(로그인/역할 불일치/refresh 회전/가입/코드 만료·재사용), RBAC(무인증/역할 간/기관 간/자녀 연결), 집계, 학생 데이터, health
 
 ## stub 처리 (다음 단계에서 본격 구현)
-- [ ] 메인 CAPTCHA API — `GET /captcha/challenge` 200 stub (`#captcha-mount` 슬롯용)
+- [x] 로그인 메인 CAPTCHA — `/captcha/forest/*` 문제·오브젝트별 포즈·검증·단일사용 토큰
+- [ ] 구형 `GET /captcha/challenge` — 호환용 200 stub, 신규 연동은 `/captcha/forest/*` 사용
 - [ ] 교육용 게임 로직 — 게임 상태/결과는 seed 기반 API
 - [ ] AI 챗봇 2종 (`/ai/student-chat`, `/ai/parent-chat`) — 디자인 canned 응답 stub
 - [ ] AI 이미지 분류 — catchap-ai-service stub 연동 지점만
