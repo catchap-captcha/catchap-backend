@@ -755,6 +755,16 @@ def _edu_challenge(
             return _edu_trace_challenge(subject, meta)
     # 실문항 뱅크 (생활=ms / 수학·과학=my / 사회=sw / 영어=ms english / 국어=jy — capcha_service 이식)
     pool = subject_banks.playable_pool(subject)
+    # 오늘의 퀴즈(인앱 학습): 아직 잠긴 주차의 문항은 내지 않는다 — 전체학습과 같은 달력
+    # 잠금(unlocked_count)을 존중해 '열린 챕터 범위'에서만 랜덤 출제한다. 잠금 해제 플래그가
+    # 켜지면 unlocked_count가 전 챕터라 전 범위에서 뽑는다(자동 반영). learning=False(외부
+    # 비학습 — 행동데이터 수집용 조작형 출제)는 커리큘럼 진도와 무관하므로 제한하지 않는다.
+    if learning:
+        from app.services import chapters as _ch
+
+        limit = _ch.unlocked_count(subject) * _ch.CHAPTER_SIZE
+        if 0 < limit < len(pool):
+            pool = pool[:limit]
     q = random.choice(pool)
     return _wrap_bank_question(subject, q, meta)
 
