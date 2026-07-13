@@ -251,7 +251,7 @@ def test_parent_summary_kpis_reflect_attempts(client, db, seed_org):
     )
     client.post(
         "/api/v1/parents/me/children/link-invite",
-        json={"invite_code": invite},
+        json={"invite_code": invite, "consent": True},
         headers=auth(token),
     )
 

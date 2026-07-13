@@ -1,6 +1,7 @@
 from app.models.auth_token import EmailVerificationCode, PasswordResetToken, RefreshToken
 from app.models.billing import Invoice, PaymentMethod, Plan, Subscription
 from app.models.class_room import ClassRoom
+from app.models.consent import Consent
 from app.models.content import (
     Badge,
     Chapter,
@@ -60,6 +61,7 @@ __all__ = [
     "ApiUsageLog",
     "AuditLog",
     "Badge",
+    "Consent",
     "BehaviorSummary",
     "BehaviorTrace",
     "CaptchaAsset",

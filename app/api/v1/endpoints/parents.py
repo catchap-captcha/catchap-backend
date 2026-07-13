@@ -23,6 +23,8 @@ from pydantic import BaseModel as _BaseModel
 
 class _LinkInviteReq(_BaseModel):
     invite_code: str
+    # 법정대리인(보호자) 개인정보 처리 동의 — 연동(자녀 PII 접근) 전 명시 동의 필수(#58).
+    consent: bool = False
 from app.services.stats import D  # DB(stat_blobs) 우선, design_data fallback
 from app.utils.helpers import audit, status_label
 
@@ -406,6 +408,12 @@ def link_invite(
     """
     from app.services import auth_service as _as
 
+    # 자녀 개인정보 처리에 대한 보호자(법정대리인) 동의 — 연동(민감 데이터 접근) 전 필수(#58).
+    if not req.consent:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            detail="자녀 개인정보 처리에 대한 보호자 동의가 필요합니다.",
+        )
     ident = f"invite:{principal.id}"
     _as._check_locked(db, ident)
     try:
@@ -415,6 +423,19 @@ def link_invite(
             _as._record_fail(db, ident)
         raise
     _as._reset_fails(db, ident)
+    # 보호자 동의 기록(증빙) — 누가·언제·어떤 약관 버전에 동의했는지 남긴다(#58).
+    from app.models import Consent
+
+    db.add(
+        Consent(
+            student_id=link.student_id,
+            organization_id=link.organization_id,
+            granted_by_user_id=principal.id,
+            consent_type="personal_info",
+            terms_version="v1",
+            granted_at=datetime.now(),
+        )
+    )
     # 학생 화면 연동 알림 팝업용 — 학교 발급 초대코드로 연결됐음을 아이에게 알림
     from app.models import Notification
 

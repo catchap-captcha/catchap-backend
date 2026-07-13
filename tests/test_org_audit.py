@@ -129,7 +129,7 @@ def test_parent_child_link_is_audited(client, db, seed_org):
     token = _login(client, "parent", "p1@test.dev")
     res = client.post(
         "/api/v1/parents/me/children/link-invite",
-        json={"invite_code": raw_code},
+        json={"invite_code": raw_code, "consent": True},
         headers=auth(token),
     )
     assert res.status_code == 200, res.text
@@ -139,6 +139,39 @@ def test_parent_child_link_is_audited(client, db, seed_org):
     assert row.actor_user_id == parent.id  # 행위자 = 학부모 (대상 오귀속 금지)
     assert row.organization_id == org.id
     assert row.target_id == student.id
+
+
+def test_link_requires_consent_and_records_it(client, db, seed_org):
+    """#58: 자녀 연동은 보호자(법정대리인) 동의 필수 — 없으면 400·연동 안 됨, 있으면 Consent 기록."""
+    from app.models import Consent
+    from app.services import onboarding_service
+
+    org = seed_org["org"]
+    student = seed_org["student"]
+    _mk_user(db, None, "pc@test.dev", "parent", "동의부모")
+    raw = onboarding_service.issue_parent_invite(
+        db, student_id=student.id, organization_id=org.id, created_by=seed_org["teacher"].id
+    )
+    db.commit()
+    token = _login(client, "parent", "pc@test.dev")
+
+    # 동의 없이 → 400, 연동·동의 기록 없음 (초대코드는 소비 전이라 살아있음)
+    r0 = client.post(
+        "/api/v1/parents/me/children/link-invite",
+        json={"invite_code": raw}, headers=auth(token),
+    )
+    assert r0.status_code == 400
+    assert db.query(Consent).count() == 0
+
+    # 동의 → 성공 + Consent 기록(주체=보호자, 활성)
+    r1 = client.post(
+        "/api/v1/parents/me/children/link-invite",
+        json={"invite_code": raw, "consent": True}, headers=auth(token),
+    )
+    assert r1.status_code == 200, r1.text
+    c = db.query(Consent).filter(Consent.student_id == student.id).first()
+    assert c is not None
+    assert c.consent_type == "personal_info" and c.withdrawn_at is None
 
 
 def test_parent_can_link_more_than_two_children(client, db, seed_org):
@@ -172,7 +205,7 @@ def test_parent_can_link_more_than_two_children(client, db, seed_org):
         db.commit()
         res = client.post(
             "/api/v1/parents/me/children/link-invite",
-            json={"invite_code": raw},
+            json={"invite_code": raw, "consent": True},
             headers=auth(token),
         )
         assert res.status_code == 200, f"{s.nickname} 연결 실패: {res.text}"

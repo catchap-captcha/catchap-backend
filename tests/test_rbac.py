@@ -116,7 +116,7 @@ def test_parent_only_linked_children(client, db, seed_org):
     )
     link = client.post(
         "/api/v1/parents/me/children/link-invite",
-        json={"invite_code": invite},
+        json={"invite_code": invite, "consent": True},
         headers=auth(token),
     )
     assert link.status_code == 200, link.text
@@ -129,7 +129,7 @@ def test_parent_only_linked_children(client, db, seed_org):
     assert (
         client.post(
             "/api/v1/parents/me/children/link-invite",
-            json={"invite_code": "LINK-ZZZZ-ZZZZ"},
+            json={"invite_code": "LINK-ZZZZ-ZZZZ", "consent": True},
             headers=auth(token),
         ).status_code
         == 404
@@ -141,7 +141,7 @@ def test_parent_only_linked_children(client, db, seed_org):
     assert (
         client.post(
             "/api/v1/parents/me/children/link-invite",
-            json={"invite_code": invite2},
+            json={"invite_code": invite2, "consent": True},
             headers=auth(token),
         ).status_code
         == 409
@@ -189,7 +189,7 @@ def test_parent_child_limit(client, db, seed_org):
         )
         return client.post(
             "/api/v1/parents/me/children/link-invite",
-            json={"invite_code": code},
+            json={"invite_code": code, "consent": True},
             headers=auth(token),
         )
 

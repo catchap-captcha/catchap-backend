@@ -1579,17 +1579,18 @@ def security_stats(
         .filter(StudentProfile.organization_id == org_id, StudentProfile.status != "disabled")
         .count()
     )
-    linked = (
-        db.query(func.count(func.distinct(ParentStudentLink.student_id)))
-        .filter(
-            ParentStudentLink.organization_id == org_id,
-            ParentStudentLink.status == "approved",
-        )
+    # 실제 보호자 동의(Consent, 철회 안 됨) 기준 — 예전엔 연결율 프록시 + 가짜 상수(98.6%)
+    # 폴백이라 감사 시 허위 지표였다(#58). 이제 동의 없으면 정직하게 0.0%로 표시한다.
+    from app.models import Consent
+
+    consented = (
+        db.query(func.count(func.distinct(Consent.student_id)))
+        .filter(Consent.organization_id == org_id, Consent.withdrawn_at.is_(None))
         .scalar()
         or 0
     )
-    consent_rate = f"{min(100, linked / total * 100):.1f}%" if total and linked else None
-    return {"consent_rate": fb(consent_rate, D.ORG_CONSENT_RATE)}
+    consent_rate = f"{min(100, consented / total * 100):.1f}%" if total else None
+    return {"consent_rate": consent_rate, "consented": int(consented), "total": total}
 
 
 # ---------------------------------------------------------------- 학생 등록 · 가입코드 (온보딩)
@@ -1711,6 +1712,33 @@ def _student_in_org(db: Session, org_id: str, student_id: str) -> StudentProfile
     if st is None or st.organization_id != org_id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="학생을 찾을 수 없습니다.")
     return st
+
+
+@router.post("/{org_id}/students/{student_id}/withdraw")
+def withdraw_student(
+    org_id: str,
+    student_id: str,
+    principal: Principal = Depends(require_org_admin),
+    db: Session = Depends(get_db),
+):
+    """학생 탈퇴 — 개인정보 파기(익명화). 실명·나이·성별·로그인ID·별명 등 식별정보를 지우고
+    계정을 비활성화(로그인 차단)한다. 학습 통계는 익명으로 남는다. 되돌릴 수 없으며 감사에 남는다.
+    (PIPA 목적 달성 후 파기 — 사용자 결정 2026-07-13: 익명화 방식.)"""
+    from app.services.privacy_service import anonymize_student
+
+    check_org_scope(principal, org_id)
+    student = _student_in_org(db, org_id, student_id)
+    changed = anonymize_student(db, student)
+    audit(
+        db,
+        action="org.student_withdraw",
+        actor_user_id=principal.id,
+        organization_id=org_id,
+        target_type="student",
+        target_id=student.id,
+    )
+    db.commit()
+    return {"ok": True, "anonymized": changed}
 
 
 def _active_homeroom(db: Session, cls: ClassRoom | None) -> User | None:
