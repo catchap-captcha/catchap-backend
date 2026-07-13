@@ -193,12 +193,43 @@ def login(db: Session, req: s.LoginRequest) -> s.TokenPair:
         raise HTTPException(status.HTTP_403_FORBIDDEN, detail="비활성화된 계정입니다.")
     if user.email_verified_at is None:
         raise HTTPException(status.HTTP_403_FORBIDDEN, detail="이메일 인증이 완료되지 않았습니다.")
+    _assert_role_matches(user, req.role)  # 로그인 탭(역할 구분)과 계정 역할 일치 강제
     _assert_org_approved(db, user)  # 기관 승인 게이트 (ops 승인 전 로그인 차단)
     _reset_fails(db, identifier)
     # last_login_at은 사용자 노출 시각 → created_at과 같은 로컬(KST) 규약. _now()는 토큰용 UTC.
     user.last_login_at = datetime.now()
     db.commit()
     return issue_tokens(db, user.id, user.role, "user")
+
+
+# 로그인 탭(역할 구분) → 허용 계정 역할. 'org' 탭은 기관 그룹 전체(교사 포함 — 가입도 기관 탭).
+_LOGIN_ROLE_GROUPS: dict[str, set[str]] = {
+    "parent": {"parent"},
+    "org": {"org_admin", "grade_head", "teacher"},
+    "org_admin": {"org_admin"},
+    "grade_head": {"grade_head"},
+    "teacher": {"teacher"},
+}
+_ROLE_LABEL = {
+    "parent": "학부모", "teacher": "선생님", "org_admin": "기관 관리자", "grade_head": "학년부장",
+}
+
+
+def _assert_role_matches(user: User, req_role: str | None) -> None:
+    """선택한 로그인 구분과 계정 역할 일치 강제 — 학부모 탭에서 교사 계정이 교사로
+    로그인되던 혼선 차단. 비밀번호는 이미 검증됐으므로(본인) 계정 종류를 알려줘도
+    존재 노출이 아니고, 실패 카운트도 올리지 않는다. req_role 미지정은 하위호환 허용."""
+    if not req_role:
+        return
+    allowed = _LOGIN_ROLE_GROUPS.get(req_role)
+    if allowed is None:
+        return  # 알 수 없는 구분 값은 강제하지 않음 (구 클라이언트 관용)
+    if user.role not in allowed:
+        label = _ROLE_LABEL.get(user.role, user.role)
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            detail=f"이 계정은 {label} 계정이에요. 알맞은 탭에서 다시 로그인해 주세요.",
+        )
 
 
 def _assert_org_approved(db: Session, user: User) -> None:

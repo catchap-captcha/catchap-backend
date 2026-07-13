@@ -62,6 +62,38 @@ def test_ops_reset_password_disabled_account_rejected(client, db):
     assert "중지된 계정" in r.json()["detail"]
 
 
+def test_login_role_tab_enforced(client, db, seed_org):
+    """로그인 탭 역할 강제 — 학부모 탭에서 교사 계정이 교사로 로그인되던 혼선 차단."""
+    from app.models import User
+
+    parent = User(
+        email="roleparent@t.dev", password_hash=hash_password("Password123!"),
+        name="역할학부모", role="parent", email_verified_at=datetime.utcnow(),
+    )
+    db.add(parent)
+    db.commit()
+
+    def try_login(role, email):
+        body = {"email": email, "password": "Password123!"}
+        if role is not None:
+            body["role"] = role
+        return client.post("/api/v1/auth/login", json=body)
+
+    # 학부모 탭 + 교사 계정 → 403 (계정 종류 안내)
+    r = try_login("parent", "t1@test.dev")
+    assert r.status_code == 403, r.text
+    assert "선생님 계정" in r.json()["detail"]
+    # 기관 탭 + 학부모 계정 → 403
+    r2 = try_login("org", "roleparent@t.dev")
+    assert r2.status_code == 403
+    assert "학부모 계정" in r2.json()["detail"]
+    # 올바른 조합은 통과: 기관 탭 그룹(교사 포함)·학부모 탭·정확 역할·미지정(하위호환)
+    assert try_login("org", "t1@test.dev").status_code == 200
+    assert try_login("parent", "roleparent@t.dev").status_code == 200
+    assert try_login("teacher", "t1@test.dev").status_code == 200
+    assert try_login(None, "t1@test.dev").status_code == 200
+
+
 def test_teacher_attention_empty_stays_empty(client, db, seed_org):
     """반이 건강(관심 필요 0명)하면 attention은 빈 목록 — 데모 아동 이름 복귀 금지."""
     from app.models import LearningAttempt

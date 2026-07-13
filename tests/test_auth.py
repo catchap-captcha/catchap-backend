@@ -85,13 +85,18 @@ def test_student_captcha_counter(client, seed_org):
     assert ok.status_code == 200
 
 
-def test_login_ignores_declared_role(client, seed_org):
-    """역할은 계정에서 판별 — 클라이언트가 보낸 role은 무시하고 실제 역할로 로그인."""
+def test_login_role_mismatch_rejected(client, seed_org):
+    """탭 구분과 계정 역할 불일치는 403 — 학부모 탭에서 교사 계정이 교사로 로그인되던
+    구 동작(role 무시)을 0713 제품 결정으로 뒤집음. 역할 위조는 여전히 불가(토큰 역할=계정 역할)."""
     res = login(client, "parent", "t1@test.dev", "Password123!")  # t1은 실제로 teacher
-    assert res.status_code == 200
+    assert res.status_code == 403
+    assert "선생님 계정" in res.json()["detail"]
+    # 올바른 탭(기관 그룹)으로는 실제 역할 그대로 로그인
+    ok = login(client, "org", "t1@test.dev", "Password123!")
+    assert ok.status_code == 200
     me = client.get(
         "/api/v1/auth/me",
-        headers={"Authorization": f"Bearer {res.json()['access_token']}"},
+        headers={"Authorization": f"Bearer {ok.json()['access_token']}"},
     )
     assert me.json()["role"] == "teacher"
 

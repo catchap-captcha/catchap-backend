@@ -200,7 +200,7 @@ def _org_admin(client, db, org):
     db.add(admin)
     db.commit()
     r = client.post("/api/v1/auth/login",
-                    json={"role": "teacher", "email": "admin@t.dev", "password": "Password123!"})
+                    json={"role": "org", "email": "admin@t.dev", "password": "Password123!"})
     return r.json()["access_token"]
 
 
