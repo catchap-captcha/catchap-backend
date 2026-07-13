@@ -88,13 +88,13 @@ def _batchim(word: str) -> bool:
 
 def _live_parent_intro(db: Session, child: StudentProfile) -> str | None:
     """자녀 실집계 기반 인사말 — 정적 산문의 하드코딩 수치(89% 등)가
-    학부모 홈 KPI(28일 실집계)와 어긋나지 않게 한다. 시도 없으면 None."""
+    학부모 홈 KPI(이번 달 실집계)와 어긋나지 않게 한다. 시도 없으면 None."""
     from datetime import date, timedelta
 
     from app.services import aggregate
 
     today = date.today()
-    rows = aggregate.attempts(db, student_ids=[child.id], since=today - timedelta(days=28))
+    rows = aggregate.attempts(db, student_ids=[child.id], since=aggregate._month_start(today))
     if not rows:
         return None
     ws = today - timedelta(days=today.weekday())

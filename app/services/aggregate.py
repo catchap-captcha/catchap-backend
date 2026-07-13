@@ -142,6 +142,31 @@ def _acc_series(rows: Sequence[LearningAttempt], buckets: list[tuple[date, date]
     return filled
 
 
+def _month_start(today: date | None = None) -> date:
+    """정답률 canonical 창의 시작 = 이번 달 1일 (0713: 고정 28일 → 달력 월 전환).
+
+    월별 창이라 30일/31일 달 길이를 그대로 따르고, '이번 달 성적'이라는
+    학부모·교사의 직관과 일치한다. 비교 창은 지난달(1일~말일)."""
+    today = today or date.today()
+    return today.replace(day=1)
+
+
+def _prev_month_start(today: date | None = None) -> date:
+    today = today or date.today()
+    first = today.replace(day=1)
+    return (first - timedelta(days=1)).replace(day=1)
+
+
+def _school_year_start(today: date | None = None) -> date:
+    """학년도(반 배정 기간) 시작 = 3월 1일 — 1~2월은 전년도 3월 1일.
+
+    교사 명단의 장기 학습시간은 반 배정이 유지되는 학년도 안에서만 집계한다
+    (작년 다른 반에서의 시간이 섞이지 않게)."""
+    today = today or date.today()
+    year = today.year if today.month >= 3 else today.year - 1
+    return date(year, 3, 1)
+
+
 def _streak_days(days: set[date], today: date | None = None) -> int:
     today = today or date.today()
     cur = today if today in days else today - timedelta(days=1)
@@ -160,7 +185,8 @@ def student_roster_metrics(
     반환: {student_id: {acc, streak, solved, today}} — **시도가 1건이라도 있는 학생만** 포함한다.
     시도가 없는(데모/미플레이) 학생은 키가 없어, 호출부가 기존 seed(LearningSummary) 값으로
     폴백한다(코드베이스의 fb 철학과 동일). 즉 실제로 푸는 학생은 실데이터, 데모는 그대로.
-    정의: acc=28일 정답률(canonical), streak=오늘 기준 역산 출석 연속, solved=누적 시도,
+    정의: acc=이번 달(1일~오늘) 정답률(canonical — 0713 고정 28일→달력 월),
+    streak=오늘 기준 역산 출석 연속, solved=누적 시도,
     today=오늘 DailyQuizStatus done 여부(권위 완료 정의).
     """
     from collections import defaultdict
@@ -171,7 +197,7 @@ def student_roster_metrics(
     ids = [i for i in student_ids]
     if not ids:
         return {}
-    since28 = today - timedelta(days=27)  # 오늘 포함 28일 창
+    acc_start = _month_start(today)  # 정답률 창 = 이번 달 (달력 월 — 30/31일 그대로)
     week_start = _week_start(today)
 
     solved: dict[str, int] = defaultdict(int)
@@ -184,7 +210,8 @@ def student_roster_metrics(
     half_ms: dict[str, int] = defaultdict(int)
     year_ms: dict[str, int] = defaultdict(int)
     half_start = today - timedelta(days=183)
-    year_start = today - timedelta(days=365)
+    # '1년' 열은 반 배정 기간(학년도) 안에서만 — 작년 다른 반 시간이 섞이지 않게 3/1에서 자른다
+    year_start = max(today - timedelta(days=365), _school_year_start(today))
     rows = (
         db.query(
             LearningAttempt.student_id,
@@ -199,7 +226,7 @@ def student_roster_metrics(
         dd = d if isinstance(d, date) else date.fromisoformat(str(d)[:10])
         solved[sid] += 1
         dates[sid].add(dd)
-        if dd >= since28:
+        if dd >= acc_start:
             acc_d[sid] += 1
             if result == "correct":
                 acc_n[sid] += 1
@@ -345,9 +372,13 @@ def student_records(db: Session, me: StudentProfile) -> dict | None:
         "learned": fb(learned, D.RECORDS_CAL_LEARNED),
     }
 
-    # 과목별 실력 (최근 28일 vs 이전 28일)
-    recent = [r for r in rows if r.created_at and r.created_at.date() >= today - timedelta(days=28)]
-    prior = [r for r in rows if r.created_at and r.created_at.date() < today - timedelta(days=28)]
+    # 과목별 실력 (이번 달 vs 지난달 — 0713 고정 28일 → 달력 월)
+    _ms = _month_start(today)
+    recent = [r for r in rows if r.created_at and r.created_at.date() >= _ms]
+    prior = [
+        r for r in rows
+        if r.created_at and _prev_month_start(today) <= r.created_at.date() < _ms
+    ]
     mastery = []
     for sub in D.SUBJECT_ORDER:
         sub_rows = [r for r in recent if r.subject == sub]
@@ -1108,12 +1139,14 @@ def org_analytics_extras(db: Session, org_id: str, start: date, end: date) -> di
 def parent_week_kpis(db: Session, child: StudentProfile) -> list[dict] | None:
     """이번 주 자녀 KPI 4종 (+ 전주 대비 delta) — 시도 없으면 None.
 
-    '평균 정답률'만은 최근 28일 창 — 자녀 목록(_child_row)·교사 우리반과 같은
+    '평균 정답률'만은 이번 달(달력 월) 창 — 자녀 목록(_child_row)·교사 우리반과 같은
     표준 창을 써서, 같은 아이의 정답률이 화면마다 다르게 보이지 않게 한다.
     """
     today = date.today()
     ws = _week_start(today)
-    rows = attempts(db, student_ids=[child.id], since=today - timedelta(days=56))
+    _ms, _pms = _month_start(today), _prev_month_start(today)
+    # 조회 하한: 지난달 1일과 지지난주 중 더 이른 날 — 월/주 두 비교 창을 모두 덮는다
+    rows = attempts(db, student_ids=[child.id], since=min(_pms, ws - timedelta(weeks=1)))
     cur = [r for r in rows if r.created_at.date() >= ws]
     prev = [r for r in rows if ws - timedelta(weeks=1) <= r.created_at.date() < ws]
     if not cur:
@@ -1123,13 +1156,9 @@ def parent_week_kpis(db: Session, child: StudentProfile) -> list[dict] | None:
         d = c - p
         return f"{'+' if d >= 0 else ''}{d}{unit}"
 
-    acc28 = [r for r in rows if r.created_at.date() >= today - timedelta(days=28)]
-    acc28_prev = [
-        r
-        for r in rows
-        if today - timedelta(days=56) <= r.created_at.date() < today - timedelta(days=28)
-    ]
-    acc_c, acc_p = _acc(acc28) or 0, _acc(acc28_prev)
+    acc_cur_rows = [r for r in rows if r.created_at.date() >= _ms]
+    acc_prev_rows = [r for r in rows if _pms <= r.created_at.date() < _ms]
+    acc_c, acc_p = _acc(acc_cur_rows) or 0, _acc(acc_prev_rows)
     t_c = round(sum(r.solve_time_ms for r in cur) / len(cur) / 1000)
     t_p = round(sum(r.solve_time_ms for r in prev) / len(prev) / 1000) if prev else None
     badges_c = (
@@ -1169,8 +1198,8 @@ _PARENT_REASON_ICON = {
 
 
 def parent_reasons(db: Session, child: StudentProfile) -> list[dict] | None:
-    """자녀 최근 28일 오답의 estimated_reason 분포 → 원인 카드 (없으면 None → D 유지)."""
-    rows = attempts(db, student_ids=[child.id], since=date.today() - timedelta(days=28))
+    """자녀 이번 달 오답의 estimated_reason 분포 → 원인 카드 (없으면 None → D 유지)."""
+    rows = attempts(db, student_ids=[child.id], since=_month_start())
     wrong = [r.estimated_reason for r in rows if r.result != "correct" and r.estimated_reason]
     if not wrong:
         return None
@@ -1187,8 +1216,8 @@ def parent_reasons(db: Session, child: StudentProfile) -> list[dict] | None:
 
 
 def parent_strengths_weaknesses(db: Session, child: StudentProfile) -> dict | None:
-    """과목별 정답률 상/하위 3 — 최근 28일."""
-    rows = attempts(db, student_ids=[child.id], since=date.today() - timedelta(days=28))
+    """과목별 정답률 상/하위 3 — 이번 달(달력 월)."""
+    rows = attempts(db, student_ids=[child.id], since=_month_start())
     by_sub: dict[str, list[LearningAttempt]] = {}
     for r in rows:
         by_sub.setdefault(r.subject, []).append(r)
@@ -1257,8 +1286,8 @@ def parent_report_overrides(
         if class_rows:
             out["trend_class_series"] = [clamp(v) for v in _acc_series(class_rows, six)]
 
-        # 반 내 정답률 순위 → 등급/상위 백분위 (최근 28일)
-        rank_rows = attempts(db, student_ids=[s.id for s in classmates], since=today - timedelta(days=28))
+        # 반 내 정답률 순위 → 등급/상위 백분위 (이번 달 — canonical 창과 통일)
+        rank_rows = attempts(db, student_ids=[s.id for s in classmates], since=_month_start(today))
         by_student: dict[str, list[LearningAttempt]] = {}
         for r in rank_rows:
             by_student.setdefault(r.student_id, []).append(r)

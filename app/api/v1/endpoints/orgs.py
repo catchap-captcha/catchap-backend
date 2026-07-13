@@ -309,7 +309,7 @@ def classes(
         rows = [c for c in rows if _class_grade(c) == scope_grade]
     design = {c["name"]: c for c in D.ORG_CLASSES}
     # 학급별 학생 수·명단(정답률 평균용)을 한 번의 조회로 함께 구성 — 같은 테이블 이중 스캔 방지.
-    # 실 정답률: 반 학생들의 28일 정답률 평균(learning_attempts 실집계). 없으면 디자인 폴백.
+    # 실 정답률: 반 학생들의 이번 달 정답률 평균(learning_attempts 실집계). 없으면 디자인 폴백.
     counts: dict[str, int] = {}
     cls_students: dict[str, list[str]] = {}
     for sid, cid in (
