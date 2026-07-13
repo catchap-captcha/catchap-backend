@@ -609,7 +609,11 @@ def send_family_message(
     principal: Principal = Depends(require_teacher),
     db: Session = Depends(get_db),
 ):
+    from app.models import Notification
+
     cls = _my_class(db, principal)
+    teacher_name = principal.user.name if principal.user else "선생님"
+    body = req.message.strip()
     # 수신 학생을 한 번에 로드해 검증 — 다건 발송 시 학생 수만큼 조회하지 않는다
     students_by_id = {
         s.id: s
@@ -617,6 +621,18 @@ def send_family_message(
         .filter(StudentProfile.id.in_(req.student_ids or [""]))
         .all()
     }
+    # 학생별 연결된 학부모(approved) 일괄 로드 — 학부모에게도 알림 전달
+    parents_by_student: dict[str, list[str]] = {}
+    for link in (
+        db.query(ParentStudentLink)
+        .filter(
+            ParentStudentLink.student_id.in_(req.student_ids or [""]),
+            ParentStudentLink.status == "approved",
+        )
+        .all()
+    ):
+        parents_by_student.setdefault(link.student_id, []).append(link.parent_user_id)
+
     created = []
     for sid in req.student_ids:
         student = students_by_id.get(sid)
@@ -626,11 +642,34 @@ def send_family_message(
             organization_id=cls.organization_id,
             teacher_id=principal.id,
             student_id=sid,
-            message=req.message.strip(),
+            message=body,
             status="sent",
         )
         db.add(msg)
         created.append(msg)
+        # 수신자 알림 생성 — 학생 화면 + 연결된 학부모 화면에 뜨게(배선 단절 해소).
+        db.add(
+            Notification(
+                student_id=sid,
+                organization_id=cls.organization_id,
+                type="family_notice",
+                category="가정통신",
+                title=f"{teacher_name} 선생님의 가정통신",
+                message=body,
+            )
+        )
+        for parent_uid in parents_by_student.get(sid, []):
+            db.add(
+                Notification(
+                    user_id=parent_uid,
+                    organization_id=cls.organization_id,
+                    type="family_notice",
+                    category="가정통신",
+                    title=f"{teacher_name} 선생님의 가정통신",
+                    message=body,
+                    child_id=sid,  # 학부모 알림의 자녀 필터
+                )
+            )
     db.commit()
     return {"ok": True, "sent": len(created), "ids": [m.id for m in created]}
 
