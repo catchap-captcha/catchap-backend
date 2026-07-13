@@ -437,6 +437,9 @@ def student_growth(db: Session, me: StudentProfile) -> dict | None:
     if prev_total_ms > 0:
         pct = round((week_total_ms - prev_total_ms) / prev_total_ms * 100)
         growth["time_delta"] = f"{'+' if pct >= 0 else ''}{pct}%"
+    else:
+        # 지난주 실측이 없으면 비교 불능 — D의 데모 델타(+18%)가 실측인 척 남지 않게 비운다
+        growth["time_delta"] = ""
     growth.update(
         {
             "streak_days": _streak_days(days),

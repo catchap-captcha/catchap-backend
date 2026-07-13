@@ -515,6 +515,12 @@ def reset_operator_password(
     op = db.get(User, op_id)
     if op is None or op.role != "ops":
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="운영자를 찾을 수 없습니다.")
+    if op.status == "disabled":
+        # 중지 계정은 임시비번을 받아도 로그인이 403이라, 메일만 가고 "로그인 안 됨"으로 보인다.
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail="중지된 계정이에요. 먼저 계정을 재개한 뒤 비밀번호를 재설정해 주세요.",
+        )
     temp_password = secrets.token_urlsafe(9)
     op.password_hash = hash_password(temp_password)
     op.must_change_password = True  # 첫 로그인 시 새 비번 강제

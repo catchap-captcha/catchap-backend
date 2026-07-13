@@ -242,11 +242,13 @@ def ops_login(db: Session, req: s.LoginRequest) -> s.TokenPair:
     _check_locked(db, identifier)  # H1: 과도한 실패 시 실제 차단
     _require_captcha_if_needed(db, identifier, req.captcha_token)  # 5회+ 실패 → 메인 캡차 요구
     user = db.query(User).filter(User.email == req.email.strip().lower()).first()
-    if (
-        user is None
-        or user.role != "ops"
-        or not verify_password(req.password, user.password_hash)
-    ):
+    # 임시 비밀번호는 이메일에서 복사해 붙여넣는 흐름이라 앞뒤 공백·개행이 섞이기 쉽다.
+    # 원문 실패 시 strip본을 한 번 더 대조한다(공백 패딩만 허용 — 보안 영향 무시 수준).
+    pw_ok = user is not None and (
+        verify_password(req.password, user.password_hash)
+        or (req.password.strip() != req.password and verify_password(req.password.strip(), user.password_hash))
+    )
+    if user is None or user.role != "ops" or not pw_ok:
         raise _login_failed(db, identifier, "이메일 또는 비밀번호가 올바르지 않습니다.")
     if user.status == "disabled":
         raise HTTPException(status.HTTP_403_FORBIDDEN, detail="비활성화된 계정입니다.")

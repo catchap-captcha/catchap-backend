@@ -139,7 +139,9 @@ def dashboard(principal: Principal = Depends(require_teacher), db: Session = Dep
         "kpis": kpis,
         "bar_data": fb(agg.get("bar_data"), d.get("bar_data")),
         "game_bars": fb(agg.get("game_bars"), d.get("game_bars")),
-        "attention": fb(agg.get("attention"), d.get("attention")),
+        # 실집계가 있으면 빈 목록도 그대로 — 관심 필요 0명(건강한 반)에 fb가 데모 아동
+        # 이름을 실데이터인 척 되살리면 안 된다. 실집계 자체가 없을 때만 디자인값.
+        "attention": agg["attention"] if agg else d.get("attention"),
         # 학급에 실 시도가 없어 그래프·KPI가 전부 디자인(데모)값이면 demo=True
         "demo": not agg,
     }
@@ -514,7 +516,8 @@ def analytics(
         "avg": fb(agg.get("avg"), round(sum(acc) / len(acc))),
         "subjects": fb(agg.get("subjects"), d_subjects),
         "reasons": fb(agg.get("reasons"), D.TEACHER_ANALYTICS_REASONS),
-        "attention": fb(agg.get("attention"), D.TEACHER_ANALYTICS_ATTENTION),
+        # 실집계가 있으면 빈 목록도 그대로(관심 필요 0명) — fb로 데모 아동 이름 복귀 금지
+        "attention": agg["attention"] if agg else D.TEACHER_ANALYTICS_ATTENTION,
         "students": fb(agg.get("students"), D.TEACHER_ANALYTICS_STUDENTS),
         "subjTarget": "80%",
         "ai_summary": D.TEACHER_ANALYTICS_AI,  # AI 분석 요약 (stat_blobs 수정 가능)
