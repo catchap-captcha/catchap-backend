@@ -241,6 +241,35 @@ def child_report(
     }
 
 
+@router.get("/parents/me/children/{child_id}/chapter-stats")
+def child_chapter_stats(
+    child_id: str,
+    principal: Principal = Depends(require_parent),
+    db: Session = Depends(get_db),
+):
+    """자녀의 전체학습(숙련 축) 과목×챕터별 정답률 — 학생 화면과 동일 집계 재사용."""
+    check_parent_child(db, principal.id, child_id)
+    child = db.get(StudentProfile, child_id)
+    if child is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="자녀 정보를 찾을 수 없습니다.")
+    return {"subjects": aggregate.chapter_stats(db, child)}
+
+
+@router.get("/parents/me/children/{child_id}/habit-stats")
+def child_habit_stats(
+    child_id: str,
+    weeks: int = Query(default=4, ge=1, le=12),
+    principal: Principal = Depends(require_parent),
+    db: Session = Depends(get_db),
+):
+    """자녀의 오늘의 퀴즈(습관 축) 일별 완료·정답률 + 연속일."""
+    check_parent_child(db, principal.id, child_id)
+    child = db.get(StudentProfile, child_id)
+    if child is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="자녀 정보를 찾을 수 없습니다.")
+    return aggregate.habit_series(db, child, weeks=weeks)
+
+
 # NOTE: 학생코드(CAT-####) 자동승인 연결(구 link-request)은 제거됨 (B1 완전 해소).
 # 자녀 연결은 학교 발급 초대코드(link-invite)로만 — 아래 link_invite 참고.
 

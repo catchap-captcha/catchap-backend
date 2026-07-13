@@ -1885,6 +1885,28 @@ def chapter_history(
     }
 
 
+@router.get("/students/me/chapter-stats")
+def chapter_stats(
+    principal: Principal = Depends(require_student), db: Session = Depends(get_db)
+):
+    """전체학습(숙련 축) 과목×챕터별 정답률 — 대시보드 그래프용.
+
+    챕터 축(chapter_no≥1)만. 오늘의 퀴즈 정답률은 daily_quiz_accuracy로 분리 노출.
+    실데이터 없어도 챕터 골격은 내려간다(정답률 null=미학습) — 가짜 진행 없음.
+    """
+    return {"subjects": aggregate.chapter_stats(db, _me(principal))}
+
+
+@router.get("/students/me/habit-stats")
+def habit_stats(
+    weeks: int = Query(default=4, ge=1, le=12),
+    principal: Principal = Depends(require_student),
+    db: Session = Depends(get_db),
+):
+    """오늘의 퀴즈(습관 축) 일별 완료·정답률 + 연속일 — 대시보드 습관 추세용."""
+    return aggregate.habit_series(db, _me(principal), weeks=weeks)
+
+
 @router.get("/students/me/game-state")
 def game_state(
     subject: str = Query(default="국어"),

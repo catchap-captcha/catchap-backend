@@ -176,6 +176,53 @@ def test_quiz_status_unified_on_attempts(client, db, seed_org):
     assert next_undone != "국어"
 
 
+def test_chapter_stats_two_axis(client, db, seed_org):
+    """전체학습 챕터별 정답률 집계 — 은행모드(chapter_no=0) 제외, 오늘의 퀴즈(NULL) 분리 노출."""
+    token = _student_token(client, seed_org)
+
+    def _att(**kw):
+        r = client.post("/api/v1/learning/attempts", json={"subject": "수학", "score": 0, **kw},
+                        headers=auth(token))
+        assert r.status_code == 200
+
+    # 수학 1챕터: 5시도 중 4정답(80%) / 2챕터: 2시도 중 1정답(50%, 표본부족)
+    for res in ["correct", "correct", "correct", "correct", "incorrect"]:
+        _att(result=res, chapter_no=1)
+    for res in ["correct", "incorrect"]:
+        _att(result=res, chapter_no=2)
+    # 오늘의 퀴즈(습관, chapter_no 없음): 5시도 전부 정답(100%) — 분리 노출용
+    for _ in range(5):
+        _att(result="correct", daily=True)
+    # 은행모드(chapter_no=0): 5시도 전부 오답 — 종합 정답률에 절대 섞이면 안 됨
+    for _ in range(5):
+        _att(result="incorrect", chapter_no=0)
+
+    res = client.get("/api/v1/students/me/chapter-stats", headers=auth(token)).json()
+    mat = next(s for s in res["subjects"] if s["subject"] == "수학")
+    by_no = {c["no"]: c for c in mat["chapters"]}
+    assert by_no[1]["accuracy"] == 80 and by_no[1]["total"] == 5 and by_no[1]["low_sample"] is False
+    assert by_no[2]["accuracy"] == 50 and by_no[2]["total"] == 2 and by_no[2]["low_sample"] is True
+    # 종합 = 챕터(≥1)만 = 5/7 ≈ 71. 은행 0/5가 섞였다면 5/12=42 → 71이어야 제외 증명.
+    assert mat["overall_accuracy"] == round(5 / 7 * 100)
+    # 오늘의 퀴즈 정답률은 분리 필드로 100, 종합엔 미포함
+    assert mat["daily_quiz_accuracy"] == 100
+    # 미학습 챕터는 accuracy=null (0%로 표시하지 않음)
+    assert any(c["accuracy"] is None and c["total"] == 0 for c in mat["chapters"])
+
+
+def test_habit_stats_streak(client, db, seed_org):
+    """오늘의 퀴즈 습관 축 일별 집계 — 오늘 시도가 있으면 연속일 ≥1, 그날 done/accuracy 반영."""
+    token = _student_token(client, seed_org)
+    for _ in range(5):
+        client.post("/api/v1/learning/attempts",
+                    json={"subject": "국어", "result": "correct", "score": 0, "daily": True},
+                    headers=auth(token))
+    res = client.get("/api/v1/students/me/habit-stats?weeks=1", headers=auth(token)).json()
+    assert res["streak"] >= 1
+    last = res["days"][-1]  # 오늘
+    assert last["attempts"] >= 5 and last["done"] >= 1 and last["accuracy"] == 100
+
+
 def test_grade_ranking_daily_completion(client, db, seed_org):
     """랭킹: 학년별 풀 + 일일 완료 점수(정답률·속도 + 6과목 완주 보너스 30 + 연속) + 상위3 보너스 코인."""
     from app.core.security import hash_password
