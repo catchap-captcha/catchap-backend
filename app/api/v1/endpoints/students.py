@@ -195,7 +195,14 @@ def _grade_scores(db: Session, student_ids: list[str]) -> dict[str, int]:
             LearningAttempt.result,
             LearningAttempt.solve_time_ms,
         )
-        .filter(LearningAttempt.student_id.in_(student_ids))
+        .filter(
+            LearningAttempt.student_id.in_(student_ids),
+            # 랭킹 정답률·속도는 서버 채점(graded)·오늘의퀴즈(chapter_no NULL) 시도만 센다.
+            # 무채점 자기신고(/learning/attempts)로 이미 완료한 과목의 정답률·속도를 부풀리는
+            # 것을 차단한다(적대적검토 후속 #4b). 챕터/은행 플레이도 습관 랭킹에서 제외.
+            LearningAttempt.graded.is_(True),
+            LearningAttempt.chapter_no.is_(None),
+        )
         .all()
     )
     stat: dict[tuple[str, date, str], list[int]] = {}
@@ -1212,7 +1219,11 @@ def _apply_attempt(
                 func.sum(case((LearningAttempt.result == "correct", 1), else_=0)), 0
             ),
         )
-        .filter(LearningAttempt.student_id == me.id, LearningAttempt.subject == req.subject)
+        .filter(
+            LearningAttempt.student_id == me.id,
+            LearningAttempt.subject == req.subject,
+            LearningAttempt.graded.is_(True),  # 자기신고로 정답률 부풀리기 차단(서버 채점만)
+        )
         .one()
     )
     prev_total = int(prev_total or 0)

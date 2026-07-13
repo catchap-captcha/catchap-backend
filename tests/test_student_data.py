@@ -237,6 +237,33 @@ def test_self_report_attempts_grant_no_score(client, db, seed_org):
     assert dash["today"]["done"] == 0
 
 
+def test_self_report_does_not_inflate_ranking(client, db, seed_org):
+    """적대적검토 후속(#4b): 이미 완료한 과목이라도 무채점 자기신고로 랭킹 점수(정답률·속도)를
+    부풀릴 수 없다. _grade_scores는 graded(서버채점)·오늘의퀴즈(chapter_no NULL)만 집계한다."""
+    from app.api.v1.endpoints.students import _grade_scores
+
+    token = _student_token(client, seed_org)
+    sid = seed_org["student"].id
+    # 국어를 서버 채점으로 완료하되 60% 정답(3/5, 5번째 정답 → done)
+    q = _single_q("국어")
+    for c in [False, False, True, True, True]:
+        _game_answer(client, token, "국어", correct=c, q=q)
+    db.expire_all()
+    score1 = _grade_scores(db, [sid]).get(sid, 0)
+    assert score1 > 0  # 완료로 랭킹 점수 생성
+
+    # 자기신고 국어 정답 대량(solve_time_ms:1)으로 정답률·속도 부풀리기 시도
+    for _ in range(20):
+        client.post(
+            "/api/v1/learning/attempts",
+            json={"subject": "국어", "result": "correct", "solve_time_ms": 1, "daily": True},
+            headers=auth(token),
+        )
+    db.expire_all()
+    score2 = _grade_scores(db, [sid]).get(sid, 0)
+    assert score2 == score1  # 자기신고로 랭킹 점수 불변
+
+
 def test_chapter_stats_two_axis(client, db, seed_org):
     """전체학습 챕터별 정답률 집계 — 은행모드(chapter_no=0) 제외, 오늘의 퀴즈(NULL) 분리 노출."""
     token = _student_token(client, seed_org)
