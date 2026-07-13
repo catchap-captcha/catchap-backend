@@ -201,11 +201,11 @@
         display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
         gap: '12px', textAlign: 'center', padding: '20px', zIndex: '30',
         background: 'rgba(255,250,244,0.97)', borderRadius: '16px' });
-      var t = h('div'); t.textContent = '🐾 아직 풀고 있니?';
+      var t = h('div'); t.textContent = '🐱 냥? 잠깐 쉬고 있었어?';
       css(t, { fontWeight: '800', fontSize: '18px', color: '#3A3226' });
-      var s = h('div'); s.textContent = '잠깐 쉬었나 봐요. 준비되면 눌러서 이어가요!';
+      var s = h('div'); s.textContent = '괜찮아! 다시 할 준비되면 아래 버튼을 콕 눌러줘 🐾';
       css(s, { fontSize: '13px', color: '#8A8070' });
-      var b = h('button'); b.textContent = '계속 풀기'; css(b, btnStyle(C, '#fff'));
+      var b = h('button'); b.textContent = '좋아, 계속할래! ✏️'; css(b, btnStyle(C, '#fff'));
       b.onclick = hideIdleGate;
       idleGate.appendChild(t); idleGate.appendChild(s); idleGate.appendChild(b);
       if (getComputedStyle(box).position === 'static') box.style.position = 'relative';
@@ -273,7 +273,7 @@
       redoBtn.onclick = function () { if (!answered && !grading && pendingRedo) { pendingRedo(); redoCount += 1; } };
       // '잘 모르겠어요' — 찍기 강요 대신 정직하게 오답 처리(운 좋은 정답 방지). 서버가 오답으로
       // 채점하고 정답·해설을 내려주면 eduFeedback이 공부 자료로 보여준다.
-      dkBtn = h('button'); dkBtn.textContent = '잘 모르겠어요';
+      dkBtn = h('button'); dkBtn.textContent = '아직 잘 모르겠어요 🤔';
       css(dkBtn, { border: '2px solid #F0E4D8', borderRadius: '12px', padding: '11px 18px',
         fontWeight: '800', fontSize: '13px', background: '#fff', color: '#B0A79B', fontFamily: 'inherit',
         marginRight: 'auto' });
@@ -352,7 +352,7 @@
         var exp = h('div');
         css(exp, { marginTop: '10px', padding: '12px 14px', borderRadius: '12px', fontSize: '13px',
           lineHeight: '1.6', background: '#FFF8EE', border: '1px solid #F3E4CC', color: '#6B5E48' });
-        exp.textContent = '📘 ' + res.explain;
+        exp.textContent = '🐾 이렇게 풀어요! ' + res.explain;
         body.appendChild(exp);
       }
       if (dkBtn) setBtnOn(dkBtn, false); // 답한 뒤엔 '잘 모르겠어요' 비활성
