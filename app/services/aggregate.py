@@ -142,6 +142,10 @@ def _acc_series(rows: Sequence[LearningAttempt], buckets: list[tuple[date, date]
     return filled
 
 
+# 정답률 최소 표본 — 이번 달 시도가 이보다 적으면 지난달→누적으로 폴백(월초 출렁임 방지)
+MIN_ACC_SAMPLE = 5
+
+
 def _month_start(today: date | None = None) -> date:
     """정답률 canonical 창의 시작 = 이번 달 1일 (0713: 고정 28일 → 달력 월 전환).
 
@@ -185,33 +189,48 @@ def student_roster_metrics(
     반환: {student_id: {acc, streak, solved, today}} — **시도가 1건이라도 있는 학생만** 포함한다.
     시도가 없는(데모/미플레이) 학생은 키가 없어, 호출부가 기존 seed(LearningSummary) 값으로
     폴백한다(코드베이스의 fb 철학과 동일). 즉 실제로 푸는 학생은 실데이터, 데모는 그대로.
-    정의: acc=이번 달(1일~오늘) 정답률(canonical — 0713 고정 28일→달력 월),
+    정의: acc=이번 달(1일~오늘) 정답률(canonical — 0713 고정 28일→달력 월).
+    월초 표본 부족(시도 < MIN_ACC_SAMPLE) 시 지난달 → 누적 순으로 폴백해
+    1문제로 0%↔100% 출렁이는 걸 막는다(실무 최소 표본 규칙).
     streak=오늘 기준 역산 출석 연속, solved=누적 시도,
     today=오늘 DailyQuizStatus done 여부(권위 완료 정의).
+    장기 학습시간(year_min)은 현재 반 배정 시작일(class_assignments)에서 절단 —
+    이력이 없으면 학년도(3/1) 근사.
     """
     from collections import defaultdict
 
-    from app.models import DailyQuizStatus
+    from app.models import ClassAssignment, DailyQuizStatus
 
     today = today or date.today()
     ids = [i for i in student_ids]
     if not ids:
         return {}
     acc_start = _month_start(today)  # 정답률 창 = 이번 달 (달력 월 — 30/31일 그대로)
+    prev_start = _prev_month_start(today)
     week_start = _week_start(today)
 
     solved: dict[str, int] = defaultdict(int)
+    all_n: dict[str, int] = defaultdict(int)
     dates: dict[str, set[date]] = defaultdict(set)
     acc_n: dict[str, int] = defaultdict(int)
     acc_d: dict[str, int] = defaultdict(int)
-    # 기간별 학습시간(ms): 오늘 / 이번 주 / 최근 6개월(반기) / 최근 1년
+    pm_n: dict[str, int] = defaultdict(int)  # 지난달 (표본 부족 폴백)
+    pm_d: dict[str, int] = defaultdict(int)
+    # 기간별 학습시간(ms): 오늘 / 이번 주 / 최근 6개월(반기) / 배정 기간(학년도 상한 1년)
     today_ms: dict[str, int] = defaultdict(int)
     week_ms: dict[str, int] = defaultdict(int)
     half_ms: dict[str, int] = defaultdict(int)
     year_ms: dict[str, int] = defaultdict(int)
     half_start = today - timedelta(days=183)
-    # '1년' 열은 반 배정 기간(학년도) 안에서만 — 작년 다른 반 시간이 섞이지 않게 3/1에서 자른다
-    year_start = max(today - timedelta(days=365), _school_year_start(today))
+    # 장기 열의 시작 = 현재 반 배정일(이력) — 없으면 학년도(3/1) 근사, 상한은 최근 1년
+    fallback_year_start = max(today - timedelta(days=365), _school_year_start(today))
+    assigned_since: dict[str, date] = {
+        sid: max(st.date(), today - timedelta(days=365))
+        for sid, st in db.query(ClassAssignment.student_id, ClassAssignment.started_on)
+        .filter(ClassAssignment.student_id.in_(ids), ClassAssignment.ended_on.is_(None))
+        .all()
+        if st is not None
+    }
     rows = (
         db.query(
             LearningAttempt.student_id,
@@ -225,11 +244,17 @@ def student_roster_metrics(
     for sid, result, d, ms in rows:
         dd = d if isinstance(d, date) else date.fromisoformat(str(d)[:10])
         solved[sid] += 1
+        if result == "correct":
+            all_n[sid] += 1
         dates[sid].add(dd)
         if dd >= acc_start:
             acc_d[sid] += 1
             if result == "correct":
                 acc_n[sid] += 1
+        elif prev_start <= dd < acc_start:
+            pm_d[sid] += 1
+            if result == "correct":
+                pm_n[sid] += 1
         t = ms or 0
         if dd == today:
             today_ms[sid] += t
@@ -237,7 +262,7 @@ def student_roster_metrics(
             week_ms[sid] += t
         if dd >= half_start:
             half_ms[sid] += t
-        if dd >= year_start:
+        if dd >= assigned_since.get(sid, fallback_year_start):
             year_ms[sid] += t
 
     done_today = {
@@ -252,10 +277,20 @@ def student_roster_metrics(
         .all()
     }
 
+    def _acc_with_fallback(sid: str) -> int:
+        """이번 달(표본 ≥ MIN_ACC_SAMPLE) → 지난달 → 누적 순 — 월초 출렁임 방지."""
+        if acc_d[sid] >= MIN_ACC_SAMPLE:
+            return round(acc_n[sid] / acc_d[sid] * 100)
+        if pm_d[sid] >= MIN_ACC_SAMPLE:
+            return round(pm_n[sid] / pm_d[sid] * 100)
+        if solved[sid]:
+            return round(all_n[sid] / solved[sid] * 100)
+        return 0
+
     out: dict[str, dict] = {}
     for sid in solved:  # 시도가 있는 학생만 (없으면 호출부가 seed 폴백)
         out[sid] = {
-            "acc": round(acc_n[sid] / acc_d[sid] * 100) if acc_d[sid] else 0,
+            "acc": _acc_with_fallback(sid),
             "streak": _streak_days(dates[sid], today),
             "solved": solved[sid],
             "today": "done" if sid in done_today else "none",
@@ -1158,7 +1193,19 @@ def parent_week_kpis(db: Session, child: StudentProfile) -> list[dict] | None:
 
     acc_cur_rows = [r for r in rows if r.created_at.date() >= _ms]
     acc_prev_rows = [r for r in rows if _pms <= r.created_at.date() < _ms]
-    acc_c, acc_p = _acc(acc_cur_rows) or 0, _acc(acc_prev_rows)
+    # 최소 표본 규칙(로스터와 동일): 이번 달 표본 부족 시 지난달 → 두 달 합산 순 폴백.
+    # 델타(지난달 대비)는 두 창 모두 표본이 충분할 때만 — 1문제짜리 비교는 소음이다.
+    if len(acc_cur_rows) >= MIN_ACC_SAMPLE:
+        acc_c = _acc(acc_cur_rows) or 0
+    elif len(acc_prev_rows) >= MIN_ACC_SAMPLE:
+        acc_c = _acc(acc_prev_rows) or 0
+    else:
+        acc_c = _acc(acc_cur_rows + acc_prev_rows) or 0
+    acc_p = (
+        _acc(acc_prev_rows)
+        if len(acc_cur_rows) >= MIN_ACC_SAMPLE and len(acc_prev_rows) >= MIN_ACC_SAMPLE
+        else None
+    )
     t_c = round(sum(r.solve_time_ms for r in cur) / len(cur) / 1000)
     t_p = round(sum(r.solve_time_ms for r in prev) / len(prev) / 1000) if prev else None
     badges_c = (

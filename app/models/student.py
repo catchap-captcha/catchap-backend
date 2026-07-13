@@ -60,3 +60,22 @@ class ParentStudentLink(Base, UUIDPk, Timestamps):
     approved_by: Mapped[str | None] = mapped_column(CHAR(36), nullable=True)
     daily_goal: Mapped[int] = mapped_column(default=5)
     time_limit_enabled: Mapped[bool] = mapped_column(default=False)
+
+
+class ClassAssignment(Base, UUIDPk, Timestamps):
+    """반 배정 이력 — 학생이 어느 반에 언제부터 언제까지 소속됐는지(SIS 표준 enrollment 기록).
+
+    StudentProfile.class_id는 '현재' 배정만 갖고 이력이 없어, 전학·반 이동 시
+    "우리 반에 있던 기간의 학습 기록"을 자를 수 없었다. 배정 변경 지점마다
+    record_class_assignment()가 열린 행을 닫고 새 행을 연다. ended_on IS NULL = 현재 배정.
+    날짜는 KST 로컬(date.today()) 규약."""
+
+    __tablename__ = "class_assignments"
+
+    organization_id: Mapped[str] = mapped_column(CHAR(36), index=True)
+    student_id: Mapped[str] = mapped_column(
+        CHAR(36), ForeignKey("student_profiles.id"), index=True
+    )
+    class_id: Mapped[str] = mapped_column(CHAR(36), ForeignKey("classes.id"), index=True)
+    started_on: Mapped[datetime] = mapped_column(DateTime)  # 배정 시작(자정 KST)
+    ended_on: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)  # NULL=현재

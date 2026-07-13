@@ -15,12 +15,40 @@ from sqlalchemy.orm import Session
 
 from app.core.security import hash_password, sha256_hash
 from app.models import (
+    ClassAssignment,
     Organization,
     ParentInviteCode,
     ParentStudentLink,
     StudentJoinCode,
     StudentProfile,
 )
+
+
+def record_class_assignment(db: Session, student: StudentProfile, new_class_id: str | None) -> None:
+    """반 배정 이력 기록(SIS enrollment) — 배정이 바뀌는 모든 지점에서 호출한다.
+
+    열린 행(ended_on IS NULL)을 오늘로 닫고, 새 반이 있으면 새 행을 연다.
+    같은 반 재배정은 무시(이력 오염 방지). 시각은 KST 로컬(datetime.now()) 규약.
+    교사 명단의 '학년도(배정 기간)' 학습시간 절단이 이 이력을 쓴다."""
+    open_row = (
+        db.query(ClassAssignment)
+        .filter(ClassAssignment.student_id == student.id, ClassAssignment.ended_on.is_(None))
+        .first()
+    )
+    if open_row is not None and open_row.class_id == new_class_id:
+        return  # 변화 없음
+    now = datetime.now()
+    if open_row is not None:
+        open_row.ended_on = now
+    if new_class_id:
+        db.add(
+            ClassAssignment(
+                organization_id=student.organization_id,
+                student_id=student.id,
+                class_id=new_class_id,
+                started_on=now,
+            )
+        )
 
 # 혼동 문자(0/O, 1/I/L) 제외한 고엔트로피 알파벳
 _ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
@@ -194,6 +222,8 @@ def activate_student(
     )
     db.add(profile)
     db.flush()
+    if profile.class_id:
+        record_class_assignment(db, profile, profile.class_id)  # 배정 이력 시작(학년도 절단용)
     row.used_at = _now()
     row.student_id = profile.id
     row.login_id = student_login_id  # 기록 일관성 — 학생이 고른 아이디로 갱신(교사 화면 반영)

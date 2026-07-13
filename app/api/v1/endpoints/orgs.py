@@ -1875,6 +1875,7 @@ def assign_student_class(
         db.flush()
     before = {"class_id": st.class_id}
     st.class_id = cls.id
+    onboarding_service.record_class_assignment(db, st, cls.id)  # 배정 이력(학년도 절단용)
     audit(
         db,
         action="student.assign_class",

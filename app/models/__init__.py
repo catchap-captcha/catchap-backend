@@ -50,7 +50,7 @@ from app.models.site import (
 )
 from app.models.stat import StatBlob
 from app.models.throttle import LoginThrottle
-from app.models.student import ParentStudentLink, StudentProfile
+from app.models.student import ClassAssignment, ParentStudentLink, StudentProfile
 from app.models.user import User
 
 __all__ = [
@@ -89,6 +89,7 @@ __all__ = [
     "Organization",
     "OrgRegistrationRequest",
     "ParentInviteCode",
+    "ClassAssignment",
     "ParentStudentLink",
     "StudentJoinCode",
     "PasswordResetToken",

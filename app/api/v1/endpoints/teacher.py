@@ -26,7 +26,7 @@ from app.schemas.teacher import (
     FamilyMessageCreate,
     TeacherProfileUpdate,
 )
-from app.services import aggregate, auth_service
+from app.services import aggregate, auth_service, onboarding_service
 from app.services.aggregate import fb
 from app.services.stats import D  # DB(stat_blobs) 우선, design_data fallback
 from app.utils.helpers import audit, status_key, status_label, student_display_name, summary_acc, utc_to_local
@@ -278,6 +278,7 @@ def add_student_by_code(
         )
     before = {"class_id": student.class_id}
     student.class_id = cls.id
+    onboarding_service.record_class_assignment(db, student, cls.id)  # 배정 이력(학년도 절단용)
     audit(
         db,
         action="teacher.class_student_add",
@@ -367,6 +368,7 @@ def remove_class_student(
 ):
     cls, student = _get_class_student(db, principal, student_id)
     student.class_id = None
+    onboarding_service.record_class_assignment(db, student, None)  # 배정 이력 닫기
     audit(
         db,
         action="teacher.class_student_remove",
