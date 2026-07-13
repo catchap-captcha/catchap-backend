@@ -270,6 +270,66 @@ def test_parent_summary_kpis_reflect_attempts(client, db, seed_org):
     assert len(report["trend"]["series"]) == 6
 
 
+def test_parent_accuracy_ignores_self_report_forgery(client, db, seed_org):
+    """적대적검토 #4b 후속: 학생이 /learning/attempts 자기신고(graded=False)를 대량 전송해도
+    학부모에게 노출되는 정답률·활동 횟수는 서버 채점(graded)만 반영한다(위조 차단).
+    자기신고는 학생 본인 뷰(기록/홈)에만 남고 학부모·기관 집계엔 새지 않아야 한다."""
+    from datetime import datetime as dt
+
+    from app.core.security import hash_password
+    from app.models import User
+    from app.services import aggregate, onboarding_service
+
+    org_id, sid = seed_org["org"].id, seed_org["student"].id
+    # 서버 채점 기준: 이번 주 국어 1정답 + 1오답 = 정답률 50%, 2회
+    _add_attempts(db, org_id, sid, [("국어", "correct", 0), ("국어", "incorrect", 0)])
+
+    # 학생이 자기신고 정답 10건(graded=False)으로 정답률·횟수 부풀리기 시도
+    stoken = _student_token(client, seed_org)
+    for _ in range(10):
+        assert (
+            client.post(
+                "/api/v1/learning/attempts",
+                json={"subject": "국어", "result": "correct", "solve_time_ms": 1},
+                headers=auth(stoken),
+            ).status_code
+            == 200
+        )
+
+    # 집계 헬퍼: 기본(graded)은 2건, graded_only=False는 12건 — 자기신고 10건이 graded에서 제외됨
+    assert len(aggregate.attempts(db, student_ids=[sid])) == 2
+    assert len(aggregate.attempts(db, student_ids=[sid], graded_only=False)) == 12
+
+    # 학부모 연결 후 자녀 목록의 정답률·횟수가 부풀려지지 않았는지(엔드투엔드)
+    parent = User(
+        email="pforge@test.dev",
+        password_hash=hash_password("Password123!"),
+        name="위조검증학부모",
+        role="parent",
+        email_verified_at=dt.utcnow(),
+    )
+    db.add(parent)
+    db.commit()
+    ptoken = client.post(
+        "/api/v1/auth/login",
+        json={"role": "parent", "email": "pforge@test.dev", "password": "Password123!"},
+    ).json()["access_token"]
+    invite = onboarding_service.issue_parent_invite(db, student_id=sid, organization_id=org_id)
+    client.post(
+        "/api/v1/parents/me/children/link-invite",
+        json={"invite_code": invite, "consent": True},
+        headers=auth(ptoken),
+    )
+
+    kid = next(
+        k
+        for k in client.get("/api/v1/parents/me/children", headers=auth(ptoken)).json()
+        if k["id"] == sid
+    )
+    assert kid["accuracy"] == "50%", f"자기신고가 학부모 정답률을 부풀림: {kid['accuracy']}"
+    assert kid["week_count"] == "2회", f"자기신고가 학부모 활동횟수를 부풀림: {kid['week_count']}"
+
+
 # ---------------------------------------------------------------- 기관
 def test_org_dashboard_and_billing_reflect_usage_logs(client, db, seed_org):
     from datetime import datetime as dt

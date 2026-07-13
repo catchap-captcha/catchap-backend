@@ -94,7 +94,7 @@ def _live_parent_intro(db: Session, child: StudentProfile) -> str | None:
     from app.services import aggregate
 
     today = date.today()
-    rows = aggregate.attempts(db, student_ids=[child.id], since=aggregate._month_start(today))
+    rows = aggregate.attempts(db, student_ids=[child.id], since=aggregate._month_start(today), graded_only=True)
     if not rows:
         return None
     ws = today - timedelta(days=today.weekday())

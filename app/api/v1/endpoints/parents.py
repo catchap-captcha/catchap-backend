@@ -57,7 +57,8 @@ def _child_row(db: Session, link: ParentStudentLink) -> dict | None:
     from datetime import date, timedelta
 
     today = date.today()
-    recent = aggregate.attempts(db, student_ids=[s.id], since=today - timedelta(days=28))
+    # 학부모에게 보이는 정답률·활동은 서버 채점(graded)만 — 학생 자기신고 위조 차단(#4b).
+    recent = aggregate.attempts(db, student_ids=[s.id], since=today - timedelta(days=28), graded_only=True)
     week_rows = [
         r
         for r in recent

@@ -1538,7 +1538,7 @@ def sidebar(
 
     today = date.today()
     ws = today - timedelta(days=today.weekday())
-    rows = aggregate.attempts(db, org_id=org_id, since=ws - timedelta(weeks=1))
+    rows = aggregate.attempts(db, org_id=org_id, since=ws - timedelta(weeks=1), graded_only=True)
     cur = [r for r in rows if r.created_at and r.created_at.date() >= ws]
     prev = [r for r in rows if r.created_at and r.created_at.date() < ws]
     best: tuple | None = None

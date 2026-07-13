@@ -98,8 +98,14 @@ def attempts(
     since: date | None = None,
     until: date | None = None,
     subject: str | None = None,
+    graded_only: bool = True,
 ) -> list[LearningAttempt]:
+    # 안전 기본값 = graded만. 자기신고(/learning/attempts, graded=False)는 서버 채점을 거치지
+    # 않아 위조 가능하므로, 학부모·교사·기관에 노출되는 정답률/집계는 서버 채점만 센다(#4b).
+    # 학생 본인 활동 뷰(기록·홈 growth·결과 화면)만 graded_only=False로 자기신고를 포함한다.
     q = db.query(LearningAttempt)
+    if graded_only:
+        q = q.filter(LearningAttempt.graded.is_(True))
     if student_ids is not None:
         if not student_ids:
             return []
@@ -246,6 +252,8 @@ def student_roster_metrics(
             LearningAttempt.solve_time_ms,
         )
         .filter(LearningAttempt.student_id.in_(ids))
+        # 자기신고(graded=False) 위조 차단 — 명단 정답률/속도는 서버 채점만 센다(#4b 정합).
+        .filter(LearningAttempt.graded.is_(True))
         .all()
     )
     for sid, result, d, ms in rows:
@@ -359,7 +367,8 @@ def _reasons_dist(rows: Sequence[LearningAttempt]) -> list[dict]:
 def student_records(db: Session, me: StudentProfile) -> dict | None:
     """weeks/calendar/mastery/accuracy_series/activities/stats — learning_attempts 실집계."""
     today = date.today()
-    all_rows = attempts(db, student_ids=[me.id])
+    # 학생 본인 활동 기록 — 자기신고(연습) 포함. 외부(학부모·교사)에는 노출되지 않는 자기 뷰.
+    all_rows = attempts(db, student_ids=[me.id], graded_only=False)
     rows = [
         r
         for r in all_rows
@@ -497,7 +506,8 @@ def student_records(db: Session, me: StudentProfile) -> dict | None:
 def student_growth(db: Session, me: StudentProfile) -> dict | None:
     today = date.today()
     ws = _week_start(today)
-    rows = attempts(db, student_ids=[me.id], since=today - timedelta(days=60))
+    # 학생 본인 홈 growth(주간 푼 문제 수 등) — 자기신고 포함(본인 활동 뷰).
+    rows = attempts(db, student_ids=[me.id], since=today - timedelta(days=60), graded_only=False)
     if not rows:
         return None
     week_rows = [r for r in rows if r.created_at and r.created_at.date() >= ws]
@@ -544,7 +554,8 @@ def student_growth(db: Session, me: StudentProfile) -> dict | None:
 
 # ---------------------------------------------------------------- 학생: 학습결과
 def student_result_today(db: Session, me: StudentProfile, subject: str) -> dict | None:
-    rows = attempts(db, student_ids=[me.id], since=date.today(), subject=subject)
+    # 학생 본인 결과 화면(방금 끝낸 세션) — 자기신고 포함(본인 활동 뷰).
+    rows = attempts(db, student_ids=[me.id], since=date.today(), subject=subject, graded_only=False)
     if not rows:
         return None
     # 결과 화면은 '방금 끝낸 세션'을 보여준다 — 오늘 누적(전 단계·재시도 합산)이 아니라
