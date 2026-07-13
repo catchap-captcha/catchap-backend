@@ -637,17 +637,32 @@ def chapter_stats(db: Session, me: StudentProfile) -> list[dict]:
             ChapterProgress.subject, ChapterProgress.chapter_no, ChapterProgress.stages_done
         ).filter(ChapterProgress.student_id == me.id).all()
     }
+    # 챕터별 미복습 오답 수(오답노트 chapter_no 연결) — '약한 챕터 진단'에 쓴다
+    from app.models import WrongAnswer
+
+    wrong_map: dict[tuple[str, int], int] = {
+        (s, int(c)): int(n)
+        for s, c, n in db.query(
+            WrongAnswer.subject, WrongAnswer.chapter_no, func.count(WrongAnswer.id)
+        ).filter(
+            WrongAnswer.student_id == me.id,
+            WrongAnswer.reviewed.is_(False),
+            WrongAnswer.chapter_no.isnot(None),
+        ).group_by(WrongAnswer.subject, WrongAnswer.chapter_no).all()
+    }
 
     out: list[dict] = []
     for subject in D.SUBJECT_ORDER:
         mx = ch.max_chapters(subject)
         unlocked = ch.unlocked_count(subject)
         chapters: list[dict] = []
-        tot_all = cor_all = 0
+        tot_all = cor_all = unreviewed_all = 0
         for no in range(1, mx + 1):
             total, correct = acc_map.get((subject, no), (0, 0))
             tot_all += total
             cor_all += correct
+            unrev = wrong_map.get((subject, no), 0)
+            unreviewed_all += unrev
             chapters.append({
                 "no": no,
                 "title": ch.chapter_title(subject, no),
@@ -656,6 +671,7 @@ def chapter_stats(db: Session, me: StudentProfile) -> list[dict]:
                 "stages_done": prog_map.get((subject, no), 0),
                 "low_sample": total < MIN_ACC_SAMPLE,
                 "unlocked": no <= unlocked,
+                "unreviewed_wrong": unrev,  # 이 챕터 미복습 오답 수(복습하면 줄어듦)
             })
         dq_total, dq_correct = dq_map.get(subject, (0, 0))
         out.append({
@@ -664,6 +680,7 @@ def chapter_stats(db: Session, me: StudentProfile) -> list[dict]:
             "max_chapters": mx,
             "overall_accuracy": _acc_pct(tot_all, cor_all),
             "daily_quiz_accuracy": _acc_pct(dq_total, dq_correct),
+            "unreviewed_wrong": unreviewed_all,
             "chapters": chapters,
         })
     return out
