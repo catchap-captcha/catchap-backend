@@ -84,6 +84,56 @@ def _today_quiz_rows(db: Session, student_id: str) -> list[DailyQuizStatus]:
     return rows
 
 
+# 과목당 오늘의퀴즈 문항 수(= 인앱 EDU 세션 EDU_SESSION_TOTAL). '오늘 이 과목 풀었나' 판정 기준.
+DAILY_QUIZ_TOTAL = 5
+
+
+def _played_today(db: Session, student_id: str) -> dict[str, int]:
+    """오늘 과목별 오늘의퀴즈 시도 수(chapter_no NULL = 습관 축만).
+
+    화면상 '오늘의 퀴즈 현황'의 단일 기준(사용자 결정 2026-07-13): 한 과목의 오늘 시도가
+    DAILY_QUIZ_TOTAL 이상이면 '오늘 완료'로 본다(마지막이 오답이어도 — 홈 진행바·과목카드·
+    다음 과목·이어하기가 모두 이 기준을 공유해 서로 어긋나지 않게). 코인·랭킹·6과목 스티커의
+    'done 승격'은 별개로 daily_quiz_status(정답 완주)만 인정한다(위조 방지 유지)."""
+    start = datetime.combine(date.today(), time.min)
+    return dict(
+        db.query(LearningAttempt.subject, func.count(LearningAttempt.id))
+        .filter(
+            LearningAttempt.student_id == student_id,
+            LearningAttempt.created_at >= start,
+            LearningAttempt.chapter_no.is_(None),
+        )
+        .group_by(LearningAttempt.subject)
+        .all()
+    )
+
+
+def _played_set(played: dict[str, int]) -> set[str]:
+    """오늘 (5문항) 푼 과목 집합 — '완료(현황)' 판정 공용."""
+    return {s for s, n in played.items() if int(n) >= DAILY_QUIZ_TOTAL}
+
+
+def _quiz_done_set(db: Session, student_id: str, played: dict[str, int] | None = None) -> set[str]:
+    """화면 표시용 '오늘 완료' 과목 집합.
+
+    현황 기준(시도 5문항) ∪ 정답완주(daily_quiz_status.status=='done'). 실제 흐름에선
+    status=='done'이 시도≥5를 함의하므로 보통 시도 집합과 같지만, 정답완주 과목을 절대
+    누락하지 않도록 합집합으로 둔다. 코인·랭킹 지급 판정과는 무관(그건 status 단독)."""
+    if played is None:
+        played = _played_today(db, student_id)
+    done = _played_set(played)
+    rows = (
+        db.query(DailyQuizStatus.subject)
+        .filter(
+            DailyQuizStatus.student_id == student_id,
+            DailyQuizStatus.quiz_date == date.today(),
+            DailyQuizStatus.status == "done",
+        )
+        .all()
+    )
+    return done | {r.subject for r in rows}
+
+
 def _my_grade(db: Session, me: StudentProfile) -> int | None:
     """학생의 학년 — 소속 반(classes.grade) 기준. 무반이면 None."""
     if not me.class_id:
@@ -220,37 +270,26 @@ def dashboard(
     me = _me(principal)
     quiz = _today_quiz_rows(db, me.id)
     today_total = len(quiz)
-    today_done = sum(1 for q in quiz if q.status == "done")
     earned = (
         db.query(StudentBadge)
         .filter(StudentBadge.student_id == me.id, StudentBadge.earned_at.isnot(None))
         .count()
     )
-    # 과목 카드: 오늘 상태(daily_quiz_status) + 오늘 학습 시도 수 (실데이터)
-    quiz_by_subject = {q.subject: q for q in quiz}
-    today_start = datetime.combine(date.today(), time.min)
-    # 오늘의퀴즈(습관) 진행바 — 전체학습 주간 챕터 플레이(chapter_no 있음)는 제외해 분리 유지.
-    attempts_today = dict(
-        db.query(LearningAttempt.subject, func.count(LearningAttempt.id))
-        .filter(
-            LearningAttempt.student_id == me.id,
-            LearningAttempt.created_at >= today_start,
-            LearningAttempt.chapter_no.is_(None),
-        )
-        .group_by(LearningAttempt.subject)
-        .all()
-    )
+    # 과목 카드·진행바: '오늘의 퀴즈 현황' 단일 기준 = 오늘 시도 수(_played_today).
+    # 5문항 다 풀면 완료로 본다(마지막 오답이어도) — 홈·오늘의퀴즈 페이지·결과화면 다음 과목이
+    # 같은 기준을 써 서로 어긋나지 않게. 전체학습 주간 챕터(chapter_no 있음)는 제외해 습관 축과 분리.
+    # 완료 = 시도≥5 ∪ 정답완주(status=='done'). status_done은 방금 조회한 quiz 행 재사용.
+    played = _played_today(db, me.id)
+    status_done = {q.subject for q in quiz if q.status == "done"}
+    done_display = _played_set(played) | status_done
+    today_done = sum(1 for card in D.HOME_SUBJECT_CARDS if card["subject"] in done_display)
     subjects = []
     for card in D.HOME_SUBJECT_CARDS:
         sub = card["subject"]
-        q = quiz_by_subject.get(sub)
-        state = {"done": "done", "progress": "progress", "doing": "progress"}.get(
-            q.status if q else "todo", "todo"
-        )
         total = card["total"]
-        done = total if state == "done" else min(total, int(attempts_today.get(sub, 0)))
-        if state == "todo" and done > 0:
-            state = "progress"
+        n = int(played.get(sub, 0))
+        done = total if sub in done_display else min(total, n)
+        state = "done" if sub in done_display else ("progress" if n > 0 else "todo")
         subjects.append(
             {**card, "done": done, "state": state, "meta": D.SUBJECT_META[sub]}
         )
@@ -621,17 +660,25 @@ def daily_quiz(
         .all()
     )
     STAGES = 5
+
+    def _card_status(r) -> str:
+        # '오늘의 퀴즈 현황' 단일 기준(홈·결과화면과 동일): 오늘 5문항 다 풀면 완료로 표시
+        # (마지막 오답이어도). 코인·랭킹의 정답완주 done은 별개(daily_quiz_status.status).
+        if int(_att_today.get(r.subject, 0)) >= STAGES:
+            return "done"
+        return r.status
+
     quizzes = [
         {
             "id": r.id,
             "subject": r.subject,
             "topic": r.topic,
-            "status": r.status,
+            "status": _card_status(r),
             "reward": r.reward_coins,
             "meta": D.SUBJECT_META.get(r.subject, {}),
             # 5단계 진행 바: 완료면 5/5, 아니면 오늘 시도 수(최대 5)
             "stages": STAGES,
-            "stage_done": STAGES if r.status == "done" else min(STAGES, int(_att_today.get(r.subject, 0))),
+            "stage_done": min(STAGES, int(_att_today.get(r.subject, 0))),
         }
         for r in rows
     ]
@@ -1761,16 +1808,10 @@ def result(
     # 오늘 해당 과목 시도 실집계(정답/오답/점수/시간/연속) — 없으면 D 프리셋
     res_agg = aggregate.student_result_today(db, me, key)
     s = {**D.RESULT_SUBJECTS[key], **(res_agg or {})}
-    # 오늘 완료 과목: daily_quiz_status 실데이터 기준
-    done_today = {
-        r.subject
-        for r in db.query(DailyQuizStatus).filter(
-            DailyQuizStatus.student_id == me.id,
-            DailyQuizStatus.quiz_date == date.today(),
-            DailyQuizStatus.status == "done",
-        ).all()
-    }
-    done_set = (done_today or set()) | {key}
+    # 오늘의 학습 지도·다음 과목: '오늘의 퀴즈 현황' 단일 기준 = 오늘 5문항 푼 과목 ∪ 정답완주.
+    # (홈·오늘의퀴즈 페이지와 같은 기준 — 예전엔 여기만 status=="done"이라, 5문 다 풀고 마지막이
+    #  오답인 과목을 '다음 과목'으로 다시 내밀어 방금 푼 과목으로 역주행하던 버그가 있었다.)
+    done_set = _quiz_done_set(db, me.id) | {key}
     # 오늘의 스티커(6과목 완주) — daily_rewards 장부 기준. 자정이 지나면 자동으로 미획득.
     from app.models import DailyReward
 

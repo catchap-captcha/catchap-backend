@@ -130,6 +130,52 @@ def test_daily_quiz_reflects_daily_quiz_status(client, db, seed_org):
     assert dash.json()["today"] == {"done": 1, "total": len(rows)}
 
 
+def test_quiz_status_unified_on_attempts(client, db, seed_org):
+    """'오늘의 퀴즈 현황' 단일 기준(2026-07-13): 오늘 5문항 다 풀면 마지막이 오답이라
+    daily_quiz_status가 done으로 승격 안 돼도 화면상 '완료'로 본다. 홈·오늘의퀴즈 페이지·
+    결과화면 다음 과목이 모두 이 기준을 공유해, 방금 푼 과목으로 역주행하지 않는다."""
+    from app.models import DailyQuizStatus
+
+    token = _student_token(client, seed_org)
+
+    # 국어 5문항을 오답으로 소진(오늘의퀴즈 축: chapter_no 없음, completed 아님) → status는 done 아님
+    for _ in range(5):
+        r = client.post(
+            "/api/v1/learning/attempts",
+            json={"subject": "국어", "result": "incorrect", "score": 0, "daily": True},
+            headers=auth(token),
+        )
+        assert r.status_code == 200
+    q = (
+        db.query(DailyQuizStatus)
+        .filter(
+            DailyQuizStatus.student_id == seed_org["student"].id,
+            DailyQuizStatus.quiz_date == date.today(),
+            DailyQuizStatus.subject == "국어",
+        )
+        .first()
+    )
+    assert q is not None and q.status != "done"  # 오답 소진 — 정답완주 아님(코인·랭킹 미지급)
+
+    # 홈 대시보드: 국어가 '완료'(시도 기준)로 잡힌다
+    dash = client.get("/api/v1/students/me/dashboard", headers=auth(token)).json()
+    kor = next(s for s in dash["subjects"] if s["subject"] == "국어")
+    assert kor["state"] == "done" and kor["done"] == kor["total"]
+    assert dash["today"]["done"] >= 1
+
+    # 오늘의퀴즈 페이지: 국어 카드도 '완료' 배지
+    dq = client.get("/api/v1/students/me/daily-quiz", headers=auth(token)).json()
+    kor_card = next(c for c in dq["quizzes"] if c["subject"] == "국어")
+    assert kor_card["status"] == "done" and kor_card["stage_done"] == kor_card["stages"]
+
+    # 결과화면 다음 과목: 소진한 국어는 today_done에 포함 → 다음 과목으로 다시 나오지 않는다
+    res = client.get("/api/v1/students/me/result?subject=국어", headers=auth(token)).json()
+    assert "국어" in res["today_done"]
+    order = res["subject_order"]
+    next_undone = next((s for s in order if s not in set(res["today_done"])), None)
+    assert next_undone != "국어"
+
+
 def test_grade_ranking_daily_completion(client, db, seed_org):
     """랭킹: 학년별 풀 + 일일 완료 점수(정답률·속도 + 6과목 완주 보너스 30 + 연속) + 상위3 보너스 코인."""
     from app.core.security import hash_password
