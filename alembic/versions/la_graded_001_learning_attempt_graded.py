@@ -1,6 +1,6 @@
 """learning_attempts.graded — 서버 채점 여부(무채점 자기신고 위조 차단, 적대적검토 #4/#5)
 
-Revision ID: a1b2c3d4e5f6
+Revision ID: la_graded_001
 Revises: f6a7b8c9d1e2
 Create Date: 2026-07-13
 """
@@ -9,7 +9,7 @@ from typing import Sequence, Union
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "a1b2c3d4e5f6"
+revision: str = "la_graded_001"
 down_revision: Union[str, None] = "f6a7b8c9d1e2"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
