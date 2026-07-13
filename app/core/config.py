@@ -24,6 +24,9 @@ class Settings(BaseSettings):
 
     # JWT
     JWT_SECRET_KEY: str = "dev-only-secret-change-me"
+    # 에러 트래킹(Sentry) — 값이 있으면 활성, 비면 no-op. 아동 PII는 send_default_pii=False +
+    # before_send 스크러빙으로 제외한다(main.py). .env.production에서 주입.
+    SENTRY_DSN: str = ""
     JWT_ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
     REFRESH_TOKEN_EXPIRE_DAYS: int = 14

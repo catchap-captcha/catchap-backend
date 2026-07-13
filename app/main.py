@@ -12,6 +12,43 @@ from app.core.logging_config import setup_logging
 setup_logging()  # 모든 모듈 로거 일관 초기화 (조용한 실패 방지)
 settings = get_settings()
 
+
+def _init_sentry() -> None:
+    """에러 트래킹 — SENTRY_DSN이 있으면 활성, 없으면 no-op(미설정 시 조용히 비활성).
+
+    아동 개인정보·비밀이 에러 페이로드로 새지 않게 send_default_pii=False(요청 본문·쿠키·
+    유저 기본 미첨부) + before_send에서 알려진 PII 키를 마스킹한다."""
+    dsn = (getattr(settings, "SENTRY_DSN", "") or "").strip()
+    if not dsn:
+        return
+    import sentry_sdk
+
+    _PII = {"real_name", "name", "age", "gender", "student_login_id", "login_id", "email",
+            "password", "password_hash", "access_token", "refresh_token", "token", "authorization"}
+
+    def _scrub(event, _hint):
+        req = event.get("request")
+        if isinstance(req, dict):
+            req.pop("data", None)
+            req.pop("cookies", None)
+            headers = req.get("headers")
+            if isinstance(headers, dict):
+                for k in list(headers):
+                    if k.lower() in _PII:
+                        headers[k] = "[scrubbed]"
+        return event
+
+    sentry_sdk.init(
+        dsn=dsn,
+        environment="production" if settings.is_production else "dev",
+        traces_sample_rate=0.0,   # 에러만 — 성능 트레이싱 off
+        send_default_pii=False,   # 요청 본문/유저/쿠키 기본 미첨부(아동 PII 보호)
+        before_send=_scrub,
+    )
+
+
+_init_sentry()
+
 # 프로덕션에서는 API 문서(스키마·엔드포인트 전수) 비공개 — 공격 표면 축소
 _docs_url = None if settings.is_production else "/docs"
 _redoc_url = None if settings.is_production else "/redoc"
