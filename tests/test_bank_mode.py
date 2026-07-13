@@ -94,6 +94,62 @@ def test_bank_attempt_no_coin_no_quiz(client, db, seed_org):
     assert att is not None and att.content_id == full["id"]
 
 
+def test_chapter_hybrid_priority_and_no_coin(client, db, seed_org):
+    """주차 커리큘럼 하이브리드 — 챕터 풀 안에서 안 푼 우선 출제 + 무보상 + 챕터번호 기록."""
+    from app.models import CoinTransaction, LearningAttempt
+    from app.services import chapters as ch_mod
+    from tests.test_wallet_shop import _first_party_key, _student_token
+
+    _first_party_key(db)
+    tok = _student_token(client)
+    student = seed_org["student"]
+
+    ids = ch_mod.chapter_all_question_ids("국어", 1)
+    assert len(ids) == 10  # 현재 챕터 크기 — 늘어나도 로직은 그대로
+
+    # 챕터 1의 9문항을 이미 풀었다고 기록 → 남은 1문항이 우선 출제돼야 한다
+    for qid in ids[:9]:
+        _mk_attempt(db, student, "국어", qid, "correct")
+
+    seen = set()
+    for _ in range(6):
+        r = client.post(
+            "/api/v1/captcha/v1/challenge?subject=%EA%B5%AD%EC%96%B4&chapter=1&stage=1",
+            headers={"X-Site-Key": "ck_edu_testfp", "Authorization": f"Bearer {tok}"},
+        )
+        assert r.status_code == 200, r.text
+        # 챌린지 응답엔 qid가 없다(정답 비노출) — 프롬프트로 대상 문항 판별
+        from app.services import subject_banks
+
+        target = subject_banks.get_question("국어", ids[9])
+        assert r.json()["prompt"] == target["prompt"], "안 푼 문항이 우선 출제돼야 한다"
+        seen.add(r.json()["prompt"])
+    assert len(seen) == 1
+
+    # 챕터 플레이 적립: 무보상 + 실제 챕터 번호 기록 + 오늘의퀴즈 미오염
+    q = subject_banks.get_question("국어", ids[9])
+    if q["type"] == "dictation":
+        from app.services import captcha_service as cs
+
+        wrapped = cs._wrap_bank_question(
+            "국어", q, {"subj": "국어", "rp": False, "chapter": 1, "stage": 1, "bank": True}
+        )
+        vr = client.post(
+            "/api/v1/captcha/v1/verify",
+            json={"challenge_token": wrapped["challenge_token"], "answer": q["answer"]},
+            headers={"X-Site-Key": "ck_edu_testfp", "Authorization": f"Bearer {tok}"},
+        )
+        assert vr.status_code == 200
+        assert vr.json()["session"]["coins_earned"] == 0
+    row = (
+        db.query(LearningAttempt)
+        .filter(LearningAttempt.student_id == student.id, LearningAttempt.content_id == ids[0])
+        .first()
+    )
+    assert row is not None and row.chapter_no == 1
+    assert db.query(CoinTransaction).filter(CoinTransaction.student_id == student.id).count() == 0
+
+
 def test_bank_challenge_http_and_progress(client, db, seed_org):
     """?bank=true 챌린지 발급 + 진도 API가 출제 분류와 일치."""
     from tests.test_wallet_shop import _first_party_key, _student_token

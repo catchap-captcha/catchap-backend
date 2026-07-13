@@ -54,6 +54,26 @@ def pick_question(db: Session, student: StudentProfile | None, subject: str) -> 
     return None
 
 
+def pick_from(
+    db: Session, student: StudentProfile | None, subject: str, candidate_ids: list[str]
+) -> dict | None:
+    """후보 집합(주차 커리큘럼의 10문항 등) 안에서 우선순위 출제 — 안 푼 → 틀린 → 맞춘.
+
+    주차 구조(월요일 잠금)는 유지하면서 그 주 문항 선별만 은행 로직을 쓰는
+    하이브리드(0713 결정)용. 비로그인은 후보 전체 랜덤."""
+    if not candidate_ids:
+        return None
+    if student is None:
+        return subject_banks.get_question(subject, random.choice(candidate_ids))
+    cand = set(candidate_ids)
+    unsolved, wrong, correct = split_pool(db, student, subject)
+    for group in (unsolved, wrong, correct):
+        scoped = [i for i in group if i in cand]
+        if scoped:
+            return subject_banks.get_question(subject, random.choice(scoped))
+    return subject_banks.get_question(subject, random.choice(candidate_ids))
+
+
 def progress(db: Session, student: StudentProfile, subject: str) -> dict:
     """은행 진도 요약 — 전체학습 화면 카드용."""
     unsolved, wrong, correct = split_pool(db, student, subject)

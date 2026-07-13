@@ -120,4 +120,5 @@ def test_year_time_cut_at_assignment_start(db, seed_org):
 
     m = aggregate.student_roster_metrics(db, [student.id])
     assert m[student.id]["year_min"] == 5, "배정(30일 전) 이전 10분은 제외돼야 한다"
-    assert m[student.id]["half_min"] == 15  # 6개월 창은 롤링이라 전부 포함
+    # 월간 창은 이번 달만 — 40일 전 10분은 제외, 오늘 5분만
+    assert m[student.id]["month_min"] == 5

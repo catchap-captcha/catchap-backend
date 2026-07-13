@@ -441,7 +441,7 @@ def all_students(
                 # 기간별 학습 시간(분): 오늘/이번 주/최근 6개월/최근 1년
                 "today_min": m.get("today_min", 0) if m else 0,
                 "week_min": m.get("week_min", 0) if m else 0,
-                "half_min": m.get("half_min", 0) if m else 0,
+                "month_min": m.get("month_min", 0) if m else 0,
                 "year_min": m.get("year_min", 0) if m else 0,
                 "weak": "",
                 "status": status_label(s.status),

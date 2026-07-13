@@ -74,6 +74,18 @@ def stage_questions(subject: str, chapter_no: int, stage: int) -> list[dict]:
     return [subject_banks.public_question(q) for q in sliced]
 
 
+def chapter_all_question_ids(subject: str, chapter_no: int) -> list[str]:
+    """챕터 풀 전체(현재 10문항, 은행이 늘면 확장) 문항 id — 주차 안 우선순위 출제용.
+
+    0713 하이브리드: 단계(5단계×2문항)는 페이스 조절이고, 어떤 문항을 낼지는
+    이 풀에서 학생별 우선순위(안 푼>틀린>맞춘)로 고른다(bank_mode.pick_from)."""
+    if chapter_no < 1:
+        return []
+    pool = subject_banks.playable_pool(subject)
+    start = (chapter_no - 1) * CHAPTER_SIZE
+    return [q["id"] for q in pool[start : start + CHAPTER_SIZE]]
+
+
 def chapter_question_ids(subject: str, chapter_no: int, stage: int) -> list[str]:
     """(챕터, 단계) 문항 id 목록 — 서버 검증용(제출 문항이 이 단계 소속인지 확인)."""
     if chapter_no < 1 or stage < 1 or stage > STAGES:

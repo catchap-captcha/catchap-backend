@@ -219,9 +219,9 @@ def student_roster_metrics(
     # 기간별 학습시간(ms): 오늘 / 이번 주 / 최근 6개월(반기) / 배정 기간(학년도 상한 1년)
     today_ms: dict[str, int] = defaultdict(int)
     week_ms: dict[str, int] = defaultdict(int)
-    half_ms: dict[str, int] = defaultdict(int)
+    month_ms: dict[str, int] = defaultdict(int)
     year_ms: dict[str, int] = defaultdict(int)
-    half_start = today - timedelta(days=183)
+    # 월간 창 = 이번 달(acc_start와 동일 — 달력 월)
     # 장기 열의 시작 = 현재 반 배정일(이력) — 없으면 학년도(3/1) 근사, 상한은 최근 1년
     fallback_year_start = max(today - timedelta(days=365), _school_year_start(today))
     try:
@@ -266,8 +266,8 @@ def student_roster_metrics(
             today_ms[sid] += t
         if dd >= week_start:
             week_ms[sid] += t
-        if dd >= half_start:
-            half_ms[sid] += t
+        if dd >= acc_start:
+            month_ms[sid] += t
         if dd >= assigned_since.get(sid, fallback_year_start):
             year_ms[sid] += t
 
@@ -303,7 +303,7 @@ def student_roster_metrics(
             # 기간별 학습 시간(분) — 오늘/이번 주/최근 6개월/최근 1년
             "today_min": round(today_ms[sid] / 60000),
             "week_min": round(week_ms[sid] / 60000),
-            "half_min": round(half_ms[sid] / 60000),
+            "month_min": round(month_ms[sid] / 60000),
             "year_min": round(year_ms[sid] / 60000),
         }
     return out

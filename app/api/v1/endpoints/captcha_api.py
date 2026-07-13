@@ -230,8 +230,9 @@ def _credit_student(
     answered = answered_before + 1
     attempt_req = AttemptCreate(
         subject=subject,
-        # 은행 모드는 chapter_no=0 마커 — 오늘의퀴즈 진행바(chapter_no IS NULL 집계)에 안 섞인다
-        chapter_no=0 if is_bank else meta.get("chapter"),
+        # 주차 플레이는 실제 챕터 번호, 자유 은행은 0 마커 — 둘 다 오늘의퀴즈
+        # 진행바(chapter_no IS NULL 집계)에 안 섞인다
+        chapter_no=meta.get("chapter") if is_chapter else (0 if is_bank else None),
         # 문항 id — 문제은행 모드의 '안 푼/틀린/맞춘' 분류 원천(bank_mode._last_results)
         content_id=str(qid) if qid else None,
         result="correct" if correct else "incorrect",
@@ -316,6 +317,29 @@ def challenge(
             raise HTTPException(status.HTTP_404_NOT_FOUND, detail="플레이할 문항이 없어요.")
         # meta.bank → verify가 코인·오늘의퀴즈를 건드리지 않고 기록·오답노트만 남긴다
         ch = cs._wrap_bank_question(eff_subject, q, {"subj": eff_subject, "bank": True})
+        cs.log_call(db, api, "captcha/challenge", 200, subject=eff_subject)
+        db.commit()
+        return {"product": api.product, "subject": eff_subject, **ch}
+    if (
+        chapter is not None and stage is not None
+        and api.product == "edu" and api.first_party and eff_subject in cs.EDU_SUBJECTS
+    ):
+        # 주차 커리큘럼 하이브리드(0713): 주차 구조(월요일 잠금)·5단계 페이스는 유지하되,
+        # 문항 선별은 그 챕터 풀 전체에서 학생별 우선순위(안 푼>틀린>맞춘)로 —
+        # 챕터당 문항이 늘어나도 고정 슬라이스 없이 학생마다 필요한 문제를 먼저 낸다.
+        # meta.bank=True → 무보상·오늘의퀴즈 미오염(전체학습 공통 규칙).
+        from app.services import bank_mode
+        from app.services import chapters as _ch
+
+        student = _optional_student(db, request)
+        ids = _ch.chapter_all_question_ids(eff_subject, chapter)
+        q = bank_mode.pick_from(db, student, eff_subject, ids)
+        if q is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, detail="플레이할 문항이 없어요.")
+        ch = cs._wrap_bank_question(
+            eff_subject, q,
+            {"subj": eff_subject, "rp": bool(replay), "chapter": chapter, "stage": stage, "bank": True},
+        )
         cs.log_call(db, api, "captcha/challenge", 200, subject=eff_subject)
         db.commit()
         return {"product": api.product, "subject": eff_subject, **ch}
