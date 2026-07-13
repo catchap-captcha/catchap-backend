@@ -153,6 +153,55 @@ def test_shop_purchase_deducts_and_owns(client, db, seed_org):
     assert w2["coins"] == 100 - cheap.price
 
 
+def test_daily_quiz_completion_pays_advertised_reward(client, db, seed_org):
+    """오늘의퀴즈 완료 시 화면에 광고된 reward_coins가 실지급 — 표시 전용이던 버그 회귀 방지."""
+    from app.models import CoinTransaction
+
+    tok = _student_token(client)
+    headers = {"Authorization": f"Bearer {tok}"}
+
+    # 오늘의퀴즈 화면이 광고하는 보상액(프리셋에서 생성됨)
+    quiz = client.get("/api/v1/students/me/daily-quiz", headers=headers).json()
+    math_row = next(q for q in quiz["quizzes"] if q["subject"] == "수학")
+    advertised = math_row["reward"]
+    assert advertised > 0
+
+    # 완료 신고(정답) → 학습 보상 10 + 완료 보상(광고액) 함께 지급
+    r = client.post(
+        "/api/v1/learning/attempts",
+        json={"subject": "수학", "result": "correct", "completed": True},
+        headers=headers,
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["quiz_bonus"] == advertised, body
+    assert body["coins"] == 100 + 10 + advertised  # seed 100 + 학습 10 + 완료 보상
+
+    tx = (
+        db.query(CoinTransaction)
+        .filter(CoinTransaction.reason == "수학 오늘의퀴즈 완료 보상")
+        .first()
+    )
+    assert tx is not None and tx.amount == advertised
+
+    # 같은 날 재완료 신고는 보상 중복 지급 없음 (학습 보상 10만)
+    r2 = client.post(
+        "/api/v1/learning/attempts",
+        json={"subject": "수학", "result": "correct", "completed": True},
+        headers=headers,
+    )
+    assert r2.json()["quiz_bonus"] == 0
+    assert r2.json()["coins"] == 100 + 10 + advertised + 10
+
+    # 복습은 완료 보상 없음
+    r3 = client.post(
+        "/api/v1/learning/attempts",
+        json={"subject": "과학", "result": "correct", "completed": True, "replay": True},
+        headers=headers,
+    )
+    assert r3.json()["quiz_bonus"] == 0
+
+
 def test_shop_purchase_by_design_key(client, db, seed_org):
     """프론트 폴백 카탈로그는 디자인 키('crown' 등)로 구매 — 키 조회도 동작해야 한다."""
     _seed_shop(db)

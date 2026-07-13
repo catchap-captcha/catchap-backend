@@ -1158,6 +1158,7 @@ def save_attempt(
     # quiz_date는 항상 서버의 오늘). 복습(replay)은 상태를 건드리지 않는다(전날 다시풀기는 기록만).
     sticker_awarded = False
     sticker_coins = 0
+    quiz_bonus = 0
     if not req.replay and req.daily:
         quiz = (
             db.query(DailyQuizStatus)
@@ -1175,8 +1176,29 @@ def save_attempt(
             db.add(quiz)
         # 랭킹·상장 위조 차단: done 승격은 '완료 신고 + 서버/제출이 정답'일 때만.
         # 오답으로는 done이 될 수 없다(오답 반복으로 랭킹 만점 방지). 이미 done이면 유지.
+        was_done = quiz.status == "done"
         completed_ok = req.completed and req.result == "correct"
         quiz.status = "done" if completed_ok else ("progress" if quiz.status != "done" else "done")
+
+        # 오늘의퀴즈 완료 보상: 화면에 광고된 과목별 reward_coins를 done '승격 순간' 1회 지급.
+        # (기존엔 표시 전용이라 완료해도 안 들어왔다 — 광고와 실지급 불일치 해소.)
+        # 전이 가드(was_done)로 하루 1회. 동시 요청은 위 학생 행 잠금(정답 경로)으로 직렬화됨.
+        if completed_ok and not was_done:
+            reward = quiz.reward_coins or next(
+                (p["reward"] for p in D.DAILY_QUIZ if p["subject"] == req.subject), 0
+            )
+            if reward > 0:
+                quiz_bonus = int(reward)
+                db.query(StudentProfile).filter(StudentProfile.id == me.id).update(
+                    {StudentProfile.coins: StudentProfile.coins + quiz_bonus},
+                    synchronize_session=False,
+                )
+                db.add(
+                    CoinTransaction(
+                        student_id=me.id, amount=quiz_bonus,
+                        reason=f"{req.subject} 오늘의퀴즈 완료 보상",
+                    )
+                )
 
         # 6과목 완주 스티커: 오늘 전 과목이 done이 되는 순간 스티커 + 코인을 함께 지급.
         # daily_rewards(UNIQUE) 멱등 — 하루 1회. reward_date=오늘이라 자정에 자동 초기화.
@@ -1226,6 +1248,7 @@ def save_attempt(
     return {
         "ok": True, "attempt_id": attempt.id, "coins_earned": coins_earned, "coins": me.coins,
         "sticker_awarded": sticker_awarded, "sticker_coins": sticker_coins,
+        "quiz_bonus": quiz_bonus,  # 오늘의퀴즈 완료 보상(광고된 reward_coins) — 승격 순간만 >0
     }
 
 

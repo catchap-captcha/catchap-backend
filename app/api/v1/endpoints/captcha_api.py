@@ -258,6 +258,8 @@ def _credit_student(
         # 6과목 완주 스티커 — 이 문항 적립으로 오늘 전 과목 done이 된 순간 함께 지급됨
         "sticker_awarded": saved.get("sticker_awarded", False),
         "sticker_coins": saved.get("sticker_coins", 0),
+        # 오늘의퀴즈 완료 보상(광고된 reward_coins) — 완료 승격 문항에서만 >0
+        "quiz_bonus": saved.get("quiz_bonus", 0),
     }
 
 
