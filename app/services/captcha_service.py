@@ -808,7 +808,11 @@ def verify_challenge(db: Session, challenge_token: str, answer) -> dict:
     kind, target = data["k"], data["a"]
     # 발급 시 서명해 둔 문항 메타(과목·문항id·일차·복습·은행) — 엔드포인트가 학생 적립에 쓰고 응답 전 제거
     extra: dict = {"meta": {k: data[k] for k in ("subj", "qid", "day", "rp", "chapter", "stage", "bank") if k in data}}
-    if kind == "select_all":
+    if answer is None:
+        # '잘 모르겠어요'(무응답) — 채점 시도 없이 오답 처리. 아래에서 정답·해설을 함께 내려
+        # 학생이 찍기 강요 없이 정직하게 오답 처리하고 해설로 공부하게 한다(운 좋은 정답 방지).
+        ok = False
+    elif kind == "select_all":
         # answer 타입 미방어 시 정수 등 비반복형 입력이 TypeError → 공개 엔드포인트 500
         picked = sorted(str(x) for x in answer) if isinstance(answer, (list, tuple)) else []
         ok = len(picked) > 0 and picked == sorted(str(x) for x in target)
@@ -872,7 +876,16 @@ def verify_challenge(db: Session, challenge_token: str, answer) -> dict:
     if not ok:
         # 오답에도 정답을 내린다(교육형 피드백 "정답은 X"용) — 챌린지는 1회 소비돼
         # 이미 무효라 재제출 오라클이 되지 않고, 매 챌린지 정답이 새로 나와 파밍 가치도 없다.
-        return {"success": False, "answer": target, **extra}
+        # 해설(explain)도 함께 내려 '잘 모르겠어요'·오답 시 공부할 수 있게 한다(메모리 조회, DB無).
+        exp = None
+        subj, qid = data.get("subj"), data.get("qid")
+        if subj and qid:
+            from app.services import subject_banks
+
+            qq = subject_banks.get_question(str(subj), str(qid))
+            if qq:
+                exp = qq.get("explain") or qq.get("hint")
+        return {"success": False, "answer": target, "explain": exp, **extra}
     verdict = _sign({"v": 1, "exp": time.time() + VERDICT_TTL, "n": secrets.token_hex(16)})
     return {"success": True, "verdict_token": verdict, "answer": target, **extra}
 

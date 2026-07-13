@@ -1713,7 +1713,8 @@ def _record_wrong(
                 subject=subject,
                 category=subject_banks.WRONG_CATEGORY.get(subject, "safe"),  # D.WRONG_TAGS 키
                 question=q["prompt"],
-                my_answer=_student_answer_text(q, student_answer)[:200],
+                # '잘 모르겠어요'(무응답)는 빈칸 대신 명시 — 오답노트에서 구분되게
+                my_answer=("잘 모르겠어요" if student_answer is None else _student_answer_text(q, student_answer))[:200],
                 correct_answer=_correct_answer_text(q)[:200],
                 tip=q.get("explain") or q.get("hint"),
                 wrong_date=date.today(),

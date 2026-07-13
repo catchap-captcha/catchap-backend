@@ -203,8 +203,9 @@
     // ── 풀 사이즈(교육형) 액션 풋터 — '다시 고르기 · 다음 문제 →'를 카드 우하단에 고정.
     //    보기 클릭은 '선택'만 하고, 다음 문제 버튼이 제출(채점)→한 번 더 누르면 다음 문제로.
     //    (버튼이 답 카드에서 멀어지지 않게 문제 영역 안에 둔다)
-    var footer = null, redoBtn = null, nextBtn = null, footerOn = false;
+    var footer = null, redoBtn = null, nextBtn = null, dkBtn = null, footerOn = false;
     var pendingSubmit = null, pendingRedo = null;
+    var curToken = null; // 현재 문항 토큰 — '잘 모르겠어요'가 render 밖(footer)에서 제출에 쓴다
     var onAnswered = null; // 렌더러별 답변 후 콜백 — 보기 근거(rationale) 공개 등
     function setBtnOn(b, on) {
       b.disabled = !on;
@@ -221,6 +222,16 @@
       css(nextBtn, { border: 'none', borderRadius: '12px', padding: '11px 24px',
         fontWeight: '800', fontSize: '14px', background: C, color: '#fff', fontFamily: 'inherit' });
       redoBtn.onclick = function () { if (!answered && !grading && pendingRedo) { pendingRedo(); redoCount += 1; } };
+      // '잘 모르겠어요' — 찍기 강요 대신 정직하게 오답 처리(운 좋은 정답 방지). 서버가 오답으로
+      // 채점하고 정답·해설을 내려주면 eduFeedback이 공부 자료로 보여준다.
+      dkBtn = h('button'); dkBtn.textContent = '잘 모르겠어요';
+      css(dkBtn, { border: '2px solid #F0E4D8', borderRadius: '12px', padding: '11px 18px',
+        fontWeight: '800', fontSize: '13px', background: '#fff', color: '#B0A79B', fontFamily: 'inherit',
+        marginRight: 'auto' });
+      dkBtn.onclick = function () {
+        if (answered || grading || !curToken) return;
+        verify(curToken, null);
+      };
       nextBtn.onclick = function () {
         if (grading) return; // 채점 응답 대기 중 더블클릭 → load() 유출로 위젯이 굳는 것 방지
         if (answered) {
@@ -233,12 +244,12 @@
           load();
         } else if (pendingSubmit) pendingSubmit();
       };
-      footer.appendChild(redoBtn); footer.appendChild(nextBtn);
+      footer.appendChild(dkBtn); footer.appendChild(redoBtn); footer.appendChild(nextBtn);
       box.insertBefore(footer, hidden);
     }
     function footerReset() {
       pendingSubmit = null; pendingRedo = null;
-      if (footer) { setBtnOn(redoBtn, false); setBtnOn(nextBtn, false); }
+      if (footer) { setBtnOn(redoBtn, false); setBtnOn(nextBtn, false); setBtnOn(dkBtn, false); }
     }
     function footerState(canRedo, canNext) {
       if (footer) { setBtnOn(redoBtn, canRedo && !answered); setBtnOn(nextBtn, canNext); }
@@ -287,6 +298,15 @@
         background: okAns ? '#E1F5EC' : '#FFEDEF', color: okAns ? OK : '#D14559' });
       fb.textContent = msg;
       body.appendChild(fb);
+      // 오답·'잘 모르겠어요' 시 해설을 보여준다(공부 자료) — 서버가 explain(없으면 hint)을 내려준다
+      if (!okAns && res.explain) {
+        var exp = h('div');
+        css(exp, { marginTop: '10px', padding: '12px 14px', borderRadius: '12px', fontSize: '13px',
+          lineHeight: '1.6', background: '#FFF8EE', border: '1px solid #F3E4CC', color: '#6B5E48' });
+        exp.textContent = '📘 ' + res.explain;
+        body.appendChild(exp);
+      }
+      if (dkBtn) setBtnOn(dkBtn, false); // 답한 뒤엔 '잘 모르겠어요' 비활성
       if (footerOn) { // 풋터의 다음 문제 버튼이 진행 담당
         footerState(false, true);
         nextBtn.textContent = sessionDone ? '결과 보기 →' : '다음 문제 →';
@@ -1280,11 +1300,13 @@
       lastOptions = []; // 이전 문항 보기가 새 문항 피드백(정답 텍스트 매칭)에 누출되지 않게
       onAnswered = null;
       footerOn = full && product === 'edu';
+      curToken = d.challenge_token; // '잘 모르겠어요'가 참조 (오늘의 퀴즈·전체학습 등 학습 세션)
       if (footerOn) {
         ensureFooter(); footerReset();
         redoBtn.textContent = d.type === 'trace_path' ? '다시 그리기'
           : (d.type === 'dictation' || d.type === 'type_in' || d.type === 'input') ? '다시 쓰기' : '다시 고르기';
         nextBtn.textContent = '다음 문제 →';
+        setBtnOn(dkBtn, true); // 문항 푸는 동안 '잘 모르겠어요' 활성 (답하면 eduFeedback이 끈다)
       }
       if (footer) footer.style.display = footerOn ? 'flex' : 'none';
       var token = d.challenge_token;

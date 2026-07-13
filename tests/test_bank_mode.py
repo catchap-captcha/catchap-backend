@@ -206,6 +206,44 @@ def test_verify_long_qid_and_answerless_wrong(client, db, seed_org):
         assert r2.status_code == 200, r2.text  # KeyError('answer')면 500
 
 
+def test_dont_know_marks_wrong_with_explain(client, db, seed_org):
+    """'잘 모르겠어요'(answer=null) — 찍기 강요 없이 오답 처리 + 해설 응답 + 오답노트 명시."""
+    from app.models import WrongAnswer
+    from app.services import captcha_service as cs
+    from app.services import subject_banks
+    from tests.test_wallet_shop import _first_party_key, _student_token
+
+    _first_party_key(db)
+    tok = _student_token(client)
+    student = seed_org["student"]
+    headers = {"X-Site-Key": "ck_edu_testfp", "Authorization": f"Bearer {tok}"}
+
+    q = next(
+        x for s in sorted(subject_banks.LIVE_SUBJECTS) for x in subject_banks.playable_pool(s)
+        if x["type"] == "single" and (x.get("explain") or x.get("hint"))
+    )
+    subj = next(
+        s for s in sorted(subject_banks.LIVE_SUBJECTS)
+        if any(x["id"] == q["id"] for x in subject_banks.playable_pool(s))
+    )
+    ch = cs._wrap_bank_question(subj, q, {"subj": subj, "bank": True})
+    r = client.post(
+        "/api/v1/captcha/v1/verify",
+        json={"challenge_token": ch["challenge_token"], "answer": None},
+        headers=headers,
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["success"] is False, "무응답은 오답으로 채점돼야 한다(운 좋은 정답 없음)"
+    assert body.get("explain"), "공부용 해설이 내려와야 한다"
+    note = (
+        db.query(WrongAnswer)
+        .filter(WrongAnswer.student_id == student.id, WrongAnswer.question == q["prompt"])
+        .first()
+    )
+    assert note is not None and note.my_answer == "잘 모르겠어요"
+
+
 def test_chapter_clamp_on_subject_without_that_week(client, db, seed_org):
     """과목 이동 자동 보정 — 그 과목에 없는 주차를 요청하면 마지막 열린 주차로 clamp(404 아님)."""
     from app.services import chapters as _ch
