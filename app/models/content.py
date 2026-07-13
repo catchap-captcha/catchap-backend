@@ -29,6 +29,26 @@ class Chapter(Base, UUIDPk, Timestamps):
     status: Mapped[str] = mapped_column(String(20), default="active")
 
 
+class Question(Base, Timestamps):
+    """교육형 문제은행 — 원본은 catchap-service/banks/*.json, 로더가 DB에 적재(A방식).
+
+    문항 필드가 유형마다 20~30개로 제각각이라 payload(JSON)에 문항 dict 전체를 담고,
+    인덱스·조회용 컬럼(subject/type/playable/order_no)만 별도로 둔다. id는 문항 슬러그
+    (예: 'math-ch4_08_...')를 그대로 PK로 쓴다(기존 subject_banks id와 동일 — 오답노트·진도 호환).
+    order_no는 은행 리스트 순서(챕터 슬라이싱이 이 순서에 의존)를 보존한다.
+    """
+
+    __tablename__ = "questions"
+
+    # 문항 슬러그 id를 PK로 — UUIDPk 대신(기존 은행 id 유지)
+    id: Mapped[str] = mapped_column(String(80), primary_key=True)
+    subject: Mapped[str] = mapped_column(String(20), index=True)  # 국어|영어|수학|과학|사회|생활
+    type: Mapped[str] = mapped_column(String(30), index=True)
+    order_no: Mapped[int] = mapped_column(index=True)  # 은행 내 순서(챕터 슬라이싱 보존)
+    playable: Mapped[bool] = mapped_column(default=True, index=True)
+    payload: Mapped[dict] = mapped_column(JSON)  # 문항 dict 전체(prompt/answer/options/…)
+
+
 class Content(Base, UUIDPk, Timestamps):
     """교육 콘텐츠/문제 메타 (검색 인덱스 포함)"""
 

@@ -18,7 +18,10 @@ from app.services import (
     science_bank,
 )
 
-BANKS: dict[str, list[dict]] = {
+# 폴백 은행(파이썬 파일) — 문제 원본은 이제 catchap-service/banks/*.json 이 정본이고
+# 로더가 DB(questions 테이블)에 적재한다(A방식). DB에 문항이 있으면 그걸 쓰고,
+# 비었거나 접근 불가면(테이블 미생성·시드 전) 아래 파일 은행으로 폴백해 무중단 유지.
+_FILE_BANKS: dict[str, list[dict]] = {
     "국어": korean_bank.KOREAN_FULL,
     "생활": life_bank.LIFE_FULL,
     "수학": math_bank.MATH_FULL,
@@ -27,6 +30,33 @@ BANKS: dict[str, list[dict]] = {
     # 영어 = 문법·그림문장·생성기(텍스트) + 듣기(오디오) + 알파벳 따라쓰기(trace)
     "영어": english_bank.ENGLISH_FULL + english_listen.ENGLISH_LISTEN + english_trace.ENGLISH_TRACE,
 }
+
+
+def _load_from_db() -> dict[str, list[dict]] | None:
+    """DB(questions)에서 과목별 문항을 order_no 순으로 로드 — 없거나 실패면 None(→ 파일 폴백).
+
+    order_by(order_no)로 은행 리스트 순서를 복원한다(챕터 슬라이싱이 이 순서에 의존).
+    앱 시작 1회 로드(파일 은행과 동일 성능) — 문제 갱신은 로더 재실행 + 서버 재기동."""
+    try:
+        from app.db.session import SessionLocal
+        from app.models import Question
+
+        db = SessionLocal()
+        try:
+            rows = db.query(Question).order_by(Question.subject, Question.order_no).all()
+        finally:
+            db.close()
+        if not rows:
+            return None
+        banks: dict[str, list[dict]] = {}
+        for r in rows:
+            banks.setdefault(r.subject, []).append(r.payload)
+        return banks
+    except Exception:
+        return None
+
+
+BANKS: dict[str, list[dict]] = _load_from_db() or _FILE_BANKS
 
 # 실전(서버 채점) 지원 과목 — 나머지 과목은 game-session available=false(프론트 데모 유지)
 LIVE_SUBJECTS = frozenset(BANKS)
