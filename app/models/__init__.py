@@ -49,7 +49,7 @@ from app.models.site import (
     Site,
 )
 from app.models.stat import StatBlob
-from app.models.throttle import LoginThrottle
+from app.models.throttle import CaptchaStore, LoginThrottle
 from app.models.student import ClassAssignment, ParentStudentLink, StudentProfile
 from app.models.user import User
 
@@ -82,6 +82,7 @@ __all__ = [
     "Invoice",
     "LearningAttempt",
     "LearningSummary",
+    "CaptchaStore",
     "LoginThrottle",
     "Membership",
     "ModelVersion",

@@ -159,6 +159,138 @@ class InMemoryStore(Store):
             return len(hits)
 
 
+def _challenge_to_payload(rec: ChallengeRecord) -> dict:
+    return {
+        "challenge_id": rec.challenge_id,
+        "theme_id": rec.theme_id,
+        "objects": [
+            {"object_id": o.object_id, "animal": o.animal,
+             "start_direction": o.start_direction, "heading": o.heading}
+            for o in rec.objects
+        ],
+        "target_animal": rec.target_animal,
+        "target_object": rec.target_object,
+        "target_direction": rec.target_direction,
+        "created_at": rec.created_at,
+        "ttl": rec.ttl,
+    }
+
+
+def _payload_to_challenge(p: dict) -> ChallengeRecord:
+    return ChallengeRecord(
+        challenge_id=p["challenge_id"],
+        theme_id=p["theme_id"],
+        objects=[ObjectSpec(**o) for o in p["objects"]],
+        target_animal=p["target_animal"],
+        target_object=p["target_object"],
+        target_direction=p["target_direction"],
+        created_at=p["created_at"],
+        ttl=p.get("ttl", CHALLENGE_TTL_SECONDS),
+    )
+
+
+class DBStore(Store):
+    """DB 공유 저장 — uvicorn 멀티워커 간 challenge/token 공유(InMemory의 워커 미공유 해소).
+
+    캡차는 독립 트랜잭션이라 요청 db 세션과 별개로 짧은 세션을 자체 생성한다.
+    레이트리밋(hit_rate)만 워커별 InMemory로 둔다(봇 완화 목적이라 워커당 카운트로 충분).
+    """
+
+    def __init__(self) -> None:
+        self._rate_lock = threading.Lock()
+        self._rate: Dict[str, List[float]] = {}
+
+    def _now_dt(self):
+        from datetime import datetime
+        return datetime.now()
+
+    def save_challenge(self, rec: ChallengeRecord) -> None:
+        from datetime import datetime, timedelta
+        from app.db.session import SessionLocal
+        from app.models import CaptchaStore as CS
+
+        db = SessionLocal()
+        try:
+            db.add(CS(k=rec.challenge_id, kind="challenge",
+                      payload=_challenge_to_payload(rec),
+                      expires_at=datetime.now() + timedelta(seconds=rec.ttl)))
+            db.commit()
+        finally:
+            db.close()
+
+    def get_challenge(self, cid: str) -> Optional[ChallengeRecord]:
+        from datetime import datetime
+        from app.db.session import SessionLocal
+        from app.models import CaptchaStore as CS
+
+        db = SessionLocal()
+        try:
+            row = db.query(CS).filter(CS.k == cid, CS.kind == "challenge").first()
+            if row is None or row.expires_at < datetime.now():
+                return None
+            return _payload_to_challenge(row.payload)
+        finally:
+            db.close()
+
+    def delete_challenge(self, cid: str) -> None:
+        from app.db.session import SessionLocal
+        from app.models import CaptchaStore as CS
+
+        db = SessionLocal()
+        try:
+            db.query(CS).filter(CS.k == cid, CS.kind == "challenge").delete()
+            db.commit()
+        finally:
+            db.close()
+
+    def save_token(self, rec: TokenRecord) -> None:
+        from datetime import datetime, timedelta
+        from app.db.session import SessionLocal
+        from app.models import CaptchaStore as CS
+
+        db = SessionLocal()
+        try:
+            db.add(CS(k=rec.token, kind="token", payload={"created_at": rec.created_at},
+                      used=rec.used, expires_at=datetime.now() + timedelta(seconds=rec.ttl)))
+            db.commit()
+        finally:
+            db.close()
+
+    def get_token(self, token: str) -> Optional[TokenRecord]:
+        from datetime import datetime
+        from app.db.session import SessionLocal
+        from app.models import CaptchaStore as CS
+
+        db = SessionLocal()
+        try:
+            row = db.query(CS).filter(CS.k == token, CS.kind == "token").first()
+            if row is None or row.expires_at < datetime.now():
+                return None
+            return TokenRecord(token=token, created_at=row.payload.get("created_at", time.time()),
+                               used=bool(row.used))
+        finally:
+            db.close()
+
+    def delete_token(self, token: str) -> None:
+        from app.db.session import SessionLocal
+        from app.models import CaptchaStore as CS
+
+        db = SessionLocal()
+        try:
+            db.query(CS).filter(CS.k == token, CS.kind == "token").delete()
+            db.commit()
+        finally:
+            db.close()
+
+    def hit_rate(self, key: str, window: int, now: float) -> int:
+        # 레이트리밋은 워커별 InMemory (봇 완화 목적 — 워커당 카운트로 충분)
+        with self._rate_lock:
+            hits = [t for t in self._rate.get(key, []) if t > now - window]
+            hits.append(now)
+            self._rate[key] = hits
+            return len(hits)
+
+
 class ForestCaptchaService:
     def __init__(self, store: Optional[Store] = None) -> None:
         self.store = store or InMemoryStore()
@@ -260,5 +392,21 @@ class ForestCaptchaService:
         return True
 
 
-# 프로세스 싱글턴 — 프로덕션은 RedisStore 주입으로 교체.
-service = ForestCaptchaService(store=InMemoryStore())
+# 프로세스 싱글턴. DBStore로 워커 간 challenge/token 공유(멀티워커에서 '정답이어도 실패'
+# 해소). 테이블(captcha_store) 미존재 등 DB 문제 시 InMemory로 폴백(단일워커 개발·테스트).
+def _default_store() -> Store:
+    try:
+        from app.db.session import SessionLocal
+        from app.models import CaptchaStore as CS  # noqa: F401
+
+        db = SessionLocal()
+        try:
+            db.query(CS).first()  # 테이블 존재·접근 확인
+        finally:
+            db.close()
+        return DBStore()
+    except Exception:
+        return InMemoryStore()
+
+
+service = ForestCaptchaService(store=_default_store())

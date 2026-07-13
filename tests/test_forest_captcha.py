@@ -66,3 +66,28 @@ def test_modified_forest_api_hides_answer_and_serves_object_pose(client):
     assert solved.json()["success"] is True
     assert fc.service.consume_token(solved.json()["captcha_token"]) is True
     assert fc.service.consume_token(solved.json()["captcha_token"]) is False
+
+
+def test_dbstore_shares_across_worker_instances(db):
+    """DBStore로 워커 간 challenge 공유 — 발급 워커와 다른 워커(새 store 인스턴스)에서
+    verify해도 정답이 통과해야 한다(멀티워커 '정답이어도 실패' 회귀 방지)."""
+    from app.services import forest_captcha as fc
+
+    # 워커 A: 별도 서비스 인스턴스로 발급
+    svc_a = fc.ForestCaptchaService(store=fc.DBStore())
+    rec = svc_a.create_challenge()
+
+    # 워커 B: 완전히 다른 서비스/스토어 인스턴스(다른 프로세스 시뮬)로 검증
+    svc_b = fc.ForestCaptchaService(store=fc.DBStore())
+    ok = svc_b.verify(rec.challenge_id, rec.target_object, rec.target_direction, rec.theme_id)
+    assert ok is True, "다른 워커에서도 정답이 통과해야 한다"
+
+    # 오답은 다른 워커에서도 실패
+    rec2 = svc_a.create_challenge()
+    bad = svc_b.verify(rec2.challenge_id, rec2.target_object, (rec2.target_direction + 1) % 8, rec2.theme_id)
+    assert bad is False
+
+    # 토큰도 워커 간 공유(발급 A → 소비 B)
+    tok = svc_a.issue_token()
+    assert svc_b.consume_token(tok) is True
+    assert svc_b.consume_token(tok) is False  # 단일 사용
