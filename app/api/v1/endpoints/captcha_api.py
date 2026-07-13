@@ -328,13 +328,18 @@ def challenge(
         from app.services import chapters as _ch
 
         student = _optional_student(db, request)
-        ids = _ch.chapter_all_question_ids(eff_subject, chapter)
+        # 과목 이동 자동 보정: 과목마다 열린 주차 수가 달라(문제은행 크기 차이),
+        # 다른 과목에 없는 주차를 요청하면(예: 국어 5주차→과학은 3주차뿐) 그 과목의
+        # 마지막 열린 주차로 clamp한다. 1 미만도 1로. verify 적립은 보정된 주차로 기록.
+        max_ch = _ch.unlocked_count(eff_subject)
+        eff_chapter = min(max(1, chapter), max_ch) if max_ch >= 1 else chapter
+        ids = _ch.chapter_all_question_ids(eff_subject, eff_chapter)
         q = bank_mode.pick_from(db, student, eff_subject, ids)
         if q is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, detail="플레이할 문항이 없어요.")
         ch = cs._wrap_bank_question(
             eff_subject, q,
-            {"subj": eff_subject, "rp": bool(replay), "chapter": chapter, "stage": stage, "bank": True},
+            {"subj": eff_subject, "rp": bool(replay), "chapter": eff_chapter, "stage": stage, "bank": True},
         )
         cs.log_call(db, api, "captcha/challenge", 200, subject=eff_subject)
         db.commit()

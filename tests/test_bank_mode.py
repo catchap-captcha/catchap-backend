@@ -206,6 +206,34 @@ def test_verify_long_qid_and_answerless_wrong(client, db, seed_org):
         assert r2.status_code == 200, r2.text  # KeyError('answer')면 500
 
 
+def test_chapter_clamp_on_subject_without_that_week(client, db, seed_org):
+    """과목 이동 자동 보정 — 그 과목에 없는 주차를 요청하면 마지막 열린 주차로 clamp(404 아님)."""
+    from app.services import chapters as _ch
+    from tests.test_wallet_shop import _first_party_key, _student_token
+
+    _first_party_key(db)
+    tok = _student_token(client)
+
+    # 문제은행이 가장 작은 과목(주차 수 적음)을 골라 그 최대를 초과하는 주차 요청
+    subj = min(
+        ("국어", "영어", "수학", "과학", "사회", "생활"),
+        key=lambda s: _ch.max_chapters(s),
+    )
+    mx = _ch.max_chapters(subj)
+    assert mx >= 1
+    over = mx + 5  # 존재하지 않는 주차
+
+    import urllib.parse
+
+    r = client.post(
+        f"/api/v1/captcha/v1/challenge?subject={urllib.parse.quote(subj)}&chapter={over}&stage=1",
+        headers={"X-Site-Key": "ck_edu_testfp", "Authorization": f"Bearer {tok}"},
+    )
+    # clamp가 되면 200 + 정상 문항, 안 되면 404("플레이할 문항이 없어요")
+    assert r.status_code == 200, f"{subj} {over}주차가 마지막 주차로 보정돼야 한다: {r.text}"
+    assert "challenge_token" in r.json()
+
+
 def test_bank_challenge_http_and_progress(client, db, seed_org):
     """?bank=true 챌린지 발급 + 진도 API가 출제 분류와 일치."""
     from tests.test_wallet_shop import _first_party_key, _student_token
