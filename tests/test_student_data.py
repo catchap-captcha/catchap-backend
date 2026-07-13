@@ -223,6 +223,35 @@ def test_habit_stats_streak(client, db, seed_org):
     assert last["attempts"] >= 5 and last["done"] >= 1 and last["accuracy"] == 100
 
 
+def test_wrong_note_chapter_link_and_review(client, db, seed_org):
+    """오답노트: 챕터 오답은 chapter_no 기록, 같은 문항 정답 시 복습완료(reviewed) 승격."""
+    from app.services import subject_banks
+
+    token = _student_token(client, seed_org)
+    q = next(x for x in subject_banks.playable_pool("수학") if x["type"] == "single")
+    correct = str(q["answer"])
+    wrong = next(str(o["id"]) for o in q["options"] if str(o["id"]) != correct)
+
+    # 2챕터 오답 → 오답노트에 chapter_no=2, 미복습
+    r = client.post("/api/v1/students/me/game-answer",
+                    json={"subject": "수학", "question_id": q["id"], "option_id": wrong, "chapter_no": 2},
+                    headers=auth(token))
+    assert r.status_code == 200 and r.json()["correct"] is False
+    notes = client.get("/api/v1/students/me/wrong-notes", headers=auth(token)).json()
+    note = next(n for n in notes["items"] if n["question"] == q["prompt"])
+    assert note["chapter_no"] == 2 and note["reviewed"] is False
+    assert notes["summary"]["reviewed"] == 0
+
+    # 같은 문항 정답 → 복습완료 승격
+    r2 = client.post("/api/v1/students/me/game-answer",
+                     json={"subject": "수학", "question_id": q["id"], "option_id": correct, "chapter_no": 2},
+                     headers=auth(token))
+    assert r2.status_code == 200 and r2.json()["correct"] is True
+    notes2 = client.get("/api/v1/students/me/wrong-notes", headers=auth(token)).json()
+    note2 = next(n for n in notes2["items"] if n["question"] == q["prompt"])
+    assert note2["reviewed"] is True and notes2["summary"]["reviewed"] >= 1
+
+
 def test_grade_ranking_daily_completion(client, db, seed_org):
     """랭킹: 학년별 풀 + 일일 완료 점수(정답률·속도 + 6과목 완주 보너스 30 + 연속) + 상위3 보너스 코인."""
     from app.core.security import hash_password

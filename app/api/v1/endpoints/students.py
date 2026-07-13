@@ -443,6 +443,7 @@ def wrong_notes(
                 "tip": w.tip,
                 "date": date_label(w.wrong_date),
                 "reviewed": w.reviewed,
+                "chapter_no": w.chapter_no,  # 전체학습 챕터 오답이면 그 챕터, 오늘의 퀴즈면 null
                 "tag": tag,
             }
         )
@@ -1667,12 +1668,31 @@ def _student_answer_text(q: dict, student_answer) -> str:
     return ""  # dict(연결/분류 제출) 등 — 재현 생략
 
 
-def _record_wrong(db: Session, me: StudentProfile, subject: str, q: dict, student_answer) -> None:
+def _mark_reviewed(db: Session, me: StudentProfile, q: dict) -> None:
+    """정답으로 다시 맞힌 문항의 미복습 오답노트를 복습완료(reviewed=True)로 승격.
+
+    복습 순환의 마지막 고리 — 이게 없으면 한번 틀린 문항이 오답노트에 영원히 남고
+    '복습 완료 수'가 항상 0이었다. 프롬프트 텍스트로 매칭(오답 저장 키와 동일)."""
+    prompt = q.get("prompt")
+    if not prompt:
+        return
+    db.query(WrongAnswer).filter(
+        WrongAnswer.student_id == me.id,
+        WrongAnswer.question == prompt,
+        WrongAnswer.reviewed.is_(False),
+    ).update({WrongAnswer.reviewed: True}, synchronize_session=False)
+
+
+def _record_wrong(
+    db: Session, me: StudentProfile, subject: str, q: dict, student_answer,
+    chapter_no: int | None = None,
+) -> None:
     """게임 오답을 오답노트(WrongAnswer)·취약추천(Recommendation)에 실기록.
 
     전 문제 유형 지원 — 정답은 _correct_answer_text(유형별 렌더), 학생 답은
     _student_answer_text. 같은 문항이 '미복습' 상태로 있으면 중복 저장하지 않는다.
-    복습(replay) 오답은 호출부에서 제외한다.
+    복습(replay) 오답은 호출부에서 제외한다. chapter_no는 전체학습 주차 챕터 오답이면 그
+    챕터(≥1), 오늘의 퀴즈 오답이면 None — '약한 챕터 미복습 오답' 진단에 쓴다.
     """
     from app.services import subject_banks
 
@@ -1697,6 +1717,7 @@ def _record_wrong(db: Session, me: StudentProfile, subject: str, q: dict, studen
                 correct_answer=_correct_answer_text(q)[:200],
                 tip=q.get("explain") or q.get("hint"),
                 wrong_date=date.today(),
+                chapter_no=chapter_no if (isinstance(chapter_no, int) and chapter_no >= 1) else None,
             )
         )
 
@@ -1758,10 +1779,14 @@ def game_answer(
         picked_ids = [str(req.option_id)] if req.option_id else []
         correct = picked_ids == answer_ids
 
-    # 오답이면 오답노트·취약추천에 실기록 (복습은 제외 — 반복 파밍/중복 누적 방지)
-    if not correct and not req.replay:
-        student_ans = req.option_ids if q["type"] == "multi" else req.option_id
-        _record_wrong(db, me, req.subject, q, student_ans)
+    # 오답이면 오답노트·취약추천에 실기록 / 정답이면 그 문항 미복습 오답노트를 복습완료로 승격.
+    # (복습은 제외 — 반복 파밍/중복 누적 방지)
+    if not req.replay:
+        if not correct:
+            student_ans = req.option_ids if q["type"] == "multi" else req.option_id
+            _record_wrong(db, me, req.subject, q, student_ans, chapter_no=req.chapter_no)
+        else:
+            _mark_reviewed(db, me, q)
 
     # 서버 판정 결과를 학습기록으로 저장 (기존 save_attempt와 동일 부수효과: 코인 상한·진도·퀴즈 상태)
     # 챕터 플레이(chapter_no 지정)는 daily=False — 코인·정답률(숙련도)은 반영하되 오늘의퀴즈(습관) 미갱신.

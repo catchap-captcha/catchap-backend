@@ -99,6 +99,9 @@ class WrongAnswer(Base, UUIDPk, Timestamps):
     tip: Mapped[str | None] = mapped_column(Text, nullable=True)
     reviewed: Mapped[bool] = mapped_column(default=False)
     wrong_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    # 전체학습 주차 챕터 오답이면 그 챕터(≥1), 오늘의 퀴즈 오답이면 NULL — '약한 챕터 미복습
+    # 오답' 진단(대시보드)에 쓴다. 정답으로 다시 맞히면 reviewed=True로 승격(복습 순환).
+    chapter_no: Mapped[int | None] = mapped_column(nullable=True, index=True)
 
 
 class Recommendation(Base, UUIDPk, Timestamps):

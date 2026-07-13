@@ -180,7 +180,11 @@ def _credit_student(
     문항부터 완료 신고(completed) — 오늘의퀴즈 done은 save_attempt가 '정답일 때만' 승격한다.
     복습(rp: 발급 토큰에 서명된 값)은 코인·퀴즈 상태에 반영하지 않는다.
     """
-    from app.api.v1.endpoints.students import _record_wrong, save_attempt  # 지연 import (순환 회피)
+    from app.api.v1.endpoints.students import (  # 지연 import (순환 회피)
+        _mark_reviewed,
+        _record_wrong,
+        save_attempt,
+    )
     from app.core.permissions import Principal
     from app.schemas.student import AttemptCreate
     from app.services import subject_banks
@@ -216,10 +220,14 @@ def _credit_student(
 
     # 뱅크 문항 오답 → 오답노트·취약추천 (전 문제 유형 — 정답 텍스트는 _record_wrong가
     # 유형별로 렌더, route/trace/swipe 등 텍스트 정답 없는 유형은 개념(explain)으로). 복습 제외.
-    if qid and not correct and not replay:
+    # 정답이면 그 문항의 미복습 오답노트를 복습완료로 승격(복습 순환 완성).
+    if qid and not replay:
         q = subject_banks.get_question(subject, str(qid))
         if q is not None:
-            _record_wrong(db, student, subject, q, answer)
+            if not correct:
+                _record_wrong(db, student, subject, q, answer, chapter_no=meta.get("chapter"))
+            else:
+                _mark_reviewed(db, student, q)
 
     answered_before = (
         db.query(func.count(LearningAttempt.id))
