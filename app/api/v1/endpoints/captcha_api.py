@@ -205,13 +205,18 @@ def _credit_student(
     # 뱅크 문항 오답 → 오답노트·취약추천 (동작형 drag/trace는 대상 아님, 복습 제외)
     if qid and not correct and not replay:
         q = subject_banks.get_question(subject, str(qid))
-        if q is not None:
+        # input(정답 목록은 'answers')·route·trace 등 'answer' 키 없는 유형은 오답노트
+        # 스킵 — q["answer"] 직접 접근은 KeyError로 verify 전체를 500내던 실버그.
+        ans = q.get("answer") if q is not None else None
+        if ans is None and q is not None and isinstance(q.get("answers"), list) and q["answers"]:
+            ans = q["answers"][0]
+        if q is not None and ans is not None:
             if q["type"] == "multi":
                 picked_ids = [str(x) for x in (answer or [])]
-                answer_ids = [str(a) for a in (q["answer"] or [])]
+                answer_ids = [str(a) for a in (ans or [])]
             else:
                 picked_ids = [str(answer)] if answer is not None else []
-                answer_ids = [str(q["answer"])]
+                answer_ids = [str(ans)]
             _record_wrong(db, student, subject, q, picked_ids, answer_ids)
 
     answered_before = (
@@ -233,8 +238,9 @@ def _credit_student(
         # 주차 플레이는 실제 챕터 번호, 자유 은행은 0 마커 — 둘 다 오늘의퀴즈
         # 진행바(chapter_no IS NULL 집계)에 안 섞인다
         chapter_no=meta.get("chapter") if is_chapter else (0 if is_bank else None),
-        # 문항 id — 문제은행 모드의 '안 푼/틀린/맞춘' 분류 원천(bank_mode._last_results)
-        content_id=str(qid) if qid else None,
+        # 문항 id — 문제은행 모드의 '안 푼/틀린/맞춘' 분류 원천(bank_mode._last_results).
+        # 컬럼(80자) 초과분은 잘라 저장 — 초과로 verify 전체가 500나는 것보다 낫다.
+        content_id=str(qid)[:80] if qid else None,
         result="correct" if correct else "incorrect",
         score=20 if correct else 0,  # 5문 기준 100점 만점 (game-answer와 동일)
         completed=answered >= EDU_SESSION_TOTAL and not replay and not is_bank,

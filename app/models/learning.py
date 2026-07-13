@@ -72,7 +72,9 @@ class LearningAttempt(Base, UUIDPk, Timestamps):
     )
     subject: Mapped[str] = mapped_column(String(20), index=True)
     chapter_no: Mapped[int | None] = mapped_column(nullable=True)
-    content_id: Mapped[str | None] = mapped_column(CHAR(36), nullable=True)
+    # 뱅크 문항 id — UUID가 아니라 'math-ch4_08_...'류 슬러그(최장 49자 관측)라 CHAR(36)이면
+    # verify가 500(Data too long)났다. 여유를 두고 80자.
+    content_id: Mapped[str | None] = mapped_column(String(80), nullable=True)
     result: Mapped[str] = mapped_column(String(20))  # correct | incorrect
     score: Mapped[int] = mapped_column(default=0)
     solve_time_ms: Mapped[int] = mapped_column(default=0)

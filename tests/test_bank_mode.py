@@ -150,6 +150,62 @@ def test_chapter_hybrid_priority_and_no_coin(client, db, seed_org):
     assert db.query(CoinTransaction).filter(CoinTransaction.student_id == student.id).count() == 0
 
 
+def test_verify_long_qid_and_answerless_wrong(client, db, seed_org):
+    """0713 라이브 500 회귀 — ① 36자 초과 문항 id 적립, ② answer 키 없는 유형(input) 오답."""
+    from app.models import LearningAttempt
+    from app.services import captcha_service as cs
+    from app.services import subject_banks
+    from tests.test_wallet_shop import _first_party_key, _student_token
+
+    _first_party_key(db)
+    tok = _student_token(client)
+    student = seed_org["student"]
+    headers = {"X-Site-Key": "ck_edu_testfp", "Authorization": f"Bearer {tok}"}
+
+    # ① 최장급 슬러그 id 문항 — verify가 500 없이 적립돼야 한다
+    long_q = max(
+        (q for s in sorted(subject_banks.LIVE_SUBJECTS) for q in subject_banks.playable_pool(s)),
+        key=lambda q: len(q["id"]),
+    )
+    subj = next(
+        s for s in sorted(subject_banks.LIVE_SUBJECTS)
+        if any(q["id"] == long_q["id"] for q in subject_banks.playable_pool(s))
+    )
+    assert len(long_q["id"]) > 36, "36자 초과 id가 있어야 회귀를 잡는다"
+    ch = cs._wrap_bank_question(subj, long_q, {"subj": subj, "bank": True})
+    r = client.post(
+        "/api/v1/captcha/v1/verify",
+        json={"challenge_token": ch["challenge_token"], "answer": "오답용-임의값"},
+        headers=headers,
+    )
+    assert r.status_code == 200, r.text  # 500(Data too long)이면 실패
+    att = (
+        db.query(LearningAttempt)
+        .filter(LearningAttempt.student_id == student.id, LearningAttempt.content_id == long_q["id"])
+        .first()
+    )
+    assert att is not None, "긴 id도 잘리지 않고 저장돼야 한다"
+
+    # ② input 유형(answer 키 없음, answers 목록) 오답 — KeyError 없이 처리
+    input_q = next(
+        (q for s in sorted(subject_banks.LIVE_SUBJECTS)
+         for q in subject_banks.playable_pool(s) if q["type"] == "input"),
+        None,
+    )
+    if input_q is not None:
+        subj2 = next(
+            s for s in sorted(subject_banks.LIVE_SUBJECTS)
+            if any(q["id"] == input_q["id"] for q in subject_banks.playable_pool(s))
+        )
+        ch2 = cs._wrap_bank_question(subj2, input_q, {"subj": subj2, "bank": True})
+        r2 = client.post(
+            "/api/v1/captcha/v1/verify",
+            json={"challenge_token": ch2["challenge_token"], "answer": "완전 틀린 답"},
+            headers=headers,
+        )
+        assert r2.status_code == 200, r2.text  # KeyError('answer')면 500
+
+
 def test_bank_challenge_http_and_progress(client, db, seed_org):
     """?bank=true 챌린지 발급 + 진도 API가 출제 분류와 일치."""
     from tests.test_wallet_shop import _first_party_key, _student_token
