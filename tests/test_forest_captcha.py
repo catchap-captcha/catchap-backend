@@ -71,7 +71,22 @@ def test_modified_forest_api_hides_answer_and_serves_object_pose(client):
 def test_dbstore_shares_across_worker_instances(db):
     """DBStore로 워커 간 challenge 공유 — 발급 워커와 다른 워커(새 store 인스턴스)에서
     verify해도 정답이 통과해야 한다(멀티워커 '정답이어도 실패' 회귀 방지)."""
+    import pytest
+    from sqlalchemy import text
+    from sqlalchemy.exc import OperationalError
+
     from app.services import forest_captcha as fc
+    from app.db.session import SessionLocal
+
+    # DBStore는 요청 세션이 아니라 앱 설정 DB(SessionLocal)에 직접 붙는다 — 여러 인스턴스가
+    # '실제로 공유되는' 저장소여야 검증이 성립하므로 in-memory SQLite로는 대체 불가.
+    # 공유 DB가 미가용이면(예: MySQL 미기동 CI) 이 회귀 가드는 skip한다.
+    try:
+        probe = SessionLocal()
+        probe.execute(text("SELECT 1"))
+        probe.close()
+    except OperationalError as e:
+        pytest.skip(f"공유 DB 미가용 — DBStore 크로스워커 테스트 skip: {e}")
 
     # 워커 A: 별도 서비스 인스턴스로 발급
     svc_a = fc.ForestCaptchaService(store=fc.DBStore())
