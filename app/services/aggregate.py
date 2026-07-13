@@ -224,13 +224,19 @@ def student_roster_metrics(
     half_start = today - timedelta(days=183)
     # 장기 열의 시작 = 현재 반 배정일(이력) — 없으면 학년도(3/1) 근사, 상한은 최근 1년
     fallback_year_start = max(today - timedelta(days=365), _school_year_start(today))
-    assigned_since: dict[str, date] = {
-        sid: max(st.date(), today - timedelta(days=365))
-        for sid, st in db.query(ClassAssignment.student_id, ClassAssignment.started_on)
-        .filter(ClassAssignment.student_id.in_(ids), ClassAssignment.ended_on.is_(None))
-        .all()
-        if st is not None
-    }
+    try:
+        assigned_since: dict[str, date] = {
+            sid: max(st.date(), today - timedelta(days=365))
+            for sid, st in db.query(ClassAssignment.student_id, ClassAssignment.started_on)
+            .filter(ClassAssignment.student_id.in_(ids), ClassAssignment.ended_on.is_(None))
+            .all()
+            if st is not None
+        }
+    except Exception:
+        # class_assignments 테이블이 아직 없으면(DDL 미적용 배포 창) 학년도 근사로 동작 —
+        # 명단 조회가 마이그레이션에 인질 잡히지 않게 한다.
+        db.rollback()
+        assigned_since = {}
     rows = (
         db.query(
             LearningAttempt.student_id,

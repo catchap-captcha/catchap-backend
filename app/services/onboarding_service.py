@@ -30,11 +30,17 @@ def record_class_assignment(db: Session, student: StudentProfile, new_class_id: 
     열린 행(ended_on IS NULL)을 오늘로 닫고, 새 반이 있으면 새 행을 연다.
     같은 반 재배정은 무시(이력 오염 방지). 시각은 KST 로컬(datetime.now()) 규약.
     교사 명단의 '학년도(배정 기간)' 학습시간 절단이 이 이력을 쓴다."""
-    open_row = (
-        db.query(ClassAssignment)
-        .filter(ClassAssignment.student_id == student.id, ClassAssignment.ended_on.is_(None))
-        .first()
-    )
+    try:
+        open_row = (
+            db.query(ClassAssignment)
+            .filter(ClassAssignment.student_id == student.id, ClassAssignment.ended_on.is_(None))
+            .first()
+        )
+    except Exception:
+        # 테이블이 아직 없으면(DDL 미적용 배포 창) 이력 기록만 건너뛴다 —
+        # 배정 자체(class_id 변경)가 이력 때문에 실패하면 안 된다.
+        db.rollback()
+        return
     if open_row is not None and open_row.class_id == new_class_id:
         return  # 변화 없음
     now = datetime.now()
