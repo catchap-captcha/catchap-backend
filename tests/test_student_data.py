@@ -130,23 +130,51 @@ def test_daily_quiz_reflects_daily_quiz_status(client, db, seed_org):
     assert dash.json()["today"] == {"done": 1, "total": len(rows)}
 
 
+def _single_q(subject):
+    from app.services import subject_banks
+
+    return next(x for x in subject_banks.playable_pool(subject) if x["type"] == "single")
+
+
+def _game_answer(client, token, subject, correct, last=False, q=None):
+    """game-answer(서버가 정답 검증 = graded 경로)로 single 문항 1건 제출 — graded 시도 생성.
+
+    무채점 자기신고(/learning/attempts)는 점수 부수효과가 없으므로, done·코인·스티커를
+    검증하는 테스트는 반드시 이 서버 채점 경로를 써야 한다(적대적검토 #4/#5 수정 이후)."""
+    q = q or _single_q(subject)
+    ans = str(q["answer"])
+    opt = ans if correct else next(str(o["id"]) for o in q["options"] if str(o["id"]) != ans)
+    r = client.post(
+        "/api/v1/students/me/game-answer",
+        json={"subject": subject, "question_id": q["id"], "option_id": opt, "last": last},
+        headers=auth(token),
+    )
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def _complete_subject(client, token, subject):
+    """게임 채점으로 5문항 정답 → 오늘의퀴즈 done 승격(graded≥5 + 정답). 마지막 응답 반환."""
+    q = _single_q(subject)
+    res = None
+    for i in range(5):
+        res = _game_answer(client, token, subject, correct=True, last=(i == 4), q=q)
+    return res
+
+
 def test_quiz_status_unified_on_attempts(client, db, seed_org):
-    """'오늘의 퀴즈 현황' 단일 기준(2026-07-13): 오늘 5문항 다 풀면 마지막이 오답이라
-    daily_quiz_status가 done으로 승격 안 돼도 화면상 '완료'로 본다. 홈·오늘의퀴즈 페이지·
-    결과화면 다음 과목이 모두 이 기준을 공유해, 방금 푼 과목으로 역주행하지 않는다."""
+    """'오늘의 퀴즈 현황' 단일 기준(2026-07-13): 오늘 5문항(서버 채점=graded)을 다 풀면
+    마지막이 오답이라 daily_quiz_status가 done으로 승격 안 돼도 화면상 '완료'로 본다.
+    홈·오늘의퀴즈 페이지·결과화면 다음 과목이 이 기준을 공유해 역주행하지 않는다."""
     from app.models import DailyQuizStatus
 
     token = _student_token(client, seed_org)
 
-    # 국어 5문항을 오답으로 소진(오늘의퀴즈 축: chapter_no 없음, completed 아님) → status는 done 아님
-    for _ in range(5):
-        r = client.post(
-            "/api/v1/learning/attempts",
-            json={"subject": "국어", "result": "incorrect", "score": 0, "daily": True},
-            headers=auth(token),
-        )
-        assert r.status_code == 200
-    q = (
+    # 국어 5문항을 게임 채점(graded)으로 소진(마지막 오답) → status는 done 아님
+    q = _single_q("국어")
+    for i in range(5):
+        _game_answer(client, token, "국어", correct=False, last=(i == 4), q=q)
+    quiz = (
         db.query(DailyQuizStatus)
         .filter(
             DailyQuizStatus.student_id == seed_org["student"].id,
@@ -155,9 +183,9 @@ def test_quiz_status_unified_on_attempts(client, db, seed_org):
         )
         .first()
     )
-    assert q is not None and q.status != "done"  # 오답 소진 — 정답완주 아님(코인·랭킹 미지급)
+    assert quiz is None or quiz.status != "done"  # 오답 소진 — 정답완주 아님(코인·랭킹 미지급)
 
-    # 홈 대시보드: 국어가 '완료'(시도 기준)로 잡힌다
+    # 홈 대시보드: 국어가 '완료'(graded 시도 5 기준)로 잡힌다
     dash = client.get("/api/v1/students/me/dashboard", headers=auth(token)).json()
     kor = next(s for s in dash["subjects"] if s["subject"] == "국어")
     assert kor["state"] == "done" and kor["done"] == kor["total"]
@@ -174,6 +202,39 @@ def test_quiz_status_unified_on_attempts(client, db, seed_org):
     order = res["subject_order"]
     next_undone = next((s for s in order if s not in set(res["today_done"])), None)
     assert next_undone != "국어"
+
+
+def test_self_report_attempts_grant_no_score(client, db, seed_org):
+    """적대적검토 #4/#5 회귀: 무채점 자기신고(/learning/attempts)로는 오늘의퀴즈 done·랭킹·
+    코인·스티커·화면상 완료를 전부 얻을 수 없다. 6과목 completed:true를 보내도 무효."""
+    from app.models import DailyQuizStatus, StudentProfile
+
+    token = _student_token(client, seed_org)
+    before = db.get(StudentProfile, seed_org["student"].id).coins
+    for subj in ["국어", "영어", "수학", "과학", "사회", "생활"]:
+        r = client.post(
+            "/api/v1/learning/attempts",
+            json={"subject": subj, "result": "correct", "score": 100, "completed": True, "solve_time_ms": 1},
+            headers=auth(token),
+        )
+        assert r.status_code == 200
+        body = r.json()
+        assert body["coins_earned"] == 0 and body["sticker_awarded"] is False
+
+    db.expire_all()
+    done = (
+        db.query(DailyQuizStatus)
+        .filter(
+            DailyQuizStatus.student_id == seed_org["student"].id,
+            DailyQuizStatus.status == "done",
+        )
+        .count()
+    )
+    assert done == 0  # done 승격 없음 → 랭킹·스티커 근거 안 생김
+    assert db.get(StudentProfile, seed_org["student"].id).coins == before  # 코인 미증가
+    # 대시보드 '완료'도 없음(_played는 graded만) — 자기신고로 표시 위조도 불가
+    dash = client.get("/api/v1/students/me/dashboard", headers=auth(token)).json()
+    assert dash["today"]["done"] == 0
 
 
 def test_chapter_stats_two_axis(client, db, seed_org):
@@ -328,14 +389,9 @@ def test_replay_attempt_no_status_no_coins(client, db, seed_org):
     )
     assert quiz is None or quiz.status != "done"  # 복습으로 오늘 완료 처리되지 않음
 
-    # 일반 완료는 여전히 동작 (코인 + done)
-    r2 = client.post(
-        "/api/v1/learning/attempts",
-        json={"subject": "국어", "result": "correct", "score": 100, "completed": True},
-        headers=auth(token),
-    )
-    assert r2.status_code == 200
-    assert r2.json()["coins_earned"] > 0
+    # 정식 완료(서버 채점)는 여전히 동작 — 게임 채점 5문항 정답 → done + 코인 지급.
+    # (무채점 /learning/attempts로는 이제 done·코인이 안 되므로 game-answer 경로를 쓴다.)
+    _complete_subject(client, token, "국어")
     db.expire_all()
     quiz2 = (
         db.query(DailyQuizStatus)
@@ -347,6 +403,7 @@ def test_replay_attempt_no_status_no_coins(client, db, seed_org):
         .first()
     )
     assert quiz2 is not None and quiz2.status == "done"
+    assert db.get(StudentProfile, seed_org["student"].id).coins > before_coins  # 코인 지급됨
 
 
 def test_game_session_server_graded(client, db, seed_org):
@@ -713,22 +770,16 @@ def test_all_subjects_sticker_awarded_once(client, db, seed_org):
     subjects = ["국어", "영어", "수학", "과학", "사회", "생활"]
     before = db.get(StudentProfile, seed_org["student"].id).coins
 
+    # 각 과목을 서버 채점(game-answer)으로 5문항 정답 완료 → 6번째 과목 done 순간 스티커.
+    # (무채점 /learning/attempts로는 이제 done·스티커가 안 되므로 서버 채점 경로를 쓴다.)
     last_res = None
     for subj in subjects:
-        last_res = client.post(
-            "/api/v1/learning/attempts",
-            json={"subject": subj, "result": "correct", "score": 100, "completed": True},
-            headers=auth(token),
-        ).json()
+        last_res = _complete_subject(client, token, subj)
     # 여섯 번째 과목 완료 응답에 스티커+보너스 코인이 실린다
     assert last_res["sticker_awarded"] is True
     assert last_res["sticker_coins"] > 0
-    # 앞선 5개 응답에는 없었을 것 — 대신 다시 완료해도 중복 지급이 없는지 확인
-    again = client.post(
-        "/api/v1/learning/attempts",
-        json={"subject": "국어", "result": "correct", "score": 100, "completed": True},
-        headers=auth(token),
-    ).json()
+    # 이미 done인 과목을 다시 정답 완료해도 중복 지급이 없는지 확인
+    again = _game_answer(client, token, "국어", correct=True, last=True)
     assert again["sticker_awarded"] is False and again["sticker_coins"] == 0
 
     db.expire_all()

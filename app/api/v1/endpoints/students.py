@@ -102,6 +102,7 @@ def _played_today(db: Session, student_id: str) -> dict[str, int]:
             LearningAttempt.student_id == student_id,
             LearningAttempt.created_at >= start,
             LearningAttempt.chapter_no.is_(None),
+            LearningAttempt.graded.is_(True),  # 서버 채점만 — 자기신고가 표시상 '완료'도 못 만들게
         )
         .group_by(LearningAttempt.subject)
         .all()
@@ -1116,7 +1117,16 @@ def save_attempt(
     principal: Principal = Depends(require_student),
     db: Session = Depends(get_db),
 ):
-    me = _me(principal)
+    # 공개 자기신고 경로 — graded=False. 서버 채점(정답 검증) 없이 온 값이므로 오늘의퀴즈
+    # done 승격·랭킹·코인·스티커 등 점수 부수효과를 주지 않는다(기록·행동데이터만 남긴다).
+    # 서버 채점 경로(위젯 verify·game-answer)는 _apply_attempt(graded=True)로 호출한다.
+    # (적대적 검토 0713 #4/#5 — 무채점 자기신고로 랭킹/스티커/코인 위조 차단.)
+    return _apply_attempt(req, _me(principal), db, graded=False)
+
+
+def _apply_attempt(
+    req: AttemptCreate, me: StudentProfile, db: Session, graded: bool = False
+) -> dict:
     if req.subject not in D.SUBJECT_ORDER:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="알 수 없는 과목입니다.")
     attempt = LearningAttempt(
@@ -1130,6 +1140,7 @@ def save_attempt(
         solve_time_ms=req.solve_time_ms,
         retry_count=req.retry_count,
         estimated_reason=req.estimated_reason,
+        graded=graded,
     )
     db.add(attempt)
 
@@ -1148,8 +1159,9 @@ def save_attempt(
         )
 
     coins_earned = 0
-    # 복습(replay)·문제은행(no_coin)은 보상 없음 — 코인은 오늘의퀴즈(습관) 축 전용
-    if req.result == "correct" and not req.replay and not req.no_coin:
+    # 복습(replay)·문제은행(no_coin)은 보상 없음 — 코인은 오늘의퀴즈(습관) 축 전용.
+    # graded(서버 채점)만 코인 지급 — 무채점 자기신고(/learning/attempts)로는 코인 없음.
+    if graded and req.result == "correct" and not req.replay and not req.no_coin:
         # 학생 행 잠금(SELECT ... FOR UPDATE)으로 동시 적립을 직렬화 — earned_today를
         # 읽고 지급하는 사이에 다른 요청이 끼어들면 상한 경계에서 수 코인 오버슛이 났다.
         db.query(StudentProfile).filter(StudentProfile.id == me.id).with_for_update().first()
@@ -1234,7 +1246,7 @@ def save_attempt(
     sticker_awarded = False
     sticker_coins = 0
     quiz_bonus = 0
-    if not req.replay and req.daily:
+    if graded and not req.replay and req.daily:
         quiz = (
             db.query(DailyQuizStatus)
             .filter(
@@ -1249,10 +1261,25 @@ def save_attempt(
                 student_id=me.id, quiz_date=date.today(), subject=req.subject, status="progress"
             )
             db.add(quiz)
-        # 랭킹·상장 위조 차단: done 승격은 '완료 신고 + 서버/제출이 정답'일 때만.
-        # 오답으로는 done이 될 수 없다(오답 반복으로 랭킹 만점 방지). 이미 done이면 유지.
+        # 랭킹·상장 위조 차단(적대적검토 #4): done 승격은 클라이언트 completed 자기신고가
+        # 아니라 '서버가 오늘 이 과목을 graded(서버 채점)로 DAILY_QUIZ_TOTAL 문항 이상 풀었고
+        # 이번 제출이 정답'일 때만. 오답으로는 done 불가. 이미 done이면 유지. 방금 add한
+        # 시도를 카운트에 반영하기 위해 flush 후 집계한다.
+        db.flush()
+        graded_today = (
+            db.query(func.count(LearningAttempt.id))
+            .filter(
+                LearningAttempt.student_id == me.id,
+                LearningAttempt.subject == req.subject,
+                func.date(LearningAttempt.created_at) == date.today(),
+                LearningAttempt.chapter_no.is_(None),
+                LearningAttempt.graded.is_(True),
+            )
+            .scalar()
+            or 0
+        )
         was_done = quiz.status == "done"
-        completed_ok = req.completed and req.result == "correct"
+        completed_ok = req.result == "correct" and int(graded_today) >= DAILY_QUIZ_TOTAL
         quiz.status = "done" if completed_ok else ("progress" if quiz.status != "done" else "done")
 
         # 오늘의퀴즈 완료 보상: 화면에 광고된 과목별 reward_coins를 done '승격 순간' 1회 지급.
@@ -1802,7 +1829,8 @@ def game_answer(
         daily=not is_chapter,
         behavior=req.behavior,
     )
-    saved = save_attempt(attempt_req, principal, db)
+    # game-answer는 서버가 문항 정답을 검증한 경로 → graded=True(점수 부수효과 대상).
+    saved = _apply_attempt(attempt_req, me, db, graded=True)
     # 챕터 단계 완료: 단계 마지막 문항(last)까지 풀면 stages_done 커서 전진(이어하기 저장).
     stages_done = None
     if is_chapter and req.stage is not None and req.last and not req.replay:

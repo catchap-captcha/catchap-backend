@@ -80,6 +80,10 @@ class LearningAttempt(Base, UUIDPk, Timestamps):
     solve_time_ms: Mapped[int] = mapped_column(default=0)
     retry_count: Mapped[int] = mapped_column(default=0)
     estimated_reason: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    # 서버 채점 여부 — True는 위젯 verify·game-answer(서버가 정답 검증) 경로, False는
+    # /learning/attempts 자기신고(비검증). 오늘의퀴즈 done 승격·랭킹·코인·스티커는 graded만
+    # 근거로 삼아 무채점 자기신고 위조를 차단한다(0713 적대적 검토 #4/#5). 기존 행은 True로 백필.
+    graded: Mapped[bool] = mapped_column(default=True, index=True)
 
 
 class WrongAnswer(Base, UUIDPk, Timestamps):

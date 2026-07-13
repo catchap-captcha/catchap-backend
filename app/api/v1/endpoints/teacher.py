@@ -7,7 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from app.core.permissions import Principal, require_teacher
+from app.core.permissions import Principal, managed_grade, require_teacher
 from app.core.security import hash_password
 from app.db.session import get_db
 from app.models import (
@@ -405,6 +405,26 @@ def all_students(
     db: Session = Depends(get_db),
 ):
     org_id = principal.organization_id
+    # 역할별 학생 스코프 강제(적대적검토 #7): 교장/운영=전 학년, 학년부장=담당 학년,
+    # 담임/교사=담당(담임·보조) 학급만. 예전엔 스코프 없이 전교생 실명이 나가 orgs roster의
+    # 세심한 학년/학급 스코프가 이 엔드포인트로 우회됐다.
+    scope_grade: int | None = None
+    scope_class_ids: set[str] | None = None
+    if principal.role == "grade_head":
+        scope_grade = managed_grade(db, principal)
+        if scope_grade is None:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, detail="담당 학년이 지정되지 않았습니다.")
+    elif principal.role == "teacher":
+        scope_class_ids = {
+            c.id
+            for c in db.query(ClassRoom)
+            .filter(
+                ClassRoom.organization_id == org_id,
+                (ClassRoom.teacher_id == principal.id)
+                | (ClassRoom.assistant_teacher_id == principal.id),
+            )
+            .all()
+        }
     # 실배정 학생 전체 (student_profiles/classes 실테이블 기준) — seed roster 폐기
     students = (
         db.query(StudentProfile)
@@ -419,11 +439,18 @@ def all_students(
     real = aggregate.student_roster_metrics(db, [s.id for s in students])
 
     groups: dict[str, list[dict]] = {}
+    scoped_total = 0  # 역할 스코프 안 학생 수(전교생 수 누출 방지 — 검색 필터 이전 기준)
     for s in students:
         c = classes.get(s.class_id)
         if c is None:
             continue
         g, cn = _class_gc(c)
+        # 역할 스코프 강제 — 클라이언트 필터(grade/cls)와 별개로 서버가 먼저 제한한다.
+        if scope_grade is not None and g != scope_grade:
+            continue
+        if scope_class_ids is not None and s.class_id not in scope_class_ids:
+            continue
+        scoped_total += 1
         if grade is not None and g != grade:
             continue
         if cls is not None and cn != cls:
@@ -479,7 +506,7 @@ def all_students(
             }
         )
     total = sum(g["count"] for g in out)
-    return {"total": len(students), "filtered": total, "groups": out}
+    return {"total": scoped_total, "filtered": total, "groups": out}
 
 
 # ---------------------------------------------------------------- 학습 분석

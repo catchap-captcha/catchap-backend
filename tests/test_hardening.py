@@ -26,17 +26,35 @@ def _student_token(client, seed_org):
 
 # ---------------------------------------------------------------- A1
 def test_incorrect_completed_does_not_mark_done(client, db, seed_org):
-    """오답인데 completed=true 로 신고해도 done 으로 승격되지 않는다 (랭킹 만점 위조 차단)."""
+    """오답으로는 done 승격 불가 + 무채점 자기신고로는 아예 done 불가 (랭킹 위조 차단, #4/#5).
+
+    이제 done·코인은 서버 채점 경로(game-answer)만 근거로 삼는다. 자기신고(/learning/attempts)는
+    correct+completed를 보내도 무효고, 서버 채점이라도 마지막 문항이 오답이면 done 안 된다."""
     from datetime import date
 
+    from tests.test_student_data import _game_answer, _single_q
+
     token = _student_token(client, seed_org)
+
+    # 무채점 자기신고 — correct+completed여도 done·코인 없음
     r = client.post(
         "/api/v1/learning/attempts",
-        json={"subject": "국어", "result": "incorrect", "completed": True},
+        json={"subject": "국어", "result": "correct", "completed": True},
         headers=auth(token),
     )
     assert r.status_code == 200, r.text
-    assert r.json()["coins_earned"] == 0  # 오답 보상 없음
+    assert r.json()["coins_earned"] == 0
+    assert (
+        db.query(DailyQuizStatus)
+        .filter(DailyQuizStatus.student_id == seed_org["student"].id, DailyQuizStatus.status == "done")
+        .count()
+        == 0
+    )
+
+    # 서버 채점 4정답 + 마지막 오답 → done 아님(정답완주 아님)
+    q = _single_q("국어")
+    for i in range(5):
+        _game_answer(client, token, "국어", correct=(i < 4), last=(i == 4), q=q)
     quiz = (
         db.query(DailyQuizStatus)
         .filter(
@@ -46,15 +64,10 @@ def test_incorrect_completed_does_not_mark_done(client, db, seed_org):
         )
         .first()
     )
-    assert quiz is not None and quiz.status != "done"  # 진행중일 뿐 완료 아님
+    assert quiz is None or quiz.status != "done"
 
-    # 정답+완료면 정상적으로 done
-    r2 = client.post(
-        "/api/v1/learning/attempts",
-        json={"subject": "국어", "result": "correct", "completed": True},
-        headers=auth(token),
-    )
-    assert r2.status_code == 200
+    # 한 문항 더 정답(graded≥5 + 정답) → 정상 done
+    _game_answer(client, token, "국어", correct=True, last=True, q=q)
     db.expire_all()
     quiz2 = (
         db.query(DailyQuizStatus)

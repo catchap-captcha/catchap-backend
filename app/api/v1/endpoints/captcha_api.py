@@ -181,9 +181,9 @@ def _credit_student(
     복습(rp: 발급 토큰에 서명된 값)은 코인·퀴즈 상태에 반영하지 않는다.
     """
     from app.api.v1.endpoints.students import (  # 지연 import (순환 회피)
+        _apply_attempt,
         _mark_reviewed,
         _record_wrong,
-        save_attempt,
     )
     from app.core.permissions import Principal
     from app.schemas.student import AttemptCreate
@@ -261,7 +261,8 @@ def _credit_student(
         # 문항 풀이시간(위젯 실측) — 0이면 학생홈 '학습 시간'·요일별 그래프가 전부 0분이 된다
         solve_time_ms=solve_time_ms,
     )
-    saved = save_attempt(attempt_req, principal, db)
+    # 위젯 verify는 서버가 챌린지 정답을 검증한 경로 → graded=True(점수 부수효과 대상).
+    saved = _apply_attempt(attempt_req, student, db, graded=True)
 
     quiz_done = (
         db.query(DailyQuizStatus)

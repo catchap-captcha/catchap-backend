@@ -545,3 +545,46 @@ def test_grade_head_cannot_use_org_admin_only(client, db, seed_org):
     assert (
         client.get(f"/api/v1/orgs/{org.id}/grade-heads", headers=auth(gh_tok)).status_code == 403
     )
+
+
+def test_teacher_students_scope_enforced(client, db, seed_org):
+    """적대적검토 #7: /teacher/students가 역할 스코프를 강제 — 담임/교사는 담당 학급,
+    학년부장은 담당 학년만. 다른 학년·학급 학생 실명이 이 API로 새지 않는다."""
+    from app.models import ClassRoom, StudentProfile
+
+    org = seed_org["org"]
+    # 2학년 다른 학급 + 학생(담당 밖)
+    cls2 = ClassRoom(organization_id=org.id, name="2-1반", grade=2)
+    db.add(cls2)
+    db.flush()
+    s2 = StudentProfile(
+        organization_id=org.id, class_id=cls2.id, student_login_id="stu2",
+        student_code="CAT-2222", password_hash=hash_password("1234"),
+        nickname="이학년", real_name="이학년실명",
+    )
+    db.add(s2)
+    db.commit()
+
+    def _all_ids(resp):
+        return {st["id"] for g in resp["groups"] for st in g["students"]}
+
+    # 담임 교사(1-1반) → 자기 학급 학생만, 2학년 학생 미노출
+    tok = _login(client, "t1@test.dev")
+    resp = client.get("/api/v1/teacher/students", headers=auth(tok)).json()
+    ids = _all_ids(resp)
+    assert seed_org["student"].id in ids
+    assert s2.id not in ids  # 담당 밖 학생은 안 보인다
+
+    # 학년부장(1학년)으로 임명 → 1학년만, 2학년 미노출 (역할 갱신 후 재로그인)
+    _org_admin(db, org)
+    admin = _login(client, "principal@test.dev")
+    mid = _teacher_membership_id(db, org)
+    r = client.post(
+        f"/api/v1/orgs/{org.id}/teachers/{mid}/grade-head",
+        json={"grade": 1}, headers=auth(admin),
+    )
+    assert r.status_code == 200, r.text
+    tok2 = _login(client, "t1@test.dev")
+    resp2 = client.get("/api/v1/teacher/students", headers=auth(tok2)).json()
+    ids2 = _all_ids(resp2)
+    assert seed_org["student"].id in ids2 and s2.id not in ids2

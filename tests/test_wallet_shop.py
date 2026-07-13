@@ -154,52 +154,48 @@ def test_shop_purchase_deducts_and_owns(client, db, seed_org):
 
 
 def test_daily_quiz_completion_pays_advertised_reward(client, db, seed_org):
-    """오늘의퀴즈 완료 시 화면에 광고된 reward_coins가 실지급 — 표시 전용이던 버그 회귀 방지."""
+    """오늘의퀴즈 완료(서버 채점) 시 광고된 reward_coins가 실지급 — 하루 1회, 중복·자기신고 미지급.
+
+    done·보상은 이제 서버 채점 경로(game-answer)만 근거로 삼는다(적대적검토 #4/#5).
+    무채점 자기신고(/learning/attempts)로는 완료 보상이 지급되지 않는다."""
     from app.models import CoinTransaction
+    from tests.test_student_data import _complete_subject, _game_answer
 
     tok = _student_token(client)
     headers = {"Authorization": f"Bearer {tok}"}
 
-    # 오늘의퀴즈 화면이 광고하는 보상액(프리셋에서 생성됨)
     quiz = client.get("/api/v1/students/me/daily-quiz", headers=headers).json()
     math_row = next(q for q in quiz["quizzes"] if q["subject"] == "수학")
     advertised = math_row["reward"]
     assert advertised > 0
 
-    # 완료 신고(정답) → 학습 보상 10 + 완료 보상(광고액) 함께 지급
-    r = client.post(
+    # 자기신고로는 완료 보상 없음
+    r0 = client.post(
         "/api/v1/learning/attempts",
         json={"subject": "수학", "result": "correct", "completed": True},
         headers=headers,
     )
-    assert r.status_code == 200, r.text
-    body = r.json()
-    assert body["quiz_bonus"] == advertised, body
-    assert body["coins"] == 100 + 10 + advertised  # seed 100 + 학습 10 + 완료 보상
+    assert r0.status_code == 200 and r0.json()["quiz_bonus"] == 0
 
+    # 서버 채점 5문항 정답 완료 → done 순간 완료 보상(광고액) 1회 지급
+    _complete_subject(client, tok, "수학")
+    db.expire_all()
     tx = (
         db.query(CoinTransaction)
         .filter(CoinTransaction.reason == "수학 오늘의퀴즈 완료 보상")
-        .first()
+        .all()
     )
-    assert tx is not None and tx.amount == advertised
+    assert len(tx) == 1 and tx[0].amount == advertised
 
-    # 같은 날 재완료 신고는 보상 중복 지급 없음 (학습 보상 10만)
-    r2 = client.post(
-        "/api/v1/learning/attempts",
-        json={"subject": "수학", "result": "correct", "completed": True},
-        headers=headers,
+    # 같은 날 재완료(정답)해도 완료 보상 중복 없음
+    _game_answer(client, tok, "수학", correct=True, last=True)
+    db.expire_all()
+    assert (
+        db.query(CoinTransaction)
+        .filter(CoinTransaction.reason == "수학 오늘의퀴즈 완료 보상")
+        .count()
+        == 1
     )
-    assert r2.json()["quiz_bonus"] == 0
-    assert r2.json()["coins"] == 100 + 10 + advertised + 10
-
-    # 복습은 완료 보상 없음
-    r3 = client.post(
-        "/api/v1/learning/attempts",
-        json={"subject": "과학", "result": "correct", "completed": True, "replay": True},
-        headers=headers,
-    )
-    assert r3.json()["quiz_bonus"] == 0
 
 
 def test_shop_purchase_by_design_key(client, db, seed_org):
