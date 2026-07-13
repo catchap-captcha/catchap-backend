@@ -176,6 +176,8 @@ def _credit_student(
     subject = str(meta.get("subj") or "")
     replay = bool(meta.get("rp"))
     qid = meta.get("qid")
+    # 전체학습 문제은행 모드(0713): 기록·정답률·오답노트만 — 코인·오늘의퀴즈·연속도전 미반영.
+    is_bank = bool(meta.get("bank"))
     # 전체학습 주간 챕터 플레이면 오늘의퀴즈(습관)를 건드리지 않는다(학습·습관 분리).
     is_chapter = meta.get("chapter") is not None
     # 챕터 복습은 서버가 판정한다 — 이미 완주한 단계(stages_done 이상)의 재플레이는
@@ -218,6 +220,9 @@ def _credit_student(
             LearningAttempt.student_id == student.id,
             LearningAttempt.subject == subject,
             func.date(LearningAttempt.created_at) == date.today(),
+            # 오늘의퀴즈 세션 판정은 데일리 시도(chapter_no NULL)만 — 챕터/은행 플레이가
+            # 세어지면 5문항 완료가 조기/오판정된다
+            LearningAttempt.chapter_no.is_(None),
         )
         .scalar()
         or 0
@@ -225,12 +230,16 @@ def _credit_student(
     answered = answered_before + 1
     attempt_req = AttemptCreate(
         subject=subject,
-        chapter_no=meta.get("chapter"),
+        # 은행 모드는 chapter_no=0 마커 — 오늘의퀴즈 진행바(chapter_no IS NULL 집계)에 안 섞인다
+        chapter_no=0 if is_bank else meta.get("chapter"),
+        # 문항 id — 문제은행 모드의 '안 푼/틀린/맞춘' 분류 원천(bank_mode._last_results)
+        content_id=str(qid) if qid else None,
         result="correct" if correct else "incorrect",
         score=20 if correct else 0,  # 5문 기준 100점 만점 (game-answer와 동일)
-        completed=answered >= EDU_SESSION_TOTAL and not replay,
+        completed=answered >= EDU_SESSION_TOTAL and not replay and not is_bank,
         replay=replay,
-        daily=not is_chapter,  # 챕터 플레이는 오늘의퀴즈 done/연속도전 미갱신
+        daily=not is_chapter and not is_bank,  # 챕터·은행 플레이는 오늘의퀴즈/연속도전 미갱신
+        no_coin=is_bank,  # 문제은행은 무보상(제품 결정) — 코인은 오늘의퀴즈 전용
         behavior=None,  # 행동데이터는 record_behavior(edu-api)로 이미 적재 — 이중 기록 방지
         # 문항 풀이시간(위젯 실측) — 0이면 학생홈 '학습 시간'·요일별 그래프가 전부 0분이 된다
         solve_time_ms=solve_time_ms,
@@ -272,6 +281,7 @@ def challenge(
     replay: bool = False,  # edu: 복습 세션 — verify 적립 시 코인·퀴즈 상태 미반영
     chapter: int | None = None,  # 전체학습 주간 챕터 — 그 챕터 문항만 + 오늘의퀴즈 미오염
     stage: int | None = None,  # 챕터 단계(1~5) — 단계 문항 슬라이스
+    bank: bool = False,  # 전체학습 문제은행 모드 — 안 푼>틀린>맞춘 우선 출제, 코인·퀴즈 미반영
     db: Session = Depends(get_db),
 ):
     _throttle(db, request, "chall", RATE_CHALLENGE_PER_MIN)
@@ -295,6 +305,20 @@ def challenge(
         learning = True  # 커리큘럼 일차(생활 인앱)도 학습 세션
     if chapter is not None:
         learning = True  # 전체학습 주간 챕터도 학습 세션(조작형 대신 실문항)
+    if bank and api.product == "edu" and eff_subject in cs.EDU_SUBJECTS:
+        # 전체학습 문제은행 모드 — 학생 이력 기반 우선순위 출제(안 푼>틀린>맞춘).
+        # 인증 학생이 없으면(외부 임베드) 은행 전체 랜덤으로 동작한다.
+        from app.services import bank_mode
+
+        student = _optional_student(db, request)
+        q = bank_mode.pick_question(db, student, eff_subject)
+        if q is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, detail="플레이할 문항이 없어요.")
+        # meta.bank → verify가 코인·오늘의퀴즈를 건드리지 않고 기록·오답노트만 남긴다
+        ch = cs._wrap_bank_question(eff_subject, q, {"subj": eff_subject, "bank": True})
+        cs.log_call(db, api, "captcha/challenge", 200, subject=eff_subject)
+        db.commit()
+        return {"product": api.product, "subject": eff_subject, **ch}
     ch = cs.make_challenge(
         api.product, eff_subject, day=day, replay=replay, learning=learning,
         chapter=chapter, stage=stage,

@@ -574,6 +574,33 @@ def recommendations(
 
 
 # ---------------------------------------------------------------- 오늘의퀴즈
+@router.get("/students/me/bank-progress")
+def bank_progress(
+    principal: Principal = Depends(require_student), db: Session = Depends(get_db)
+):
+    """전체학습(문제은행) 진도 — 과목별 안 푼/틀린/맞춘 문항 수 + 과목 정답률.
+
+    챕터/주간 잠금/코인이 없는 은행 모드(0713)의 화면 카드용. 출제 우선순위와
+    같은 분류(bank_mode.split_pool)를 쓰므로 화면 수치와 실제 출제가 항상 일치한다.
+    """
+    from app.services import bank_mode, subject_banks
+
+    me = _me(principal)
+    acc_by_subject = {
+        p.subject: p.accuracy
+        for p in db.query(StudentProgress).filter(StudentProgress.student_id == me.id).all()
+    }
+    out = []
+    for subject in D.SUBJECT_ORDER:
+        if subject not in subject_banks.LIVE_SUBJECTS:
+            continue
+        row = bank_mode.progress(db, me, subject)
+        row["accuracy"] = acc_by_subject.get(subject)
+        row["meta"] = D.SUBJECT_META.get(subject, {})
+        out.append(row)
+    return {"subjects": out}
+
+
 @router.get("/students/me/daily-quiz")
 def daily_quiz(
     principal: Principal = Depends(require_student), db: Session = Depends(get_db)
@@ -1073,8 +1100,8 @@ def save_attempt(
         )
 
     coins_earned = 0
-    # 복습(replay: 전날 다시풀기·오늘 재도전)은 보상 없음 — 반복 파밍 차단
-    if req.result == "correct" and not req.replay:
+    # 복습(replay)·문제은행(no_coin)은 보상 없음 — 코인은 오늘의퀴즈(습관) 축 전용
+    if req.result == "correct" and not req.replay and not req.no_coin:
         # 학생 행 잠금(SELECT ... FOR UPDATE)으로 동시 적립을 직렬화 — earned_today를
         # 읽고 지급하는 사이에 다른 요청이 끼어들면 상한 경계에서 수 코인 오버슛이 났다.
         db.query(StudentProfile).filter(StudentProfile.id == me.id).with_for_update().first()

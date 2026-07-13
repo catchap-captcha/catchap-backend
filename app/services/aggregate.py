@@ -178,7 +178,13 @@ def student_roster_metrics(
     dates: dict[str, set[date]] = defaultdict(set)
     acc_n: dict[str, int] = defaultdict(int)
     acc_d: dict[str, int] = defaultdict(int)
+    # 기간별 학습시간(ms): 오늘 / 이번 주 / 최근 6개월(반기) / 최근 1년
+    today_ms: dict[str, int] = defaultdict(int)
     week_ms: dict[str, int] = defaultdict(int)
+    half_ms: dict[str, int] = defaultdict(int)
+    year_ms: dict[str, int] = defaultdict(int)
+    half_start = today - timedelta(days=183)
+    year_start = today - timedelta(days=365)
     rows = (
         db.query(
             LearningAttempt.student_id,
@@ -197,8 +203,15 @@ def student_roster_metrics(
             acc_d[sid] += 1
             if result == "correct":
                 acc_n[sid] += 1
+        t = ms or 0
+        if dd == today:
+            today_ms[sid] += t
         if dd >= week_start:
-            week_ms[sid] += ms or 0
+            week_ms[sid] += t
+        if dd >= half_start:
+            half_ms[sid] += t
+        if dd >= year_start:
+            year_ms[sid] += t
 
     done_today = {
         r[0]
@@ -219,7 +232,11 @@ def student_roster_metrics(
             "streak": _streak_days(dates[sid], today),
             "solved": solved[sid],
             "today": "done" if sid in done_today else "none",
-            "week_min": round(week_ms[sid] / 60000),  # 이번 주 학습 시간(분)
+            # 기간별 학습 시간(분) — 오늘/이번 주/최근 6개월/최근 1년
+            "today_min": round(today_ms[sid] / 60000),
+            "week_min": round(week_ms[sid] / 60000),
+            "half_min": round(half_ms[sid] / 60000),
+            "year_min": round(year_ms[sid] / 60000),
         }
     return out
 

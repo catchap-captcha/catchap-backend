@@ -17,7 +17,8 @@ class StudentProfileUpdate(BaseModel):
 
 class AttemptCreate(BaseModel):
     subject: str
-    chapter_no: int | None = Field(default=None, ge=1, le=1000)
+    # 0 = 문제은행(전체학습) 마커 — 오늘의퀴즈 집계(chapter_no IS NULL)와 분리하기 위한 관례
+    chapter_no: int | None = Field(default=None, ge=0, le=1000)
     content_id: str | None = None
     result: str = Field(default="correct", pattern="^(correct|incorrect)$")
     # 클라이언트 자기신고 값 — 랭킹/집계 오염 방지 위해 상한 고정 (서버 채점은 교육 API 단계)
@@ -27,6 +28,8 @@ class AttemptCreate(BaseModel):
     estimated_reason: str | None = Field(default=None, max_length=200)
     completed: bool = False  # true면 오늘의퀴즈 해당 과목 완료 처리
     replay: bool = False  # 전날 복습/다시풀기 — 오늘 완료 처리·코인 지급 없음
+    # 문제은행(전체학습) 모드 — 기록·정답률·오답노트만 남기고 코인은 지급하지 않는다(제품 결정 0713)
+    no_coin: bool = False
     # 오늘의퀴즈(습관) 상태 갱신 여부. 전체학습 주간 챕터 플레이는 daily=False로 두어
     # 코인·정답률(숙련도)은 반영하되 오늘의퀴즈 done/연속도전은 건드리지 않는다(학습·습관 분리).
     daily: bool = True

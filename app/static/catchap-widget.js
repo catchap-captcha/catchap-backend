@@ -102,6 +102,7 @@
     var chapter = box.getAttribute('data-chapter') || '';      // 전체학습 주간 챕터
     var stage = box.getAttribute('data-stage') || '';          // 챕터 단계(1~5)
     var replay = box.getAttribute('data-replay') === '1';      // 복습(코인·퀴즈 상태 미반영)
+    var bankMode = box.getAttribute('data-bank') === '1';      // 전체학습 문제은행(안 푼>틀린>맞춘, 무보상)
     var sessionTotal = parseInt(box.getAttribute('data-total') || '0', 10) || 0; // 세션 문항 수
     // 효과음: 기본 켜짐(외부 임베드). 인앱은 게임 화면이 학생 설정에 따라 직접 재생하므로
     // data-sfx="0"으로 꺼서 이중 재생을 막는다.
@@ -1999,6 +2000,7 @@
       if (chapter) qs.push('chapter=' + encodeURIComponent(chapter));
       if (stage) qs.push('stage=' + encodeURIComponent(stage));
       if (replay) qs.push('replay=true');
+      if (bankMode) qs.push('bank=true');
       var path = '/captcha/v1/challenge' + (qs.length ? '?' + qs.join('&') : '');
       getAuth().then(function (a) {
         return api(base, path, key, null, a);

@@ -804,8 +804,8 @@ def verify_challenge(db: Session, challenge_token: str, answer) -> dict:
     if not _consume(db, "challenge", data.get("n", ""), data.get("exp", 0)):
         raise HTTPException(status.HTTP_409_CONFLICT, detail="이미 사용된 챌린지예요.")
     kind, target = data["k"], data["a"]
-    # 발급 시 서명해 둔 문항 메타(과목·문항id·일차·복습) — 엔드포인트가 학생 적립에 쓰고 응답 전 제거
-    extra: dict = {"meta": {k: data[k] for k in ("subj", "qid", "day", "rp", "chapter", "stage") if k in data}}
+    # 발급 시 서명해 둔 문항 메타(과목·문항id·일차·복습·은행) — 엔드포인트가 학생 적립에 쓰고 응답 전 제거
+    extra: dict = {"meta": {k: data[k] for k in ("subj", "qid", "day", "rp", "chapter", "stage", "bank") if k in data}}
     if kind == "select_all":
         # answer 타입 미방어 시 정수 등 비반복형 입력이 TypeError → 공개 엔드포인트 500
         picked = sorted(str(x) for x in answer) if isinstance(answer, (list, tuple)) else []
