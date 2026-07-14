@@ -809,7 +809,7 @@ def student_scratch(
     from app.services import scratch_access
 
     return {
-        "student": {"id": st.id, "name": student_display_name(st)},
+        "student": {"id": st.id, "name": _display_name(st)},
         "subjects": scratch_access.subject_summary(db, student_id),
         "items": scratch_access.list_scratch(db, student_id, subject),
     }
