@@ -92,11 +92,19 @@ def get_scratch(db: Session, student_id: str, record_id: str) -> dict | None:
 
 
 def ops_aggregate(db: Session) -> dict:
-    """운영자용 익명 집계 — 원본 필기·학생 신원 미노출, 과목별 획수·거리·시간 통계만.
+    """운영자용 익명 집계 — 원본 필기·학생 신원 미노출, 과목별·시계열 통계만.
 
     필적은 재식별 가능하므로 운영자에겐 개별 원본을 절대 노출하지 않고 이 집계만 제공한다.
+    실무 대시보드용 확장(0714): 최근 7일 수집·일별 14일 추이·필기 학생 수(익명 카운트)·
+    개인정보 지표(파기/보존동의 건수).
     """
+    from datetime import datetime, timedelta
+
     from sqlalchemy import func
+
+    now = datetime.utcnow()
+    d7 = now - timedelta(days=7)
+    d14 = now - timedelta(days=14)
 
     rows = (
         db.query(
@@ -105,7 +113,15 @@ def ops_aggregate(db: Session) -> dict:
             func.avg(ScratchRecord.stroke_count),
             func.avg(ScratchRecord.distance_px),
             func.avg(ScratchRecord.draw_ms),
+            func.sum(ScratchRecord.stroke_count),
+            func.count(func.distinct(ScratchRecord.student_id)),
         )
+        .group_by(ScratchRecord.subject)
+        .all()
+    )
+    last7 = dict(
+        db.query(ScratchRecord.subject, func.count(ScratchRecord.id))
+        .filter(ScratchRecord.created_at >= d7)
         .group_by(ScratchRecord.subject)
         .all()
     )
@@ -113,15 +129,42 @@ def ops_aggregate(db: Session) -> dict:
         {
             "subject": s,
             "records": int(c or 0),
+            "week_records": int(last7.get(s, 0)),
+            "students": int(st or 0),  # 익명 카운트 — 신원 미노출
             "avg_strokes": round(float(a or 0), 1),
+            "total_strokes": int(ts or 0),
             "avg_distance_px": round(float(d or 0)),
             "avg_draw_ms": round(float(m or 0)),
         }
-        for s, c, a, d, m in rows
+        for s, c, a, d, m, ts, st in rows
     ]
+
+    # 최근 14일 일별 수집 추이 — 대시보드 스파크바
+    daily_rows = (
+        db.query(func.date(ScratchRecord.created_at), func.count(ScratchRecord.id))
+        .filter(ScratchRecord.created_at >= d14)
+        .group_by(func.date(ScratchRecord.created_at))
+        .all()
+    )
+    by_date = {str(d): int(c) for d, c in daily_rows}
+    daily = []
+    for i in range(13, -1, -1):
+        day = (now - timedelta(days=i)).date()
+        daily.append({"date": day.isoformat(), "count": by_date.get(day.isoformat(), 0)})
+
+    # 개인정보 지표 — 파기·보존동의 현황(운영 책임 가시화)
+    purged_n = db.query(func.count(ScratchRecord.id)).filter(ScratchRecord.purged.is_(True)).scalar() or 0
+    retain_n = (
+        db.query(func.count(ScratchRecord.id)).filter(ScratchRecord.consent_retain.is_(True)).scalar() or 0
+    )
+
     return {
         "by_subject": by_subject,
         "total_records": sum(x["records"] for x in by_subject),
+        "week_records": sum(x["week_records"] for x in by_subject),
+        "total_students": sum(x["students"] for x in by_subject),
+        "daily": daily,
+        "privacy": {"purged": int(purged_n), "consent_retain": int(retain_n)},
     }
 
 
