@@ -324,16 +324,29 @@ def challenge(
     if chapter is not None:
         learning = True  # 전체학습 주간 챕터도 학습 세션(조작형 대신 실문항)
     if bank and api.product == "edu" and eff_subject in cs.EDU_SUBJECTS:
-        # 전체학습 문제은행 모드 — 학생 이력 기반 우선순위 출제(안 푼>틀린>맞춘).
+        # 전체학습 문제은행 모드 — 학생 이력 기반 우선순위 출제(안 푼>틀린>맞춘), 단계 없이 무한.
         # 인증 학생이 없으면(외부 임베드) 은행 전체 랜덤으로 동작한다.
+        # chapter가 함께 오면(전체학습 = 주차 목차 유지) 그 주차 문항 풀 안에서만 우선순위 출제한다
+        # (사용자 결정 0714: 주차는 목차로 유지, 그 안은 안푼>틀린>푼 무한순환 — 5단계 게이팅 제거).
         from app.services import bank_mode
 
         student = _optional_student(db, request)
-        q = bank_mode.pick_question(db, student, eff_subject)
+        if chapter is not None:
+            from app.services import chapters as _ch
+
+            max_ch = _ch.unlocked_count(eff_subject)
+            eff_chapter = min(max(1, chapter), max_ch) if max_ch >= 1 else chapter
+            ids = _ch.chapter_all_question_ids(eff_subject, eff_chapter)
+            q = bank_mode.pick_from(db, student, eff_subject, ids)
+            bank_meta = {"subj": eff_subject, "bank": True, "chapter": eff_chapter}
+        else:
+            q = bank_mode.pick_question(db, student, eff_subject)
+            bank_meta = {"subj": eff_subject, "bank": True}
         if q is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, detail="플레이할 문항이 없어요.")
-        # meta.bank → verify가 코인·오늘의퀴즈를 건드리지 않고 기록·오답노트만 남긴다
-        ch = cs._wrap_bank_question(eff_subject, q, {"subj": eff_subject, "bank": True})
+        # meta.bank → verify가 코인·오늘의퀴즈를 건드리지 않고 기록·오답노트만 남긴다.
+        # chapter도 실으면 그 주차로 오답노트·통계가 기록된다(무보상은 유지).
+        ch = cs._wrap_bank_question(eff_subject, q, bank_meta)
         return _emit_challenge(db, api, eff_subject, ch)
     if (
         chapter is not None and stage is not None
