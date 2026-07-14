@@ -51,6 +51,40 @@ def get_scratch(db: Session, student_id: str, record_id: str) -> dict | None:
     return _full(r)
 
 
+def ops_aggregate(db: Session) -> dict:
+    """운영자용 익명 집계 — 원본 필기·학생 신원 미노출, 과목별 획수·거리·시간 통계만.
+
+    필적은 재식별 가능하므로 운영자에겐 개별 원본을 절대 노출하지 않고 이 집계만 제공한다.
+    """
+    from sqlalchemy import func
+
+    rows = (
+        db.query(
+            ScratchRecord.subject,
+            func.count(ScratchRecord.id),
+            func.avg(ScratchRecord.stroke_count),
+            func.avg(ScratchRecord.distance_px),
+            func.avg(ScratchRecord.draw_ms),
+        )
+        .group_by(ScratchRecord.subject)
+        .all()
+    )
+    by_subject = [
+        {
+            "subject": s,
+            "records": int(c or 0),
+            "avg_strokes": round(float(a or 0), 1),
+            "avg_distance_px": round(float(d or 0)),
+            "avg_draw_ms": round(float(m or 0)),
+        }
+        for s, c, a, d, m in rows
+    ]
+    return {
+        "by_subject": by_subject,
+        "total_records": sum(x["records"] for x in by_subject),
+    }
+
+
 def subject_summary(db: Session, student_id: str) -> list[dict]:
     """학생의 과목별 필기 요약(개수·총 획수) — 재생 목록 화면 상단용."""
     from collections import defaultdict

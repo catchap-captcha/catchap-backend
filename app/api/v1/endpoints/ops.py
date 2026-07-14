@@ -2113,3 +2113,16 @@ def behavior_redteam_generate(
     )
     db.commit()
     return {"ok": True, "created": created}
+
+
+# ---------------------------------------------------------------- 연습장 필기 익명 집계 (운영자)
+@router.get("/scratch/aggregate")
+def scratch_aggregate(
+    principal: Principal = Depends(require_ops),
+    db: Session = Depends(get_db),
+):
+    """운영자 연습장 필기 익명 집계 — 개별 아동의 필기 원본은 노출하지 않고(필적 재식별 방지)
+    과목별 획수·필기거리·시간 통계만 제공한다."""
+    from app.services import scratch_access
+
+    return scratch_access.ops_aggregate(db)
