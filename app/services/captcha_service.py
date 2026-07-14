@@ -44,7 +44,10 @@ PLAN_PRODUCTS = {
 }
 DEFAULT_PRODUCTS = ["captcha"]  # 구독 없으면 메인만
 
-CHALLENGE_TTL = 180  # 초
+CHALLENGE_TTL = 180  # 초 — 메인 캡차(봇 방어): 짧게 유지
+# 교육형 학습 문항: 아이가 연습장에 계산하며 오래 푸는 걸 감안(수학 등). 풀이 상한
+# SOLVE_TIME_CAP(15분)을 넉넉히 넘겨야 3분 만료로 "다시 시도"가 뜨지 않는다.
+EDU_CHALLENGE_TTL = 20 * 60  # 초(20분)
 VERDICT_TTL = 300  # 초
 
 
@@ -317,9 +320,13 @@ def make_challenge(
 
 
 def _wrap(kind: str, answer, public: dict, meta: dict | None = None) -> dict:
-    """meta(subj/qid/day/rp)는 토큰에만 서명 포함 — verify에서 학생 적립·오답노트에 쓴다."""
+    """meta(subj/qid/day/rp)는 토큰에만 서명 포함 — verify에서 학생 적립·오답노트에 쓴다.
+
+    meta가 있으면 교육형 학습 문항(연습장 계산 등 오래 풀 수 있음) → 넉넉한 TTL,
+    meta가 없으면 메인 캡차(봇 방어) → 짧은 TTL. (main은 _wrap에 meta를 안 넘긴다)"""
+    ttl = EDU_CHALLENGE_TTL if meta else CHALLENGE_TTL
     token = _sign(
-        {"k": kind, "a": answer, "exp": time.time() + CHALLENGE_TTL, "n": secrets.token_hex(16),
+        {"k": kind, "a": answer, "exp": time.time() + ttl, "n": secrets.token_hex(16),
          **(meta or {})}
     )
     return {"challenge_token": token, **public}
