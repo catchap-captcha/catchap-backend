@@ -12,7 +12,36 @@
  */
 (function () {
   'use strict';
-  var C = '#FF5A4D', OK = '#17B08C';
+  // ── 디자인 토큰 (1단계 도입) — 코드 전체에 흩어져 있던 하드코딩 스타일의 단일 근거.
+  // 기존 브랜드 톤을 유지하며 체계화: 코랄(#FF5A4D)=주 액션, 잉크 브라운(#3A3226)=본문.
+  // 대비(크림 #FFFAF4 배경 기준): ink 11.9:1 · inkSoft 6.6:1 · inkFaint 4.6:1 — 본문/보조 AA 이상.
+  var T = {
+    color: {
+      brand: '#FF5A4D',        // 브랜드 코랄 — 주 버튼·선택 강조
+      brandSoft: '#FFF0EE',    // 선택 배경(코랄 틴트)
+      brandLine: '#FFB8A8',    // 코랄 보조 라인(드롭 링 등)
+      ok: '#17B08C', okSoft: '#E1F5EC',        // 정답
+      err: '#D14559', errSoft: '#FFEDEF',      // 오답(아동용 — 채도 낮춘 로즈)
+      ink: '#3A3226',          // 본문 잉크(웜 브라운)
+      inkSoft: '#6B6157',      // 보조 텍스트(뜻·라벨)
+      inkFaint: '#8A8070',     // 힌트·자리표시
+      inkMute: '#B0A79B',      // 상태 표시·비활성
+      line: '#F0E4D8',         // 카드 테두리(웜 샌드)
+      lineSoft: '#E3D6C6',     // 점선 존 테두리
+      cream: '#FFFAF4',        // 놀이 영역 배경
+      card: '#fff',
+      // 발자국 트레일 젤리 — 브랜드 코랄에 로즈 살짝 섞은 투톤(위 밝은 하이라이트/아래 진한 그늘).
+      // 반투명(≈0.5~0.62)이라 글자 위를 덮어도 읽히되 1단계(0.30)보다 또렷하다.
+      pawLite: 'rgba(255,138,110,0.52)', // 젤리 윗면 하이라이트(밝은 살구코랄)
+      pawBase: 'rgba(232,86,74,0.60)',   // 젤리 본색(코랄)
+      pawDeep: 'rgba(196,63,74,0.62)',   // 젤리 아랫면 그늘(로즈)
+    },
+    font: { xl: '21px', lg: '17px', md: '15px', sm: '13px', xs: '12px' },
+    radius: { lg: '16px', md: '12px', sm: '10px', pill: '30px' },
+    shadow: { card: '0 10px 30px -20px rgba(120,90,70,.4)', pop: '0 10px 24px -14px rgba(120,90,70,0.35)' },
+    tap: '44px', // 아동 손가락 최소 터치타깃(WCAG 2.5.5 · 플랫폼 HIG 44pt)
+  };
+  var C = T.color.brand, OK = T.color.ok; // 기존 사용처(전 렌더러) 호환 별칭
 
   function css(el, o) { for (var k in o) el.style[k] = o[k]; }
   function h(tag, cls) { var e = document.createElement(tag); if (cls) e.className = cls; return e; }
@@ -33,7 +62,13 @@
   function ensureKeyframes() {
     if (document.getElementById('catchap-kf')) return;
     var st = document.createElement('style'); st.id = 'catchap-kf';
-    st.textContent = '@keyframes ccMove{from{margin-left:-2.5%}to{margin-left:2.5%}}';
+    st.textContent = '@keyframes ccMove{from{margin-left:-2.5%}to{margin-left:2.5%}}'
+      // 발자국 트레일 — 나타난 뒤 서서히 사라지며 살짝 작아진다(걷고 지나간 자국)
+      + '@keyframes ccPawFade{0%{opacity:1}100%{opacity:0;transform:scale(.72)}}'
+      // 오디오 재생중 이퀄라이저 막대 — 위아래로 출렁
+      + '@keyframes ccWave{0%,100%{transform:scaleY(.32)}50%{transform:scaleY(1)}}'
+      // 카드 뒤집기 — Y축 회전(memory/puzzle 스냅)
+      + '@keyframes ccPop{0%{transform:scale(.6);opacity:.2}60%{transform:scale(1.08)}100%{transform:scale(1);opacity:1}}';
     document.head.appendChild(st);
   }
 
@@ -177,6 +212,87 @@
     box.addEventListener('pointerup', function (e) { tracePoint(e, true); onActivity(); });
     box.addEventListener('keydown', function () { onActivity(); });
 
+    // ── 캣찹 발자국 트레일 — 포인터(마우스·손가락)가 걸어간 길에 고양이 발자국을 남긴다.
+    // 순수 시각 레이어: pointer-events:none 오버레이에만 그려 조작·채점·verify 계약과 무관하고,
+    // data-paws="0"으로 끌 수 있다(기본 켬). prefers-reduced-motion이면 만들지 않는다(접근성).
+    // 일정 보폭(PAW_STEP)마다 좌우 발을 번갈아, 진행 방향으로 회전시켜 '걷는' 자국을 만들고
+    // 각 발자국은 ccPawFade로 서서히 사라진 뒤 DOM에서 제거된다(노드 상한 = 성능 보호).
+    var PAW_STEP = 34;    // 발자국 간격(px) — 연속 도배가 아니라 걷는 보폭
+    var PAW_JUMP = 120;   // 이보다 큰 이동은 걸음이 아니라 점프 — 자국 없이 기준점만 갱신
+    var PAW_MAX = 24;     // 동시 표시 상한
+    var PAW_LIFE = 1100;  // 수명(ms) — ccPawFade 길이와 일치
+    var pawsOn = box.getAttribute('data-paws') !== '0'
+      && !(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+    var pawLayer = null, pawLast = null, pawSide = 0, pawAlive = [];
+    // 고양이 발자국 SVG("toe beans"/젤리 스타일) — 발끝이 위(-y)라 진행 방향으로 회전시킨다.
+    // 젤리 콘셉트: (1) 발가락 젤리 4개 = 통통한 둥근 젤리, 부채꼴 아치로(안쪽 2개가 조금 앞으로)
+    // (2) 메인 젤리(掌球) = 크고 둥근 하트/콩팥형 · (3) 발가락과 掌球 살짝 분리 · (4) 발톱 없음.
+    // 좌우 발 scaleX(-1) 미러. 입체감: 세로 그라디언트(위 밝은 하이라이트→아래 진한 그늘)로
+    // 젤리 본색을 칠하고, 각 젤리 윗부분에 반투명 하이라이트 타원을 얹어 촉촉한 광택을 준다.
+    var PG = 'ccPawG' + Math.random().toString(36).slice(2, 8); // 그라디언트 id 충돌 방지(다중 인스턴스)
+    var PAW_SVG = '<svg width="17" height="17" viewBox="0 0 24 24"'
+      + ' style="display:block;overflow:visible;animation:ccPawFade ' + (PAW_LIFE / 1000) + 's ease-out forwards">'
+      + '<defs><linearGradient id="' + PG + '" x1="0" y1="0" x2="0" y2="1">'
+      + '<stop offset="0" stop-color="' + T.color.pawLite + '"/>'
+      + '<stop offset="0.55" stop-color="' + T.color.pawBase + '"/>'
+      + '<stop offset="1" stop-color="' + T.color.pawDeep + '"/></linearGradient></defs>'
+      + '<g fill="url(#' + PG + ')">'
+      // 발가락 젤리 4개 — 통통한 둥근 타원. 바깥 2개는 조금 아래·벌어짐
+      + '<ellipse cx="5.5" cy="10.2" rx="2.5" ry="2.9" transform="rotate(-18 5.5 10.2)"/>'
+      + '<ellipse cx="9.7" cy="7.2" rx="2.6" ry="3.1" transform="rotate(-7 9.7 7.2)"/>'
+      + '<ellipse cx="14.3" cy="7.2" rx="2.6" ry="3.1" transform="rotate(7 14.3 7.2)"/>'
+      + '<ellipse cx="18.5" cy="10.2" rx="2.5" ry="2.9" transform="rotate(18 18.5 10.2)"/>'
+      // 메인 젤리(掌球) — 둥글고 통통한 하트/콩팥형
+      + '<path d="M12,12.4C9.2,12.4 6.1,13.7 6.1,16.5C6.1,18.5 8.0,19.7 9.6,19.7'
+      + 'C11.0,19.7 11.4,18.9 12,18.9C12.6,18.9 13.0,19.7 14.4,19.7'
+      + 'C16.0,19.7 17.9,18.5 17.9,16.5C17.9,13.7 14.8,12.4 12,12.4Z"/></g>'
+      // 젤리 광택 — 각 젤리 윗부분에 반투명 흰 하이라이트 타원(촉촉한 반사)
+      + '<g fill="rgba(255,255,255,0.42)">'
+      + '<ellipse cx="5.2" cy="9.1" rx="1.1" ry="1.4" transform="rotate(-18 5.2 9.1)"/>'
+      + '<ellipse cx="9.4" cy="5.9" rx="1.2" ry="1.5" transform="rotate(-7 9.4 5.9)"/>'
+      + '<ellipse cx="14.0" cy="5.9" rx="1.2" ry="1.5" transform="rotate(7 14 5.9)"/>'
+      + '<ellipse cx="18.2" cy="9.1" rx="1.1" ry="1.4" transform="rotate(18 18.2 9.1)"/>'
+      + '<ellipse cx="10.6" cy="14.0" rx="2.6" ry="1.7"/></g></svg>';
+    function pawSpawn(x, y, ang, mirror) {
+      if (!pawLayer) {
+        if (getComputedStyle(box).position === 'static') box.style.position = 'relative';
+        pawLayer = h('div');
+        css(pawLayer, { position: 'absolute', top: '0', left: '0', right: '0', bottom: '0',
+          overflow: 'hidden', pointerEvents: 'none', zIndex: '20' }); // 문항 위 · idle 게이트(30) 아래
+        box.appendChild(pawLayer);
+      }
+      var p = h('div', 'cc-paw');
+      p.innerHTML = PAW_SVG;
+      css(p, { position: 'absolute', left: x + 'px', top: y + 'px', pointerEvents: 'none',
+        transform: 'translate(-50%,-50%) rotate(' + Math.round(ang) + 'deg)' + (mirror ? ' scaleX(-1)' : '') });
+      pawLayer.appendChild(p);
+      pawAlive.push(p);
+      if (pawAlive.length > PAW_MAX) { var old = pawAlive.shift(); if (old.parentNode) old.parentNode.removeChild(old); }
+      setTimeout(function () {
+        var i = pawAlive.indexOf(p);
+        if (i !== -1) pawAlive.splice(i, 1);
+        if (p.parentNode) p.parentNode.removeChild(p);
+      }, PAW_LIFE + 60);
+    }
+    function pawStep(e) {
+      if (!pawsOn) return;
+      var r = box.getBoundingClientRect();
+      if (!r.width) return;
+      var x = e.clientX - r.left, y = e.clientY - r.top;
+      if (x < 0 || y < 0 || x > r.width || y > r.height) { pawLast = null; return; }
+      if (!pawLast) { pawLast = [x, y]; return; }
+      var dx = x - pawLast[0], dy = y - pawLast[1];
+      var dist = Math.sqrt(dx * dx + dy * dy);
+      if (dist < PAW_STEP) return;
+      if (dist > PAW_JUMP) { pawLast = [x, y]; return; }
+      pawSide = 1 - pawSide;
+      var off = pawSide ? 5 : -5; // 좌우 발 교대 — 진행 방향의 수직으로 어긋나게(걷는 자국)
+      pawSpawn(x - dy / dist * off, y + dx / dist * off,
+        Math.atan2(dy, dx) * 180 / Math.PI + 90, pawSide === 0);
+      pawLast = [x, y];
+    }
+    box.addEventListener('pointermove', pawStep);
+
     // ── 방치 감지 — 학습시간은 '화면 보며 실제로 푸는 활성 시간'만 센다(승인 2026-07-13).
     // 탭 이탈(hidden)이면 즉시 타이머 정지, 화면 켠 채 오래 무입력이면 정지 + '아직 있니?'
     // 게이트로 재확인 후 이어간다. 방치 구간은 solve_time_ms에서 빠져 수학처럼 오래 푸는
@@ -231,8 +347,9 @@
       b.onclick = load; body.appendChild(b);
     }
     function btnStyle(bg, col) {
-      return { marginTop: '10px', width: '100%', border: 'none', borderRadius: '10px', padding: '11px',
-        fontWeight: '800', fontSize: '14px', cursor: 'pointer', background: bg, color: col };
+      return { marginTop: '10px', width: '100%', border: 'none', borderRadius: T.radius.md,
+        padding: '11px', minHeight: T.tap, fontWeight: '800', fontSize: '14px',
+        fontFamily: 'inherit', cursor: 'pointer', background: bg, color: col };
     }
 
     function solved(verdict) {
@@ -265,18 +382,19 @@
       footer = h('div');
       css(footer, { display: 'flex', justifyContent: 'flex-end', gap: '10px', marginTop: '16px' });
       redoBtn = h('button'); redoBtn.textContent = '다시 고르기';
-      css(redoBtn, { border: '2px solid #F0E4D8', borderRadius: '12px', padding: '11px 20px',
-        fontWeight: '800', fontSize: '14px', background: '#fff', color: '#8A8070', fontFamily: 'inherit' });
+      css(redoBtn, { border: '2px solid ' + T.color.line, borderRadius: T.radius.md, padding: '11px 20px',
+        minHeight: T.tap, fontWeight: '800', fontSize: '14px', background: T.color.card,
+        color: T.color.inkFaint, fontFamily: 'inherit' });
       nextBtn = h('button'); nextBtn.textContent = '다음 문제 →';
-      css(nextBtn, { border: 'none', borderRadius: '12px', padding: '11px 24px',
-        fontWeight: '800', fontSize: '14px', background: C, color: '#fff', fontFamily: 'inherit' });
+      css(nextBtn, { border: 'none', borderRadius: T.radius.md, padding: '11px 24px',
+        minHeight: T.tap, fontWeight: '800', fontSize: '14px', background: C, color: '#fff', fontFamily: 'inherit' });
       redoBtn.onclick = function () { if (!answered && !grading && pendingRedo) { pendingRedo(); redoCount += 1; } };
       // '잘 모르겠어요' — 찍기 강요 대신 정직하게 오답 처리(운 좋은 정답 방지). 서버가 오답으로
       // 채점하고 정답·해설을 내려주면 eduFeedback이 공부 자료로 보여준다.
       dkBtn = h('button'); dkBtn.textContent = '아직 잘 모르겠어요 🤔';
-      css(dkBtn, { border: '2px solid #F0E4D8', borderRadius: '12px', padding: '11px 18px',
-        fontWeight: '800', fontSize: '13px', background: '#fff', color: '#B0A79B', fontFamily: 'inherit',
-        marginRight: 'auto' });
+      css(dkBtn, { border: '2px solid ' + T.color.line, borderRadius: T.radius.md, padding: '11px 18px',
+        minHeight: T.tap, fontWeight: '800', fontSize: T.font.sm, background: T.color.card,
+        color: T.color.inkMute, fontFamily: 'inherit', marginRight: 'auto' });
       dkBtn.onclick = function () {
         if (answered || grading || !curToken) return;
         verify(curToken, null);
@@ -343,8 +461,8 @@
           : (ansText ? '아쉬워요! 정답은 "' + ansText + '"' : '아쉬워요! 다시 한 번 생각해봐요.');
       }
       css(fb, { display: 'flex', alignItems: 'center', gap: '8px', marginTop: '12px', padding: '13px 15px',
-        borderRadius: '12px', fontWeight: '800', fontSize: '14px',
-        background: okAns ? '#E1F5EC' : '#FFEDEF', color: okAns ? OK : '#D14559' });
+        borderRadius: T.radius.md, fontWeight: '800', fontSize: '14px',
+        background: okAns ? T.color.okSoft : T.color.errSoft, color: okAns ? OK : T.color.err });
       fb.textContent = msg;
       body.appendChild(fb);
       // 오답·'잘 모르겠어요' 시 해설을 보여준다(공부 자료) — 서버가 explain(없으면 hint)을 내려준다
@@ -373,17 +491,17 @@
     function hintLine(text) {
       if (!text) return;
       var hint = h('div'); hint.textContent = '💡 ' + text;
-      css(hint, { marginTop: '10px', fontSize: '12px', color: '#8A8070' });
+      css(hint, { marginTop: '10px', fontSize: T.font.xs, lineHeight: '1.5', color: T.color.inkFaint });
       body.appendChild(hint);
     }
 
     // ── 끌어다 놓기 (drag_drop) — 아이템을 목표에 드래그, 드롭 좌표를 서버가 채점
     function renderDrag(d, token) {
       var area = h('div');
-      css(area, { position: 'relative', width: '100%', height: '260px', background: '#FFFAF4',
-        border: '2px dashed #F0E4D8', borderRadius: '14px', overflow: 'hidden', touchAction: 'none' });
+      css(area, { position: 'relative', width: '100%', height: '260px', background: T.color.cream,
+        border: '2px dashed ' + T.color.line, borderRadius: '14px', overflow: 'hidden', touchAction: 'none' });
       var ring = h('div');
-      css(ring, { position: 'absolute', width: '86px', height: '86px', border: '3px dashed #FFB8A8',
+      css(ring, { position: 'absolute', width: '90px', height: '90px', border: '3px dashed ' + T.color.brandLine,
         borderRadius: '50%', transform: 'translate(-50%,-50%)', pointerEvents: 'none',
         left: (d.zone.cx * 100) + '%', top: (d.zone.cy * 100) + '%' });
       var target = h('div'); target.textContent = d.target;
@@ -396,30 +514,19 @@
       area.appendChild(ring); area.appendChild(target); area.appendChild(item);
       body.appendChild(area);
       hintLine(d.hint);
-      var dragging = false;
-      function norm(e) {
-        var r = area.getBoundingClientRect();
-        return { x: Math.max(0, Math.min(1, (e.clientX - r.left) / r.width)),
-                 y: Math.max(0, Math.min(1, (e.clientY - r.top) / r.height)) };
-      }
-      item.addEventListener('pointerdown', function (e) {
-        if (answered) return;
-        dragging = true; item.setPointerCapture(e.pointerId);
-        item.style.cursor = 'grabbing'; e.preventDefault();
-      });
-      item.addEventListener('pointermove', function (e) {
-        if (!dragging) return;
-        var p = norm(e);
-        item.style.left = (p.x * 100) + '%'; item.style.top = (p.y * 100) + '%';
-      });
       var dropAt = null; // 풋터 모드: 놓은 위치를 기억해 두고 다음 문제 버튼이 제출
-      item.addEventListener('pointerup', function (e) {
-        if (!dragging || answered) return;
-        dragging = false; item.style.cursor = 'grab';
-        var p = norm(e);
-        var ans = { x: Math.round(p.x * 1000) / 1000, y: Math.round(p.y * 1000) / 1000 };
-        if (footerOn) { dropAt = ans; footerState(true, true); }
-        else verify(token, ans);
+      function itemHome() { item.style.left = (d.start.x * 100) + '%'; item.style.top = (d.start.y * 100) + '%'; }
+      makeDnd().dragFree(item, {
+        area: area,
+        disabled: function () { return answered; },
+        onMove: function (p) { item.style.left = (p.x * 100) + '%'; item.style.top = (p.y * 100) + '%'; },
+        onCancel: itemHome, // 제스처 취소(스크롤 등) — 제출 없이 원위치
+        onDrop: function (p) {
+          if (answered) return;
+          var ans = { x: Math.round(p.x * 1000) / 1000, y: Math.round(p.y * 1000) / 1000 };
+          if (footerOn) { dropAt = ans; footerState(true, true); }
+          else verify(token, ans);
+        },
       });
       if (footerOn) {
         pendingRedo = function () {
@@ -445,40 +552,64 @@
       var svg = document.createElementNS(NS, 'svg');
       svg.setAttribute('viewBox', '0 0 100 100');
       svg.setAttribute('preserveAspectRatio', 'xMidYMid meet');
-      css(svg, { width: '100%', height: '260px', display: 'block', background: '#FFFAF4',
-        border: '2px dashed #F0E4D8', borderRadius: '14px', touchAction: 'none', cursor: 'crosshair' });
+      css(svg, { width: '100%', height: '260px', display: 'block', background: T.color.cream,
+        border: '2px dashed ' + T.color.line, borderRadius: '14px', touchAction: 'none', cursor: 'crosshair' });
       // 원본 가이드 5단계(guideStyle): dotted(점선)→faint(흐린 실선)→arrow(점선+시작점·방향)→
       // partial(앞부분만 점선)→blank(가이드 없음, 위에 예시 글자만).
       var gs = d.guideStyle || 'dotted';
+      var GUIDE = '#C9B7A2'; // 가이드 선색(웜 그레이) — 사용자 코랄 획과 대비되게 중립 유지
       if (gs === 'blank' && d.showExample && d.glyph) {
         var ex = h('div'); ex.textContent = d.glyph;
-        css(ex, { textAlign: 'center', fontSize: '46px', fontWeight: '800', color: '#3A3226',
-          border: '2px solid #F0E4D8', borderRadius: '12px', width: '72px', margin: '0 auto 10px', background: '#fff' });
+        css(ex, { textAlign: 'center', fontSize: '46px', fontWeight: '800', color: T.color.ink,
+          border: '2px solid ' + T.color.line, borderRadius: T.radius.md, width: '72px', margin: '0 auto 10px', background: T.color.card });
         body.appendChild(ex);
       }
-      if (gs === 'dotted') svg.appendChild(pl(d.path, '#D9CDBE', '4', '1.5 5.5'));
-      else if (gs === 'faint') { var f = pl(d.path, '#E2D8CB', '5'); f.setAttribute('opacity', '0.55'); svg.appendChild(f); }
+      // 둥근 점 대시(dot) — 기존 '1.5 5.5' 대시보다 또렷하고 아이 친화적
+      if (gs === 'dotted') svg.appendChild(pl(d.path, GUIDE, '4.5', '0.1 6.5'));
+      else if (gs === 'faint') { var f = pl(d.path, '#DBCFC0', '5.5'); f.setAttribute('opacity', '0.6'); svg.appendChild(f); }
       else if (gs === 'arrow') {
-        svg.appendChild(pl(d.path, '#D9CDBE', '4', '1.5 5.5'));
+        svg.appendChild(pl(d.path, GUIDE, '4.5', '0.1 6.5'));
+      } else if (gs === 'partial') {
+        svg.appendChild(pl(d.path.slice(0, Math.max(2, Math.ceil(d.path.length / 2))), GUIDE, '4.5', '0.1 6.5'));
+      } // blank: 가이드 없음
+      // 시작점 마커 — blank 외 전 가이드에 '여기서 출발' 표시(초록 점 + 펄스 링 + 방향 화살촉).
+      // 순수 가이드(표시용)라 d.path·채점 좌표 불변.
+      if (gs !== 'blank' && d.path && d.path.length) {
+        var sp0 = d.path[0];
+        var pulse = document.createElementNS(NS, 'circle');
+        pulse.setAttribute('cx', sp0[0] * 100); pulse.setAttribute('cy', sp0[1] * 100);
+        pulse.setAttribute('r', '5'); pulse.setAttribute('fill', 'none');
+        pulse.setAttribute('stroke', OK); pulse.setAttribute('stroke-width', '1.4'); pulse.setAttribute('opacity', '0.55');
+        var reduceTr = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+        if (!reduceTr) {
+          var an = document.createElementNS(NS, 'animate');
+          an.setAttribute('attributeName', 'r'); an.setAttribute('values', '3.5;7;3.5');
+          an.setAttribute('dur', '1.4s'); an.setAttribute('repeatCount', 'indefinite');
+          pulse.appendChild(an);
+          var an2 = document.createElementNS(NS, 'animate');
+          an2.setAttribute('attributeName', 'opacity'); an2.setAttribute('values', '0.7;0.1;0.7');
+          an2.setAttribute('dur', '1.4s'); an2.setAttribute('repeatCount', 'indefinite');
+          pulse.appendChild(an2);
+        }
+        svg.appendChild(pulse);
         var sdot = document.createElementNS(NS, 'circle');
-        sdot.setAttribute('cx', d.path[0][0] * 100); sdot.setAttribute('cy', d.path[0][1] * 100);
-        sdot.setAttribute('r', '3'); sdot.setAttribute('fill', C);
+        sdot.setAttribute('cx', sp0[0] * 100); sdot.setAttribute('cy', sp0[1] * 100);
+        sdot.setAttribute('r', '3.4'); sdot.setAttribute('fill', OK);
+        sdot.setAttribute('stroke', '#fff'); sdot.setAttribute('stroke-width', '1');
         svg.appendChild(sdot);
-        if (d.path.length > 1) { // 시작 방향 화살촉
+        if (d.path.length > 1) { // 시작 방향 화살촉 — 어느 쪽으로 그을지
           var p0 = d.path[0], p1 = d.path[1];
           var ang = Math.atan2(p1[1] - p0[1], p1[0] - p0[0]);
-          var ax = p0[0] * 100 + Math.cos(ang) * 8, ay = p0[1] * 100 + Math.sin(ang) * 8;
+          var ax = p0[0] * 100 + Math.cos(ang) * 9, ay = p0[1] * 100 + Math.sin(ang) * 9;
           var arw2 = document.createElementNS(NS, 'path');
           var w1 = ang + 2.6, w2 = ang - 2.6;
-          arw2.setAttribute('d', 'M' + ax + ',' + ay + ' L' + (ax + Math.cos(w1) * 4) + ',' + (ay + Math.sin(w1) * 4)
-            + ' M' + ax + ',' + ay + ' L' + (ax + Math.cos(w2) * 4) + ',' + (ay + Math.sin(w2) * 4));
-          arw2.setAttribute('stroke', C); arw2.setAttribute('stroke-width', '1.6'); arw2.setAttribute('fill', 'none');
-          arw2.setAttribute('stroke-linecap', 'round');
+          arw2.setAttribute('d', 'M' + ax + ',' + ay + ' L' + (ax + Math.cos(w1) * 4.5) + ',' + (ay + Math.sin(w1) * 4.5)
+            + ' M' + ax + ',' + ay + ' L' + (ax + Math.cos(w2) * 4.5) + ',' + (ay + Math.sin(w2) * 4.5));
+          arw2.setAttribute('stroke', OK); arw2.setAttribute('stroke-width', '1.8'); arw2.setAttribute('fill', 'none');
+          arw2.setAttribute('stroke-linecap', 'round'); arw2.setAttribute('stroke-linejoin', 'round');
           svg.appendChild(arw2);
         }
-      } else if (gs === 'partial') {
-        svg.appendChild(pl(d.path.slice(0, Math.max(2, Math.ceil(d.path.length / 2))), '#D9CDBE', '4', '1.5 5.5'));
-      } // blank: 가이드 없음
+      }
       // 사용자 획 — 원본처럼 여러 획 지원: 획 사이를 잇는 선이 그려지지 않게 path(M...)로 렌더
       var user = document.createElementNS(NS, 'path');
       user.setAttribute('fill', 'none'); user.setAttribute('stroke', C); user.setAttribute('stroke-width', '3.5');
@@ -538,17 +669,39 @@
       css(svg, { width: '100%', maxWidth: '440px', margin: '0 auto', height: '300px', display: 'block',
         background: '#F2F8F1', border: '2px solid #DCEBD8', borderRadius: '14px', touchAction: 'none', cursor: 'crosshair' });
       // 위험존(빨강) → 도착(초록) → 시작(캐릭터)
-      function zone(z, fill, stroke) {
-        svg.appendChild(mk('rect', { x: z.x * 100, y: z.y * 100, width: z.w * 100, height: z.h * 100, rx: 3, fill: fill, stroke: stroke, 'stroke-width': 1 }));
-        if (z.emoji) { var t = mk('text', { x: (z.x + z.w / 2) * 100, y: (z.y + z.h / 2) * 100 + 3, 'text-anchor': 'middle', 'font-size': '9' }); t.textContent = z.emoji; svg.appendChild(t); }
-        if (z.label) { var l = mk('text', { x: (z.x + z.w / 2) * 100, y: (z.y + z.h) * 100 + 4, 'text-anchor': 'middle', 'font-size': '4', fill: '#6B7B66' }); l.textContent = z.label; svg.appendChild(l); }
+      function zone(z, fill, stroke, dashed) {
+        var rc = mk('rect', { x: z.x * 100, y: z.y * 100, width: z.w * 100, height: z.h * 100, rx: 3, fill: fill, stroke: stroke, 'stroke-width': 1.4 });
+        if (dashed) rc.setAttribute('stroke-dasharray', '3 2');
+        svg.appendChild(rc);
+        if (z.emoji) { var t = mk('text', { x: (z.x + z.w / 2) * 100, y: (z.y + z.h / 2) * 100 + 3, 'text-anchor': 'middle', 'font-size': '10' }); t.textContent = z.emoji; svg.appendChild(t); }
+        if (z.label) { var l = mk('text', { x: (z.x + z.w / 2) * 100, y: (z.y + z.h) * 100 + 4.5, 'text-anchor': 'middle', 'font-size': '4', 'font-weight': '700', fill: '#6B7B66' }); l.textContent = z.label; svg.appendChild(l); }
       }
-      (d.dangers || []).forEach(function (z) { zone(z, 'rgba(226,87,76,0.14)', '#E2574C'); });
-      if (d.dest) zone(d.dest, 'rgba(23,176,140,0.16)', '#17B08C');
-      var user = mk('polyline', { fill: 'none', stroke: C, 'stroke-width': '3', 'stroke-linecap': 'round', 'stroke-linejoin': 'round' });
+      // 위험존 — 대비 강화(빗금 테두리로 '지나가면 안 됨' 신호)
+      (d.dangers || []).forEach(function (z) { zone(z, 'rgba(226,87,76,0.18)', '#E2574C', true); });
+      // 도착존 — 초록 + 펄스 링으로 목표 강조
+      if (d.dest) {
+        zone(d.dest, 'rgba(23,176,140,0.18)', OK);
+        var dcx = (d.dest.x + d.dest.w / 2) * 100, dcy = (d.dest.y + d.dest.h / 2) * 100;
+        var dr = mk('circle', { cx: dcx, cy: dcy, r: 3, fill: 'none', stroke: OK, 'stroke-width': '1.4', opacity: '0.7' });
+        if (!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches)) {
+          var da = mk('animate', { attributeName: 'r', values: '3;9;3', dur: '1.6s', repeatCount: 'indefinite' });
+          var da2 = mk('animate', { attributeName: 'opacity', values: '0.7;0.05;0.7', dur: '1.6s', repeatCount: 'indefinite' });
+          dr.appendChild(da); dr.appendChild(da2);
+        }
+        svg.appendChild(dr);
+      }
+      var user = mk('polyline', { fill: 'none', stroke: C, 'stroke-width': '3.5', 'stroke-linecap': 'round', 'stroke-linejoin': 'round' });
       svg.appendChild(user);
+      // 출발 표시 — 캐릭터 뒤에 펄스 링(여기서 잡아 끌어). 위치는 시작점 고정(원점 안내).
+      var scx = d.start.x * 100, scy = d.start.y * 100;
+      var sring = mk('circle', { cx: scx, cy: scy, r: 6, fill: 'none', stroke: C, 'stroke-width': '1.6', opacity: '0.6' });
+      if (!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches)) {
+        sring.appendChild(mk('animate', { attributeName: 'r', values: '5;9;5', dur: '1.5s', repeatCount: 'indefinite' }));
+        sring.appendChild(mk('animate', { attributeName: 'opacity', values: '0.7;0.1;0.7', dur: '1.5s', repeatCount: 'indefinite' }));
+      }
+      svg.appendChild(sring);
       // 원본 방식: 캐릭터 토큰을 '끌어서' 이동 — 경로는 캐릭터가 지나간 궤적으로 기록된다.
-      var st = mk('text', { x: d.start.x * 100, y: d.start.y * 100 + 3, 'text-anchor': 'middle', 'font-size': '9', cursor: 'grab' });
+      var st = mk('text', { x: d.start.x * 100, y: d.start.y * 100 + 3, 'text-anchor': 'middle', 'font-size': '11', cursor: 'grab' });
       st.textContent = d.character || '🧒'; svg.appendChild(st);
       body.appendChild(svg);
       if (!footerOn) { var row = h('div'); css(row, { display: 'flex', gap: '8px' });
@@ -596,12 +749,12 @@
     //    제출 {item: 카드id, x, y} → 서버가 아이템 일치 + 드롭 존 거리로 채점.
     function renderDragPick(d, token) {
       var area = h('div');
-      css(area, { position: 'relative', width: '100%', height: '300px', background: '#FFFAF4',
-        border: '2px dashed #F0E4D8', borderRadius: '14px', overflow: 'hidden', touchAction: 'none' });
+      css(area, { position: 'relative', width: '100%', height: '300px', background: T.color.cream,
+        border: '2px dashed ' + T.color.line, borderRadius: '14px', overflow: 'hidden', touchAction: 'none' });
       var ring = h('div');
       // 링 크기 = 서버 채점 반경(정규화 0.14)과 동일한 타원 — 보이는 링 안 = 정답 존
       css(ring, { position: 'absolute', width: (d.zone.r * 2 * 100) + '%', height: (d.zone.r * 2 * 100) + '%',
-        border: '3px dashed #FFB8A8', borderRadius: '50%', transform: 'translate(-50%,-50%)',
+        border: '3px dashed ' + T.color.brandLine, borderRadius: '50%', transform: 'translate(-50%,-50%)',
         pointerEvents: 'none', left: (d.zone.cx * 100) + '%', top: (d.zone.cy * 100) + '%' });
       var tgt = h('div'); tgt.textContent = (d.target && d.target.e) || '🎯';
       css(tgt, { position: 'absolute', fontSize: '44px', transform: 'translate(-50%,-50%)', pointerEvents: 'none',
@@ -614,12 +767,7 @@
           top: 'calc(' + (d.zone.cy * 100) + '% + 50px)', pointerEvents: 'none' });
         area.appendChild(tl);
       }
-      var dropAt = null, els = {};
-      function norm(e) {
-        var r = area.getBoundingClientRect();
-        return { x: Math.max(0, Math.min(1, (e.clientX - r.left) / r.width)),
-                 y: Math.max(0, Math.min(1, (e.clientY - r.top) / r.height)) };
-      }
+      var dropAt = null, els = {}, pickDnd = makeDnd(); // 공용 드래그 엔진(dragFree) 1회 생성
       // 카드들을 아래쪽에 가로로 배치 — 각자 드래그 가능
       var n = d.items.length;
       d.items.forEach(function (it, i) {
@@ -635,31 +783,26 @@
         var sx = (i + 1) / (n + 1), sy = 0.82;
         css(card, { position: 'absolute', textAlign: 'center', transform: 'translate(-50%,-50%)',
           left: (sx * 100) + '%', top: (sy * 100) + '%', cursor: 'grab', userSelect: 'none', touchAction: 'none',
-          padding: '6px 8px', background: '#fff', border: '2px solid #F0E4D8', borderRadius: '12px' });
-        var dragging = false;
-        card.addEventListener('pointerdown', function (e) {
-          if (answered) return;
-          dragging = true; card.setPointerCapture(e.pointerId);
-          card.style.cursor = 'grabbing'; card.style.zIndex = '5'; e.preventDefault();
-        });
-        card.addEventListener('pointermove', function (e) {
-          if (!dragging) return;
-          var p = norm(e);
-          card.style.left = (p.x * 100) + '%'; card.style.top = (p.y * 100) + '%';
-        });
-        card.addEventListener('pointerup', function (e) {
-          if (!dragging || answered) return;
-          dragging = false; card.style.cursor = 'grab'; card.style.zIndex = '1';
-          var p = norm(e);
-          // 원본과 동일: 존 밖 릴리즈 = 무판정, 카드 원위치(손 미끄러짐이 오답이 되지 않게)
-          var dx = p.x - d.zone.cx, dy = p.y - d.zone.cy;
-          if (Math.sqrt(dx * dx + dy * dy) > d.zone.r) {
-            card.style.left = (sx * 100) + '%'; card.style.top = (sy * 100) + '%';
-            return;
-          }
-          dropAt = { item: it.id, x: Math.round(p.x * 1000) / 1000, y: Math.round(p.y * 1000) / 1000 };
-          if (footerOn) footerState(true, true);
-          else verify(token, dropAt);
+          padding: '8px 10px', minWidth: '44px', minHeight: '44px', boxSizing: 'border-box',
+          background: T.color.card, border: '2px solid ' + T.color.line, borderRadius: T.radius.md,
+          boxShadow: '0 3px 8px -4px rgba(120,90,70,.5)' });
+        function cardHome() { card.style.left = (sx * 100) + '%'; card.style.top = (sy * 100) + '%'; }
+        pickDnd.dragFree(card, {
+          area: area,
+          disabled: function () { return answered; },
+          onStart: function () { card.style.zIndex = '5'; },
+          onMove: function (p) { card.style.left = (p.x * 100) + '%'; card.style.top = (p.y * 100) + '%'; },
+          onCancel: function () { card.style.zIndex = '1'; cardHome(); }, // 취소 = 무판정 원위치
+          onDrop: function (p) {
+            card.style.zIndex = '1';
+            if (answered) return;
+            // 원본과 동일: 존 밖 릴리즈 = 무판정, 카드 원위치(손 미끄러짐이 오답이 되지 않게)
+            var dx = p.x - d.zone.cx, dy = p.y - d.zone.cy;
+            if (Math.sqrt(dx * dx + dy * dy) > d.zone.r) { cardHome(); return; }
+            dropAt = { item: it.id, x: Math.round(p.x * 1000) / 1000, y: Math.round(p.y * 1000) / 1000 };
+            if (footerOn) footerState(true, true);
+            else verify(token, dropAt);
+          },
         });
         els[it.id] = { el: card, sx: sx, sy: sy };
         area.appendChild(card);
@@ -744,7 +887,42 @@
         handle.addEventListener('pointerup', end);
         handle.addEventListener('pointercancel', end);
       }
-      return { addZone: addZone, drag: drag };
+      // 자유 드래그 — 존 판정 없이 '놓은 좌표'가 답인 유형(drag_drop·drag_pick)용 공용 엔진.
+      // forest 캡차의 검증된 포인터 패턴(drag-rotate.js)과 동일: pointerdown/move/up +
+      // setPointerCapture(마우스·터치·펜 통합, HTML5 DnD 금지), pointercancel은 제출이 아니라
+      // 원위치 복원(onCancel) — 스크롤 제스처에 뺏긴 드래그가 오답이 되지 않게 한다.
+      // 좌표는 opts.area 기준 0~1 정규화(클램프) — 기존 렌더러·서버 채점과 동일 계약.
+      function dragFree(handle, opts) {
+        // opts: { area, onStart(), onMove(p), onDrop(p), onCancel(), disabled:function(){} }
+        var active = false;
+        handle.style.touchAction = 'none'; handle.style.cursor = 'grab'; handle.style.userSelect = 'none';
+        function norm(e) {
+          var r = opts.area.getBoundingClientRect();
+          return { x: Math.max(0, Math.min(1, (e.clientX - r.left) / r.width)),
+                   y: Math.max(0, Math.min(1, (e.clientY - r.top) / r.height)) };
+        }
+        handle.addEventListener('pointerdown', function (e) {
+          if (opts.disabled && opts.disabled()) return;
+          active = true;
+          try { handle.setPointerCapture(e.pointerId); } catch (er) {}
+          handle.style.cursor = 'grabbing';
+          if (opts.onStart) opts.onStart();
+          e.preventDefault();
+        });
+        handle.addEventListener('pointermove', function (e) {
+          if (!active) return;
+          if (opts.onMove) opts.onMove(norm(e));
+        });
+        function end(e) {
+          if (!active) return; active = false;
+          handle.style.cursor = 'grab';
+          if (e.type === 'pointercancel') { if (opts.onCancel) opts.onCancel(); return; }
+          if (opts.onDrop) opts.onDrop(norm(e));
+        }
+        handle.addEventListener('pointerup', end);
+        handle.addEventListener('pointercancel', end);
+      }
+      return { addZone: addZone, drag: drag, dragFree: dragFree };
     }
 
     // ── 참조 지도(사회 방위 sort) — 원본 renderRefMap 이식: 기준 건물을 강조하고 북 나침반을
@@ -773,24 +951,61 @@
       body.appendChild(map);
     }
 
+    // ── 공용 오디오 버튼 — 사운드 웨이브 이퀄라이저(재생중 출렁) + 재생중/완료 라벨.
+    //    반환: { el, playing(on), setLabel(t) }. reduced-motion이면 막대를 정지 상태로 둔다.
+    function audioBtn(label, opts) {
+      opts = opts || {};
+      var reduce = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+      var el = h('button');
+      css(el, { display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '10px',
+        margin: opts.compact ? '0 auto 12px' : '0 auto 16px',
+        padding: opts.compact ? '11px 22px' : '14px 30px', minHeight: T.tap,
+        fontSize: opts.compact ? T.font.md : T.font.lg, fontWeight: '800',
+        border: 'none', borderRadius: T.radius.pill, background: C, color: '#fff',
+        cursor: 'pointer', fontFamily: 'inherit', boxShadow: T.shadow.pop });
+      var eq = h('span'); css(eq, { display: 'inline-flex', alignItems: 'center', gap: '3px', height: '20px' });
+      var bars = [];
+      [0, 1, 2, 3].forEach(function (i) {
+        var bar = h('span');
+        css(bar, { display: 'inline-block', width: '4px', height: '20px', borderRadius: '2px',
+          background: '#fff', transformOrigin: 'center', transform: 'scaleY(0.32)' });
+        bar.style.animation = 'ccWave 0.85s ease-in-out infinite';
+        bar.style.animationDelay = (i * 0.13) + 's';
+        bar.style.animationPlayState = 'paused';
+        bars.push(bar); eq.appendChild(bar);
+      });
+      var lab = h('span'); lab.textContent = label;
+      el.appendChild(eq); el.appendChild(lab);
+      function playing(on) {
+        bars.forEach(function (b) {
+          b.style.animationPlayState = (on && !reduce) ? 'running' : 'paused';
+          if (!on) b.style.transform = 'scaleY(0.32)';
+          else if (reduce) b.style.transform = 'scaleY(0.7)'; // 모션 최소화 시 정적 표시
+        });
+      }
+      return { el: el, playing: playing, setLabel: function (t) { lab.textContent = t; } };
+    }
+
     // ── 입력형(dictation/type_in) — 원본(국어): 받아쓰기는 TTS로 듣고, 높임말은 밑줄
     //    낱말을 보고 타이핑. 제출 문자열 → 서버 trim 정확 일치.
     function renderTyping(d, token) {
       if (d.type === 'dictation') {
         var canSpeak = typeof window.speechSynthesis !== 'undefined';
         var played = false;
-        var sp = h('button'); sp.textContent = '🔊 듣기';
-        css(sp, { display: 'block', margin: '0 auto 16px', padding: '13px 26px', fontSize: '17px', fontWeight: '800',
-          border: 'none', borderRadius: '30px', background: canSpeak ? C : '#D8CBBB', color: '#fff',
-          cursor: canSpeak ? 'pointer' : 'not-allowed' });
+        var ab = audioBtn('듣기');
+        if (!canSpeak) { ab.el.style.background = '#D8CBBB'; ab.el.style.cursor = 'not-allowed'; ab.el.style.boxShadow = 'none'; }
+        var sp = ab.el;
         sp.onclick = function () {
           if (!canSpeak) return;
           try {
             window.speechSynthesis.cancel();
             var u = new SpeechSynthesisUtterance(d.tts);
             u.lang = 'ko-KR'; u.rate = 0.9;
+            u.onstart = function () { ab.playing(true); ab.setLabel('듣는 중…'); };
+            u.onend = function () { ab.playing(false); ab.setLabel('다시 듣기'); };
+            u.onerror = function () { ab.playing(false); ab.setLabel('다시 듣기'); };
             window.speechSynthesis.speak(u);
-            played = true; sp.textContent = '🔊 다시 듣기';
+            played = true; ab.setLabel('듣는 중…');
           } catch (e) {}
         };
         body.appendChild(sp);
@@ -804,11 +1019,11 @@
         var sent = h('div');
         sent.appendChild(document.createTextNode(d.before || ''));
         var hi = h('span'); hi.textContent = d.highlight || '';
-        css(hi, { color: '#E2574C', borderBottom: '3px solid #E2574C', fontWeight: '800' });
+        css(hi, { color: T.color.err, borderBottom: '3px solid ' + T.color.err, fontWeight: '800' });
         sent.appendChild(hi);
         sent.appendChild(document.createTextNode(d.after || ''));
-        css(sent, { fontSize: '17px', fontWeight: '700', color: '#3A3226', lineHeight: '1.8',
-          background: '#fff', border: '2px solid #F0E4D8', borderRadius: '14px',
+        css(sent, { fontSize: '17px', fontWeight: '700', color: T.color.ink, lineHeight: '1.8',
+          background: T.color.card, border: '2px solid ' + T.color.line, borderRadius: '14px',
           padding: '14px 18px', maxWidth: '440px', margin: '0 auto 16px' });
         body.appendChild(sent);
       }
@@ -819,8 +1034,11 @@
       input.placeholder = d.type === 'dictation' ? '들은 문장을 그대로 입력해요'
         : d.type === 'input' ? '답을 입력해요' : '알맞은 표현을 입력해요';
       css(input, { display: 'block', width: '100%', maxWidth: '420px', margin: '0 auto', boxSizing: 'border-box',
-        fontFamily: 'inherit', fontSize: '16px', fontWeight: '600', padding: '13px 15px',
-        borderRadius: '13px', border: '2px solid #F0E4D8', color: '#3A3226', outline: 'none' });
+        fontFamily: 'inherit', fontSize: '16px', fontWeight: '600', padding: '14px 16px', minHeight: T.tap,
+        borderRadius: T.radius.md, border: '2px solid ' + T.color.line, color: T.color.ink, outline: 'none' });
+      // 포커스 시 코랄 테두리(입력 위치 강조)
+      input.addEventListener('focus', function () { input.style.borderColor = C; });
+      input.addEventListener('blur', function () { input.style.borderColor = T.color.line; });
       input.addEventListener('input', function () {
         if (footerOn) { var v = input.value.trim(); footerState(v.length > 0, v.length > 0); }
       });
@@ -848,23 +1066,25 @@
       var gapEls = {};
       var line = h('div');
       css(line, { display: 'flex', flexWrap: 'wrap', alignItems: 'center', justifyContent: 'center',
-        gap: '4px', maxWidth: '480px', margin: '0 auto 8px' });
+        gap: '6px', maxWidth: '480px', margin: '0 auto 8px' });
       (d.tokens || []).forEach(function (w, i) {
         var word = h('span'); word.textContent = w;
-        css(word, { fontSize: '17px', fontWeight: '700', color: '#3A3226' });
+        css(word, { fontSize: '19px', fontWeight: '700', color: T.color.ink });
         line.appendChild(word);
         if ((d.gaps || []).indexOf(i) !== -1) {
           var g = h('button'); g.textContent = '_';
-          css(g, { width: '28px', height: '28px', margin: '0 3px', borderRadius: '50%',
-            border: '2px solid #F0E4D8', background: '#fff', color: '#B7A68F',
-            fontSize: '15px', fontWeight: '800', cursor: 'pointer', lineHeight: '1', padding: '0' });
+          // 44px 원형 — 어절 사이 탭 타깃(WCAG 2.5.5, 기존 28px는 아동 손가락에 작음)
+          css(g, { width: '44px', height: '44px', margin: '0 2px', borderRadius: '50%',
+            border: '2px solid ' + T.color.line, background: T.color.card, color: T.color.inkFaint,
+            fontSize: '18px', fontWeight: '800', cursor: 'pointer', lineHeight: '1', padding: '0',
+            flexShrink: '0', touchAction: 'manipulation', transition: 'border-color .12s, background .12s' });
           g.onclick = function () {
             if (answered) return;
             picked[i] = !picked[i];
             g.textContent = picked[i] ? '✓' : '_';
-            g.style.borderColor = picked[i] ? C : '#F0E4D8';
-            g.style.background = picked[i] ? '#FFF0EE' : '#fff';
-            g.style.color = picked[i] ? C : '#B7A68F';
+            g.style.borderColor = picked[i] ? C : T.color.line;
+            g.style.background = picked[i] ? T.color.brandSoft : T.color.card;
+            g.style.color = picked[i] ? C : T.color.inkFaint;
             if (footerOn) {
               var pn = Object.keys(picked).filter(function (k) { return picked[k]; }).length;
               footerState(pn > 0, pn > 0);
@@ -884,7 +1104,7 @@
         pendingRedo = function () {
           picked = {};
           Object.keys(gapEls).forEach(function (k) { var g = gapEls[k];
-            g.textContent = '_'; g.style.borderColor = '#F0E4D8'; g.style.background = '#fff'; g.style.color = '#B7A68F'; });
+            g.textContent = '_'; g.style.borderColor = T.color.line; g.style.background = T.color.card; g.style.color = T.color.inkFaint; });
           footerState(false, false);
         };
         pendingSubmit = subG;
@@ -897,7 +1117,9 @@
     // ── 십자말(crossword) — 원본(국어): 격자 셀 탭으로 낱말 선택 → 음절 타일로 채우기.
     //    낱말 정답은 서버에만 있어 즉시 판정 대신 전부 채우면 제출({w0:"낱말",...} match 채점).
     function renderCrossword(d, token) {
-      var CELL = 40;
+      // 셀 46px — 아동 터치타깃(44px 이상). 큰 격자(size)는 화면 폭에 맞춰 축소해 넘침 방지.
+      var CELL = 46;
+      if (d.size && d.size * (CELL + 4) > 360) CELL = Math.max(38, Math.floor(360 / d.size) - 4);
       var wordCells = [], cellOwner = {}, startNo = {};
       (d.words || []).forEach(function (w, wi) {
         var cells = [];
@@ -927,11 +1149,12 @@
           if (!cellOwner[key]) { var sp = h('div'); css(sp, { width: CELL + 'px', height: CELL + 'px' }); grid.appendChild(sp); return; }
           var cell = h('button');
           css(cell, { position: 'relative', width: CELL + 'px', height: CELL + 'px', fontFamily: 'inherit',
-            fontSize: '17px', fontWeight: '800', borderRadius: '8px', border: '2px solid #F0E4D8',
-            background: '#fff', color: '#3A3226', cursor: 'pointer', padding: '0' });
+            fontSize: '19px', fontWeight: '800', borderRadius: T.radius.sm, border: '2px solid ' + T.color.line,
+            background: T.color.card, color: T.color.ink, cursor: 'pointer', padding: '0',
+            touchAction: 'manipulation', transition: 'border-color .12s, background .12s' });
           if (startNo[key] !== undefined) {
             var no = h('span'); no.textContent = startNo[key];
-            css(no, { position: 'absolute', top: '1px', left: '4px', fontSize: '9px', fontWeight: '700', color: '#B7A68F' });
+            css(no, { position: 'absolute', top: '2px', left: '4px', fontSize: '10px', fontWeight: '700', color: T.color.inkMute });
             cell.appendChild(no);
           }
           var ch = h('span'); ch.textContent = filled[key] || '';
@@ -1015,8 +1238,9 @@
         tray.innerHTML = '';
         bank.forEach(function (t) {
           var tb = h('button'); tb.textContent = t.letter;
-          css(tb, { fontFamily: 'inherit', fontSize: '16px', fontWeight: '800', padding: '8px 14px',
-            borderRadius: '11px', border: '2px solid #F0E4D8', background: '#fff', color: '#3A3226', cursor: 'pointer' });
+          css(tb, { fontFamily: 'inherit', fontSize: '18px', fontWeight: '800', padding: '0',
+            minWidth: '44px', minHeight: '44px', borderRadius: T.radius.md, border: '2px solid ' + T.color.line,
+            background: T.color.card, color: T.color.ink, cursor: 'pointer', touchAction: 'manipulation' });
           tb.onclick = function () {
             if (answered || active == null) return;
             var next = null;
@@ -1067,10 +1291,10 @@
       css(lab, { fontSize: '13px', marginBottom: '8px' });
       wrap.appendChild(lab);
       var card = h('div'); card.textContent = d.card;
-      css(card, { background: '#fff', border: '2px solid #F0E4D8', borderRadius: '18px', padding: '26px 20px',
-        fontSize: '16.5px', fontWeight: '700', color: '#3A3226', lineHeight: '1.7', textAlign: 'center',
+      css(card, { background: T.color.card, border: '2px solid ' + T.color.line, borderRadius: '18px', padding: '26px 20px',
+        fontSize: '16.5px', fontWeight: '700', color: T.color.ink, lineHeight: '1.7', textAlign: 'center',
         cursor: 'grab', userSelect: 'none', touchAction: 'none', transition: 'transform 0.15s',
-        boxShadow: '0 10px 24px -14px rgba(120,90,70,0.35)' });
+        boxShadow: T.shadow.pop });
       wrap.appendChild(card);
       body.appendChild(wrap);
       var row = h('div'); css(row, { display: 'flex', gap: '10px', justifyContent: 'center', maxWidth: '420px', margin: '0 auto' });
@@ -1120,7 +1344,7 @@
       });
       if (footerOn) {
         pendingRedo = function () {
-          chosen = null; card.style.transform = 'none'; card.style.borderColor = '#F0E4D8';
+          chosen = null; card.style.transform = 'none'; card.style.borderColor = T.color.line;
           leftBtn.style.opacity = '1'; rightBtn.style.opacity = '1';
           footerState(false, false);
         };
@@ -1173,11 +1397,14 @@
         body.appendChild(el); return el;
       });
       var playing = false;
+      var ab = audioBtn('순서대로 듣기', { compact: !footerOn });
       function playAll() {
         if (playing || !auds.length) return;
         playing = true; var i = 0;
+        ab.playing(true); ab.setLabel('듣는 중…');
+        function done() { playing = false; ab.playing(false); ab.setLabel('다시 듣기'); }
         function next() {
-          if (i >= auds.length) { playing = false; return; }
+          if (i >= auds.length) { done(); return; }
           var a = auds[i++];
           try {
             a.currentTime = 0;
@@ -1185,22 +1412,19 @@
             a.onerror = function () { setTimeout(next, 200); }; // 로드 실패 시 다음으로(잠김 방지)
             var pr = a.play();
             // play()는 거부를 프로미스로 반환 — 자동재생 차단/실패 시 잠금 해제(버튼 재시도 가능)
-            if (pr && pr.catch) pr.catch(function () { playing = false; });
-          } catch (e) { playing = false; }
+            if (pr && pr.catch) pr.catch(function () { done(); });
+          } catch (e) { done(); }
         }
         next();
       }
-      var playBtn = h('button'); playBtn.textContent = '🔊 순서대로 듣기';
-      css(playBtn, { display: 'block', margin: '0 auto 16px', padding: footerOn ? '14px 28px' : '10px 20px',
-        fontSize: footerOn ? '18px' : '15px', fontWeight: '800', border: 'none', borderRadius: '30px',
-        background: C, color: '#fff', cursor: 'pointer' });
+      var playBtn = ab.el;
       playBtn.onclick = playAll;
       body.appendChild(playBtn);
       setTimeout(playAll, 200);
       var slotWrap = h('div');
       css(slotWrap, { display: 'flex', flexWrap: 'wrap', gap: '8px', justifyContent: 'center', minHeight: '30px',
         padding: '12px', marginBottom: '12px', maxWidth: '440px', margin: '0 auto 12px',
-        border: '2px dashed #E3D6C6', borderRadius: '14px', background: '#FFFAF4', alignItems: 'center' });
+        border: '2px dashed ' + T.color.lineSoft, borderRadius: '14px', background: T.color.cream, alignItems: 'center' });
       var tray = h('div'); css(tray, { display: 'flex', flexWrap: 'wrap', gap: '10px', justifyContent: 'center' });
       var byId = {}; (d.options || []).forEach(function (o) { byId[o.id] = o; });
       function paint() {
@@ -1258,21 +1482,25 @@
       css(info, { textAlign: 'center', fontSize: '13px', fontWeight: '800', color: '#8A8070', marginBottom: '10px' });
       body.appendChild(info); body.appendChild(grid);
       var els = {};
-      function face(el, c, up) {
+      var reduceM = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+      function face(el, c, up, animate) {
         el.textContent = up ? c.face : '❓';
         el.style.background = up ? '#FFF9F1' : '#FFE9E2';
         el.style.borderColor = matched[c.id] ? OK : (up ? C : '#F0C9BC');
         el.style.fontSize = c.kind === 'image' ? '30px' : '15px';
         if (!up) el.style.fontSize = '24px';
+        // 뒤집기 팝 애니메이션 — 열 때(up) 부드럽게 튕겨 나타남(reduced-motion 존중)
+        if (animate && !reduceM) { el.style.animation = 'none'; void el.offsetWidth; el.style.animation = 'ccPop 0.28s ease-out'; }
       }
       cards.forEach(function (c) {
         var el = h('button');
-        css(el, { aspectRatio: '3 / 4', border: '2px solid #F0C9BC', borderRadius: '12px', cursor: 'pointer',
-          fontWeight: '800', color: '#3A3226', padding: '2px', overflowWrap: 'anywhere' });
+        css(el, { aspectRatio: '3 / 4', border: '2px solid #F0C9BC', borderRadius: T.radius.md, cursor: 'pointer',
+          fontWeight: '800', color: T.color.ink, padding: '2px', overflowWrap: 'anywhere',
+          touchAction: 'manipulation', transition: 'border-color .15s, background .15s' });
         el.onclick = function () {
           if (answered || lock || done || matched[c.id]) return;
           if (open.some(function (o) { return o.id === c.id; })) return;
-          face(el, c, true); open.push(c);
+          face(el, c, true, true); open.push(c);
           if (open.length < 2) return;
           lock = true;
           var a = open[0], b = open[1];
@@ -1376,8 +1604,9 @@
         prompt.textContent = d.prompt;
       }
       css(prompt, footerOn
-        ? { fontWeight: '800', fontSize: '21px', color: '#3A3226', marginBottom: '20px', textAlign: 'center' }
-        : { fontWeight: '800', fontSize: '15px', color: '#3A3226', marginBottom: '12px' });
+        ? { fontWeight: '800', fontSize: T.font.xl, lineHeight: '1.45', color: T.color.ink,
+            marginBottom: '20px', textAlign: 'center' }
+        : { fontWeight: '800', fontSize: T.font.md, lineHeight: '1.5', color: T.color.ink, marginBottom: '12px' });
       body.appendChild(prompt);
 
       // figure(문제 위 도형 그림) — 서버 뱅크의 신뢰된 SVG 마크업. 모든 유형 공통.
@@ -1399,14 +1628,14 @@
       }
       if (d.meaning) {
         var gmn = h('div'); gmn.textContent = '뜻: ' + d.meaning;
-        css(gmn, { textAlign: 'center', fontSize: '15px', fontWeight: '700', color: '#6B6157', margin: '0 0 14px' });
+        css(gmn, { textAlign: 'center', fontSize: T.font.md, fontWeight: '700', color: T.color.inkSoft, margin: '0 0 14px' });
         body.appendChild(gmn);
       }
       // 상황 지문(생활 5단계 시나리오) — 프롬프트 아래 상황 설명 박스.
       if (d.scenario) {
         var scn = h('div'); scn.textContent = d.scenario;
-        css(scn, { textAlign: 'center', fontSize: '16px', fontWeight: '700', color: '#3A3226',
-          background: '#FFF6EA', border: '1.5px solid #F0E0C8', borderRadius: '12px',
+        css(scn, { textAlign: 'center', fontSize: '16px', fontWeight: '700', color: T.color.ink, lineHeight: '1.6',
+          background: '#FFF6EA', border: '1.5px solid #F0E0C8', borderRadius: T.radius.md,
           padding: '12px 16px', maxWidth: '460px', margin: '0 auto 16px' });
         body.appendChild(scn);
       }
@@ -1423,8 +1652,11 @@
         } else {
           b.textContent = text;
         }
-        css(b, { textAlign: 'center', padding: '12px 14px', border: '2px solid #F0E4D8', borderRadius: '12px',
-          background: '#fff', cursor: 'pointer', fontSize: '15px', fontWeight: '700', color: '#3A3226', lineHeight: '1.3' });
+        css(b, { textAlign: 'center', padding: '12px 14px', border: '2px solid ' + T.color.line,
+          borderRadius: T.radius.md, background: T.color.card, cursor: 'pointer', fontSize: T.font.md,
+          fontWeight: '700', color: T.color.ink, lineHeight: '1.3', fontFamily: 'inherit',
+          minHeight: T.tap, minWidth: T.tap, touchAction: 'manipulation',
+          transition: 'border-color .15s, background .15s' });
         return b;
       }
       var PAIRC = ['#FF7A59', '#2E7BFF', '#17B08C', '#8B6BFF', '#FF922E', '#E0489E'];
@@ -1449,17 +1681,19 @@
         var picked = {};
         var cellEls = [];
         var grid = h('div');
-        css(grid, { display: 'grid', gridTemplateColumns: 'repeat(3,1fr)', gap: '8px' });
+        css(grid, { display: 'grid', gridTemplateColumns: 'repeat(3,1fr)', gap: '10px' });
         if (footerOn) css(grid, { maxWidth: '420px', margin: '0 auto', width: '100%' });
         d.cells.forEach(function (c) {
           var cell = h('button'); cell.textContent = c.emoji;
-          css(cell, { fontSize: '30px', padding: '14px 0', border: '2px solid #F0E4D8', borderRadius: '12px',
-            background: '#fff', cursor: 'pointer' });
+          css(cell, { fontSize: '32px', padding: '16px 0', minHeight: T.tap, border: '2px solid ' + T.color.line,
+            borderRadius: T.radius.md, background: T.color.card, cursor: 'pointer', touchAction: 'manipulation',
+            transition: 'border-color .12s, background .12s, transform .08s' });
           cell.onclick = function () {
             if (answered) return;
             picked[c.id] = !picked[c.id];
-            cell.style.borderColor = picked[c.id] ? C : '#F0E4D8';
-            cell.style.background = picked[c.id] ? '#FFF0EE' : '#fff';
+            cell.style.borderColor = picked[c.id] ? C : T.color.line;
+            cell.style.background = picked[c.id] ? T.color.brandSoft : T.color.card;
+            cell.style.transform = picked[c.id] ? 'scale(0.96)' : 'scale(1)';
             if (footerOn) {
               var n = Object.keys(picked).filter(function (k) { return picked[k]; }).length;
               footerState(n > 0, n > 0);
@@ -1477,7 +1711,7 @@
         if (footerOn) {
           pendingRedo = function () {
             picked = {};
-            cellEls.forEach(function (cell) { cell.style.borderColor = '#F0E4D8'; cell.style.background = '#fff'; });
+            cellEls.forEach(function (cell) { cell.style.borderColor = T.color.line; cell.style.background = T.color.card; cell.style.transform = 'scale(1)'; });
             footerState(false, false);
           };
           pendingSubmit = submitCells;
@@ -1501,8 +1735,9 @@
           lastOptions.forEach(function (o) {
             if (!mPicked[o.id]) return;
             var chip = h('div'); chip.textContent = (o.emoji ? o.emoji + ' ' : '') + o.text;
-            css(chip, { fontSize: '13px', fontWeight: '700', padding: '5px 9px', margin: '3px',
-              background: '#fff', border: '1px solid ' + C, borderRadius: '8px', cursor: 'pointer', color: '#3A3226' });
+            css(chip, { fontSize: T.font.sm, fontWeight: '700', padding: '7px 11px', margin: '3px',
+              minHeight: '34px', display: 'flex', alignItems: 'center',
+              background: T.color.card, border: '1.5px solid ' + C, borderRadius: T.radius.sm, cursor: 'pointer', color: T.color.ink });
             chip.onclick = function () { if (answered) return; mToggle(o, false); };
             mBoxChips.appendChild(chip);
           });
@@ -1511,7 +1746,7 @@
           if (answered) return;
           mPicked[o.id] = on == null ? !mPicked[o.id] : on;
           var mb = mBtns[lastOptions.indexOf(o)];
-          if (mb) { mb.style.borderColor = mPicked[o.id] ? C : '#F0E4D8'; mb.style.background = mPicked[o.id] ? '#FFF0EE' : '#fff';
+          if (mb) { mb.style.borderColor = mPicked[o.id] ? C : T.color.line; mb.style.background = mPicked[o.id] ? T.color.brandSoft : T.color.card;
             if (mBoxChips) mb.style.display = mPicked[o.id] ? 'none' : ''; }
           mPaintBox();
           if (footerOn) {
@@ -1543,10 +1778,14 @@
             ? { textAlign: 'left', padding: '10px 14px', border: '2px solid #F0E4D8', borderRadius: '4px 16px 16px 16px',
                 background: '#F6F1E9', cursor: 'pointer', fontSize: '14px', fontWeight: '700', color: '#3A3226', maxWidth: '85%' }
             : (footerOn && !mFrame
-              ? { textAlign: 'center', padding: '16px 24px', minWidth: '110px', border: '2px solid #F0E4D8',
-                  borderRadius: '14px', background: '#fff', cursor: 'pointer', fontSize: '16px', fontWeight: '700', color: '#3A3226' }
-              : { textAlign: 'left', padding: '13px 15px', border: '2px solid #F0E4D8', borderRadius: '12px',
-                  background: '#fff', cursor: 'pointer', fontSize: '15px', fontWeight: '700', color: '#3A3226' }));
+              ? { textAlign: 'center', padding: '16px 24px', minWidth: '110px', minHeight: T.tap,
+                  border: '2px solid ' + T.color.line, borderRadius: '14px', background: T.color.card,
+                  cursor: 'pointer', fontSize: '16px', fontWeight: '700', color: T.color.ink,
+                  fontFamily: 'inherit', transition: 'border-color .15s, background .15s' }
+              : { textAlign: 'left', padding: '13px 15px', minHeight: T.tap, border: '2px solid ' + T.color.line,
+                  borderRadius: T.radius.md, background: T.color.card, cursor: 'pointer', fontSize: T.font.md,
+                  fontWeight: '700', color: T.color.ink, fontFamily: 'inherit',
+                  transition: 'border-color .15s, background .15s' }));
           if (mDnd) {
             mDnd.drag(mb, { disabled: function () { return answered; },
               onDrop: function () { mToggle(o, true); },
@@ -1579,7 +1818,7 @@
         if (footerOn) {
           pendingRedo = function () {
             mPicked = {};
-            mBtns.forEach(function (mb) { mb.style.borderColor = '#F0E4D8'; mb.style.background = '#fff'; mb.style.display = ''; });
+            mBtns.forEach(function (mb) { mb.style.borderColor = T.color.line; mb.style.background = T.color.card; mb.style.display = ''; });
             mPaintBox();
             footerState(false, false);
           };
@@ -1599,6 +1838,7 @@
         var cSvg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
         cSvg.setAttribute('style', 'position:absolute;inset:0;width:100%;height:100%;pointer-events:none;z-index:1;');
         var colL = h('div'), colR = h('div'); css(colL, { display: 'grid', gap: '8px' }); css(colR, { display: 'grid', gap: '8px' });
+        var NSc = 'http://www.w3.org/2000/svg';
         function cLines() {
           while (cSvg.firstChild) cSvg.removeChild(cSvg.firstChild);
           var ob = cOuter.getBoundingClientRect();
@@ -1606,19 +1846,33 @@
           d.left.forEach(function (l, i) {
             var rid = cPairs[l.id]; if (rid == null || !cR[rid]) return;
             var a = cL[l.id].getBoundingClientRect(), b = cR[rid].getBoundingClientRect();
-            var ln = document.createElementNS('http://www.w3.org/2000/svg', 'line');
-            ln.setAttribute('x1', a.right - ob.left); ln.setAttribute('y1', a.top + a.height / 2 - ob.top);
-            ln.setAttribute('x2', b.left - ob.left); ln.setAttribute('y2', b.top + b.height / 2 - ob.top);
-            ln.setAttribute('stroke', PAIRC[i % 6]); ln.setAttribute('stroke-width', '3'); ln.setAttribute('stroke-linecap', 'round');
+            var col = PAIRC[i % 6];
+            var x1 = a.right - ob.left, y1 = a.top + a.height / 2 - ob.top;
+            var x2 = b.left - ob.left, y2 = b.top + b.height / 2 - ob.top;
+            // 굵은 선 + 양끝 색점(연결 지점 명확화) — 시각 피드백 강화
+            var ln = document.createElementNS(NSc, 'line');
+            ln.setAttribute('x1', x1); ln.setAttribute('y1', y1);
+            ln.setAttribute('x2', x2); ln.setAttribute('y2', y2);
+            ln.setAttribute('stroke', col); ln.setAttribute('stroke-width', '4'); ln.setAttribute('stroke-linecap', 'round');
             cSvg.appendChild(ln);
+            [[x1, y1], [x2, y2]].forEach(function (pt) {
+              var dot = document.createElementNS(NSc, 'circle');
+              dot.setAttribute('cx', pt[0]); dot.setAttribute('cy', pt[1]); dot.setAttribute('r', '5');
+              dot.setAttribute('fill', col); dot.setAttribute('stroke', '#fff'); dot.setAttribute('stroke-width', '2');
+              cSvg.appendChild(dot);
+            });
           });
         }
         function cPaint() {
           d.left.forEach(function (l, i) { var e = cL[l.id]; var on = cPairs[l.id] != null;
-            e.style.borderColor = cSel === l.id ? C : (on ? PAIRC[i % 6] : '#F0E4D8'); e.style.background = on ? '#FFF6F3' : '#fff'; });
+            e.style.borderColor = cSel === l.id ? C : (on ? PAIRC[i % 6] : T.color.line);
+            e.style.borderWidth = (cSel === l.id || on) ? '2.5px' : '2px';
+            e.style.background = on ? '#FFF6F3' : T.color.card; });
           d.right.forEach(function (r) { var e = cR[r.id]; var ow = Object.keys(cPairs).filter(function (k) { return cPairs[k] === r.id; })[0];
             var ci = ow ? d.left.map(function (l) { return l.id; }).indexOf(ow) : -1;
-            e.style.borderColor = ci >= 0 ? PAIRC[ci % 6] : '#F0E4D8'; e.style.background = ci >= 0 ? '#FFF6F3' : '#fff'; });
+            e.style.borderColor = ci >= 0 ? PAIRC[ci % 6] : T.color.line;
+            e.style.borderWidth = ci >= 0 ? '2.5px' : '2px';
+            e.style.background = ci >= 0 ? '#FFF6F3' : T.color.card; });
           cLines();
           var done = d.left.length && Object.keys(cPairs).length === d.left.length;
           if (footerOn) footerState(Object.keys(cPairs).length > 0 || cSel != null, done);
@@ -1635,7 +1889,7 @@
         d.right.forEach(function (r) { var e = optCell(r.text); cR[r.id] = e; colR.appendChild(e);
           e.onclick = function () { if (answered || cSel == null) return; cLink(cSel, r.id); };
           cDnd.addZone(e, r.id, function (on) { if (Object.keys(cPairs).some(function (k) { return cPairs[k] === r.id; })) return;
-            e.style.borderColor = on ? C : '#F0E4D8'; e.style.background = on ? '#FFF6F3' : '#fff'; }); });
+            e.style.borderColor = on ? C : T.color.line; e.style.background = on ? '#FFF6F3' : T.color.card; }); });
         cWrap.appendChild(colL); cWrap.appendChild(colR);
         cOuter.appendChild(cWrap); cOuter.appendChild(cSvg); body.appendChild(cOuter);
         function subC() { if (Object.keys(cPairs).length === d.left.length) verify(token, cPairs); }
@@ -1648,14 +1902,17 @@
         var sDnd = makeDnd();
         // 참조 지도(사회 방위 등) — 원본 renderRefMap: 기준 건물 강조 + 나침반. 없으면 생략.
         if (d.mapRef) renderRefMap(d.mapRef);
-        var itRow = h('div'); css(itRow, { display: 'flex', flexWrap: 'wrap', gap: '8px', justifyContent: 'center', marginBottom: '12px' });
-        var binRow = h('div'); css(binRow, { display: 'grid', gridTemplateColumns: 'repeat(' + Math.min(d.bins.length, 3) + ',1fr)', gap: '10px', maxWidth: '480px', margin: '0 auto' });
+        var itRow = h('div'); css(itRow, { display: 'flex', flexWrap: 'wrap', gap: '10px', justifyContent: 'center', marginBottom: '16px' });
+        // width:100% — full 모드 body(flex column)에서 margin auto만 주면 stretch가 풀려
+        // 내용 너비로 쭈그러든다(바구니가 좁게 나오던 버그). 100%로 채우고 maxWidth로 센터.
+        var binRow = h('div'); css(binRow, { display: 'grid', gridTemplateColumns: 'repeat(' + Math.min(d.bins.length, 3) + ',1fr)',
+          gap: '12px', width: '100%', maxWidth: '480px', margin: '0 auto', boxSizing: 'border-box' });
         function sPaint() {
           d.items.forEach(function (it) { var e = sIt[it.id]; var bin = sMap[it.id];
-            e.style.display = bin ? 'none' : ''; e.style.borderColor = sSel === it.id ? C : '#F0E4D8'; e.style.background = sSel === it.id ? '#FFF0EE' : '#fff'; });
+            e.style.display = bin ? 'none' : ''; e.style.borderColor = sSel === it.id ? C : T.color.line; e.style.background = sSel === it.id ? T.color.brandSoft : T.color.card; });
           d.bins.forEach(function (b) { var box2 = sBinEls[b.id]; box2.chips.innerHTML = '';
             d.items.filter(function (it) { return sMap[it.id] === b.id; }).forEach(function (it) {
-              var chip = h('div'); chip.textContent = it.text; css(chip, { fontSize: '13px', fontWeight: '700', padding: '5px 9px', margin: '3px', background: '#fff', border: '1px solid ' + C, borderRadius: '8px', cursor: 'pointer', color: '#3A3226' });
+              var chip = h('div'); chip.textContent = it.text; css(chip, { fontSize: T.font.sm, fontWeight: '700', padding: '7px 11px', margin: '3px', minHeight: '34px', display: 'flex', alignItems: 'center', background: T.color.card, border: '1.5px solid ' + C, borderRadius: T.radius.sm, cursor: 'pointer', color: T.color.ink });
               chip.onclick = function () { if (answered) return; delete sMap[it.id]; sPaint(); }; box2.chips.appendChild(chip); }); });
           // placeCount: 방해 항목이 있는 분류 — 정답 개수만 담으면 제출 가능(남는 건 트레이에)
           var done = Object.keys(sMap).length === (d.placeCount || d.items.length);
@@ -1668,12 +1925,12 @@
             onDrop: function (binId) { sDrop(it.id, binId); },
             onTap: function () { if (answered) return; sSel = sSel === it.id ? null : it.id; sPaint(); } });
         });
-        d.bins.forEach(function (b) { var box2 = h('div'); css(box2, { border: '2px dashed #E0D3C4', borderRadius: '12px', padding: '8px', minHeight: '70px', textAlign: 'center', cursor: 'pointer' });
-          var lab = h('div'); lab.textContent = b.label; css(lab, { fontSize: '13px', fontWeight: '800', color: '#8A8070', marginBottom: '4px' });
+        d.bins.forEach(function (b) { var box2 = h('div'); css(box2, { border: '2.5px dashed ' + T.color.lineSoft, borderRadius: T.radius.md, padding: '10px', minHeight: '88px', textAlign: 'center', cursor: 'pointer', boxSizing: 'border-box', transition: 'border-color .15s, background .15s' });
+          var lab = h('div'); lab.textContent = b.label; css(lab, { fontSize: T.font.sm, fontWeight: '800', color: T.color.inkFaint, marginBottom: '6px' });
           var chips = h('div'); css(chips, { display: 'flex', flexWrap: 'wrap', justifyContent: 'center' });
           box2.appendChild(lab); box2.appendChild(chips); box2.chips = chips;
           box2.onclick = function () { if (answered || sSel == null) return; sMap[sSel] = b.id; sSel = null; sPaint(); };
-          sDnd.addZone(box2, b.id, function (on) { box2.style.borderColor = on ? C : '#E0D3C4'; box2.style.background = on ? '#FFF6F3' : ''; });
+          sDnd.addZone(box2, b.id, function (on) { box2.style.borderColor = on ? C : T.color.lineSoft; box2.style.background = on ? '#FFF6F3' : ''; });
           sBinEls[b.id] = box2; binRow.appendChild(box2); });
         body.appendChild(itRow); body.appendChild(binRow);
         function subS() { if (Object.keys(sMap).length === (d.placeCount || d.items.length)) verify(token, sMap); }
@@ -1688,17 +1945,18 @@
         var oSeq = [], oDnd = makeDnd(), need = d.slotCount || d.cards.length;
         function byId(id) { return d.cards.filter(function (c) { return c.id === id; })[0]; }
         var slotWrap = h('div');
+        // width:100% — flex-column body에서 margin auto만 주면 stretch가 풀려 좁아지는 문제 방지
         css(slotWrap, { display: 'flex', flexWrap: 'wrap', gap: '8px', justifyContent: 'center',
-          minHeight: '30px', padding: '14px 12px', marginBottom: '14px', maxWidth: '480px',
-          marginLeft: 'auto', marginRight: 'auto', border: '2px dashed #E3D6C6', borderRadius: '14px',
-          background: '#FFFAF4', alignItems: 'center' });
+          minHeight: '30px', padding: '14px 12px', marginBottom: '14px', width: '100%', maxWidth: '480px',
+          marginLeft: 'auto', marginRight: 'auto', boxSizing: 'border-box', border: '2px dashed ' + T.color.lineSoft,
+          borderRadius: '14px', background: T.color.cream, alignItems: 'center', transition: 'border-color .15s, background .15s' });
         var trayWrap = h('div');
-        css(trayWrap, { display: 'flex', flexWrap: 'wrap', gap: '8px', justifyContent: 'center', maxWidth: '480px', margin: '0 auto' });
+        css(trayWrap, { display: 'flex', flexWrap: 'wrap', gap: '10px', justifyContent: 'center', maxWidth: '480px', margin: '0 auto' });
         function oPaint() {
           slotWrap.textContent = '';
           if (oSeq.length === 0) {
             var ph = h('span'); ph.textContent = '아래 카드를 여기로 끌어다(또는 눌러) 순서대로 배치해요';
-            css(ph, { color: '#B7A68F', fontSize: '13px', fontWeight: '700' });
+            css(ph, { color: T.color.inkFaint, fontSize: T.font.sm, fontWeight: '700' });
             slotWrap.appendChild(ph);
           }
           oSeq.forEach(function (id, i) {
@@ -1711,8 +1969,9 @@
             s.appendChild(badge);
             if (c.img) { var sim = h('img'); sim.src = imgUrl(c.img); css(sim, { display: 'block', width: '52px', height: '52px', objectFit: 'contain', margin: '4px auto 2px', pointerEvents: 'none' }); s.appendChild(sim); }
             s.appendChild(document.createTextNode(c.text));
-            css(s, { padding: '10px 14px', border: '2px solid ' + C, borderRadius: '12px',
-              background: '#FFF0EE', cursor: 'pointer', fontSize: '15px', fontWeight: '700', color: '#3A3226' });
+            css(s, { padding: '10px 14px', minHeight: T.tap, border: '2px solid ' + C, borderRadius: T.radius.md,
+              background: T.color.brandSoft, cursor: 'pointer', fontSize: T.font.md, fontWeight: '700', color: T.color.ink,
+              touchAction: 'manipulation' });
             s.onclick = function () { if (answered) return; oSeq.splice(i, 1); oPaint(); };
             slotWrap.appendChild(s);
           });
@@ -1722,8 +1981,9 @@
             var e = h('button');
             if (c.img) { var tim = h('img'); tim.src = imgUrl(c.img); css(tim, { display: 'block', width: '52px', height: '52px', objectFit: 'contain', margin: '0 auto 4px', pointerEvents: 'none' }); e.appendChild(tim); e.appendChild(document.createTextNode(c.text)); }
             else e.textContent = c.text;
-            css(e, { padding: '12px 16px', border: '2px solid #F0E4D8', borderRadius: '12px',
-              background: '#fff', cursor: 'pointer', fontSize: '15px', fontWeight: '700', color: '#3A3226' });
+            css(e, { padding: '12px 16px', minHeight: T.tap, border: '2px solid ' + T.color.line, borderRadius: T.radius.md,
+              background: T.color.card, cursor: 'pointer', fontSize: T.font.md, fontWeight: '700', color: T.color.ink,
+              touchAction: 'manipulation' });
             function oPush() { if (answered || oSeq.length >= need) return; oSeq.push(c.id); oPaint(); }
             oDnd.drag(e, { disabled: function () { return answered || oSeq.length >= need; },
               onDrop: function () { oPush(); }, onTap: oPush });
@@ -1732,7 +1992,7 @@
           var done = oSeq.length === need;
           if (footerOn) footerState(oSeq.length > 0, done);
         }
-        oDnd.addZone(slotWrap, '__slot__', function (on) { slotWrap.style.borderColor = on ? C : '#E3D6C6'; slotWrap.style.background = on ? '#FFF3EC' : '#FFFAF4'; });
+        oDnd.addZone(slotWrap, '__slot__', function (on) { slotWrap.style.borderColor = on ? C : T.color.lineSoft; slotWrap.style.background = on ? '#FFF3EC' : T.color.cream; });
         body.appendChild(slotWrap); body.appendChild(trayWrap);
         oPaint();
         function subO() { if (oSeq.length === need) verify(token, oSeq.slice()); }
@@ -1743,23 +2003,29 @@
         // 위치(원본 복원): 핀을 지도/장면 위 알맞은 존으로 끌어다 놓기. 탭(존 탭) 폴백 유지.
         // 제출 zoneId. d.reference가 있으면 기준 건물을 강조(방위 문제에서 기준을 눈으로 찾게).
         var pSel = null, pEls = {}, pDnd = makeDnd();
-        var board = h('div'); css(board, { position: 'relative', width: '100%', maxWidth: '440px', margin: '0 auto',
-          aspectRatio: '1 / 0.9', background: '#F7F1E8', border: '2px solid #EADFce', borderRadius: '14px', overflow: 'hidden' });
-        if (d.compass) { ['북 N|top:4px;left:50%;transform:translateX(-50%)', '남 S|bottom:4px;left:50%;transform:translateX(-50%)',
-          '동 E|right:6px;top:50%;transform:translateY(-50%)', '서 W|left:6px;top:50%;transform:translateY(-50%)'].forEach(function (s) {
-          var parts = s.split('|'); var lab = h('div'); lab.textContent = parts[0]; lab.setAttribute('style', 'position:absolute;font-size:11px;font-weight:800;color:#B7A68F;z-index:1;' + parts[1]); board.appendChild(lab); }); }
+        var board = h('div'); css(board, { position: 'relative', width: '100%', maxWidth: '460px', margin: '0 auto',
+          aspectRatio: '1 / 0.94', background: '#F7F1E8', border: '2px solid #EADFCE', borderRadius: T.radius.lg, overflow: 'hidden' });
+        if (d.compass) { ['북 N|top:5px;left:50%;transform:translateX(-50%)', '남 S|bottom:5px;left:50%;transform:translateX(-50%)',
+          '동 E|right:7px;top:50%;transform:translateY(-50%)', '서 W|left:7px;top:50%;transform:translateY(-50%)'].forEach(function (s) {
+          var parts = s.split('|'); var lab = h('div'); lab.textContent = parts[0]; lab.setAttribute('style', 'position:absolute;font-size:11px;font-weight:800;color:' + T.color.inkMute + ';z-index:1;pointer-events:none;' + parts[1]); board.appendChild(lab); }); }
+        var PREF = '#8B6BFF', PREFBG = '#F1ECFF'; // 기준 건물 강조(브랜드 코랄과 구분되는 보라 — 의도적 3색)
         function pPaint() { d.zones.forEach(function (z2) { var base = z2.id === d.reference;
           var sel = z2.id === pSel;
-          pEls[z2.id].style.borderColor = sel ? C : (base ? '#8B6BFF' : '#E3D6C6');
-          pEls[z2.id].style.background = sel ? '#FFF0EE' : (base ? '#F1ECFF' : '#fff'); }); }
+          pEls[z2.id].style.borderColor = sel ? C : (base ? PREF : T.color.lineSoft);
+          pEls[z2.id].style.borderWidth = (sel || base) ? '2.5px' : '2px';
+          pEls[z2.id].style.background = sel ? T.color.brandSoft : (base ? PREFBG : T.color.card); }); }
         d.zones.forEach(function (z) { var e = h('button');
           e.textContent = (z.emoji ? z.emoji + ' ' : '') + z.label + (z.id === d.reference ? ' (기준)' : '');
-          e.setAttribute('style', 'position:absolute;left:' + z.x + '%;top:' + z.y + '%;width:' + z.w + '%;height:' + z.h + '%;'
-            + 'border:2px solid #E3D6C6;border-radius:10px;background:#fff;cursor:pointer;font-size:12px;font-weight:700;color:#3A3226;padding:2px;'
+          // 존을 살짝 안쪽으로(gap) 그려 붙어 보이지 않게 — margin 대신 inset 계산으로 격자 정합 유지
+          e.setAttribute('style', 'position:absolute;left:calc(' + z.x + '% + 3px);top:calc(' + z.y + '% + 3px);'
+            + 'width:calc(' + z.w + '% - 6px);height:calc(' + z.h + '% - 6px);'
+            + 'border:2px solid ' + T.color.lineSoft + ';border-radius:' + T.radius.md + ';background:' + T.color.card
+            + ';cursor:pointer;font-size:13px;font-weight:700;color:' + T.color.ink + ';padding:2px;line-height:1.25;'
+            + 'box-shadow:0 2px 5px -3px rgba(120,90,70,.5);box-sizing:border-box;transition:border-color .15s, background .15s;'
             + (z.moving ? 'animation:ccMove 2.2s ease-in-out infinite alternate;' : ''));
           e.onclick = function () { if (answered) return; pSel = z.id; pPaint(); if (footerOn) footerState(true, true); };
           pDnd.addZone(e, z.id, function (on) { if (z.id === pSel) return;
-            e.style.background = on ? '#FFF6F3' : (z.id === d.reference ? '#F1ECFF' : '#fff'); });
+            e.style.background = on ? '#FFF6F3' : (z.id === d.reference ? PREFBG : T.color.card); });
           pEls[z.id] = e; board.appendChild(e); });
         pPaint();
         // 끌어다 놓을 토큰 — 원본 캐릭터(🧒 등)가 있으면 그걸, 없으면 핀. start 위치(없으면 하단 중앙).
@@ -1828,10 +2094,14 @@
           pieceEls[p.id] = pc; tray.appendChild(pc);
         });
         body.appendChild(tray);
+        var pzReduce = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+        var pzWas = {}; // 직전 배치 상태 — 새로 채워진 슬롯만 스냅 애니메이션
         function pzPaint() {
           d.slots.forEach(function (sl) { var el = slotEls[sl.id]; var pid = placed[sl.id];
-            if (pid) { var pc = d.pieces.filter(function (x) { return x.id === pid; })[0]; crop(el, pc.col, pc.row, pc.flag); el.style.borderColor = C; el.style.borderStyle = 'solid'; }
-            else { el.style.backgroundImage = 'none'; el.style.borderColor = '#D8C8B4'; el.style.borderStyle = 'dashed'; } });
+            if (pid) { var pc = d.pieces.filter(function (x) { return x.id === pid; })[0]; crop(el, pc.col, pc.row, pc.flag); el.style.borderColor = C; el.style.borderStyle = 'solid';
+              if (pzWas[sl.id] !== pid && !pzReduce) { el.style.animation = 'none'; void el.offsetWidth; el.style.animation = 'ccPop 0.26s ease-out'; } }
+            else { el.style.backgroundImage = 'none'; el.style.borderColor = '#D8C8B4'; el.style.borderStyle = 'dashed'; }
+            pzWas[sl.id] = pid; });
           d.pieces.forEach(function (p) { var el = pieceEls[p.id]; var used = Object.keys(placed).some(function (k) { return placed[k] === p.id; });
             el.style.opacity = used ? '0.25' : '1'; el.style.borderColor = zSel === p.id ? C : '#F0E4D8'; });
           var done = Object.keys(placed).length === d.slots.length;
@@ -1873,19 +2143,25 @@
         // 듣기(listen): 🔊 오디오 재생 버튼 — 파일은 불투명 이름이라 정답(단어) 노출 없음
         if (d.type === 'listen' && d.audio) {
           var au = h('audio'); au.src = base + '/captcha/v1/audio/' + d.audio; au.preload = 'auto';
-          var playBtn = h('button'); playBtn.textContent = '🔊 다시 듣기';
-          css(playBtn, footerOn
-            ? { display: 'block', margin: '0 auto 18px', padding: '14px 28px', fontSize: '18px', fontWeight: '800',
-                border: 'none', borderRadius: '30px', background: C, color: '#fff', cursor: 'pointer' }
-            : { display: 'block', margin: '0 auto 12px', padding: '10px 20px', fontSize: '15px', fontWeight: '800',
-                border: 'none', borderRadius: '24px', background: C, color: '#fff', cursor: 'pointer' });
+          var lab0 = '다시 듣기';
+          var lab = audioBtn(lab0, { compact: !footerOn });
+          var playBtn = lab.el;
+          // 재생 종료·일시정지 시 라벨을 유휴 상태로 되돌리되, 남은 재생횟수 힌트는 보존
+          // (원본은 '(N번 남음)'이 다음 클릭까지 유지됐다 — ended가 이를 지우지 않게 restLabel 사용).
+          function restLabel() {
+            if (!d.plays) return lab0;
+            return playsLeft <= 0 ? '다 들었어요' : '다시 듣기 (' + playsLeft + '번 남음)';
+          }
+          au.addEventListener('play', function () { lab.playing(true); lab.setLabel('듣는 중…'); });
+          au.addEventListener('ended', function () { lab.playing(false); lab.setLabel(restLabel()); });
+          au.addEventListener('pause', function () { lab.playing(false); lab.setLabel(restLabel()); });
           // 원본 maxAudioPlays — 어려운 단계(4~5)는 재생 횟수 제한(자동재생 포함)
           var playsLeft = d.plays ? d.plays : Infinity;
           function playCount() {
             playsLeft -= 1;
             if (d.plays) {
-              playBtn.textContent = playsLeft > 0 ? ('🔊 다시 듣기 (' + playsLeft + '번 남음)') : '🔊 다 들었어요';
-              if (playsLeft <= 0) { playBtn.disabled = true; playBtn.style.opacity = '0.5'; playBtn.style.cursor = 'default'; }
+              if (playsLeft <= 0) { playBtn.disabled = true; playBtn.style.opacity = '0.5'; playBtn.style.cursor = 'default'; lab.setLabel('다 들었어요'); }
+              else lab.setLabel('다시 듣기 (' + playsLeft + '번 남음)');
             }
           }
           // 재생이 '실제로 시작됐을 때만' 횟수를 차감 — 자동재생이 차단되는 환경에서
@@ -1937,14 +2213,14 @@
           css(imgHintEl, { border: '2px dashed #E3D6C6', borderRadius: '16px', padding: '10px 24px',
             maxWidth: '200px', margin: '0 auto 12px' });
           gDnd.addZone(imgHintEl, '__img__', function (on) {
-            imgHintEl.style.borderColor = on ? C : '#E3D6C6'; imgHintEl.style.background = on ? '#FFF6F3' : ''; });
+            imgHintEl.style.borderColor = on ? C : T.color.lineSoft; imgHintEl.style.background = on ? '#FFF6F3' : ''; });
         }
         function chooseOpt(o, b) {
           if (answered) return;
           chosen = o.id;
           if (gGap) { gGap.textContent = (o.emoji ? o.emoji + ' ' : '') + o.text; gGap.style.color = C; }
-          optBtns.forEach(function (x) { x.style.borderColor = '#F0E4D8'; x.style.background = '#fff'; });
-          b.style.borderColor = C; b.style.background = '#FFF0EE';
+          optBtns.forEach(function (x) { x.style.borderColor = T.color.line; x.style.background = T.color.card; });
+          b.style.borderColor = C; b.style.background = T.color.brandSoft;
           if (footerOn) footerState(true, true);
           else verify(token, o.id);
         }
@@ -1963,10 +2239,14 @@
             setOpt(b, o);
           }
           css(b, footerOn
-            ? { textAlign: 'center', padding: '16px 24px', minWidth: '110px', border: '2px solid #F0E4D8',
-                borderRadius: '14px', background: '#fff', cursor: 'pointer', fontSize: '16px', fontWeight: '700', color: '#3A3226' }
-            : { textAlign: 'left', padding: '13px 15px', border: '2px solid #F0E4D8', borderRadius: '12px',
-                background: '#fff', cursor: 'pointer', fontSize: '15px', fontWeight: '700', color: '#3A3226' });
+            ? { textAlign: 'center', padding: '16px 24px', minWidth: '110px', minHeight: T.tap,
+                border: '2px solid ' + T.color.line, borderRadius: '14px', background: T.color.card,
+                cursor: 'pointer', fontSize: '16px', fontWeight: '700', color: T.color.ink,
+                fontFamily: 'inherit', transition: 'border-color .15s, background .15s' }
+            : { textAlign: 'left', padding: '13px 15px', minHeight: T.tap, border: '2px solid ' + T.color.line,
+                borderRadius: T.radius.md, background: T.color.card, cursor: 'pointer', fontSize: T.font.md,
+                fontWeight: '700', color: T.color.ink, fontFamily: 'inherit',
+                transition: 'border-color .15s, background .15s' });
           if (gDnd) {
             // 빈칸에 끌어다 넣기 + 탭 폴백
             gDnd.drag(b, { disabled: function () { return answered; },
@@ -2001,8 +2281,8 @@
         if (footerOn) {
           pendingRedo = function () {
             chosen = null;
-            optBtns.forEach(function (x) { x.style.borderColor = '#F0E4D8'; x.style.background = '#fff'; });
-            if (gGap) { gGap.textContent = '____'; gGap.style.color = '#B7A68F'; }
+            optBtns.forEach(function (x) { x.style.borderColor = T.color.line; x.style.background = T.color.card; });
+            if (gGap) { gGap.textContent = '____'; gGap.style.color = T.color.inkMute; }
             footerState(false, false);
           };
           pendingSubmit = function () { if (chosen != null) verify(token, chosen); };
