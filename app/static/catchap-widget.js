@@ -365,6 +365,22 @@
     }
 
     var lastOptions = [], lastType = '', answered = false;
+    var hintSlot = null; // 공통 셸이 프롬프트·맥락 아래(보기 위)에 미리 놓는 힌트 자리 —
+    // 각 렌더러의 hintLine(d.hint) 호출이 여기 채워져 '문제→힌트→보기' 순서로 읽힌다.
+
+    // ── 연습장(scratchpad) — 계산·필기용 별도 캔버스(수학 등). 문제 조작과 완전 분리:
+    // 캔버스 포인터 이벤트는 stopPropagation으로 box의 trace/발자국/제출과 섞이지 않는다.
+    // 순수 부가 기능 — 안 열어도 문제풀이 정상. 획을 behavior.scratch로 전송(백엔드가 향후 저장·집계).
+    var SCR_COLORS = [{ name: '검정', hex: '#2A2A2A' }, { name: '빨강', hex: '#E0475E' }, { name: '파랑', hex: '#2E7BFF' }];
+    var SCR_WIDTHS = [{ name: '가는', w: 2 }, { name: '보통', w: 4 }, { name: '굵은', w: 7 }];
+    var SCR_ERASE_R = 15; // 지우개 반경(px) — 이 안에 획 점이 있으면 그 획 제거
+    var scr = {
+      built: false, open: false, wrap: null, toggle: null, panel: null, canvas: null, ctx: null,
+      strokes: [], cur: null, drawing: false, last: null, dpr: 1,
+      color: '#2A2A2A', width: 4, mode: 'pen',
+      firstAt: 0, lastAt: 0, drawnDist: 0, drawnCount: 0,
+      colorBtns: [], widthBtns: [], eraserBtn: null,
+    };
 
     // ── 풀 사이즈(교육형) 액션 풋터 — '다시 고르기 · 다음 문제 →'를 카드 우하단에 고정.
     //    보기 클릭은 '선택'만 하고, 다음 문제 버튼이 제출(채점)→한 번 더 누르면 다음 문제로.
@@ -488,11 +504,16 @@
       body.appendChild(next);
     }
 
+    // 힌트(💡 지시/도움말) — 공통 셸이 미리 놓은 hintSlot(프롬프트·맥락 아래, 보기 위)에
+    // 채운다. slot이 없으면(방어) body에 붙인다. 위계상 프롬프트보다 작고 부드러운 보조 텍스트.
     function hintLine(text) {
       if (!text) return;
       var hint = h('div'); hint.textContent = '💡 ' + text;
-      css(hint, { marginTop: '10px', fontSize: T.font.xs, lineHeight: '1.5', color: T.color.inkFaint });
-      body.appendChild(hint);
+      css(hint, { fontSize: T.font.sm, lineHeight: '1.5', color: T.color.inkSoft, fontWeight: '600',
+        textAlign: footerOn ? 'center' : 'left', maxWidth: '480px',
+        margin: footerOn ? '0 auto 16px' : '0 0 12px' });
+      if (hintSlot) { hintSlot.textContent = ''; hintSlot.appendChild(hint); }
+      else body.appendChild(hint);
     }
 
     // ── 끌어다 놓기 (drag_drop) — 아이템을 목표에 드래그, 드롭 좌표를 서버가 채점
@@ -1567,6 +1588,210 @@
       try { if (window.speechSynthesis) window.speechSynthesis.cancel(); } catch (e) {}
     }
 
+    // ── 연습장 구현 ─────────────────────────────────────────────────────
+    function scrPointerXY(e) {
+      var r = scr.canvas.getBoundingClientRect();
+      return { x: e.clientX - r.left, y: e.clientY - r.top };
+    }
+    function scrPt(p) { return [Date.now() - traceStart, Math.round(p.x * 10) / 10, Math.round(p.y * 10) / 10]; }
+    function scrPaper() {
+      var ctx = scr.ctx, w = scr.canvas.clientWidth, h = scr.canvas.clientHeight;
+      ctx.clearRect(0, 0, w, h);
+      ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, w, h);
+      ctx.strokeStyle = '#F0EAE0'; ctx.lineWidth = 1; // 연한 모눈(웜 톤)
+      var g = 26, x, y;
+      for (x = g; x < w; x += g) { ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, h); ctx.stroke(); }
+      for (y = g; y < h; y += g) { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke(); }
+    }
+    function scrSeg(a, b, color, width) {
+      var ctx = scr.ctx;
+      ctx.strokeStyle = color; ctx.lineWidth = width; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+      ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+    }
+    function scrDot(p, color, width) {
+      var ctx = scr.ctx; ctx.fillStyle = color;
+      ctx.beginPath(); ctx.arc(p.x, p.y, Math.max(1, width / 2), 0, Math.PI * 2); ctx.fill();
+    }
+    function scrStrokePts(s) { return s.points.map(function (pt) { return { x: pt[1], y: pt[2] }; }); }
+    function scrRedraw() {
+      if (!scr.ctx) return;
+      scrPaper();
+      scr.strokes.forEach(function (s) {
+        var pts = scrStrokePts(s);
+        if (pts.length === 1) { scrDot(pts[0], s.color, s.width); return; }
+        for (var i = 1; i < pts.length; i++) scrSeg(pts[i - 1], pts[i], s.color, s.width);
+      });
+    }
+    function scrResize() {
+      if (!scr.canvas || !scr.ctx) return;
+      var rect = scr.canvas.getBoundingClientRect();
+      if (!rect.width) return; // 패널이 닫혀 폭 0이면 건너뜀(열 때 다시 호출)
+      scr.dpr = window.devicePixelRatio || 1;
+      scr.canvas.width = Math.max(1, Math.round(rect.width * scr.dpr));
+      scr.canvas.height = Math.max(1, Math.round(rect.height * scr.dpr));
+      scr.ctx.setTransform(scr.dpr, 0, 0, scr.dpr, 0, 0);
+      scrRedraw();
+    }
+    function scrEraseAt(p) {
+      var before = scr.strokes.length;
+      scr.strokes = scr.strokes.filter(function (s) {
+        return !s.points.some(function (pt) {
+          var dx = pt[1] - p.x, dy = pt[2] - p.y; return (dx * dx + dy * dy) <= (SCR_ERASE_R * SCR_ERASE_R);
+        });
+      });
+      if (scr.strokes.length !== before) scrRedraw();
+    }
+    function scrFinish() {
+      if (!scr.drawing) return;
+      scr.drawing = false;
+      if (scr.mode !== 'eraser' && scr.cur && scr.cur.points.length) scr.strokes.push(scr.cur);
+      scr.cur = null;
+    }
+    function scrSync() { // 툴바 선택 상태 시각 반영
+      scr.colorBtns.forEach(function (cb) {
+        var on = scr.mode === 'pen' && scr.color === cb.hex;
+        cb.el.style.outline = on ? '3px solid ' + cb.hex : 'none';
+        cb.el.style.outlineOffset = '2px';
+        cb.el.style.transform = on ? 'scale(1.08)' : 'scale(1)';
+      });
+      scr.widthBtns.forEach(function (wb) {
+        var on = scr.width === wb.w;
+        wb.el.style.borderColor = on ? C : T.color.line;
+        wb.el.style.background = on ? T.color.brandSoft : T.color.card;
+      });
+      if (scr.eraserBtn) {
+        var on = scr.mode === 'eraser';
+        scr.eraserBtn.style.borderColor = on ? C : T.color.line;
+        scr.eraserBtn.style.background = on ? T.color.brandSoft : T.color.card;
+        scr.eraserBtn.style.color = on ? C : T.color.inkSoft;
+      }
+      scr.canvas.style.cursor = scr.mode === 'eraser' ? 'cell' : 'crosshair';
+    }
+    function scrClearAll() { scr.strokes = []; scr.cur = null; scrRedraw(); }
+    function scrToggle() {
+      scr.open = !scr.open;
+      scr.panel.style.display = scr.open ? 'block' : 'none';
+      scr.toggle.textContent = scr.open ? '✍️ 연습장 닫기' : '✍️ 연습장 열기';
+      scr.toggle.style.borderColor = scr.open ? C : T.color.line;
+      scr.toggle.style.color = scr.open ? C : T.color.inkSoft;
+      if (scr.open) setTimeout(scrResize, 30); // 펼친 뒤 실제 폭으로 캔버스 재설정
+    }
+    function scrToolBtn(label) {
+      var b = h('button'); b.textContent = label;
+      css(b, { display: 'inline-flex', alignItems: 'center', justifyContent: 'center', gap: '4px',
+        minWidth: T.tap, minHeight: T.tap, padding: '0 12px', border: '2px solid ' + T.color.line,
+        borderRadius: T.radius.sm, background: T.color.card, color: T.color.inkSoft, fontWeight: '800',
+        fontSize: T.font.sm, fontFamily: 'inherit', cursor: 'pointer', touchAction: 'manipulation' });
+      return b;
+    }
+    function ensureScratch() {
+      if (scr.built) return;
+      scr.built = true;
+      scr.wrap = h('div'); css(scr.wrap, { margin: '14px 0 0' });
+      scr.toggle = h('button');
+      css(scr.toggle, { display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '8px',
+        margin: '0 auto', padding: '11px 20px', minHeight: T.tap, border: '2px solid ' + T.color.line,
+        borderRadius: T.radius.pill, background: T.color.card, color: T.color.inkSoft, fontWeight: '800',
+        fontSize: T.font.sm, fontFamily: 'inherit', cursor: 'pointer', touchAction: 'manipulation' });
+      scr.toggle.textContent = '✍️ 연습장 열기';
+      scr.toggle.onclick = scrToggle;
+      scr.wrap.appendChild(scr.toggle);
+
+      scr.panel = h('div');
+      css(scr.panel, { display: 'none', marginTop: '10px', border: '2px solid ' + T.color.line,
+        borderRadius: T.radius.md, background: T.color.card, overflow: 'hidden', boxShadow: T.shadow.card });
+      var bar = h('div');
+      css(bar, { display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '7px', padding: '9px 10px',
+        borderBottom: '1px solid ' + T.color.line, background: '#FFFBF6' });
+      // 펜 3색
+      SCR_COLORS.forEach(function (c) {
+        var b = h('button'); b.title = c.name; b.setAttribute('aria-label', c.name + ' 펜');
+        css(b, { width: T.tap, height: T.tap, minWidth: T.tap, borderRadius: '50%', border: '2px solid #fff',
+          background: c.hex, cursor: 'pointer', padding: '0', boxShadow: '0 1px 3px rgba(0,0,0,.25)',
+          touchAction: 'manipulation' });
+        b.onclick = function () { scr.mode = 'pen'; scr.color = c.hex; scrSync(); };
+        scr.colorBtns.push({ el: b, hex: c.hex });
+        bar.appendChild(b);
+      });
+      var sep = h('span'); css(sep, { width: '1px', height: '26px', background: T.color.line, margin: '0 2px' }); bar.appendChild(sep);
+      // 굵기 3단계 — 점 크기로 표현
+      SCR_WIDTHS.forEach(function (wd) {
+        var b = h('button'); b.title = wd.name + ' 선'; b.setAttribute('aria-label', wd.name + ' 선');
+        css(b, { minWidth: T.tap, minHeight: T.tap, border: '2px solid ' + T.color.line, borderRadius: T.radius.sm,
+          background: T.color.card, cursor: 'pointer', padding: '0', display: 'inline-flex',
+          alignItems: 'center', justifyContent: 'center', touchAction: 'manipulation' });
+        var dot = h('span'); css(dot, { display: 'block', width: (wd.w + 4) + 'px', height: (wd.w + 4) + 'px',
+          borderRadius: '50%', background: T.color.ink }); b.appendChild(dot);
+        b.onclick = function () { scr.width = wd.w; if (scr.mode === 'eraser') scr.mode = 'pen'; scrSync(); };
+        scr.widthBtns.push({ el: b, w: wd.w });
+        bar.appendChild(b);
+      });
+      var sep2 = h('span'); css(sep2, { width: '1px', height: '26px', background: T.color.line, margin: '0 2px' }); bar.appendChild(sep2);
+      // 지우개(획 지움) · 전체 지우기
+      scr.eraserBtn = scrToolBtn('🧽 지우개');
+      scr.eraserBtn.onclick = function () { scr.mode = scr.mode === 'eraser' ? 'pen' : 'eraser'; scrSync(); };
+      bar.appendChild(scr.eraserBtn);
+      var clr = scrToolBtn('🗑 전체 지우기');
+      css(clr, { marginLeft: 'auto', color: T.color.inkFaint });
+      clr.onclick = scrClearAll;
+      bar.appendChild(clr);
+
+      scr.canvas = h('canvas');
+      css(scr.canvas, { display: 'block', width: '100%', height: '240px', minHeight: '200px',
+        touchAction: 'none', cursor: 'crosshair', background: '#fff' });
+      scr.ctx = scr.canvas.getContext('2d');
+      // 캔버스 포인터 이벤트 — stopPropagation으로 box(trace/발자국/idle) 오염 방지. 활동은 수동 통지.
+      scr.canvas.addEventListener('pointerdown', function (e) {
+        e.preventDefault(); e.stopPropagation();
+        try { scr.canvas.setPointerCapture(e.pointerId); } catch (er) {}
+        onActivity();
+        var p = scrPointerXY(e);
+        scr.drawing = true; scr.last = p;
+        if (scr.mode === 'eraser') { scrEraseAt(p); return; }
+        scr.cur = { color: scr.color, width: scr.width, points: [scrPt(p)] };
+        scr.drawnCount += 1;
+        var now = Date.now(); if (!scr.firstAt) scr.firstAt = now; scr.lastAt = now;
+        scrDot(p, scr.color, scr.width);
+      });
+      scr.canvas.addEventListener('pointermove', function (e) {
+        e.stopPropagation(); // 캔버스 위 hover도 box로 안 번지게(발자국·trace가 캔버스에 안 찍힘)
+        if (!scr.drawing) return;
+        e.preventDefault();
+        var p = scrPointerXY(e);
+        if (scr.mode === 'eraser') { scrEraseAt(p); scr.last = p; return; }
+        var dx = p.x - scr.last.x, dy = p.y - scr.last.y, d = Math.sqrt(dx * dx + dy * dy);
+        if (d < 1.2) return;
+        scrSeg(scr.last, p, scr.color, scr.width);
+        scr.cur.points.push(scrPt(p)); scr.drawnDist += d; scr.last = p; scr.lastAt = Date.now();
+      });
+      ['pointerup', 'pointercancel', 'lostpointercapture'].forEach(function (n) {
+        scr.canvas.addEventListener(n, function (e) { if (e && e.stopPropagation) e.stopPropagation(); scrFinish(); });
+      });
+      scr.panel.appendChild(bar); scr.panel.appendChild(scr.canvas);
+      scr.wrap.appendChild(scr.panel);
+      // 문제 본문(body) 아래, 진행 풋터 위에 배치 (풋터가 있으면 그 앞).
+      box.insertBefore(scr.wrap, footer || hidden);
+      scrSync();
+      // 창 크기 변화 대응 — 리마운트 시 죽은 핸들러가 안 돌게 isConnected 가드.
+      window.addEventListener('resize', function () { if (box.isConnected && scr.open) scrResize(); });
+    }
+    function scrReset() { // 새 문항 — 연습장 데이터 초기화(열림 상태·펜 선택은 유지)
+      scr.strokes = []; scr.cur = null; scr.drawing = false;
+      scr.firstAt = 0; scr.lastAt = 0; scr.drawnDist = 0; scr.drawnCount = 0;
+      if (scr.ctx) scrRedraw();
+    }
+    // verify에 실을 연습장 획 데이터 — 안 썼으면 null(payload에 미포함).
+    function scratchData() {
+      if (!scr.built || (scr.drawnCount === 0 && scr.strokes.length === 0)) return null;
+      return {
+        strokes: scr.strokes.map(function (s) { return { color: s.color, width: s.width, points: s.points }; }),
+        strokeCount: scr.drawnCount,          // 그은 획 수(누적 — 지운 것도 포함, 필기 노력 지표)
+        distancePx: Math.round(scr.drawnDist), // 총 필기 거리(누적)
+        firstWriteMs: scr.firstAt ? Math.max(0, scr.firstAt - traceStart) : 0, // 첫 필기까지(문항 표시 기준)
+        drawMs: (scr.firstAt && scr.lastAt) ? Math.max(0, scr.lastAt - scr.firstAt) : 0, // 첫~마지막 필기 시간
+      };
+    }
+
     function render(d) {
       stopSounds();
       body.innerHTML = '';
@@ -1588,6 +1813,9 @@
         setBtnOn(dkBtn, true); // 문항 푸는 동안 '잘 모르겠어요' 활성 (답하면 eduFeedback이 끈다)
       }
       if (footer) footer.style.display = footerOn ? 'flex' : 'none';
+      // 연습장 — 앱(full) 문항에만 노출. 매 문항 데이터 초기화(열림·펜 선택은 유지).
+      if (full) { ensureScratch(); scrReset(); scr.wrap.style.display = ''; if (scr.open) setTimeout(scrResize, 30); }
+      else if (scr.wrap) scr.wrap.style.display = 'none';
       var token = d.challenge_token;
       var prompt = h('div');
       if (/「[^」]+」/.test(d.prompt || '')) {
@@ -1603,42 +1831,50 @@
       } else {
         prompt.textContent = d.prompt;
       }
+      // 타이포 위계(3단계 정비): 프롬프트=L1(최상위). full 22px, 읽기 줄길이 위해 maxWidth 제한.
       css(prompt, footerOn
-        ? { fontWeight: '800', fontSize: T.font.xl, lineHeight: '1.45', color: T.color.ink,
-            marginBottom: '20px', textAlign: 'center' }
+        ? { fontWeight: '800', fontSize: '22px', lineHeight: '1.4', color: T.color.ink,
+            marginBottom: '18px', textAlign: 'center', maxWidth: '30ch', marginLeft: 'auto', marginRight: 'auto' }
         : { fontWeight: '800', fontSize: T.font.md, lineHeight: '1.5', color: T.color.ink, marginBottom: '12px' });
       body.appendChild(prompt);
 
+      // 공통 셸 수직 리듬: 맥락 블록(figure/image+meaning/scenario)은 하단 16px로 통일.
       // figure(문제 위 도형 그림) — 서버 뱅크의 신뢰된 SVG 마크업. 모든 유형 공통.
       if (d.figure) {
         var fig = h('div');
-        css(fig, { textAlign: 'center', margin: '0 auto 18px', maxWidth: '100%', overflowX: 'auto' });
+        css(fig, { textAlign: 'center', margin: '0 auto 16px', maxWidth: '100%', overflowX: 'auto' });
         fig.innerHTML = d.figure;
         var fsvg = fig.querySelector('svg');
         if (fsvg) { fsvg.style.maxWidth = '100%'; fsvg.style.height = 'auto'; }
         body.appendChild(fig);
       }
-      // 원본 그림 힌트(이모지)·한국어 뜻 — 영어 어순(08)·영문법(09) 등 모든 유형 공통.
+      // 그림 힌트(이모지)+한국어 뜻 — 한 단위로 묶어 배치(그림은 뜻과 가깝게, 아래로 16px).
       var imgHintEl = null;
       if (d.image) {
         var gim = h('div'); gim.textContent = d.image;
-        css(gim, { textAlign: 'center', fontSize: '52px', lineHeight: '1.1', margin: '0 0 10px' });
+        // L2 그림 힌트: 46px(기존 52는 프롬프트 대비 과함). 뜻이 있으면 바로 아래 붙게 tight.
+        css(gim, { textAlign: 'center', fontSize: '46px', lineHeight: '1.1', margin: d.meaning ? '0 0 6px' : '0 0 16px' });
         body.appendChild(gim);
         imgHintEl = gim;
       }
       if (d.meaning) {
-        var gmn = h('div'); gmn.textContent = '뜻: ' + d.meaning;
-        css(gmn, { textAlign: 'center', fontSize: T.font.md, fontWeight: '700', color: T.color.inkSoft, margin: '0 0 14px' });
+        // L3 해석(보조): 프롬프트보다 작고 부드러운 색. '뜻' 라벨은 더 옅게.
+        var gmn = h('div');
+        var mlab = h('span'); mlab.textContent = '뜻 '; css(mlab, { color: T.color.inkMute, fontWeight: '700' });
+        gmn.appendChild(mlab); gmn.appendChild(document.createTextNode(d.meaning));
+        css(gmn, { textAlign: 'center', fontSize: T.font.md, fontWeight: '700', color: T.color.inkSoft, margin: '0 0 16px' });
         body.appendChild(gmn);
       }
-      // 상황 지문(생활 5단계 시나리오) — 프롬프트 아래 상황 설명 박스.
+      // 상황 지문(생활 5단계 시나리오) — 문제 맥락 박스(프롬프트 바로 아래, 따뜻한 배경).
       if (d.scenario) {
         var scn = h('div'); scn.textContent = d.scenario;
-        css(scn, { textAlign: 'center', fontSize: '16px', fontWeight: '700', color: T.color.ink, lineHeight: '1.6',
+        css(scn, { textAlign: 'center', fontSize: T.font.md, fontWeight: '700', color: T.color.ink, lineHeight: '1.6',
           background: '#FFF6EA', border: '1.5px solid #F0E0C8', borderRadius: T.radius.md,
-          padding: '12px 16px', maxWidth: '460px', margin: '0 auto 16px' });
+          padding: '13px 18px', maxWidth: '460px', margin: '0 auto 16px' });
         body.appendChild(scn);
       }
+      // 힌트 자리 — 프롬프트·맥락 아래, 보기/캔버스 위. 각 렌더러의 hintLine(d.hint)이 채운다.
+      hintSlot = h('div'); body.appendChild(hintSlot);
 
       // 조작형 공용: 표준 보기 셀 버튼. img(지도기호·CPR 사진 등)가 있으면 그림+라벨로.
       function imgUrl(rel) { return base + '/captcha/v1/img/' + String(rel).replace(/^assets\//, ''); }
@@ -2258,6 +2494,10 @@
           opts.appendChild(b);
         });
         body.appendChild(opts);
+        // 이 분기는 지문(d.paragraph)·문장(d.sentence)을 셸 힌트 자리 뒤에 붙이므로, 힌트가
+        // 그 맥락 위로 떠 보인다. 힌트 자리를 보기 바로 위로 옮겨 '지문/문장 → 힌트 → 보기'
+        // 순서를 맞춘다(가독·교육 흐름). 힌트가 없으면 빈 slot이라 무해.
+        if (hintSlot && (d.paragraph || d.sentence)) body.insertBefore(hintSlot, opts);
         // 중심생각 2단계 — 보기 숨김 + "생각 정리 완료" 버튼으로 공개 (원본 흐름)
         if (d.readFirst) {
           opts.style.display = 'none';
@@ -2287,7 +2527,7 @@
           };
           pendingSubmit = function () { if (chosen != null) verify(token, chosen); };
         }
-        if (d.hint) { var hint = h('div'); hint.textContent = '💡 ' + d.hint; css(hint, { marginTop: '10px', fontSize: '12px', color: '#8A8070', textAlign: footerOn ? 'center' : 'left' }); body.appendChild(hint); }
+        if (d.hint) hintLine(d.hint);
       }
     }
 
@@ -2306,6 +2546,9 @@
         trace: trace.slice(),
         box: { w: Math.round(rect.width), h: Math.round(rect.height) },
       };
+      // 연습장 필기 데이터 — 실제로 쓴 경우에만 실어 보낸다(안 쓰면 payload 미포함).
+      var scData = scratchData();
+      if (scData) behavior.scratch = scData;
       getAuth().then(function (a) {
         return api(base, '/captcha/v1/verify', key, { challenge_token: token, answer: answer, behavior: behavior }, a);
       }).then(function (r) {
