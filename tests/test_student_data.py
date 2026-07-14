@@ -330,14 +330,23 @@ def test_wrong_note_chapter_link_and_review(client, db, seed_org):
     assert note["chapter_no"] == 2 and note["reviewed"] is False
     assert notes["summary"]["reviewed"] == 0
 
-    # 같은 문항 정답 → 복습완료 승격
+    # 같은 문항 1회 정답 → 아직 미복습(사용자 결정: 2회 정답부터 승격, 운으로 한 번 맞힌 것 제외)
     r2 = client.post("/api/v1/students/me/game-answer",
                      json={"subject": "수학", "question_id": q["id"], "option_id": correct, "chapter_no": 2},
                      headers=auth(token))
     assert r2.status_code == 200 and r2.json()["correct"] is True
     notes2 = client.get("/api/v1/students/me/wrong-notes", headers=auth(token)).json()
     note2 = next(n for n in notes2["items"] if n["question"] == q["prompt"])
-    assert note2["reviewed"] is True and notes2["summary"]["reviewed"] >= 1
+    assert note2["reviewed"] is False and notes2["summary"]["reviewed"] == 0
+
+    # 2회째 정답 → 복습완료 승격
+    r3 = client.post("/api/v1/students/me/game-answer",
+                     json={"subject": "수학", "question_id": q["id"], "option_id": correct, "chapter_no": 2},
+                     headers=auth(token))
+    assert r3.status_code == 200 and r3.json()["correct"] is True
+    notes3 = client.get("/api/v1/students/me/wrong-notes", headers=auth(token)).json()
+    note3 = next(n for n in notes3["items"] if n["question"] == q["prompt"])
+    assert note3["reviewed"] is True and notes3["summary"]["reviewed"] >= 1
 
 
 def test_grade_ranking_daily_completion(client, db, seed_org):

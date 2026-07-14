@@ -1707,13 +1707,30 @@ def _student_answer_text(q: dict, student_answer) -> str:
 
 
 def _mark_reviewed(db: Session, me: StudentProfile, q: dict) -> None:
-    """정답으로 다시 맞힌 문항의 미복습 오답노트를 복습완료(reviewed=True)로 승격.
+    """정답으로 '2회' 다시 맞힌 문항의 미복습 오답노트를 복습완료(reviewed=True)로 승격.
 
-    복습 순환의 마지막 고리 — 이게 없으면 한번 틀린 문항이 오답노트에 영원히 남고
-    '복습 완료 수'가 항상 0이었다. 프롬프트 텍스트로 매칭(오답 저장 키와 동일)."""
+    사용자 결정(2026-07-14): 한 번 운 좋게 맞힌 걸로 지우지 않고 2회 정답부터 승격(간격
+    반복 학습). 현재 정답 시도는 아직 LearningAttempt에 저장되기 전이므로, 이 문항의 '이전'
+    graded 정답이 1회 이상이면(=지금이 2번째) 승격한다. 오답노트는 프롬프트로 매칭한다."""
     prompt = q.get("prompt")
+    qid = q.get("id")
     if not prompt:
         return
+    prior_correct = 0
+    if qid:
+        prior_correct = (
+            db.query(func.count(LearningAttempt.id))
+            .filter(
+                LearningAttempt.student_id == me.id,
+                LearningAttempt.content_id == str(qid)[:80],
+                LearningAttempt.result == "correct",
+                LearningAttempt.graded.is_(True),
+            )
+            .scalar()
+            or 0
+        )
+    if prior_correct < 1:
+        return  # 첫 정답 — 아직 승격하지 않는다(2회 필요)
     db.query(WrongAnswer).filter(
         WrongAnswer.student_id == me.id,
         WrongAnswer.question == prompt,
@@ -1833,6 +1850,9 @@ def game_answer(
     attempt_req = AttemptCreate(
         subject=req.subject,
         chapter_no=req.chapter_no,
+        # 문항 id — 오답노트 2회 승격 카운트·bank_mode(안 푼/틀린/맞춘) 분류의 원천.
+        # (기존엔 game-answer가 content_id를 안 넣어 이 문항이 '안 푼'으로 오분류됐다.)
+        content_id=str(req.question_id)[:80] if req.question_id else None,
         result="correct" if correct else "incorrect",
         score=20 if correct else 0,  # 5문 기준 100점 만점
         completed=req.last and not req.replay,
