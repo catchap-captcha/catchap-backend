@@ -651,6 +651,15 @@ def inquiries(
         ):
             replies_by_inq.setdefault(rep.inquiry_id, []).append(rep)
 
+    # 답변 운영자 id → 표시명 해석 — 문의 관리 화면에 '누가 답장했나'가 보이게(감사로그와 동일 정보).
+    answerer_ids = {rep.answered_by for reps in replies_by_inq.values() for rep in reps if rep.answered_by}
+    answerer_names: dict[str, str] = {}
+    if answerer_ids:
+        for uid, uname, uemail in (
+            db.query(User.id, User.name, User.email).filter(User.id.in_(answerer_ids)).all()
+        ):
+            answerer_names[uid] = uname or uemail or "운영자"
+
     return {
         "items": [
             {
@@ -667,6 +676,7 @@ def inquiries(
                         "id": rep.id,
                         "body": rep.body,
                         "answered_by": rep.answered_by,
+                        "answered_by_name": answerer_names.get(rep.answered_by),
                         "email_status": rep.email_status,
                         "created_at": rep.created_at.isoformat() if rep.created_at else None,
                     }
