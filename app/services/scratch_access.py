@@ -7,9 +7,72 @@
 """
 from __future__ import annotations
 
+from datetime import datetime
+
 from sqlalchemy.orm import Session
 
 from app.models import ScratchRecord
+
+# 필기 원본 보존 동의 약관 버전 — 문구 갱신 시 올린다(동의 증빙 추적, Consent.terms_version).
+SCRATCH_TERMS_VERSION = "scratch_retain_v1"
+
+
+def has_retain_consent(db: Session, student_id: str) -> bool:
+    """이 학생 필기 원본 '보존 동의'가 활성(철회 안 됨)인지 — 보호자가 켠 상태."""
+    from app.models import Consent
+
+    return (
+        db.query(Consent.id)
+        .filter(
+            Consent.student_id == student_id,
+            Consent.consent_type == "scratch_retain",
+            Consent.withdrawn_at.is_(None),
+        )
+        .first()
+        is not None
+    )
+
+
+def set_retain_consent(
+    db: Session, student_id: str, organization_id: str | None, granted_by_user_id: str, retain: bool
+) -> None:
+    """보호자의 필기 원본 보존 동의 설정(멱등). 커밋은 호출자 책임.
+
+    - retain=True: 활성 동의가 없으면 Consent(scratch_retain) 신규 기록(누가·언제·약관버전).
+    - retain=False: 활성 동의가 있으면 withdrawn_at 채워 철회.
+    - 두 경우 모두 이 학생의 '미파기' 필기 레코드 consent_retain을 즉시 갱신
+      (이미 파기된 원본은 되살리지 않는다). 이후 새 레코드는 저장 시점 동의로 결정된다.
+    """
+    from app.models import Consent
+
+    active = (
+        db.query(Consent)
+        .filter(
+            Consent.student_id == student_id,
+            Consent.consent_type == "scratch_retain",
+            Consent.withdrawn_at.is_(None),
+        )
+        .first()
+    )
+    now = datetime.utcnow()
+    if retain and active is None:
+        db.add(
+            Consent(
+                student_id=student_id,
+                organization_id=organization_id or "",
+                granted_by_user_id=granted_by_user_id,
+                consent_type="scratch_retain",
+                terms_version=SCRATCH_TERMS_VERSION,
+                granted_at=now,
+            )
+        )
+        db.flush()  # autoflush=False라 같은 세션 내 재호출이 pending 동의를 보게 함(멱등 보장)
+    elif not retain and active is not None:
+        active.withdrawn_at = now
+    db.query(ScratchRecord).filter(
+        ScratchRecord.student_id == student_id,
+        ScratchRecord.purged.is_(False),
+    ).update({ScratchRecord.consent_retain: bool(retain)}, synchronize_session=False)
 
 
 def _question_view(subject: str, content_id: str | None) -> dict | None:

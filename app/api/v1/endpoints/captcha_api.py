@@ -380,6 +380,10 @@ def _store_scratch(db: Session, student: StudentProfile, meta: dict, scratch) ->
     if not strokes:
         return  # 그린 게 없으면 저장하지 않는다(빈 레코드 방지)
     try:
+        from app.services import scratch_access
+
+        # 새 레코드의 보존 여부는 저장 시점의 보호자 동의로 결정 — 동의 상태면 탈퇴 후에도 유지.
+        retain = scratch_access.has_retain_consent(db, student.id)
         db.add(
             ScratchRecord(
                 student_id=student.id,
@@ -391,6 +395,7 @@ def _store_scratch(db: Session, student: StudentProfile, meta: dict, scratch) ->
                 distance_px=int(scratch.get("distancePx") or 0),
                 first_write_ms=int(scratch.get("firstWriteMs") or 0),
                 draw_ms=int(scratch.get("drawMs") or 0),
+                consent_retain=retain,
             )
         )
     except Exception:

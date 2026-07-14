@@ -471,3 +471,44 @@ def link_invite(
 
 # 연습장 필기(보호자 열람)는 사용자 결정(0714)으로 제거 — 필기 원본 재생은 학생 본인과
 # 기관 교사(열람 감사)만. scratch_access 접근 모델 주석 참고.
+
+
+# ---------------------------------------------------------------- 필기 원본 보존 동의 (법정대리인)
+class _ScratchConsentReq(_BaseModel):
+    retain: bool
+
+
+@router.get("/parents/me/children/{child_id}/scratch-consent")
+def get_child_scratch_consent(
+    child_id: str,
+    principal: Principal = Depends(require_parent),
+    db: Session = Depends(get_db),
+):
+    """자녀 필기 원본 보존 동의 상태 — 연결된 자녀만. 보호자는 열람은 못 하되 보존 동의는 준다."""
+    check_parent_child(db, principal.id, child_id)
+    from app.services import scratch_access
+
+    return {
+        "retain": scratch_access.has_retain_consent(db, child_id),
+        "terms_version": scratch_access.SCRATCH_TERMS_VERSION,
+    }
+
+
+@router.put("/parents/me/children/{child_id}/scratch-consent")
+def set_child_scratch_consent(
+    child_id: str,
+    req: _ScratchConsentReq,
+    principal: Principal = Depends(require_parent),
+    db: Session = Depends(get_db),
+):
+    """자녀 필기 원본 보존 동의 설정/철회 — 법정대리인(보호자) 동의로 Consent에 증빙 기록.
+    동의하면 탈퇴 후에도 원본 유지, 철회하면 다음 파기 대상. 기존 미파기 레코드에 즉시 반영."""
+    check_parent_child(db, principal.id, child_id)
+    from app.services import scratch_access
+
+    st = db.get(StudentProfile, child_id)
+    scratch_access.set_retain_consent(
+        db, child_id, st.organization_id if st else None, principal.id, bool(req.retain)
+    )
+    db.commit()
+    return {"retain": bool(req.retain), "terms_version": scratch_access.SCRATCH_TERMS_VERSION}
