@@ -12,12 +12,51 @@ from sqlalchemy.orm import Session
 from app.models import ScratchRecord
 
 
+def _question_view(subject: str, content_id: str | None) -> dict | None:
+    """content_id로 문제은행 문항을 되살려 '보기용' 요약을 만든다(필기를 문제와 나란히 보기 위함).
+
+    저장 시 content_id = 문항 id(qid)이므로 get_question으로 O(1) 조회된다. 문항이
+    갱신·삭제됐거나 매칭 실패면 None(재생은 필기만 표시)."""
+    if not content_id:
+        return None
+    try:
+        from app.services import subject_banks
+
+        q = subject_banks.get_question(subject, content_id)
+    except Exception:
+        q = None
+    if not q:
+        return None
+    view: dict = {
+        "prompt": q.get("prompt"),
+        "topic": q.get("topic"),
+        "type": q.get("type"),
+        "explain": q.get("explain"),
+    }
+    opts = q.get("options") or q.get("items")
+    if isinstance(opts, list):
+        view["options"] = [
+            {"id": o.get("id"), "text": o.get("text") or o.get("e") or o.get("emoji") or ""}
+            for o in opts
+            if isinstance(o, dict)
+        ]
+    if q.get("answer") is not None:
+        view["answer"] = q.get("answer")
+    if q.get("answers"):
+        view["answers"] = q.get("answers")
+    if q.get("figure"):
+        view["figure"] = q.get("figure")
+    return view
+
+
 def _meta(r: ScratchRecord) -> dict:
-    """목록용 메타 — 원본 획(strokes)은 제외(용량↓). 파기 여부·집계 지표 포함."""
+    """목록용 메타 — 원본 획(strokes)은 제외(용량↓). 파기 여부·집계 지표 + 문제 미리보기(prompt)."""
+    qv = _question_view(r.subject, r.content_id)
     return {
         "id": r.id,
         "subject": r.subject,
         "content_id": r.content_id,
+        "prompt": (qv or {}).get("prompt"),  # 목록에서 '문항 id' 대신 문제 원문 미리보기
         "stroke_count": r.stroke_count,
         "distance_px": r.distance_px,
         "first_write_ms": r.first_write_ms,
@@ -28,9 +67,10 @@ def _meta(r: ScratchRecord) -> dict:
 
 
 def _full(r: ScratchRecord) -> dict:
-    """재생용 — 원본 획(strokes) 포함. 파기됐으면 빈 획 + purged=True."""
+    """재생용 — 원본 획(strokes) + 문항(question) 포함. 파기됐으면 빈 획 + purged=True."""
     d = _meta(r)
     d["strokes"] = [] if r.purged else (r.strokes or [])
+    d["question"] = _question_view(r.subject, r.content_id)  # 문제(프롬프트·보기·정답·해설)를 필기와 함께
     return d
 
 
