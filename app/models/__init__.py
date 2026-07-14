@@ -16,6 +16,7 @@ from app.models.content import (
 from app.models.learning import (
     BehaviorSummary,
     BehaviorTrace,
+    ScratchRecord,
     ChapterProgress,
     ConceptRead,
     DailyQuizStatus,
@@ -64,6 +65,7 @@ __all__ = [
     "Consent",
     "BehaviorSummary",
     "BehaviorTrace",
+    "ScratchRecord",
     "CaptchaAsset",
     "CaptchaConsumedToken",
     "CaptchaSetting",

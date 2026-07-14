@@ -357,3 +357,28 @@ def test_verify_rejects_cross_subject_token(client, db, seed_org):
                      json={"challenge_token": ch2["challenge_token"], "answer": "x"},
                      headers={"X-Site-Key": ext_math})
     assert r2.status_code == 200, r2.text
+
+
+def test_scratch_record_stored(db, seed_org):
+    """연습장 필기 원본이 과목·문항별로 저장되고, 빈 scratch는 저장 안 된다(무제한 저장 방침)."""
+    from app.api.v1.endpoints.captcha_api import _store_scratch
+    from app.models import ScratchRecord
+
+    student = seed_org["student"]
+    scratch = {
+        "strokes": [{"color": "#2A2A2A", "width": 4, "points": [[0, 0.1, 0.2], [50, 0.3, 0.4]]}],
+        "strokeCount": 1, "distancePx": 120, "firstWriteMs": 300, "drawMs": 400,
+    }
+    _store_scratch(db, student, {"subj": "수학", "qid": "math-ch1_01"}, scratch)
+    db.commit()
+    rows = db.query(ScratchRecord).filter(ScratchRecord.student_id == student.id).all()
+    assert len(rows) == 1
+    r = rows[0]
+    assert r.subject == "수학" and r.content_id == "math-ch1_01"
+    assert r.stroke_count == 1 and r.distance_px == 120
+    assert len(r.strokes) == 1 and r.strokes[0]["color"] == "#2A2A2A"
+
+    # 빈 scratch(그린 것 없음)는 저장하지 않는다
+    _store_scratch(db, student, {"subj": "국어", "qid": "kor-1"}, {"strokes": []})
+    db.commit()
+    assert db.query(ScratchRecord).filter(ScratchRecord.student_id == student.id).count() == 1

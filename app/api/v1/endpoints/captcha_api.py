@@ -368,6 +368,35 @@ def challenge(
     return _emit_challenge(db, api, eff_subject, ch)
 
 
+def _store_scratch(db: Session, student: StudentProfile, meta: dict, scratch) -> None:
+    """연습장 필기 원본 1건 저장 — 과목·문항(content_id)별. 아동 필적이라 민감:
+    재생 스코프(본인·교사·보호자)·보존/파기·동의는 별도 계층. 저장 실패는 채점을 막지 않는다.
+    원본(strokes)은 무제한 저장(사용자 방침 — 아이가 아무리 많이 그어도 다 저장)."""
+    from app.models import ScratchRecord
+
+    if not isinstance(scratch, dict):
+        return
+    strokes = scratch.get("strokes")
+    if not strokes:
+        return  # 그린 게 없으면 저장하지 않는다(빈 레코드 방지)
+    try:
+        db.add(
+            ScratchRecord(
+                student_id=student.id,
+                organization_id=student.organization_id,
+                subject=str(meta.get("subj") or "")[:20],
+                content_id=(str(meta.get("qid"))[:80] if meta.get("qid") else None),
+                strokes=strokes,
+                stroke_count=int(scratch.get("strokeCount") or 0),
+                distance_px=int(scratch.get("distancePx") or 0),
+                first_write_ms=int(scratch.get("firstWriteMs") or 0),
+                draw_ms=int(scratch.get("drawMs") or 0),
+            )
+        )
+    except Exception:
+        pass  # 부가 기능 — 필기 저장 실패가 채점/응답을 막지 않게
+
+
 class _VerifyReq(BaseModel):
     challenge_token: str
     answer: object  # 문자열 또는 배열(그림 다중선택)
@@ -414,6 +443,10 @@ def verify(
         cs.record_behavior(
             db, api, behavior, bool(result.get("success")), verified_student=student
         )
+        # 연습장 필기 원본 저장 — 인증 학생 + scratch가 있을 때만(과목·문항별, B 백엔드).
+        # 원본은 무제한 저장(사용자 방침). 재생 스코프·보존/파기·동의는 별도 계층에서 처리.
+        if student is not None and isinstance(behavior, dict):
+            _store_scratch(db, student, meta, behavior.get("scratch"))
         # 인앱(인증 학생) 풀이는 학습기록으로 적립 — 코인·진도·오늘의퀴즈 (실전 모드 대체)
         if student is not None and meta.get("subj"):
             result["session"] = _credit_student(
