@@ -1813,8 +1813,11 @@
         setBtnOn(dkBtn, true); // 문항 푸는 동안 '잘 모르겠어요' 활성 (답하면 eduFeedback이 끈다)
       }
       if (footer) footer.style.display = footerOn ? 'flex' : 'none';
-      // 연습장 — 앱(full) 문항에만 노출. 매 문항 데이터 초기화(열림·펜 선택은 유지).
-      if (full) { ensureScratch(); scrReset(); scr.wrap.style.display = ''; if (scr.open) setTimeout(scrResize, 30); }
+      // 연습장 — 앱(full) 문항 중 '수학'에만 노출(다른 과목은 계산 필기가 불필요, 사용자 요청 0714).
+      // 과목은 서버가 내려준 d.subject 우선(문항별 정확), 없으면 요청 subject 폴백.
+      var scrSubj = String(d.subject || subject || '');
+      var scrMath = scrSubj.indexOf('수학') !== -1 || /math/i.test(scrSubj);
+      if (full && scrMath) { ensureScratch(); scrReset(); scr.wrap.style.display = ''; if (scr.open) setTimeout(scrResize, 30); }
       else if (scr.wrap) scr.wrap.style.display = 'none';
       var token = d.challenge_token;
       var prompt = h('div');
