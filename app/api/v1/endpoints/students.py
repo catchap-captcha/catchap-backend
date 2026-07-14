@@ -468,6 +468,39 @@ def wrong_notes(
     }
 
 
+# ---------------------------------------------------------------- 연습장 필기 재생 (본인)
+@router.get("/students/me/scratch")
+def my_scratch(
+    subject: str | None = Query(default=None),
+    principal: Principal = Depends(require_student),
+    db: Session = Depends(get_db),
+):
+    """본인 연습장 필기 목록 — 과목별. 원본 획은 목록에 미포함(용량↓), 재생은 detail에서."""
+    me = _me(principal)
+    from app.services import scratch_access
+
+    return {
+        "subjects": scratch_access.subject_summary(db, me.id),
+        "items": scratch_access.list_scratch(db, me.id, subject),
+    }
+
+
+@router.get("/students/me/scratch/{record_id}")
+def my_scratch_detail(
+    record_id: str,
+    principal: Principal = Depends(require_student),
+    db: Session = Depends(get_db),
+):
+    """본인 연습장 필기 재생 — strokes 포함(자기 것만)."""
+    me = _me(principal)
+    from app.services import scratch_access
+
+    d = scratch_access.get_scratch(db, me.id, record_id)
+    if d is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="필기 기록을 찾을 수 없어요.")
+    return d
+
+
 # ---------------------------------------------------------------- 배지
 def _earned_foot(earned_at: datetime | date) -> str:
     """획득일 → 화면 하단 라벨 (student_badges.earned_at 실데이터 기준)."""

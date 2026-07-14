@@ -791,3 +791,55 @@ def my_classes(principal: Principal = Depends(require_teacher), db: Session = De
             }
         )
     return out
+
+
+# ---------------------------------------------------------------- 연습장 필기 재생 (교사)
+@router.get("/students/{student_id}/scratch")
+def student_scratch(
+    student_id: str,
+    subject: str | None = Query(default=None),
+    principal: Principal = Depends(require_teacher),
+    db: Session = Depends(get_db),
+):
+    """학생 연습장 필기 목록 — 모든 교사가 자기 기관 학생 필기를 볼 수 있다(사용자 결정 2026-07-14).
+    목록 열람은 감사하지 않고, 원본 재생(detail)에서 감사한다. 타 기관 학생은 404."""
+    st = db.get(StudentProfile, student_id)
+    if st is None or st.organization_id != principal.organization_id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="학생을 찾을 수 없어요.")
+    from app.services import scratch_access
+
+    return {
+        "student": {"id": st.id, "name": student_display_name(st)},
+        "subjects": scratch_access.subject_summary(db, student_id),
+        "items": scratch_access.list_scratch(db, student_id, subject),
+    }
+
+
+@router.get("/students/{student_id}/scratch/{record_id}")
+def student_scratch_detail(
+    student_id: str,
+    record_id: str,
+    principal: Principal = Depends(require_teacher),
+    db: Session = Depends(get_db),
+):
+    """학생 연습장 필기 재생(strokes) — 모든 교사 열람 가능하되 열람을 감사 기록한다
+    (누가·언제·누구 걸 봤나). 담당/비담당 무관 전부 감사 — 남용 추적·책임."""
+    st = db.get(StudentProfile, student_id)
+    if st is None or st.organization_id != principal.organization_id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="학생을 찾을 수 없어요.")
+    from app.services import scratch_access
+
+    d = scratch_access.get_scratch(db, student_id, record_id)
+    if d is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="필기 기록을 찾을 수 없어요.")
+    audit(
+        db,
+        action="student.scratch_view",
+        actor_user_id=principal.id,
+        organization_id=principal.organization_id,
+        target_type="student",
+        target_id=student_id,
+        after={"record_id": record_id, "subject": d.get("subject")},
+    )
+    db.commit()
+    return d

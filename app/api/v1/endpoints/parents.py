@@ -467,3 +467,38 @@ def link_invite(
     )
     db.commit()
     return {"ok": True, "student_id": link.student_id}
+
+
+# ---------------------------------------------------------------- 연습장 필기 재생 (보호자, 자녀만)
+@router.get("/parents/me/children/{child_id}/scratch")
+def child_scratch(
+    child_id: str,
+    subject: str | None = Query(default=None),
+    principal: Principal = Depends(require_parent),
+    db: Session = Depends(get_db),
+):
+    """자녀 연습장 필기 목록 — 과목별. 연결된 자녀만(check_parent_child)."""
+    check_parent_child(db, principal.id, child_id)
+    from app.services import scratch_access
+
+    return {
+        "subjects": scratch_access.subject_summary(db, child_id),
+        "items": scratch_access.list_scratch(db, child_id, subject),
+    }
+
+
+@router.get("/parents/me/children/{child_id}/scratch/{record_id}")
+def child_scratch_detail(
+    child_id: str,
+    record_id: str,
+    principal: Principal = Depends(require_parent),
+    db: Session = Depends(get_db),
+):
+    """자녀 연습장 필기 재생(strokes) — 연결된 자녀만."""
+    check_parent_child(db, principal.id, child_id)
+    from app.services import scratch_access
+
+    d = scratch_access.get_scratch(db, child_id, record_id)
+    if d is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="필기 기록을 찾을 수 없어요.")
+    return d

@@ -382,3 +382,31 @@ def test_scratch_record_stored(db, seed_org):
     _store_scratch(db, student, {"subj": "국어", "qid": "kor-1"}, {"strokes": []})
     db.commit()
     assert db.query(ScratchRecord).filter(ScratchRecord.student_id == student.id).count() == 1
+
+
+def test_scratch_access_scope(db, seed_org):
+    """필기 재생 접근: 목록엔 원본 미포함, 재생은 본인 것만(다른 학생 id는 None), 파기 시 빈 획."""
+    from app.api.v1.endpoints.captcha_api import _store_scratch
+    from app.models import ScratchRecord
+    from app.services import scratch_access
+
+    student = seed_org["student"]
+    _store_scratch(db, student, {"subj": "수학", "qid": "m1"},
+                   {"strokes": [{"color": "#2A2A2A", "width": 4, "points": [[0, 0.1, 0.2]]}], "strokeCount": 1})
+    db.commit()
+    rec = db.query(ScratchRecord).filter(ScratchRecord.student_id == student.id).first()
+
+    # 목록: 원본(strokes) 미포함(용량↓) + 과목 요약
+    lst = scratch_access.list_scratch(db, student.id, "수학")
+    assert any(i["id"] == rec.id for i in lst) and "strokes" not in lst[0]
+    assert scratch_access.subject_summary(db, student.id)[0]["subject"] == "수학"
+
+    # 재생: 본인 OK(strokes 포함), 다른 학생 id로는 None(스코프 강제)
+    full = scratch_access.get_scratch(db, student.id, rec.id)
+    assert full and len(full["strokes"]) == 1
+    assert scratch_access.get_scratch(db, "other-student-xxxx", rec.id) is None
+
+    # 파기(purged): 재생 시 strokes 빈 값(집계 메타는 남음)
+    rec.purged = True
+    db.commit()
+    assert scratch_access.get_scratch(db, student.id, rec.id)["strokes"] == []
