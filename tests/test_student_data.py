@@ -499,9 +499,12 @@ def test_game_session_new_subjects(client, db, seed_org):
             assert q["playable"] is True, subject
 
     # 서버 채점: 수학 single 오답 → 오답노트가 과목·카테고리(num)로 기록
+    from app.services import subject_banks as _sb
     from app.services.math_bank import MATH_FULL
 
-    mq = next(q for q in MATH_FULL if q["type"] == "single")
+    # get_question은 봇 방지로 보기 위치를 시드 셔플하므로 서빙(=채점) 기준 정답을 써야 한다
+    # (raw MATH_FULL 정답 id는 셔플 후와 다를 수 있음).
+    mq = _sb.get_question("수학", next(q for q in MATH_FULL if q["type"] == "single")["id"])
     wrong = next(o["id"] for o in mq["options"] if o["id"] != mq["answer"])
     r = client.post(
         "/api/v1/students/me/game-answer",

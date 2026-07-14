@@ -25,20 +25,34 @@ def _unlock_all() -> bool:
 CHAPTER_SIZE = 10  # 한 챕터 = 10문제
 STAGE_SIZE = 2  # 한 단계 = 2문제
 STAGES = 5  # 챕터당 5단계
-# 챕터 수는 문제은행 크기(÷10)로만 정한다 — 인위적 상한 없음(은행 늘면 자동 확장).
-# 폭주 방지용 안전 상한(1년치)만 둔다.
-MAX_CHAPTERS = 52
+# 전체학습 주차 수 = min(MAX_CHAPTERS, 문제은행÷10). 임시 확정(2026-07-14): 전 과목 15주차로
+# 상한(한 학기 기준). 콘텐츠가 15주 미만인 과목(예: 과학 9주)은 그만큼만 열리고 점진 보강한다.
+MAX_CHAPTERS = 15
 # 챕터1 = 이번 주(2026-07-06 월요일) — 전체 공통 달력 기준(모든 학생 같은 주에 같은 챕터).
 ANCHOR_MONDAY = date(2026, 7, 6)
 
 
 def max_chapters(subject: str) -> int:
-    """그 과목 playable 문항으로 반복 없이 채울 수 있는 챕터 수(문제은행÷10).
+    """전체학습 주차 수 — 임시 확정(2026-07-14): 전 과목 MAX_CHAPTERS(15주차) 고정.
 
-    예(현재): 영어64→6, 생활55·수학51→5, 사회45→4, 과학33→3. 은행이 늘면 자동 확장.
+    문항이 15주×10=150개 미만인 과목(예: 과학 91→9주치)은 부족분을 문항 순환 반복으로
+    채워 동일하게 15주차를 연다(_cycle_slice). playable 문항이 하나도 없으면 0.
     """
     pool = subject_banks.playable_pool(subject)
-    return min(MAX_CHAPTERS, len(pool) // CHAPTER_SIZE)
+    return MAX_CHAPTERS if pool else 0
+
+
+def _cycle_slice(subject: str, start: int, count: int) -> list[dict]:
+    """전역 슬롯 [start, start+count)를 문제은행에서 순환(부족하면 앞에서부터 반복)해 채운다.
+
+    15주차 고정을 위해 풀이 15*10=150 미만인 과목은 문항을 반복하고, 초과 과목은 앞 150만
+    쓴다(주차 구조가 과목마다 같도록). 슬롯이 총 150을 넘으면 빈 리스트 부분은 잘린다.
+    """
+    pool = subject_banks.playable_pool(subject)
+    if not pool:
+        return []
+    total = MAX_CHAPTERS * CHAPTER_SIZE
+    return [pool[i % len(pool)] for i in range(start, min(start + count, total))]
 
 
 def unlocked_count(subject: str, today: date | None = None) -> int:
@@ -61,9 +75,7 @@ def chapter_title(subject: str, chapter_no: int) -> str:
     옛 Chapter 테이블의 고정 5개 이름(콘텐츠와 불일치·6주차↑ 무명)을 대체한다.
     한 챕터가 여러 topic을 걸치면 상위 2개를 '·'로 잇는다.
     """
-    pool = subject_banks.playable_pool(subject)
-    start = (chapter_no - 1) * CHAPTER_SIZE
-    sliced = pool[start : start + CHAPTER_SIZE]
+    sliced = _cycle_slice(subject, (chapter_no - 1) * CHAPTER_SIZE, CHAPTER_SIZE)
     if not sliced:
         return f"{chapter_no}주차"
     from collections import Counter
@@ -79,11 +91,8 @@ def stage_questions(subject: str, chapter_no: int, stage: int) -> list[dict]:
     """(챕터, 단계)에 해당하는 2문항 — public_question(정답·해설 제거). 범위 밖이면 빈 리스트."""
     if chapter_no < 1 or stage < 1 or stage > STAGES:
         return []
-    pool = subject_banks.playable_pool(subject)
     start = (chapter_no - 1) * CHAPTER_SIZE + (stage - 1) * STAGE_SIZE
-    if start < 0 or start >= len(pool):
-        return []
-    sliced = pool[start : start + STAGE_SIZE]
+    sliced = _cycle_slice(subject, start, STAGE_SIZE)
     return [subject_banks.public_question(q) for q in sliced]
 
 
@@ -94,9 +103,7 @@ def chapter_all_question_ids(subject: str, chapter_no: int) -> list[str]:
     이 풀에서 학생별 우선순위(안 푼>틀린>맞춘)로 고른다(bank_mode.pick_from)."""
     if chapter_no < 1:
         return []
-    pool = subject_banks.playable_pool(subject)
-    start = (chapter_no - 1) * CHAPTER_SIZE
-    return [q["id"] for q in pool[start : start + CHAPTER_SIZE]]
+    return [q["id"] for q in _cycle_slice(subject, (chapter_no - 1) * CHAPTER_SIZE, CHAPTER_SIZE)]
 
 
 def chapter_question_ids(subject: str, chapter_no: int, stage: int) -> list[str]:
