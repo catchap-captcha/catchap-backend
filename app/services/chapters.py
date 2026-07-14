@@ -25,18 +25,18 @@ def _unlock_all() -> bool:
 CHAPTER_SIZE = 10  # 한 챕터 = 10문제
 STAGE_SIZE = 2  # 한 단계 = 2문제
 STAGES = 5  # 챕터당 5단계
-# 전체학습 주차 수 = min(MAX_CHAPTERS, 문제은행÷10). 임시 확정(2026-07-14): 전 과목 15주차로
-# 상한(한 학기 기준). 콘텐츠가 15주 미만인 과목(예: 과학 9주)은 그만큼만 열리고 점진 보강한다.
-MAX_CHAPTERS = 15
+# 전체학습 주차 수 — 임시 확정(2026-07-14): 전 과목 20주차 고정. 문항이 20*10=200 미만인
+# 과목(수학 153→15주치, 과학 91→9주치)은 _cycle_slice가 문항을 순환 반복해 20주차를 채운다.
+MAX_CHAPTERS = 20
 # 챕터1 = 이번 주(2026-07-06 월요일) — 전체 공통 달력 기준(모든 학생 같은 주에 같은 챕터).
 ANCHOR_MONDAY = date(2026, 7, 6)
 
 
 def max_chapters(subject: str) -> int:
-    """전체학습 주차 수 — 임시 확정(2026-07-14): 전 과목 MAX_CHAPTERS(15주차) 고정.
+    """전체학습 주차 수 — 임시 확정(2026-07-14): 전 과목 MAX_CHAPTERS(20주차) 고정.
 
-    문항이 15주×10=150개 미만인 과목(예: 과학 91→9주치)은 부족분을 문항 순환 반복으로
-    채워 동일하게 15주차를 연다(_cycle_slice). playable 문항이 하나도 없으면 0.
+    문항이 20주×10=200개 미만인 과목(예: 과학 91→9주치)은 부족분을 문항 순환 반복으로
+    채워 동일하게 20주차를 연다(_cycle_slice). playable 문항이 하나도 없으면 0.
     """
     pool = subject_banks.playable_pool(subject)
     return MAX_CHAPTERS if pool else 0
@@ -45,8 +45,8 @@ def max_chapters(subject: str) -> int:
 def _cycle_slice(subject: str, start: int, count: int) -> list[dict]:
     """전역 슬롯 [start, start+count)를 문제은행에서 순환(부족하면 앞에서부터 반복)해 채운다.
 
-    15주차 고정을 위해 풀이 15*10=150 미만인 과목은 문항을 반복하고, 초과 과목은 앞 150만
-    쓴다(주차 구조가 과목마다 같도록). 슬롯이 총 150을 넘으면 빈 리스트 부분은 잘린다.
+    20주차 고정을 위해 풀이 20*10=200 미만인 과목은 문항을 반복하고, 초과 과목은 앞 200만
+    쓴다(주차 구조가 과목마다 같도록). 슬롯이 총 200을 넘으면 빈 리스트 부분은 잘린다.
     """
     pool = subject_banks.playable_pool(subject)
     if not pool:

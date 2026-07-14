@@ -548,8 +548,8 @@ def test_grade_head_cannot_use_org_admin_only(client, db, seed_org):
 
 
 def test_teacher_students_scope_enforced(client, db, seed_org):
-    """적대적검토 #7: /teacher/students가 역할 스코프를 강제 — 담임/교사는 담당 학급,
-    학년부장은 담당 학년만. 다른 학년·학급 학생 실명이 이 API로 새지 않는다."""
+    """전체 학생 조회(/teacher/students)는 완화(2026-07-14)로 담임/교사·학년부장이 전교생
+    목록을 볼 수 있다. 단, 개별 학생 조치(비밀번호 재설정·코드 열람)는 여전히 담당 학급만."""
     from app.models import ClassRoom, StudentProfile
 
     org = seed_org["org"]
@@ -568,23 +568,15 @@ def test_teacher_students_scope_enforced(client, db, seed_org):
     def _all_ids(resp):
         return {st["id"] for g in resp["groups"] for st in g["students"]}
 
-    # 담임 교사(1-1반) → 자기 학급 학생만, 2학년 학생 미노출
+    # 담임 교사(1-1반) → '전체 학생 조회'는 전교생 목록(다른 반 학생 포함)
     tok = _login(client, "t1@test.dev")
     resp = client.get("/api/v1/teacher/students", headers=auth(tok)).json()
     ids = _all_ids(resp)
     assert seed_org["student"].id in ids
-    assert s2.id not in ids  # 담당 밖 학생은 안 보인다
+    assert s2.id in ids  # 완화: 전체 학생 조회 = 전교생
 
-    # 학년부장(1학년)으로 임명 → 1학년만, 2학년 미노출 (역할 갱신 후 재로그인)
-    _org_admin(db, org)
-    admin = _login(client, "principal@test.dev")
-    mid = _teacher_membership_id(db, org)
+    # 그러나 개별 조치는 담당 학급만 — 다른 반(2-1) 학생 비밀번호 재설정은 403
     r = client.post(
-        f"/api/v1/orgs/{org.id}/teachers/{mid}/grade-head",
-        json={"grade": 1}, headers=auth(admin),
+        f"/api/v1/teacher/class/students/{s2.id}/reset-password", headers=auth(tok)
     )
-    assert r.status_code == 200, r.text
-    tok2 = _login(client, "t1@test.dev")
-    resp2 = client.get("/api/v1/teacher/students", headers=auth(tok2)).json()
-    ids2 = _all_ids(resp2)
-    assert seed_org["student"].id in ids2 and s2.id not in ids2
+    assert r.status_code == 403, r.text

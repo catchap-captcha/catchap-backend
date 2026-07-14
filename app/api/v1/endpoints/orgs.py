@@ -2082,10 +2082,13 @@ def org_audit_logs(
     date_to: str | None = None,  # 'YYYY-MM-DD' (해당일 끝까지 포함)
     page: int = 1,
     page_size: int = 50,
-    principal: Principal = Depends(require_org_admin),
+    principal: Principal = Depends(require_grade_head),
     db: Session = Depends(get_db),
 ):
-    """기관 활동 기록 — 교장/기관 관리자가 자기 기관 것만 본다.
+    """기관 활동 기록 — 교장/기관 관리자 + 학년부장이 자기 기관 것을 본다(2026-07-14).
+
+    학년부장 감사 열람 추가: 교사들이 전교생 필기 열람을 하게 된 만큼, 학년부장이 감독할 수
+    있도록 조회 권한을 연다(현재는 기관 범위 — 세밀한 학년 스코프는 후속). 아래 원칙은 동일.
 
     운영 감사로그(GET /ops/logs)와 달리:
     - 자기 organization_id로 스코프 고정 (타 기관 조회 불가)

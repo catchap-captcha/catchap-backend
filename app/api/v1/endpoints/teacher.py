@@ -405,26 +405,12 @@ def all_students(
     db: Session = Depends(get_db),
 ):
     org_id = principal.organization_id
-    # 역할별 학생 스코프 강제(적대적검토 #7): 교장/운영=전 학년, 학년부장=담당 학년,
-    # 담임/교사=담당(담임·보조) 학급만. 예전엔 스코프 없이 전교생 실명이 나가 orgs roster의
-    # 세심한 학년/학급 스코프가 이 엔드포인트로 우회됐다.
+    # '전체 학생 조회'는 이름 그대로 기관 전 학생을 보여준다(사용자 결정 2026-07-14):
+    # 목록 조회는 담임/학년부장도 전교생을 볼 수 있게 스코프를 두지 않는다. 단, 개별 학생
+    # 조치(비밀번호 재설정·코드 열람)는 여전히 담당 학급만 허용한다(각 액션 엔드포인트에서 강제).
+    # 참고: 이는 목록 열람 한정 완화이며, 아동 개인정보 노출 최소화 관점의 트레이드오프다.
     scope_grade: int | None = None
     scope_class_ids: set[str] | None = None
-    if principal.role == "grade_head":
-        scope_grade = managed_grade(db, principal)
-        if scope_grade is None:
-            raise HTTPException(status.HTTP_403_FORBIDDEN, detail="담당 학년이 지정되지 않았습니다.")
-    elif principal.role == "teacher":
-        scope_class_ids = {
-            c.id
-            for c in db.query(ClassRoom)
-            .filter(
-                ClassRoom.organization_id == org_id,
-                (ClassRoom.teacher_id == principal.id)
-                | (ClassRoom.assistant_teacher_id == principal.id),
-            )
-            .all()
-        }
     # 실배정 학생 전체 (student_profiles/classes 실테이블 기준) — seed roster 폐기
     students = (
         db.query(StudentProfile)
