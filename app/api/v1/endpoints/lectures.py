@@ -725,6 +725,20 @@ def ops_update_lecture(
     if req.status is not None:
         lec.status = req.status
 
+    # duration을 줄이면 이미 예약된 체크포인트가 영상 밖에 남아 그 강의를 영원히 완주 못 하게 된다
+    # (게이트가 도달 불가 → watched_max가 duration에 닿아도 status가 done으로 안 넘어감).
+    # 영상 밖으로 밀려난 예약만 해제한다 — 다음 하트비트가 새 지점을 다시 잡는다.
+    if req.duration_sec is not None:
+        (
+            db.query(LectureWatchProgress)
+            .filter(
+                LectureWatchProgress.lecture_id == lec.id,
+                LectureWatchProgress.next_checkpoint_sec.isnot(None),
+                LectureWatchProgress.next_checkpoint_sec >= lec.duration_sec,
+            )
+            .update({"next_checkpoint_sec": None}, synchronize_session=False)
+        )
+
     audit(
         db,
         action="lecture.update",
