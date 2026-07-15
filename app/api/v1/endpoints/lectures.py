@@ -49,7 +49,7 @@ from fastapi import (
 from fastapi.responses import FileResponse
 from jwt import PyJWTError
 from pydantic import BaseModel
-from sqlalchemy import func
+from sqlalchemy import and_, func, not_, or_
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
@@ -225,6 +225,39 @@ def _verify_stream_token(token: str | None, lecture_id: str) -> tuple[str, str]:
     if payload.get("type") != "lecture-stream" or payload.get("lec") != lecture_id:
         raise HTTPException(status.HTTP_403_FORBIDDEN, detail="스트림 토큰이 유효하지 않습니다.")
     return str(payload.get("sub", "")), str(payload.get("sid", ""))
+
+
+_OPS_STREAM_TOKEN_TTL_SEC = 60 * 60  # 운영자 미리보기 — 편집 한 세션 정도만
+
+
+def _sign_ops_stream_token(lecture_id: str, ops_user_id: str) -> str:
+    """운영자 미리보기 스트림 토큰 — 강의·운영자·만료 바인딩. 세션 바인딩은 없다.
+
+    학생 스트림과 type을 분리한다("lecture-stream-ops"). 같은 type을 쓰면 학생 토큰으로
+    세션 검사가 없는 운영자 경로에 들어가 동시재생 차단(세션 바인딩)을 통째로 우회한다.
+    운영자는 시청 검증 대상이 아니므로 진행·세션 개념이 없고, 그래서 더더욱 학생이
+    이 경로에 닿으면 안 된다.
+    """
+    settings = get_settings()
+    payload = {
+        "type": "lecture-stream-ops",
+        "lec": lecture_id,
+        "sub": ops_user_id,
+        "exp": int(time.time()) + _OPS_STREAM_TOKEN_TTL_SEC,
+    }
+    return jwt.encode(payload, settings.JWT_SECRET_KEY, algorithm=settings.JWT_ALGORITHM)
+
+
+def _verify_ops_stream_token(token: str | None, lecture_id: str) -> str:
+    if not token:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail="스트림 접근 토큰이 필요합니다.")
+    try:
+        payload = decode_token(token)
+    except PyJWTError:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail="스트림 토큰이 유효하지 않습니다.")
+    if payload.get("type") != "lecture-stream-ops" or payload.get("lec") != lecture_id:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail="스트림 토큰이 유효하지 않습니다.")
+    return str(payload.get("sub", ""))
 
 
 # ---------------------------------------------------------------- 조회 공통
@@ -503,6 +536,51 @@ def lecture_stream(
             status.HTTP_403_FORBIDDEN,
             detail="이 시청 세션은 더 이상 유효하지 않습니다. 다른 곳에서 재생이 시작되었어요.",
         )
+    media_type = _MEDIA_TYPES.get(lec.video_ext or "")
+    if media_type is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="영상 형식이 올바르지 않습니다.")
+    path = _video_path(lec)
+    if not path.is_file():
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="영상 파일을 찾을 수 없습니다.")
+    return FileResponse(str(path), media_type=media_type)
+
+
+@router.post("/ops/lectures/{lecture_id}/preview")
+def ops_lecture_preview(
+    lecture_id: str,
+    principal: Principal = Depends(require_ops),
+    db: Session = Depends(get_db),
+):
+    """운영자 미리보기 URL 발급 — 문항 시점을 눈으로 찾고 화면을 따오기 위한 재생.
+
+    학생 재생과 달리 세션을 만들지 않는다: 운영자는 시청 검증 대상이 아니고, 여기서 세션을
+    점유하면 같은 계정으로 강의를 보던 학생 세션을 걷어차게 된다."""
+    lec = _get_ops_lecture(db, lecture_id)
+    if not lec.video_ext:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="업로드된 영상이 없습니다.")
+    token = _sign_ops_stream_token(lec.id, principal.id)
+    return {
+        "stream_url": f"/api/v1/ops/lectures/{lec.id}/stream?t={token}",
+        "duration_sec": lec.duration_sec,
+    }
+
+
+@router.get("/ops/lectures/{lecture_id}/stream")
+def ops_lecture_stream(
+    lecture_id: str,
+    t: str | None = None,
+    db: Session = Depends(get_db),
+):
+    """운영자 미리보기 스트리밍 — 서명 토큰(쿼리) 인가. 세션·진행 검사 없음.
+
+    <video src>가 Authorization 헤더를 못 실어 쿼리 서명을 쓰는 것은 학생 스트림과 같다.
+    토큰 type이 달라 학생 토큰으로는 못 들어온다(세션 바인딩 우회 차단).
+    hidden/draft 강의도 열린다 — 운영자는 공개 전 검수를 해야 하고, _get_ops_lecture가
+    이미 운영자 권한을 확인한 뒤 발급된 토큰이다."""
+    _verify_ops_stream_token(t, lecture_id)
+    lec = db.get(Lecture, lecture_id)
+    if lec is None or lec.status == "deleted":
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="강의를 찾을 수 없습니다.")
     media_type = _MEDIA_TYPES.get(lec.video_ext or "")
     if media_type is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="영상 형식이 올바르지 않습니다.")
@@ -797,6 +875,23 @@ def ops_update_lecture(
     if req.duration_sec is not None:
         if req.duration_sec <= 0:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="영상 길이가 올바르지 않습니다.")
+        # 길이를 줄이면 그 밖으로 나간 문항은 영영 안 뜨고, 그게 마지막 문항이면 이 강의의
+        # 시청 검증이 통째로 조용히 꺼진다. 문항 PUT은 같은 상황을 400으로 막으면서 여기만
+        # 통과시키면 비대칭이라, 강사는 설명만 고치려다 영문 모를 400을 맞는다.
+        orphaned = (
+            db.query(func.count(LectureQuestion.id))
+            .filter(
+                LectureQuestion.lecture_id == lec.id,
+                LectureQuestion.status == "active",
+                LectureQuestion.position_sec >= req.duration_sec,
+            )
+            .scalar()
+        )
+        if orphaned:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                detail=f"출제 시점이 새 영상 길이를 벗어나는 공개 문항이 {orphaned}개 있습니다. 문항 시점을 먼저 정리해 주세요.",
+            )
         lec.duration_sec = req.duration_sec
     if req.check_min_sec is not None:
         lec.check_min_sec = req.check_min_sec
@@ -955,6 +1050,8 @@ def _question_row(q: LectureQuestion) -> dict:
         "id": q.id,
         "lecture_id": q.lecture_id,
         "position_sec": q.position_sec,
+        "pinned": bool(q.pinned),
+        "window_sec": int(q.window_sec or 0),
         "prompt": payload.get("prompt"),
         "options": options,
         "explain": payload.get("explain"),
@@ -982,6 +1079,12 @@ def _question_row(q: LectureQuestion) -> dict:
 
 class _QuestionCreate(BaseModel):
     position_sec: int = 0
+    # True면 학생이 position_sec에 닿는 순간 반드시 이 문항이 뜬다(무작위 간격보다 우선).
+    # False면 종전대로 position_sec 이후 확인에서 무작위로 뽑히는 풀 문항.
+    pinned: bool = False
+    # 고정 문항의 출제 구간 길이(초). 0이면 정확히 position_sec, >0이면
+    # [position_sec, position_sec+window_sec] 안의 무작위 시점(강사도 정확한 초는 모른다).
+    window_sec: int = 0
     prompt: str
     options: list[str]
     answer_index: int
@@ -1007,6 +1110,104 @@ def _validate_question_body(
         )
     if not (0 <= answer_index < len(options)):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="answer_index가 보기 범위를 벗어납니다.")
+
+
+def _validate_question_timing(
+    pinned: bool, position_sec: int, window_sec: int, duration_sec: int
+) -> None:
+    """출제 시점이 실제로 도달 가능한지 — 뜰 수 없는 문항은 조용히 죽는 대신 거절한다.
+
+    ★ 풀 문항도 검사한다. position이 영상 밖이면 그 문항은 영영 안 뜨는 데서 끝나지 않고,
+    그 강의에 다른 문항이 없으면 pool_min이 영상 밖이라 체크포인트 자체가 안 잡혀
+    시청 검증이 통째로, 아무 신호 없이 꺼진다(100초 강의에 900 오타 하나면 충분 —
+    적대적 검토에서 실증). 목록에는 멀쩡한 active 문항으로 보이므로 알아챌 방법이 없다.
+
+    구간 끝(position+window)이 영상을 넘는 건 거절하지 않는다 — "3:20부터 끝까지"는
+    강사의 정상적인 의도이고, 예약 시 duration-1로 잘라 쓴다. 시작점만 영상 안이면 된다.
+    """
+    if duration_sec and position_sec >= duration_sec:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            detail="출제 시점이 영상 길이를 벗어났습니다. 영상 안의 시점을 지정해 주세요.",
+        )
+    if not pinned:
+        return
+    if position_sec < 1:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            detail="고정 문항은 출제 시점이 1초 이상이어야 합니다(0초는 아직 아무것도 보지 않은 지점이라 뜰 수 없어요).",
+        )
+    if window_sec < 0:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST, detail="출제 구간 길이는 0초 이상이어야 합니다."
+        )
+
+def _reject_duplicate_pin(
+    db: Session, lecture_id: str, position_sec: int, exclude_id: str | None = None
+) -> None:
+    """같은 시점에 고정 문항 둘 — 하나만 뜨고 나머지는 죽는다. 조용히 버리지 말고 거절한다.
+
+    한 시점의 고정은 하나만 출제되고(random.choice), 통과하면 그 시점은 다시 안 잡히므로
+    나머지는 무작위 확인에도 안 나오는(고정은 풀에서 제외) 영구 사문이 된다. 강사 목록에는
+    active로 멀쩡히 보여 알 수 없다(적대적 검토에서 실증).
+    """
+    dup = (
+        db.query(func.count(LectureQuestion.id))
+        .filter(
+            LectureQuestion.lecture_id == lecture_id,
+            LectureQuestion.status == "active",
+            LectureQuestion.pinned.is_(True),
+            LectureQuestion.position_sec == position_sec,
+            *([LectureQuestion.id != exclude_id] if exclude_id else []),
+        )
+        .scalar()
+    )
+    if dup:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            detail="같은 시점에 고정된 공개 문항이 이미 있습니다. 한 시점에는 하나만 출제되니 다른 시점을 지정해 주세요.",
+        )
+
+
+def _reconcile_progress(db: Session, lecture_id: str) -> None:
+    """문항 구성이 바뀐 뒤 학생들의 예약을 정합화한다 — 문항 생성·수정·삭제 후 호출.
+
+    해제된 예약은 다음 하트비트가 새 구성으로 다시 잡는다(record_progress의 재예약 경로).
+    이미 지나온 지점은 건드리지 않는다 — 지난 구간을 소급해 다시 묻지는 않는다.
+
+    ① 낼 문제가 없어진 예약: 그대로 두면 학생이 그 지점에 닿아도 출제할 문항이 없어
+       게이트는 4xx만 내고, 진행은 cp+GRACE에서 클램프돼 강의를 영영 못 끝낸다
+       (강사가 마지막 문항을 지우거나 시점을 뒤로 옮기면 실제로 발생).
+    ② 고정 시점을 지나쳐 버릴 예약: 예약이 고정 시점보다 뒤에 있으면 학생은 지정 시점을
+       그냥 통과해 고정이 무의미해진다.
+    """
+    pool_min, pins = lecture_service.question_windows(db, lecture_id)
+    cp_col = LectureWatchProgress.next_checkpoint_sec
+
+    # ① 그 지점에 낼 수 있는 문항이 없는 예약 — 풀 문항은 pool_min 이후에만, 고정 문항은
+    #    자기 구간 안에서만 나온다. 둘 다 해당 없으면 그 예약으로는 게이트를 열 수 없다.
+    servable = [and_(cp_col >= s, cp_col <= e) for s, e in pins]
+    if pool_min is not None:
+        servable.append(cp_col >= pool_min)
+    unservable = db.query(LectureWatchProgress).filter(
+        LectureWatchProgress.lecture_id == lecture_id, cp_col.isnot(None)
+    )
+    if servable:
+        unservable = unservable.filter(not_(or_(*servable)))
+    unservable.update({"next_checkpoint_sec": None}, synchronize_session=False)
+
+    # ② 아직 안 닿은 고정 구간을 통째로 건너뛰는 예약 — 구간 안에 있는 예약은 유효하니 둔다
+    for s, e in pins:
+        (
+            db.query(LectureWatchProgress)
+            .filter(
+                LectureWatchProgress.lecture_id == lecture_id,
+                cp_col.isnot(None),
+                cp_col > e,
+                LectureWatchProgress.watched_max_sec < s,
+            )
+            .update({"next_checkpoint_sec": None}, synchronize_session=False)
+        )
 
 
 @router.get("/ops/lectures/{lecture_id}/questions")
@@ -1039,9 +1240,17 @@ def ops_create_question(
     _validate_question_body(req.prompt, req.options, req.answer_index)
     if req.status not in ("draft", "active"):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="status는 draft|active만 가능합니다.")
+    position = max(0, req.position_sec)
+    _validate_question_timing(
+        req.pinned, position, int(req.window_sec or 0), int(lec.duration_sec or 0)
+    )
+    if req.pinned and req.status == "active":
+        _reject_duplicate_pin(db, lec.id, position)
     q = LectureQuestion(
         lecture_id=lec.id,
-        position_sec=max(0, req.position_sec),
+        position_sec=position,
+        pinned=bool(req.pinned),
+        window_sec=max(0, int(req.window_sec or 0)),
         payload={
             "prompt": req.prompt.strip(),
             "options": [str(o).strip() for o in req.options],
@@ -1054,13 +1263,19 @@ def ops_create_question(
     )
     db.add(q)
     db.flush()
+    _reconcile_progress(db, lec.id)
     audit(
         db,
         action="lecture.question.create",
         actor_user_id=principal.id,
         target_type="lecture_question",
         target_id=q.id,
-        after={"lecture_id": lec.id, "position_sec": q.position_sec, "status": q.status},
+        after={
+            "lecture_id": lec.id,
+            "position_sec": q.position_sec,
+            "pinned": q.pinned,
+            "status": q.status,
+        },
     )
     db.commit()
     return _question_row(q)
@@ -1068,6 +1283,8 @@ def ops_create_question(
 
 class _QuestionUpdate(BaseModel):
     position_sec: int | None = None
+    pinned: bool | None = None
+    window_sec: int | None = None
     prompt: str | None = None
     options: list[str] | None = None
     answer_index: int | None = None
@@ -1111,7 +1328,12 @@ def ops_update_question(
         str(new_prompt), list(new_options), int(new_answer), option_images=opt_imgs
     )
 
-    before = {"position_sec": q.position_sec, "status": q.status, "answer_index": q.answer_index}
+    before = {
+        "position_sec": q.position_sec,
+        "pinned": q.pinned,
+        "status": q.status,
+        "answer_index": q.answer_index,
+    }
     payload["prompt"] = str(new_prompt).strip()
     payload["options"] = [str(o).strip() for o in new_options]
     if req.explain is not None:
@@ -1120,8 +1342,25 @@ def ops_update_question(
     q.answer_index = int(new_answer)
     if req.position_sec is not None:
         q.position_sec = max(0, req.position_sec)
+    if req.pinned is not None:
+        q.pinned = bool(req.pinned)
+    if req.window_sec is not None:
+        q.window_sec = max(0, int(req.window_sec))
     if req.status is not None:
         q.status = req.status
+    lec = db.get(Lecture, lecture_id)
+    _validate_question_timing(
+        bool(q.pinned),
+        int(q.position_sec),
+        int(q.window_sec or 0),
+        int(lec.duration_sec or 0) if lec else 0,
+    )
+    if q.pinned and q.status == "active":
+        _reject_duplicate_pin(db, lecture_id, int(q.position_sec), exclude_id=q.id)
+    # 시점·고정 여부·활성 상태 중 무엇이 바뀌었든 예약 정합화 — 어떤 조합이 바뀌었는지
+    # 일일이 따지면 초안→활성 같은 경로가 빠진다(실제로 빠뜨렸다). 현재 구성으로 다시 맞춘다.
+    db.flush()
+    _reconcile_progress(db, lecture_id)
 
     audit(
         db,
@@ -1152,6 +1391,10 @@ def ops_delete_question(
     # 보존한다. deleted 문항은 서빙·출제 경로가 전부 status 필터로 닫혀 파일 부재가 무해하다.
     image_paths = [_question_image_path(r) for r in _question_image_refs(q.payload or {})]
     q.status = "deleted"
+    # 지운 문항에 기대고 있던 예약을 걷는다 — 마지막 문항을 지우면 학생이 게이트에 닿아도
+    # 낼 문제가 없어 4xx만 나고 진행은 클램프에 갇힌다(문항 0개 = 검증 없음이 정직한 상태).
+    db.flush()
+    _reconcile_progress(db, lecture_id)
     audit(
         db,
         action="lecture.question.delete",

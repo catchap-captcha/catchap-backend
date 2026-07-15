@@ -4,6 +4,7 @@ from sqlalchemy import (
     CHAR,
     JSON,
     BigInteger,
+    Boolean,
     DateTime,
     ForeignKey,
     Index,
@@ -67,7 +68,19 @@ class LectureQuestion(Base, UUIDPk, Timestamps):
     __table_args__ = (Index("ix_lq_lecture_pos", "lecture_id", "position_sec"),)
 
     lecture_id: Mapped[str] = mapped_column(CHAR(36), ForeignKey("lectures.id"), index=True)
-    position_sec: Mapped[int] = mapped_column(default=0)  # 이 시점 이전 내용에서 출제
+    position_sec: Mapped[int] = mapped_column(default=0)  # 이 문항이 다루는 강의 시점
+    # 출제 시점 — 강사가 고르는 세 가지 방식
+    #   pinned=False(기본): position_sec 이후 아무 확인에서나 무작위로 뽑히는 '풀' 문항
+    #   pinned=True, window_sec=0: 학생이 position_sec에 닿는 순간 반드시 이 문항이 뜬다
+    #   pinned=True, window_sec>0: [position_sec, position_sec+window_sec] 구간 안에서
+    #     서버가 고른 무작위 시점에 뜬다
+    # 고정은 강사만 아는 정보를 쓴다 — "이 대목 직후에 물어야 방금 본 사람만 답한다".
+    # 구간은 거기에 예측 불가능성을 더한다: 강사는 '문제 풀이 대목'만 지정하고 정확한 초는
+    # 서버가 고른다. 매번 같은 초에 뜨면 학생이 그 지점만 외워 대기하는 학습이 생긴다.
+    # 풀 문항과 고정 문항은 서로 배타적으로 뽑힌다(고정이 무작위 확인에 새어나오면
+    # 지정 시점에 낼 문제가 사라진다).
+    pinned: Mapped[bool] = mapped_column(Boolean, default=False)
+    window_sec: Mapped[int] = mapped_column(default=0)
     # {prompt, options[], explain} + 이미지 문항 확장(선택): prompt_image={id, ext},
     # option_images={"<보기 인덱스>": {id, ext}}. 파일 경로는 저장하지 않고
     # LECTURE_MEDIA_DIR/questions/{id}{ext}로 유도한다(영상·자료와 동일 — 경로조작 원천 차단).
