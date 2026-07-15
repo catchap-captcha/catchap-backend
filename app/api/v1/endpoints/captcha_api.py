@@ -290,6 +290,83 @@ def _credit_student(
     }
 
 
+def _lecture_challenge(db: Session, request: Request, api: ApiKey, lecture_id: str) -> dict:
+    """강의 체크포인트 확인 문제 발급 — 시청 검증 게이트(1st-party edu 키 + 학생 인증 전용).
+
+    서버가 ① 강의 존재·active ② 그 학생의 next_checkpoint_sec 도달을 확인한 뒤,
+    그 강의의 active 문항 중 position_sec ≤ 체크포인트인 것에서 무작위 1개를 낸다.
+    문항이 없으면 명확한 4xx — 과목 은행 문제로 폴백하지 않는다(강의와 무관한 문제를
+    풀게 하는 것은 시청 검증이 아니다).
+    meta(lec/cp)는 토큰에 서명돼 verify에서 위조 없이 복원된다. bank=True는 verify의
+    코인·오늘의퀴즈 미오염 스위치(이중 안전장치 — lec 분기는 애초에 적립을 안 탄다).
+    """
+    import random
+
+    from app.models import Lecture, LectureQuestion, LectureWatchProgress
+
+    # 외부 판매 키 차단 — 시청 검증은 우리 인앱(1st-party) 전용 도메인
+    if api.product != "edu" or not api.first_party:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN, detail="이 키로는 강의 시청 검증을 사용할 수 없어요."
+        )
+    student = _optional_student(db, request)
+    if student is None:
+        raise HTTPException(
+            status.HTTP_401_UNAUTHORIZED, detail="강의 확인 문제는 학생 로그인이 필요해요."
+        )
+    lec = db.get(Lecture, lecture_id)
+    if lec is None or lec.status != "active":
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="강의를 찾을 수 없어요.")
+    progress = (
+        db.query(LectureWatchProgress)
+        .filter(
+            LectureWatchProgress.student_id == student.id,
+            LectureWatchProgress.lecture_id == lec.id,
+        )
+        .first()
+    )
+    if progress is None or progress.next_checkpoint_sec is None:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, detail="지금은 확인 문제가 필요한 지점이 아니에요."
+        )
+    cp = int(progress.next_checkpoint_sec)
+    if int(progress.watched_max_sec or 0) < cp:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, detail="아직 확인 문제 지점까지 시청하지 않았어요."
+        )
+    candidates = (
+        db.query(LectureQuestion)
+        .filter(
+            LectureQuestion.lecture_id == lec.id,
+            LectureQuestion.status == "active",
+            LectureQuestion.position_sec <= cp,
+        )
+        .all()
+    )
+    if not candidates:
+        # 폴백 출제 금지 — 게이트를 열 문항이 없음을 정직하게 알린다
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail="이 강의에 출제할 확인 문항이 없어요. 운영자에게 문항 등록을 요청해 주세요.",
+        )
+    q = random.choice(candidates)
+    payload = q.payload or {}
+    public = {
+        "type": "single",  # 위젯 기본(단일 선택) 렌더러 — prompt + options
+        "subject": lec.subject,
+        "prompt": payload.get("prompt", ""),
+        "hint": payload.get("explain") or "",
+        "options": [
+            {"id": str(i), "text": str(t)} for i, t in enumerate(payload.get("options", []))
+        ],
+        "lecture": lec.id,
+        "checkpoint_sec": cp,
+    }
+    meta = {"subj": lec.subject, "lec": lec.id, "cp": cp, "bank": True}
+    ch = cs._wrap("single", str(int(q.answer_index)), public, meta)
+    return _emit_challenge(db, api, lec.subject, ch)
+
+
 @router.post("/challenge")
 def challenge(
     request: Request,
@@ -300,12 +377,15 @@ def challenge(
     chapter: int | None = None,  # 전체학습 주간 챕터 — 그 챕터 문항만 + 오늘의퀴즈 미오염
     stage: int | None = None,  # 챕터 단계(1~5) — 단계 문항 슬라이스
     bank: bool = False,  # 전체학습 문제은행 모드 — 안 푼>틀린>맞춘 우선 출제, 코인·퀴즈 미반영
+    lecture: str | None = None,  # 강의 시청 검증 — 체크포인트 확인 문제(1st-party edu 전용)
     db: Session = Depends(get_db),
 ):
     _throttle(db, request, "chall", RATE_CHALLENGE_PER_MIN)
     api = _key(db, x_site_key)
     _origin_guard(db, request, api)
     cs.assert_entitled(db, api)  # 요금제·quota 검사
+    if lecture is not None:
+        return _lecture_challenge(db, request, api, lecture)
     # 교육형 키는 발급 시 과목이 박혀 있지만, 우리 앱(과목별 게임화면)이 붙을 땐
     # 화면 과목에 맞춰 요청별로 과목을 바꿀 수 있게 허용한다. (EDU_SUBJECTS 안에서만)
     eff_subject = api.subject
@@ -415,6 +495,62 @@ def _store_scratch(db: Session, student: StudentProfile, meta: dict, scratch) ->
         pass  # 부가 기능 — 필기 저장 실패가 채점/응답을 막지 않게
 
 
+def _verify_lecture_checkpoint(
+    db: Session, api: ApiKey, student: StudentProfile | None, meta: dict,
+    success: bool, behavior: dict | None,
+) -> dict:
+    """강의 체크포인트 채점 후처리 — 학습 적립(_credit_student)을 아예 호출하지 않는다.
+
+    LearningAttempt·코인·오늘의퀴즈·오답노트 전부 비생성. 대신 체크포인트 이벤트를
+    기록하고 통과 시 다음 지점을 재예약한다. meta.cp와 진행 행의 현재
+    next_checkpoint_sec 일치를 검증해 오래된 토큰 재사용(이미 지난 체크포인트로
+    카운트 올리기)을 차단한다. 행동데이터는 source_type='lecture'로 적재.
+    """
+    from app.models import LectureWatchProgress
+    from app.services import lecture_service
+
+    if not api.first_party:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN, detail="이 키로는 강의 시청 검증을 사용할 수 없어요."
+        )
+    if student is None:
+        raise HTTPException(
+            status.HTTP_401_UNAUTHORIZED, detail="강의 확인 문제는 학생 로그인이 필요해요."
+        )
+    lecture_id = str(meta.get("lec"))
+    cp = meta.get("cp")
+    progress = (
+        db.query(LectureWatchProgress)
+        .filter(
+            LectureWatchProgress.student_id == student.id,
+            LectureWatchProgress.lecture_id == lecture_id,
+        )
+        .first()
+    )
+    if progress is None or progress.next_checkpoint_sec != cp:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, detail="이미 지나간 확인 문제예요. 새 문제를 받아 주세요."
+        )
+    cs.record_behavior_event(
+        db,
+        organization_id=student.organization_id or api.organization_id,
+        student_id=student.id,
+        source_type="lecture",
+        behavior=behavior,
+        correct=success,
+    )
+    updated = lecture_service.record_checkpoint(
+        db, student_id=student.id, lecture_id=lecture_id,
+        position_sec=int(cp or 0), passed=success,
+    )
+    return {
+        "watched_max_sec": int(updated.watched_max_sec or 0),
+        "next_checkpoint_sec": updated.next_checkpoint_sec,
+        "checkpoints_passed": int(updated.checkpoints_passed or 0),
+        "status": updated.status,
+    }
+
+
 class _VerifyReq(BaseModel):
     challenge_token: str
     answer: object  # 문자열 또는 배열(그림 다중선택)
@@ -455,21 +591,29 @@ def verify(
         # 끌어다 놓기의 드롭 거리는 서버 채점값을 기록 (클라이언트 자기신고 대체)
         if "drop_distance_norm" in result:
             behavior = {**behavior, "drop_distance_norm": result["drop_distance_norm"]}
-        # 인증 학생의 행동데이터는 본인 귀속 — JWT로 검증된 신원을 명시 전달.
-        # (behavior dict에 student_id를 실어 보내던 방식은 record_behavior의
-        #  '키 기관 일치' 재검증에 걸려 인앱(1st-party) 학생이 전부 익명 적재되던 버그)
-        cs.record_behavior(
-            db, api, behavior, bool(result.get("success")), verified_student=student
-        )
-        # 연습장 필기 원본 저장 — 인증 학생 + scratch가 있을 때만(과목·문항별, B 백엔드).
-        # 원본은 무제한 저장(사용자 방침). 재생 스코프·보존/파기·동의는 별도 계층에서 처리.
-        if student is not None and isinstance(behavior, dict):
-            _store_scratch(db, student, meta, behavior.get("scratch"))
-        # 인앱(인증 학생) 풀이는 학습기록으로 적립 — 코인·진도·오늘의퀴즈 (실전 모드 대체)
-        if student is not None and meta.get("subj"):
-            result["session"] = _credit_student(
-                db, student, meta, bool(result.get("success")), req.answer, solve_time_ms=solve_ms
+        if meta.get("lec"):
+            # 강의 시청 체크포인트 — 학습 적립 경로(_credit_student)를 타지 않는다
+            # (LearningAttempt·코인·오늘의퀴즈·오답노트 비생성). 이벤트 기록 + 재예약만.
+            result["lecture"] = _verify_lecture_checkpoint(
+                db, api, student, meta, bool(result.get("success")), behavior
             )
+        else:
+            # 인증 학생의 행동데이터는 본인 귀속 — JWT로 검증된 신원을 명시 전달.
+            # (behavior dict에 student_id를 실어 보내던 방식은 record_behavior의
+            #  '키 기관 일치' 재검증에 걸려 인앱(1st-party) 학생이 전부 익명 적재되던 버그)
+            cs.record_behavior(
+                db, api, behavior, bool(result.get("success")), verified_student=student
+            )
+            # 연습장 필기 원본 저장 — 인증 학생 + scratch가 있을 때만(과목·문항별, B 백엔드).
+            # 원본은 무제한 저장(사용자 방침). 재생 스코프·보존/파기·동의는 별도 계층에서 처리.
+            if student is not None and isinstance(behavior, dict):
+                _store_scratch(db, student, meta, behavior.get("scratch"))
+            # 인앱(인증 학생) 풀이는 학습기록으로 적립 — 코인·진도·오늘의퀴즈 (실전 모드 대체)
+            if student is not None and meta.get("subj"):
+                result["session"] = _credit_student(
+                    db, student, meta, bool(result.get("success")), req.answer,
+                    solve_time_ms=solve_ms,
+                )
     cs.log_call(db, api, "captcha/verify", 200 if result["success"] else 400)
     db.commit()
     return result

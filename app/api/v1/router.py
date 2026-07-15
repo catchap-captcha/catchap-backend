@@ -6,6 +6,7 @@ from app.api.v1.endpoints import (
     forest_captcha,
     health,
     institutions,
+    lectures,
     misc,
     notifications,
     ops,
@@ -35,5 +36,6 @@ for _mod in (
     captcha_api,
     forest_captcha,
     widget,
+    lectures,
 ):
     api_router.include_router(_mod.router)

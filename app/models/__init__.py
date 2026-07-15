@@ -26,6 +26,13 @@ from app.models.learning import (
     StudentProgress,
     WrongAnswer,
 )
+from app.models.lecture import (
+    Lecture,
+    LectureCheckpointEvent,
+    LectureMaterial,
+    LectureQuestion,
+    LectureWatchProgress,
+)
 from app.models.membership import Invitation, Membership
 from app.models.misc import (
     AiPrediction,
@@ -88,6 +95,11 @@ __all__ = [
     "Invoice",
     "LearningAttempt",
     "LearningSummary",
+    "Lecture",
+    "LectureCheckpointEvent",
+    "LectureMaterial",
+    "LectureQuestion",
+    "LectureWatchProgress",
     "CaptchaStore",
     "LoginThrottle",
     "Membership",

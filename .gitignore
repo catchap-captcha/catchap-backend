@@ -14,5 +14,8 @@ __pycache__/
 # 로그
 *.log
 
+# 강의 영상 업로드 (LECTURE_MEDIA_DIR)
+media/
+
 # Claude Code working dir (worktrees, jobs)
 .claude/

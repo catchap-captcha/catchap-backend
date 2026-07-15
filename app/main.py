@@ -1,4 +1,5 @@
 import logging
+import re
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -57,8 +58,9 @@ _openapi_url = None if settings.is_production else "/openapi.json"
 app = FastAPI(
     title="CatChap API",
     version="0.1.0",
-    description="어린이 교육용 CAPTCHA API 학습 서비스 — 인증/기관/학습 대시보드와 "
-    "숲속 마을 메인 CAPTCHA, 교육형 CAPTCHA API를 제공합니다.",
+    description="어린이 교육용 CAPTCHA API 학습 서비스 — 인증/기관/학습 대시보드, "
+    "숲속 마을 메인 CAPTCHA, 교육형 CAPTCHA API에 더해 강의 시청 검증"
+    "(영상 시청 중 체크포인트 캡차 게이트로 실제 시청을 확인)을 제공합니다.",
     docs_url=_docs_url,
     redoc_url=_redoc_url,
     openapi_url=_openapi_url,
@@ -76,16 +78,38 @@ app.include_router(api_router, prefix="/api/v1")
 
 _log = logging.getLogger("catchap.main")
 
-# JSON 본문 상한 — 행동 궤적(trace) 같은 배열 입력이 무제한으로 커져 메모리를 소모하지
-# 않게 한다. 파일 업로드 엔드포인트가 없어 전역 1MB로 충분 (궤적 2000점 ≈ 40KB).
+# 요청 본문 상한 — 행동 궤적(trace) 같은 배열 입력이 무제한으로 커져 메모리를 소모하지
+# 않게 한다. 기본 1MB(궤적 2000점 ≈ 40KB). 유일한 예외는 강의 영상 업로드
+# (POST /api/v1/ops/lectures, multipart)로, 그 경로+메서드만 MAX_UPLOAD_BYTES까지 허용한다.
+# 이 미들웨어는 Content-Length 헤더만 검사하고 바디를 버퍼링하지 않으므로, 헤더 위조에
+# 대비한 실제 누적 바이트 재검사는 업로드 엔드포인트(lectures.py)가 청크 복사 중에 수행한다.
 MAX_BODY_BYTES = 1_000_000
+_UPLOAD_PATH = "/api/v1/ops/lectures"  # 정확 일치(하위 경로 PUT/questions 등은 1MB 유지)
+# 강의 자료(자료실) 파일 업로드 — POST /ops/lectures/{id}/materials 정확 형태만.
+# 상한은 영상(500MB)과 분리한 MAX_MATERIAL_UPLOAD_BYTES(50MB): 자료는 문서류라 50MB면
+# 충분하고, 500MB를 그대로 열면 자료 경로가 대용량 업로드 표면(디스크 소모)이 된다.
+# multipart일 때만 예외 — 같은 경로의 link 생성(JSON 본문)은 1MB로 충분하며,
+# JSON 파서는 본문 전체를 메모리에 올리므로 예외를 주면 안 된다.
+_MATERIAL_UPLOAD_RE = re.compile(r"^/api/v1/ops/lectures/[^/]+/materials$")
 
 
 @app.middleware("http")
 async def _limit_body_size(request: Request, call_next):
     cl = request.headers.get("content-length")
-    if cl and cl.isdigit() and int(cl) > MAX_BODY_BYTES:
-        return JSONResponse(status_code=413, content={"detail": "요청 본문이 너무 큽니다."})
+    if cl and cl.isdigit():
+        content_type = (request.headers.get("content-type") or "").lower()
+        if request.method == "POST" and request.url.path == _UPLOAD_PATH:
+            limit = settings.MAX_UPLOAD_BYTES
+        elif (
+            request.method == "POST"
+            and content_type.startswith("multipart/form-data")
+            and _MATERIAL_UPLOAD_RE.match(request.url.path)
+        ):
+            limit = settings.MAX_MATERIAL_UPLOAD_BYTES
+        else:
+            limit = MAX_BODY_BYTES
+        if int(cl) > limit:
+            return JSONResponse(status_code=413, content={"detail": "요청 본문이 너무 큽니다."})
     return await call_next(request)
 
 

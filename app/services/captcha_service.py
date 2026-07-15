@@ -814,8 +814,9 @@ def verify_challenge(db: Session, challenge_token: str, answer) -> dict:
     if not _consume(db, "challenge", data.get("n", ""), data.get("exp", 0)):
         raise HTTPException(status.HTTP_409_CONFLICT, detail="이미 사용된 챌린지예요.")
     kind, target = data["k"], data["a"]
-    # 발급 시 서명해 둔 문항 메타(과목·문항id·일차·복습·은행) — 엔드포인트가 학생 적립에 쓰고 응답 전 제거
-    extra: dict = {"meta": {k: data[k] for k in ("subj", "qid", "day", "rp", "chapter", "stage", "bank") if k in data}}
+    # 발급 시 서명해 둔 문항 메타(과목·문항id·일차·복습·은행·강의 체크포인트) —
+    # 엔드포인트가 학생 적립/체크포인트 처리에 쓰고 응답 전 제거
+    extra: dict = {"meta": {k: data[k] for k in ("subj", "qid", "day", "rp", "chapter", "stage", "bank", "lec", "cp") if k in data}}
     if answer is None:
         # '잘 모르겠어요'(무응답) — 채점 시도 없이 오답 처리. 아래에서 정답·해설을 함께 내려
         # 학생이 찍기 강요 없이 정직하게 오답 처리하고 해설로 공부하게 한다(운 좋은 정답 방지).

@@ -1,0 +1,1343 @@
+"""강의 시청 검증 — 학생 시청(목록/상세/하트비트/스트리밍) + 운영자 강의·문항 CRUD.
+
+  학생(require_student)
+    GET  /lectures                    active 강의 목록 + 내 진행 요약 — (subject, order_no, created_at) 목차순
+    GET  /lectures/{id}               상세 + 진행 + 문항 수 + 자료실(materials) + 과목 목차(toc)
+                                      (순수 조회 — 세션·스트림 URL 없음)
+    GET  /lectures/{id}/materials/{mid}/download
+                                      file 자료 다운로드(FileResponse attachment) — 경로는 자료 id로만 유도
+    POST /lectures/{id}/session       재생 시작 — 서버가 session_id 발급(서명 토큰) + 서명 stream_url.
+                                      다른 활성 세션이 있으면 409(active_elsewhere)
+    POST /lectures/{id}/progress      하트비트 — X-Lecture-Session 토큰으로 세션 식별, 서버 검증
+                                      (속도상한·체크포인트 클램프·동시세션 409·상호작용 면제·의심 가중)
+    POST /lectures/{id}/takeover      이어보기 — 이전 활성 세션 무효화, 새 세션 토큰·stream_url 발급
+    GET  /lectures/{id}/stream?t=     서명 토큰(세션 바인딩) 검증 후 FileResponse(Range 네이티브).
+                                      takeover로 세션이 무효화되면 이전 토큰은 403
+
+  운영자(require_ops) — 학생 실명·개별 기록은 노출하지 않는다(ops PII 금지)
+    GET/POST /ops/lectures            목록 / 업로드(multipart, 청크 복사·누적 바이트 재검사)
+    PUT/DELETE /ops/lectures/{id}     메타 수정 / 소프트 삭제
+    GET/POST/PUT/DELETE /ops/lectures/{id}/questions[/{qid}]  확인 문항 CRUD
+    POST /ops/lectures/{id}/questions/generate                LLM 자동 생성(키 없으면 503)
+    GET/POST/PUT/DELETE /ops/lectures/{id}/materials[/{mid}]  자료실 CRUD
+                                      (POST: kind=link는 JSON, kind=file은 multipart 업로드)
+
+체크포인트 캡차 발급/채점 자체는 공개 캡차 API(captcha_api.py)의 ?lecture= 분기가 담당한다.
+"""
+
+import os
+import re
+import time
+from pathlib import Path
+
+import jwt
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Form,
+    Header,
+    HTTPException,
+    Request,
+    UploadFile,
+    status,
+)
+from fastapi.responses import FileResponse
+from jwt import PyJWTError
+from pydantic import BaseModel
+from sqlalchemy import func
+from sqlalchemy.orm import Session
+
+from app.core.config import get_settings
+from app.core.permissions import Principal, require_ops, require_student
+from app.core.security import decode_token, new_uuid
+from app.db.session import get_db
+from app.models import Lecture, LectureMaterial, LectureQuestion, LectureWatchProgress
+from app.services import auth_service, lecture_service
+from app.services.captcha_service import EDU_SUBJECTS
+from app.utils.helpers import audit
+
+router = APIRouter(tags=["lectures"])
+
+# 확장자·Content-Type 화이트리스트 — 이 둘 밖의 업로드는 거절(경로조작·비디오 위장 차단)
+_MEDIA_TYPES = {".mp4": "video/mp4", ".webm": "video/webm"}
+_ALLOWED_CONTENT_TYPES = {"video/mp4", "video/webm"}
+
+# 강의 자료(자료실) 확장자 화이트리스트 — 문서·이미지·압축만. 실행파일(exe/bat/sh/js …)은
+# 목록에 없으므로 구조적으로 거절된다. 다운로드는 항상 attachment + octet-stream으로
+# 내려보내 브라우저 인라인 실행(HTML/SVG XSS)도 차단한다.
+_MATERIAL_EXTS = {
+    ".pdf", ".zip", ".png", ".jpg", ".jpeg", ".gif",
+    ".hwp", ".hwpx", ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx", ".txt",
+}
+
+_UPLOAD_CHUNK = 1024 * 1024  # 1MB 단위 청크 복사 — 영상 전체를 RAM에 올리지 않는다
+_STREAM_TOKEN_TTL_SEC = 6 * 60 * 60  # 스트림 서명 토큰 유효기간 6시간
+# 세션 토큰 유효기간 — 스트림 토큰과 동일 6시간. 만료보다 중요한 무효화 수단은
+# takeover(세션 교체)다: progress.session_id가 바뀌는 순간 이전 토큰은 즉시 죽는다.
+_SESSION_TOKEN_TTL_SEC = 6 * 60 * 60
+
+RATE_HEARTBEAT_PER_HOUR = 720  # 하트비트 — 5초 간격 시청 기준 여유
+RATE_UPLOAD_PER_HOUR = 20
+RATE_MATERIAL_UPLOAD_PER_HOUR = 40  # 자료 '파일' 업로드만 — link 생성(JSON)은 대상 아님
+# 세션 발급 상한 — 정상 사용(재생 시작·새로고침)은 시간당 수 회. 발급 스팸으로 자기
+# session_id를 회전시키며 진행 행을 흔드는 것을 억제한다.
+RATE_SESSION_PER_HOUR = 60
+# takeover 상한 — 두 세션이 하트비트마다 번갈아 takeover하면 동시 재생 차단이 무력화되므로
+# 별도의 낮은 상한을 둔다. 정상 사용(새로고침·기기 이동)은 시간당 수 회를 넘지 않는다.
+RATE_TAKEOVER_PER_HOUR = 30
+
+
+def _client_ip(request: Request) -> str:
+    return request.client.host if request.client else "unknown"
+
+
+def _media_dir() -> Path:
+    return Path(get_settings().LECTURE_MEDIA_DIR)
+
+
+def _video_path(lec: Lecture) -> Path:
+    # 경로는 DB에 저장하지 않는다 — id(UUID)+화이트리스트 확장자로만 유도(경로조작 원천 차단)
+    return _media_dir() / f"{lec.id}{lec.video_ext}"
+
+
+def _materials_dir() -> Path:
+    return _media_dir() / "materials"
+
+
+def _material_path(mat: LectureMaterial) -> Path:
+    # 영상과 동일 원칙 — 자료 파일 경로도 id(UUID)+화이트리스트 확장자로만 유도
+    return _materials_dir() / f"{mat.id}{mat.file_ext}"
+
+
+# ---------------------------------------------------------------- 세션·스트림 서명 토큰
+# 세션 식별자는 서버만 발급한다(new_uuid). 클라이언트가 만든 식별자는 어떤 경로로도
+# 신뢰하지 않는다 — 클라 생성 viewer_id를 그대로 믿었다가 검증을 우회당한 선행 사고
+# (LectureCaptcha)와 동형의 구멍이므로, 클라에는 원문 session_id 대신 '서명된 세션
+# 토큰'을 쥐여 주고 서버가 토큰에서 session_id를 복원한다(위조·임의 조합 불가).
+def _sign_session_token(session_id: str, student_id: str, lecture_id: str) -> str:
+    """시청 세션 토큰 — 서버 발급 session_id를 학생·강의에 바인딩해 서명."""
+    settings = get_settings()
+    payload = {
+        "type": "lecture-session",
+        "sid": session_id,
+        "sub": student_id,
+        "lec": lecture_id,
+        "exp": int(time.time()) + _SESSION_TOKEN_TTL_SEC,
+    }
+    return jwt.encode(payload, settings.JWT_SECRET_KEY, algorithm=settings.JWT_ALGORITHM)
+
+
+def _verify_session_token(token: str | None, lecture_id: str, student_id: str) -> str:
+    """세션 토큰 검증 → session_id. 서명·만료·강의·학생 불일치는 전부 403.
+
+    student_id까지 대조한다 — 남의 세션 토큰을 훔쳐 와도 본인 JWT와 조합할 수 없다."""
+    if not token:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            detail="시청 세션 토큰이 필요합니다. 재생 시작(POST /session)으로 발급받으세요.",
+        )
+    try:
+        payload = decode_token(token)
+    except PyJWTError:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail="시청 세션 토큰이 유효하지 않습니다.")
+    if (
+        payload.get("type") != "lecture-session"
+        or payload.get("lec") != lecture_id
+        or payload.get("sub") != student_id
+    ):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail="시청 세션 토큰이 유효하지 않습니다.")
+    return str(payload.get("sid", ""))
+
+
+def _sign_stream_token(lecture_id: str, student_id: str, session_id: str) -> str:
+    """스트림 접근 토큰 — JWT_SECRET 재사용, 강의·학생·세션·만료(6h) 바인딩.
+
+    <video src>는 Authorization 헤더를 못 실으므로 쿼리 서명으로 인가한다.
+    session_id 바인딩이 핵심 — takeover로 세션이 교체되면 이전 스트림 URL은
+    서명이 유효해도 403(두 번째 기기는 영상 바이트 자체를 못 받는다)."""
+    settings = get_settings()
+    payload = {
+        "type": "lecture-stream",
+        "lec": lecture_id,
+        "sub": student_id,
+        "sid": session_id,
+        "exp": int(time.time()) + _STREAM_TOKEN_TTL_SEC,
+    }
+    return jwt.encode(payload, settings.JWT_SECRET_KEY, algorithm=settings.JWT_ALGORITHM)
+
+
+def _verify_stream_token(token: str | None, lecture_id: str) -> tuple[str, str]:
+    """서명·만료·강의 바인딩 검증 → (student_id, session_id). 불일치는 전부 403.
+
+    세션이 아직 활성인지(progress.session_id 일치)는 호출자가 DB로 검사한다."""
+    if not token:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail="스트림 접근 토큰이 필요합니다.")
+    try:
+        payload = decode_token(token)
+    except PyJWTError:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail="스트림 토큰이 유효하지 않습니다.")
+    if payload.get("type") != "lecture-stream" or payload.get("lec") != lecture_id:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail="스트림 토큰이 유효하지 않습니다.")
+    return str(payload.get("sub", "")), str(payload.get("sid", ""))
+
+
+# ---------------------------------------------------------------- 조회 공통
+def _active_question_count(db: Session, lecture_id: str) -> int:
+    return (
+        db.query(func.count(LectureQuestion.id))
+        .filter(
+            LectureQuestion.lecture_id == lecture_id,
+            LectureQuestion.status == "active",
+        )
+        .scalar()
+        or 0
+    )
+
+
+def _progress_dict(p: LectureWatchProgress | None) -> dict | None:
+    if p is None:
+        return None
+    return {
+        "watched_max_sec": int(p.watched_max_sec or 0),
+        "next_checkpoint_sec": p.next_checkpoint_sec,
+        "checkpoints_passed": int(p.checkpoints_passed or 0),
+        "status": p.status,
+    }
+
+
+def _get_active_lecture(db: Session, lecture_id: str) -> Lecture:
+    lec = db.get(Lecture, lecture_id)
+    if lec is None or lec.status != "active":
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="강의를 찾을 수 없어요.")
+    return lec
+
+
+# ================================================================ 학생
+def _progress_map(db: Session, student_id: str, lecture_ids: list[str]) -> dict:
+    return {
+        p.lecture_id: p
+        for p in db.query(LectureWatchProgress)
+        .filter(
+            LectureWatchProgress.student_id == student_id,
+            LectureWatchProgress.lecture_id.in_(lecture_ids or [""]),
+        )
+        .all()
+    }
+
+
+def _student_lecture_item(db: Session, lec: Lecture, progress: LectureWatchProgress | None) -> dict:
+    return {
+        "id": lec.id,
+        "title": lec.title,
+        "description": lec.description,
+        "subject": lec.subject,
+        "order_no": int(lec.order_no or 0),
+        "duration_sec": lec.duration_sec,
+        "question_count": _active_question_count(db, lec.id),
+        "progress": _progress_dict(progress),
+    }
+
+
+def _student_material_item(m: LectureMaterial) -> dict:
+    """학생용 자료 항목 — file은 내부 경로 대신 다운로드 엔드포인트 경로만 노출."""
+    item = {
+        "id": m.id,
+        "title": m.title,
+        "kind": m.kind,
+        "order_no": int(m.order_no or 0),
+        "file_ext": m.file_ext,
+        "file_bytes": int(m.file_bytes or 0),
+    }
+    if m.kind == "link":
+        item["url"] = m.url  # 외부 URL — 프론트가 직접 새 탭으로 연다
+    else:
+        item["download_url"] = f"/api/v1/lectures/{m.lecture_id}/materials/{m.id}/download"
+    return item
+
+
+def _active_materials(db: Session, lecture_id: str) -> list[LectureMaterial]:
+    return (
+        db.query(LectureMaterial)
+        .filter(
+            LectureMaterial.lecture_id == lecture_id,
+            LectureMaterial.status == "active",
+        )
+        .order_by(LectureMaterial.order_no, LectureMaterial.created_at)
+        .all()
+    )
+
+
+@router.get("/lectures")
+def list_lectures(
+    subject: str | None = None,
+    principal: Principal = Depends(require_student),
+    db: Session = Depends(get_db),
+):
+    # 목차 정렬 — 같은 과목 안에서 order_no 오름차순이 1강·2강… 순서다.
+    # order_no가 같으면(레거시 0 포함) 업로드 순(created_at asc)으로 안정 정렬.
+    q = db.query(Lecture).filter(Lecture.status == "active")
+    if subject:
+        q = q.filter(Lecture.subject == subject)
+    rows = q.order_by(Lecture.subject, Lecture.order_no, Lecture.created_at).all()
+
+    progress = _progress_map(db, principal.id, [r.id for r in rows])
+    return [_student_lecture_item(db, lec, progress.get(lec.id)) for lec in rows]
+
+
+@router.get("/lectures/{lecture_id}")
+def lecture_detail(
+    lecture_id: str,
+    principal: Principal = Depends(require_student),
+    db: Session = Depends(get_db),
+):
+    lec = _get_active_lecture(db, lecture_id)
+    progress = lecture_service.ensure_progress(db, principal.id, lec)
+    db.commit()  # 최초 진입 시 진행 행(첫 체크포인트 예약 포함) 확정
+    # 같은 과목의 강의 목차(사이드바용) — 목록과 동일한 (order_no, created_at) 오름차순
+    toc_rows = (
+        db.query(Lecture)
+        .filter(Lecture.status == "active", Lecture.subject == lec.subject)
+        .order_by(Lecture.order_no, Lecture.created_at)
+        .all()
+    )
+    toc_progress = _progress_map(db, principal.id, [r.id for r in toc_rows])
+    # 순수 조회 — 세션·stream_url을 주지 않는다. 상세만 열어 본 사용자가 다른 기기의
+    # 시청을 차단(오탐)하지 않게, 재생 시작은 POST /session으로 명시적으로 분리했다.
+    return {
+        "id": lec.id,
+        "title": lec.title,
+        "description": lec.description,
+        "subject": lec.subject,
+        "order_no": int(lec.order_no or 0),
+        "duration_sec": lec.duration_sec,
+        "question_count": _active_question_count(db, lec.id),
+        "progress": _progress_dict(progress),
+        "next_checkpoint_sec": progress.next_checkpoint_sec,
+        # 자료실 — file 자료는 내부 경로가 아니라 다운로드 엔드포인트 경로만 노출
+        "materials": [_student_material_item(m) for m in _active_materials(db, lec.id)],
+        # 과목 목차 — 강의실 사이드바가 바로 그릴 수 있는 형태(내 진행 포함)
+        "toc": [
+            _student_lecture_item(db, r, toc_progress.get(r.id)) for r in toc_rows
+        ],
+    }
+
+
+def _session_response(progress: LectureWatchProgress, lec: Lecture, session_id: str) -> dict:
+    """세션 발급/이어받기 공통 응답 — 서명 세션 토큰 + 세션 바인딩 stream_url + 진행 정본."""
+    token = _sign_session_token(session_id, progress.student_id, lec.id)
+    stream_token = _sign_stream_token(lec.id, progress.student_id, session_id)
+    return {
+        "ok": True,
+        "session_id": session_id,  # 표시·디버깅용 — 인증은 오직 서명 토큰으로만 한다
+        "session_token": token,  # 하트비트·takeover의 X-Lecture-Session 헤더 값
+        "stream_url": f"/api/v1/lectures/{lec.id}/stream?t={stream_token}",
+        "watched_max_sec": int(progress.watched_max_sec or 0),
+        "next_checkpoint_sec": progress.next_checkpoint_sec,
+        "checkpoints_passed": int(progress.checkpoints_passed or 0),
+        "status": progress.status,
+        "duration_sec": int(lec.duration_sec or 0),
+    }
+
+
+@router.post("/lectures/{lecture_id}/session")
+def lecture_session_start(
+    lecture_id: str,
+    principal: Principal = Depends(require_student),
+    db: Session = Depends(get_db),
+):
+    """재생 시작 — 서버가 session_id를 발급(new_uuid)하고 서명 토큰으로 반환.
+
+    클라이언트 생성 식별자는 받지 않는다(담합 우회 차단: 두 기기가 값을 짜고 와도
+    각자 다른 서버 세션을 받게 되어 두 번째는 409). 같은 학생의 다른 활성 세션이
+    살아 있으면 409(active_elsewhere) — 이어보기는 POST /takeover."""
+    auth_service.rate_limit(
+        db, f"lect-ss:{principal.id}", limit=RATE_SESSION_PER_HOUR, window_seconds=3600
+    )
+    lec = _get_active_lecture(db, lecture_id)
+    progress = lecture_service.ensure_progress(db, principal.id, lec)
+    session_id = new_uuid()  # 서버 발급 — 클라 입력이 끼어들 자리가 없다
+    lecture_service.claim_session(db, progress, session_id)  # 동시 세션이면 409
+    db.commit()
+    return _session_response(progress, lec, session_id)
+
+
+class _ProgressReq(BaseModel):
+    position_sec: int
+    # 직전 하트비트 이후 pointermove/click/keydown이 있었나 — 자기신고(위조 가능).
+    # 체크포인트 도달 시 캡차 면제(연속 상한 있음)에만 쓰인다. 봇 차단 수단이 아니다.
+    interacted: bool = False
+    # 탭이 백그라운드였나 — 자기신고(위조 가능, 참고용 의심 가중).
+    tab_hidden: bool = False
+    # (제거됨) session_id — 세션 식별은 X-Lecture-Session 서명 토큰으로만 한다.
+    # 본문에 session_id를 실어 보내도 무시된다(pydantic이 미정의 필드를 버린다).
+
+
+@router.post("/lectures/{lecture_id}/progress")
+def lecture_progress(
+    lecture_id: str,
+    req: _ProgressReq,
+    x_lecture_session: str | None = Header(default=None),
+    principal: Principal = Depends(require_student),
+    db: Session = Depends(get_db),
+):
+    """시청 하트비트 — 클라이언트 position은 참고값일 뿐, 서버가 검증한 정본을 돌려준다.
+
+    세션 식별은 X-Lecture-Session 헤더의 서명 토큰(POST /session 발급)으로만 한다 —
+    클라가 지어낸 session_id는 어디에도 끼지 못한다. 같은 학생의 다른 활성 세션
+    (다른 강의 포함)이 살아 있으면 409(active_elsewhere) — 동시 재생은 캡차가 아니라
+    차단이다. 이어보기는 POST /takeover."""
+    auth_service.rate_limit(
+        db, f"lect-hb:{principal.id}", limit=RATE_HEARTBEAT_PER_HOUR, window_seconds=3600
+    )
+    session_id = _verify_session_token(x_lecture_session, lecture_id, principal.id)
+    lec = _get_active_lecture(db, lecture_id)
+    progress = lecture_service.ensure_progress(db, principal.id, lec)
+    lecture_service.claim_session(db, progress, session_id)  # 동시 세션이면 409
+    state = lecture_service.advance(
+        db, progress, lec, req.position_sec,
+        interacted=req.interacted, tab_hidden=req.tab_hidden,
+    )
+    db.commit()
+    return state
+
+
+@router.post("/lectures/{lecture_id}/takeover")
+def lecture_takeover(
+    lecture_id: str,
+    principal: Principal = Depends(require_student),
+    db: Session = Depends(get_db),
+):
+    """이어보기 — 이전 활성 세션(새로고침 전 탭·다른 기기)을 무효화하고 '새' 서버 세션을
+    발급해 이어받는다. 응답은 POST /session과 같은 형태(새 session_token·stream_url).
+
+    호출자는 아직 유효한 세션 토큰이 없다(자기 발급 시도가 409를 받은 상태) — 그래서
+    이 엔드포인트는 학생 JWT + 별도 상한(RATE_TAKEOVER_PER_HOUR)으로만 보호한다.
+    두 세션이 번갈아 takeover를 스팸해 동시 차단을 우회하는 것은 이 상한이 막는다.
+    무효화된 쪽의 다음 하트비트·스트림 요청은 각각 409/403을 받는다."""
+    auth_service.rate_limit(
+        db, f"lect-tk:{principal.id}", limit=RATE_TAKEOVER_PER_HOUR, window_seconds=3600
+    )
+    lec = _get_active_lecture(db, lecture_id)
+    progress = lecture_service.ensure_progress(db, principal.id, lec)
+    session_id = new_uuid()  # takeover도 서버 발급 — 이전 세션과 절대 겹치지 않는다
+    lecture_service.claim_session(db, progress, session_id, force=True)
+    db.commit()
+    return _session_response(progress, lec, session_id)
+
+
+@router.get("/lectures/{lecture_id}/stream")
+def lecture_stream(
+    lecture_id: str,
+    t: str | None = None,
+    db: Session = Depends(get_db),
+):
+    """영상 스트리밍 — 서명 토큰(쿼리) 인가 + 세션 활성 검사 후 FileResponse.
+
+    토큰의 session_id가 현재 progress.session_id와 다르면 403 — takeover로 세션이
+    교체된 순간 이전 기기의 스트림 URL이 즉시 죽는다(동시 차단이 '진도 인정'만이
+    아니라 영상 바이트 전달에도 걸린다). 매 Range 요청마다 진행 행 1건을 조회하는
+    비용은 유니크 인덱스(student_id, lecture_id) 단건 조회라 수용한다 — TTL(생존)
+    검사는 하지 않는다: 일시정지로 하트비트가 끊겨도 세션이 교체되지 않았다면
+    이어서 seek할 수 있어야 하고, 무효화의 정본은 takeover(세션 교체)이기 때문.
+
+    starlette FileResponse가 Range(206 부분응답)를 네이티브 처리한다 — 인메모리
+    lru_cache 서빙(정적 에셋 방식)은 영상엔 금지(RAM 폭발 + Range 미지원)."""
+    student_id, session_id = _verify_stream_token(t, lecture_id)
+    lec = _get_active_lecture(db, lecture_id)
+    progress = (
+        db.query(LectureWatchProgress)
+        .filter(
+            LectureWatchProgress.student_id == student_id,
+            LectureWatchProgress.lecture_id == lecture_id,
+        )
+        .first()
+    )
+    if progress is None or not session_id or progress.session_id != session_id:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            detail="이 시청 세션은 더 이상 유효하지 않습니다. 다른 곳에서 재생이 시작되었어요.",
+        )
+    media_type = _MEDIA_TYPES.get(lec.video_ext or "")
+    if media_type is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="영상 형식이 올바르지 않습니다.")
+    path = _video_path(lec)
+    if not path.is_file():
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="영상 파일을 찾을 수 없습니다.")
+    return FileResponse(str(path), media_type=media_type)
+
+
+@router.get("/lectures/{lecture_id}/materials/{material_id}/download")
+def lecture_material_download(
+    lecture_id: str,
+    material_id: str,
+    principal: Principal = Depends(require_student),
+    db: Session = Depends(get_db),
+):
+    """file 자료 다운로드 — 경로는 자료 id(UUID)+화이트리스트 확장자로만 유도(경로조작 차단).
+
+    항상 attachment + octet-stream으로 내려보낸다 — 브라우저 인라인 렌더(HTML/SVG류 XSS)를
+    구조적으로 막는다. link 자료는 프론트가 url로 직접 이동하므로 이 엔드포인트 대상이 아니다."""
+    _get_active_lecture(db, lecture_id)  # hidden/deleted 강의의 자료는 학생에게 닫힌다
+    mat = db.get(LectureMaterial, material_id)
+    if mat is None or mat.lecture_id != lecture_id or mat.status != "active":
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="자료를 찾을 수 없습니다.")
+    if mat.kind != "file" or not mat.file_ext:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST, detail="링크 자료는 다운로드가 아니라 URL로 이동합니다."
+        )
+    path = _material_path(mat)
+    if not path.is_file():
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="자료 파일을 찾을 수 없습니다.")
+    # 파일명은 제목+확장자 — 헤더를 깨는 문자(경로 구분자·따옴표·개행)만 치환
+    safe_title = re.sub(r'[\\/\r\n"]', "_", mat.title).strip() or "material"
+    return FileResponse(
+        str(path),
+        media_type="application/octet-stream",
+        filename=f"{safe_title}{mat.file_ext}",
+    )
+
+
+# ================================================================ 운영자
+def _lecture_row(db: Session, lec: Lecture) -> dict:
+    total = (
+        db.query(func.count(LectureQuestion.id))
+        .filter(
+            LectureQuestion.lecture_id == lec.id,
+            LectureQuestion.status != "deleted",
+        )
+        .scalar()
+        or 0
+    )
+    return {
+        "id": lec.id,
+        "title": lec.title,
+        "description": lec.description,
+        "subject": lec.subject,
+        "video_ext": lec.video_ext,
+        "video_bytes": lec.video_bytes,
+        "duration_sec": lec.duration_sec,
+        "check_min_sec": lec.check_min_sec,
+        "check_max_sec": lec.check_max_sec,
+        "status": lec.status,
+        "order_no": int(lec.order_no or 0),
+        "question_count": int(total),
+        "active_question_count": _active_question_count(db, lec.id),
+        "created_at": lec.created_at.isoformat() if lec.created_at else None,
+    }
+
+
+@router.get("/ops/lectures")
+def ops_list_lectures(
+    principal: Principal = Depends(require_ops), db: Session = Depends(get_db)
+):
+    # 운영자 목록도 목차순 — 콘솔에서 보이는 순서가 학생 목차와 일치해야 재배열이 예측 가능하다
+    rows = (
+        db.query(Lecture)
+        .filter(Lecture.status != "deleted")
+        .order_by(Lecture.subject, Lecture.order_no, Lecture.created_at)
+        .all()
+    )
+    return [_lecture_row(db, lec) for lec in rows]
+
+
+def _copy_upload_to_tmp(upload: UploadFile, tmp_path: Path, limit: int) -> int:
+    """업로드를 임시파일로 청크 복사 — 누적 바이트가 limit를 넘으면 임시파일 삭제 + 413.
+
+    전역 미들웨어는 Content-Length 헤더만 보므로(바디 미버퍼링), 헤더를 속인 초과 업로드는
+    여기서 실제로 쓴 바이트 기준으로 잘라낸다."""
+    total = 0
+    try:
+        with open(tmp_path, "wb") as f:
+            while True:
+                chunk = upload.file.read(_UPLOAD_CHUNK)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > limit:
+                    raise HTTPException(
+                        status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                        detail="업로드 파일이 허용 크기를 초과했습니다.",
+                    )
+                f.write(chunk)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
+    return total
+
+
+@router.post("/ops/lectures")
+def ops_create_lecture(
+    request: Request,
+    title: str = Form(...),
+    subject: str = Form(...),
+    duration_sec: int = Form(...),
+    description: str | None = Form(default=None),
+    check_min_sec: int = Form(default=60),
+    check_max_sec: int = Form(default=180),
+    order_no: int | None = Form(default=None),  # 미지정 → 과목 맨 뒤(max+1)
+    file: UploadFile = File(...),
+    principal: Principal = Depends(require_ops),
+    db: Session = Depends(get_db),
+):
+    """강의 업로드(multipart) — 임시파일 청크 기록 → 원자적 이동 → DB commit.
+
+    실패 시 파일을 남기지 않는다. 성공 응답은 실제 파일이 최종 경로에 존재할 때만 나간다."""
+    auth_service.rate_limit(
+        db, f"lect-upload:{_client_ip(request)}", limit=RATE_UPLOAD_PER_HOUR, window_seconds=3600
+    )
+    if subject not in EDU_SUBJECTS:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="지원하지 않는 과목입니다.")
+    if duration_sec <= 0:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="영상 길이(duration_sec)가 필요합니다.")
+    if not (1 <= check_min_sec <= check_max_sec):
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST, detail="체크포인트 간격(min≤max, 1초 이상)이 올바르지 않습니다."
+        )
+    ext = os.path.splitext(file.filename or "")[1].lower()
+    if ext not in _MEDIA_TYPES:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST, detail="mp4/webm 영상만 업로드할 수 있습니다."
+        )
+    if (file.content_type or "").lower() not in _ALLOWED_CONTENT_TYPES:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST, detail="영상 Content-Type(video/mp4·video/webm)이 아닙니다."
+        )
+    if order_no is None:
+        # 목차 맨 뒤 자동 배정 — 같은 과목의 현재 최대 order_no + 1
+        max_no = (
+            db.query(func.max(Lecture.order_no))
+            .filter(Lecture.subject == subject, Lecture.status != "deleted")
+            .scalar()
+            or 0
+        )
+        order_no = int(max_no) + 1
+
+    lec = Lecture(
+        title=title.strip()[:200],
+        description=description,
+        subject=subject,
+        video_ext=ext,
+        video_bytes=0,
+        duration_sec=duration_sec,
+        check_min_sec=check_min_sec,
+        check_max_sec=check_max_sec,
+        status="active",
+        order_no=order_no,
+        uploaded_by=principal.id,
+    )
+    db.add(lec)
+    db.flush()  # id 확정 — 파일명은 {id}{ext}
+
+    media_dir = _media_dir()
+    media_dir.mkdir(parents=True, exist_ok=True)
+    tmp_path = media_dir / f".upload-{lec.id}.tmp"
+    final_path = media_dir / f"{lec.id}{ext}"
+    try:
+        total = _copy_upload_to_tmp(file, tmp_path, get_settings().MAX_UPLOAD_BYTES)
+        if total == 0:
+            tmp_path.unlink(missing_ok=True)
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="빈 파일은 업로드할 수 없습니다.")
+        os.replace(tmp_path, final_path)  # 같은 디렉터리 내 원자적 이동
+    except BaseException:
+        db.rollback()  # 강의 행도 함께 폐기 — 파일 없는 유령 강의를 만들지 않는다
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+    try:
+        lec.video_bytes = total
+        audit(
+            db,
+            action="lecture.create",
+            actor_user_id=principal.id,
+            target_type="lecture",
+            target_id=lec.id,
+            after={
+                "title": lec.title,
+                "subject": lec.subject,
+                "video_ext": ext,
+                "video_bytes": total,
+                "duration_sec": duration_sec,
+                "order_no": order_no,
+            },
+        )
+        db.commit()
+    except BaseException:
+        final_path.unlink(missing_ok=True)  # DB 확정 실패 — 고아 파일 제거
+        raise
+    return _lecture_row(db, lec)
+
+
+class _LectureUpdate(BaseModel):
+    title: str | None = None
+    description: str | None = None
+    subject: str | None = None
+    duration_sec: int | None = None
+    check_min_sec: int | None = None
+    check_max_sec: int | None = None
+    order_no: int | None = None  # 과목 내 목차 순서 재배열
+    status: str | None = None  # active|hidden
+
+
+@router.put("/ops/lectures/{lecture_id}")
+def ops_update_lecture(
+    lecture_id: str,
+    req: _LectureUpdate,
+    principal: Principal = Depends(require_ops),
+    db: Session = Depends(get_db),
+):
+    """메타만 수정 — 영상 파일 교체는 별도 업로드(새 강의)로 처리한다."""
+    lec = db.get(Lecture, lecture_id)
+    if lec is None or lec.status == "deleted":
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="강의를 찾을 수 없습니다.")
+    if req.subject is not None and req.subject not in EDU_SUBJECTS:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="지원하지 않는 과목입니다.")
+    if req.status is not None and req.status not in ("active", "hidden"):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="status는 active|hidden만 가능합니다.")
+
+    before = {
+        "title": lec.title, "subject": lec.subject, "status": lec.status,
+        "duration_sec": lec.duration_sec, "order_no": lec.order_no,
+        "check_min_sec": lec.check_min_sec, "check_max_sec": lec.check_max_sec,
+    }
+    if req.title is not None:
+        lec.title = req.title.strip()[:200]
+    if req.description is not None:
+        lec.description = req.description
+    if req.subject is not None:
+        lec.subject = req.subject
+    if req.duration_sec is not None:
+        if req.duration_sec <= 0:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="영상 길이가 올바르지 않습니다.")
+        lec.duration_sec = req.duration_sec
+    if req.check_min_sec is not None:
+        lec.check_min_sec = req.check_min_sec
+    if req.check_max_sec is not None:
+        lec.check_max_sec = req.check_max_sec
+    if req.order_no is not None:
+        if req.order_no < 0:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="order_no는 0 이상이어야 합니다.")
+        lec.order_no = req.order_no
+    if not (1 <= lec.check_min_sec <= lec.check_max_sec):
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST, detail="체크포인트 간격(min≤max, 1초 이상)이 올바르지 않습니다."
+        )
+    if req.status is not None:
+        lec.status = req.status
+
+    audit(
+        db,
+        action="lecture.update",
+        actor_user_id=principal.id,
+        target_type="lecture",
+        target_id=lec.id,
+        before=before,
+        after={
+            "title": lec.title, "subject": lec.subject, "status": lec.status,
+            "duration_sec": lec.duration_sec, "order_no": lec.order_no,
+            "check_min_sec": lec.check_min_sec, "check_max_sec": lec.check_max_sec,
+        },
+    )
+    db.commit()
+    return _lecture_row(db, lec)
+
+
+@router.delete("/ops/lectures/{lecture_id}")
+def ops_delete_lecture(
+    lecture_id: str,
+    principal: Principal = Depends(require_ops),
+    db: Session = Depends(get_db),
+):
+    """소프트 삭제 + 영상·자료 파일 물리 삭제 — 레코드·시청 이력·문항·자료 행은 보존
+    (status=deleted로 노출만 차단)하되, 무거운 영상/자료 파일은 디스크에서 지운다(삭제된
+    강의는 status 필터로 재생·조회가 안 되므로 파일 부재가 무해하다).
+
+    자료(material)도 함께 소프트 삭제한다 — 부모 강의가 deleted면 자료 CRUD 경로가 전부
+    404가 되어(자료는 부모 강의 존재를 요구) 자료를 개별로 지울 방법이 사라지므로, 여기서
+    같이 정리하지 않으면 자료 파일이 영구 고아로 남는다(바로 이 기능이 막으려는 디스크 누수).
+
+    파일 삭제는 commit '성공 후'에 한다 — commit 전에 지우면 commit 실패 시 파일은 없는데
+    레코드는 active로 남는 최악이 된다. 파일 부재는 status=deleted + *_bytes=0으로
+    나타내고, 원래 크기는 감사 로그 before에 남긴다."""
+    lec = db.get(Lecture, lecture_id)
+    if lec is None or lec.status == "deleted":
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="강의를 찾을 수 없습니다.")
+    video_path = _video_path(lec)  # commit 후에는 속성이 만료되므로 경로를 미리 확정
+    file_existed = video_path.is_file()
+
+    # 이 강의의 살아있는 자료 — 함께 소프트 삭제하고 file 종류는 파일 경로를 미리 모은다
+    materials = (
+        db.query(LectureMaterial)
+        .filter(
+            LectureMaterial.lecture_id == lec.id,
+            LectureMaterial.status != "deleted",
+        )
+        .all()
+    )
+    material_paths: list[Path] = []
+    for m in materials:
+        if m.kind == "file" and m.file_ext:
+            material_paths.append(_material_path(m))
+        m.status = "deleted"
+        m.file_bytes = 0
+
+    before = {"status": lec.status, "video_bytes": int(lec.video_bytes or 0)}
+    lec.status = "deleted"
+    lec.video_bytes = 0
+    audit(
+        db,
+        action="lecture.delete",
+        actor_user_id=principal.id,
+        target_type="lecture",
+        target_id=lec.id,
+        before=before,
+        after={
+            "status": "deleted",
+            "video_file_removed": file_existed,
+            "materials_deleted": len(materials),
+        },
+    )
+    db.commit()
+    video_path.unlink(missing_ok=True)  # 이미 없어도 무해(멱등)
+    for p in material_paths:
+        p.unlink(missing_ok=True)
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------- 문항 CRUD
+def _get_ops_lecture(db: Session, lecture_id: str) -> Lecture:
+    lec = db.get(Lecture, lecture_id)
+    if lec is None or lec.status == "deleted":
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="강의를 찾을 수 없습니다.")
+    return lec
+
+
+def _question_row(q: LectureQuestion) -> dict:
+    # 운영자 편집 화면용 — answer_index 포함(학생 노출 경로가 아님)
+    payload = q.payload or {}
+    return {
+        "id": q.id,
+        "lecture_id": q.lecture_id,
+        "position_sec": q.position_sec,
+        "prompt": payload.get("prompt"),
+        "options": payload.get("options", []),
+        "explain": payload.get("explain"),
+        "answer_index": q.answer_index,
+        "source": q.source,
+        "status": q.status,
+        "order_no": q.order_no,
+    }
+
+
+class _QuestionCreate(BaseModel):
+    position_sec: int = 0
+    prompt: str
+    options: list[str]
+    answer_index: int
+    explain: str | None = None
+    status: str = "active"  # draft|active
+
+
+def _validate_question_body(prompt: str, options: list[str], answer_index: int) -> None:
+    if not prompt.strip():
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="문제(prompt)가 비어 있습니다.")
+    if not (2 <= len(options) <= 6) or any(not str(o).strip() for o in options):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="보기는 2~6개의 비어있지 않은 문자열이어야 합니다.")
+    if not (0 <= answer_index < len(options)):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="answer_index가 보기 범위를 벗어납니다.")
+
+
+@router.get("/ops/lectures/{lecture_id}/questions")
+def ops_list_questions(
+    lecture_id: str,
+    principal: Principal = Depends(require_ops),
+    db: Session = Depends(get_db),
+):
+    _get_ops_lecture(db, lecture_id)
+    rows = (
+        db.query(LectureQuestion)
+        .filter(
+            LectureQuestion.lecture_id == lecture_id,
+            LectureQuestion.status != "deleted",
+        )
+        .order_by(LectureQuestion.position_sec, LectureQuestion.order_no)
+        .all()
+    )
+    return [_question_row(q) for q in rows]
+
+
+@router.post("/ops/lectures/{lecture_id}/questions")
+def ops_create_question(
+    lecture_id: str,
+    req: _QuestionCreate,
+    principal: Principal = Depends(require_ops),
+    db: Session = Depends(get_db),
+):
+    lec = _get_ops_lecture(db, lecture_id)
+    _validate_question_body(req.prompt, req.options, req.answer_index)
+    if req.status not in ("draft", "active"):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="status는 draft|active만 가능합니다.")
+    q = LectureQuestion(
+        lecture_id=lec.id,
+        position_sec=max(0, req.position_sec),
+        payload={
+            "prompt": req.prompt.strip(),
+            "options": [str(o).strip() for o in req.options],
+            "explain": (req.explain or "").strip(),
+        },
+        answer_index=req.answer_index,
+        source="manual",
+        status=req.status,
+        order_no=0,
+    )
+    db.add(q)
+    db.flush()
+    audit(
+        db,
+        action="lecture.question.create",
+        actor_user_id=principal.id,
+        target_type="lecture_question",
+        target_id=q.id,
+        after={"lecture_id": lec.id, "position_sec": q.position_sec, "status": q.status},
+    )
+    db.commit()
+    return _question_row(q)
+
+
+class _QuestionUpdate(BaseModel):
+    position_sec: int | None = None
+    prompt: str | None = None
+    options: list[str] | None = None
+    answer_index: int | None = None
+    explain: str | None = None
+    status: str | None = None  # draft|active
+
+
+@router.put("/ops/lectures/{lecture_id}/questions/{question_id}")
+def ops_update_question(
+    lecture_id: str,
+    question_id: str,
+    req: _QuestionUpdate,
+    principal: Principal = Depends(require_ops),
+    db: Session = Depends(get_db),
+):
+    _get_ops_lecture(db, lecture_id)
+    q = db.get(LectureQuestion, question_id)
+    if q is None or q.lecture_id != lecture_id or q.status == "deleted":
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="문항을 찾을 수 없습니다.")
+    if req.status is not None and req.status not in ("draft", "active"):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="status는 draft|active만 가능합니다.")
+
+    payload = dict(q.payload or {})
+    new_prompt = req.prompt if req.prompt is not None else payload.get("prompt", "")
+    new_options = req.options if req.options is not None else payload.get("options", [])
+    new_answer = req.answer_index if req.answer_index is not None else q.answer_index
+    _validate_question_body(str(new_prompt), list(new_options), int(new_answer))
+
+    before = {"position_sec": q.position_sec, "status": q.status, "answer_index": q.answer_index}
+    payload["prompt"] = str(new_prompt).strip()
+    payload["options"] = [str(o).strip() for o in new_options]
+    if req.explain is not None:
+        payload["explain"] = req.explain.strip()
+    q.payload = payload
+    q.answer_index = int(new_answer)
+    if req.position_sec is not None:
+        q.position_sec = max(0, req.position_sec)
+    if req.status is not None:
+        q.status = req.status
+
+    audit(
+        db,
+        action="lecture.question.update",
+        actor_user_id=principal.id,
+        target_type="lecture_question",
+        target_id=q.id,
+        before=before,
+        after={"position_sec": q.position_sec, "status": q.status, "answer_index": q.answer_index},
+    )
+    db.commit()
+    return _question_row(q)
+
+
+@router.delete("/ops/lectures/{lecture_id}/questions/{question_id}")
+def ops_delete_question(
+    lecture_id: str,
+    question_id: str,
+    principal: Principal = Depends(require_ops),
+    db: Session = Depends(get_db),
+):
+    _get_ops_lecture(db, lecture_id)
+    q = db.get(LectureQuestion, question_id)
+    if q is None or q.lecture_id != lecture_id or q.status == "deleted":
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="문항을 찾을 수 없습니다.")
+    q.status = "deleted"
+    audit(
+        db,
+        action="lecture.question.delete",
+        actor_user_id=principal.id,
+        target_type="lecture_question",
+        target_id=q.id,
+        after={"status": "deleted"},
+    )
+    db.commit()
+    return {"ok": True}
+
+
+class _GenerateReq(BaseModel):
+    n: int = 5
+
+
+@router.post("/ops/lectures/{lecture_id}/questions/generate")
+def ops_generate_questions(
+    lecture_id: str,
+    req: _GenerateReq,
+    principal: Principal = Depends(require_ops),
+    db: Session = Depends(get_db),
+):
+    """LLM 문항 자동 생성 — source=llm, status=draft로 저장(운영자 승인 후 active).
+
+    키 미설정은 503으로 정직하게 알린다(stub 문항 생성 금지)."""
+    from app.clients.ai_client import (
+        AiGenerationError,
+        AiNotConfiguredError,
+        generate_lecture_questions,
+    )
+
+    lec = _get_ops_lecture(db, lecture_id)
+    try:
+        items = generate_lecture_questions(
+            lecture_title=lec.title,
+            description=lec.description,
+            subject=lec.subject,
+            n=req.n,
+        )
+    except AiNotConfiguredError:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="LLM API 키(ANTHROPIC_API_KEY)가 설정되지 않아 문제 자동 생성을 사용할 수 없습니다",
+        )
+    except AiGenerationError as e:
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY, detail=f"문항 자동 생성에 실패했습니다: {e}"
+        )
+
+    created: list[LectureQuestion] = []
+    for item in items:
+        q = LectureQuestion(
+            lecture_id=lec.id,
+            position_sec=0,  # 시점 배치는 운영자가 검수하며 지정
+            payload={
+                "prompt": item["prompt"],
+                "options": item["options"],
+                "explain": item.get("explain", ""),
+            },
+            answer_index=item["answer_index"],
+            source="llm",
+            status="draft",
+        )
+        db.add(q)
+        created.append(q)
+    db.flush()
+    audit(
+        db,
+        action="lecture.question.generate",
+        actor_user_id=principal.id,
+        target_type="lecture",
+        target_id=lec.id,
+        after={"count": len(created), "model": get_settings().LLM_MODEL},
+    )
+    db.commit()
+    return {"created": len(created), "questions": [_question_row(q) for q in created]}
+
+
+# ---------------------------------------------------------------- 자료실(강의 자료) CRUD
+def _material_row(m: LectureMaterial) -> dict:
+    # 운영자 편집 화면용 — url(외부 링크 원문/다운로드 경로 키) 포함. 파일시스템 경로는
+    # DB에도 응답에도 존재하지 않는다({id}{ext} 유도 원칙).
+    return {
+        "id": m.id,
+        "lecture_id": m.lecture_id,
+        "title": m.title,
+        "kind": m.kind,
+        "url": m.url,
+        "file_ext": m.file_ext,
+        "file_bytes": int(m.file_bytes or 0),
+        "order_no": int(m.order_no or 0),
+        "status": m.status,
+        "created_at": m.created_at.isoformat() if m.created_at else None,
+    }
+
+
+def _next_material_order(db: Session, lecture_id: str) -> int:
+    max_no = (
+        db.query(func.max(LectureMaterial.order_no))
+        .filter(
+            LectureMaterial.lecture_id == lecture_id,
+            LectureMaterial.status != "deleted",
+        )
+        .scalar()
+        or 0
+    )
+    return int(max_no) + 1
+
+
+@router.get("/ops/lectures/{lecture_id}/materials")
+def ops_list_materials(
+    lecture_id: str,
+    principal: Principal = Depends(require_ops),
+    db: Session = Depends(get_db),
+):
+    _get_ops_lecture(db, lecture_id)
+    rows = (
+        db.query(LectureMaterial)
+        .filter(
+            LectureMaterial.lecture_id == lecture_id,
+            LectureMaterial.status != "deleted",
+        )
+        .order_by(LectureMaterial.order_no, LectureMaterial.created_at)
+        .all()
+    )
+    return [_material_row(m) for m in rows]
+
+
+def _parse_order_no(raw, db: Session, lecture_id: str) -> int:
+    """order_no 입력 정규화 — 미지정이면 맨 뒤(max+1), 지정 시 0 이상 정수만."""
+    if raw is None or raw == "":
+        return _next_material_order(db, lecture_id)
+    try:
+        order_no = int(raw)
+    except (TypeError, ValueError):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="order_no는 정수여야 합니다.")
+    if order_no < 0:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="order_no는 0 이상이어야 합니다.")
+    return order_no
+
+
+async def _create_link_material(
+    request: Request, lec: Lecture, principal: Principal, db: Session
+) -> dict:
+    """kind=link — JSON(title+url). 외부 URL 원문을 그대로 저장한다(http/https만)."""
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST, detail="link 자료는 JSON 본문(title·url)이 필요합니다."
+        )
+    if not isinstance(body, dict):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="JSON 객체 본문이 필요합니다.")
+    title = str(body.get("title") or "").strip()
+    url = str(body.get("url") or "").strip()
+    if not title:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="제목(title)이 필요합니다.")
+    if not (url.startswith("http://") or url.startswith("https://")):
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST, detail="url은 http(s):// 로 시작하는 외부 링크여야 합니다."
+        )
+    if len(url) > 500:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="url이 너무 깁니다(500자 이하).")
+
+    mat = LectureMaterial(
+        lecture_id=lec.id,
+        title=title[:200],
+        kind="link",
+        url=url,
+        file_ext=None,
+        file_bytes=0,
+        order_no=_parse_order_no(body.get("order_no"), db, lec.id),
+        status="active",
+    )
+    db.add(mat)
+    db.flush()
+    audit(
+        db,
+        action="lecture.material.create",
+        actor_user_id=principal.id,
+        target_type="lecture_material",
+        target_id=mat.id,
+        after={"lecture_id": lec.id, "title": mat.title, "kind": "link", "url": url},
+    )
+    db.commit()
+    return _material_row(mat)
+
+
+async def _create_file_material(
+    request: Request, lec: Lecture, principal: Principal, db: Session
+) -> dict:
+    """kind=file — multipart(title+file). 영상 업로드와 동일 패턴: 임시파일 청크 복사(누적
+    바이트 재검사) → 원자적 이동 → DB commit. 실패 시 파일·행을 남기지 않는다."""
+    auth_service.rate_limit(
+        db,
+        f"lect-mat-upload:{_client_ip(request)}",
+        limit=RATE_MATERIAL_UPLOAD_PER_HOUR,
+        window_seconds=3600,
+    )
+    try:
+        form = await request.form()
+    except Exception:
+        # 깨진/잘린 multipart 본문(프록시가 헤더를 건드렸거나 업로드가 중단된 경우) —
+        # 파서 예외를 500이 아니라 400으로 정직하게 돌려준다. 이 try는 form() 한 줄만
+        # 감싸므로 아래 로직의 HTTPException(400)들을 삼키지 않는다.
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST, detail="multipart 본문을 해석할 수 없습니다."
+        )
+    title = str(form.get("title") or "").strip()
+    upload = form.get("file")
+    if not title:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="제목(title)이 필요합니다.")
+    if upload is None or isinstance(upload, str):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="file 필드(업로드 파일)가 필요합니다.")
+    ext = os.path.splitext(upload.filename or "")[1].lower()
+    if ext not in _MATERIAL_EXTS:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            detail="문서·이미지·압축 파일만 업로드할 수 있습니다(pdf/zip/png/jpg/hwp/docx/pptx 등).",
+        )
+    order_no = _parse_order_no(form.get("order_no"), db, lec.id)
+
+    mat = LectureMaterial(
+        lecture_id=lec.id,
+        title=title[:200],
+        kind="file",
+        url="",  # id 확정(flush) 후 다운로드 경로 키를 채운다
+        file_ext=ext,
+        file_bytes=0,
+        order_no=order_no,
+        status="active",
+    )
+    db.add(mat)
+    db.flush()  # id 확정 — 파일명은 materials/{id}{ext}
+    mat.url = f"/api/v1/lectures/{lec.id}/materials/{mat.id}/download"
+
+    mdir = _materials_dir()
+    mdir.mkdir(parents=True, exist_ok=True)
+    tmp_path = mdir / f".upload-{mat.id}.tmp"
+    final_path = mdir / f"{mat.id}{ext}"
+    try:
+        total = _copy_upload_to_tmp(upload, tmp_path, get_settings().MAX_MATERIAL_UPLOAD_BYTES)
+        if total == 0:
+            tmp_path.unlink(missing_ok=True)
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="빈 파일은 업로드할 수 없습니다.")
+        os.replace(tmp_path, final_path)  # 같은 디렉터리 내 원자적 이동
+    except BaseException:
+        db.rollback()  # 자료 행도 함께 폐기 — 파일 없는 유령 자료를 만들지 않는다
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+    try:
+        mat.file_bytes = total
+        audit(
+            db,
+            action="lecture.material.create",
+            actor_user_id=principal.id,
+            target_type="lecture_material",
+            target_id=mat.id,
+            after={
+                "lecture_id": lec.id,
+                "title": mat.title,
+                "kind": "file",
+                "file_ext": ext,
+                "file_bytes": total,
+            },
+        )
+        db.commit()
+    except BaseException:
+        final_path.unlink(missing_ok=True)  # DB 확정 실패 — 고아 파일 제거
+        raise
+    return _material_row(mat)
+
+
+@router.post("/ops/lectures/{lecture_id}/materials")
+async def ops_create_material(
+    lecture_id: str,
+    request: Request,
+    principal: Principal = Depends(require_ops),
+    db: Session = Depends(get_db),
+):
+    """자료 생성 — kind=file은 multipart(title+file), kind=link는 JSON(title+url).
+
+    FastAPI 시그니처는 본문 형식을 하나로 고정하므로(폼·JSON 동시 선언 불가) Content-Type으로
+    직접 분기한다. 전역 본문 상한 예외(main.py)도 같은 기준(multipart일 때만 50MB)이다."""
+    lec = _get_ops_lecture(db, lecture_id)
+    content_type = (request.headers.get("content-type") or "").lower()
+    if content_type.startswith("multipart/form-data"):
+        return await _create_file_material(request, lec, principal, db)
+    return await _create_link_material(request, lec, principal, db)
+
+
+class _MaterialUpdate(BaseModel):
+    title: str | None = None
+    order_no: int | None = None
+
+
+@router.put("/ops/lectures/{lecture_id}/materials/{material_id}")
+def ops_update_material(
+    lecture_id: str,
+    material_id: str,
+    req: _MaterialUpdate,
+    principal: Principal = Depends(require_ops),
+    db: Session = Depends(get_db),
+):
+    """메타만 수정(title·order_no) — 파일 교체·URL 변경은 삭제 후 재등록으로 처리한다."""
+    _get_ops_lecture(db, lecture_id)
+    mat = db.get(LectureMaterial, material_id)
+    if mat is None or mat.lecture_id != lecture_id or mat.status == "deleted":
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="자료를 찾을 수 없습니다.")
+
+    before = {"title": mat.title, "order_no": mat.order_no}
+    if req.title is not None:
+        if not req.title.strip():
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="제목(title)이 비어 있습니다.")
+        mat.title = req.title.strip()[:200]
+    if req.order_no is not None:
+        if req.order_no < 0:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="order_no는 0 이상이어야 합니다.")
+        mat.order_no = req.order_no
+
+    audit(
+        db,
+        action="lecture.material.update",
+        actor_user_id=principal.id,
+        target_type="lecture_material",
+        target_id=mat.id,
+        before=before,
+        after={"title": mat.title, "order_no": mat.order_no},
+    )
+    db.commit()
+    return _material_row(mat)
+
+
+@router.delete("/ops/lectures/{lecture_id}/materials/{material_id}")
+def ops_delete_material(
+    lecture_id: str,
+    material_id: str,
+    principal: Principal = Depends(require_ops),
+    db: Session = Depends(get_db),
+):
+    """소프트 삭제 + file 종류는 파일 물리 삭제 — 레코드·이력은 보존(status=deleted로
+    노출만 차단). link 종류는 지울 파일이 없다.
+
+    파일 삭제는 commit '성공 후'(강의 삭제와 동일 원칙 — commit 실패 시 파일·레코드 정합 유지).
+    파일 부재는 status=deleted + file_bytes=0으로 나타내고 원래 크기는 감사 before에 남긴다."""
+    _get_ops_lecture(db, lecture_id)
+    mat = db.get(LectureMaterial, material_id)
+    if mat is None or mat.lecture_id != lecture_id or mat.status == "deleted":
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="자료를 찾을 수 없습니다.")
+    file_path = _material_path(mat) if (mat.kind == "file" and mat.file_ext) else None
+    file_existed = file_path.is_file() if file_path is not None else False
+    before = {"status": mat.status, "file_bytes": int(mat.file_bytes or 0)}
+    mat.status = "deleted"
+    if mat.kind == "file":
+        mat.file_bytes = 0
+    audit(
+        db,
+        action="lecture.material.delete",
+        actor_user_id=principal.id,
+        target_type="lecture_material",
+        target_id=mat.id,
+        before=before,
+        after={"status": "deleted", "file_removed": file_existed},
+    )
+    db.commit()
+    if file_path is not None:
+        file_path.unlink(missing_ok=True)  # 이미 없어도 무해(멱등)
+    return {"ok": True}
