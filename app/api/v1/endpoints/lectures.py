@@ -739,6 +739,22 @@ def ops_update_lecture(
             .update({"next_checkpoint_sec": None}, synchronize_session=False)
         )
 
+    # 간격을 바꿔도 이미 예약된 지점은 옛 간격으로 잡혀 있어, 시청 중인 학생에게는
+    # 그 지점을 통과할 때까지 새 설정이 안 먹는다("촘촘히로 바꿨는데 캡차가 안 뜬다").
+    # 새 간격으로 도달 불가능해진 예약만 해제한다 — 다음 하트비트가 새 간격으로 다시 잡는다.
+    # (watched_max + 새 최대간격보다 먼 예약 = 옛 설정의 잔재)
+    if req.check_min_sec is not None or req.check_max_sec is not None:
+        (
+            db.query(LectureWatchProgress)
+            .filter(
+                LectureWatchProgress.lecture_id == lec.id,
+                LectureWatchProgress.next_checkpoint_sec.isnot(None),
+                LectureWatchProgress.next_checkpoint_sec
+                > LectureWatchProgress.watched_max_sec + lec.check_max_sec,
+            )
+            .update({"next_checkpoint_sec": None}, synchronize_session=False)
+        )
+
     audit(
         db,
         action="lecture.update",

@@ -65,7 +65,15 @@ def next_checkpoint(watched_max: int, lec: Lecture, suspicion: int = 0) -> int |
     suspicion(의심 이벤트 누적)이 있으면 간격을 (1+suspicion)로 나눠 좁힌다.
     단 CHECKPOINT_FLOOR_SEC(강의 설정 최소가 그보다 작으면 그 값) 아래로는 내리지
     않는다 — 오탐 누적이 '몇 초마다 캡차' 지옥이 되는 것을 하한으로 차단.
-    영상 길이(duration_sec)를 넘으면 None(남은 체크포인트 없음)."""
+    영상 길이(duration_sec)를 넘으면 None(남은 체크포인트 없음).
+
+    ★ 최소 1회 보장: 간격이 강의 길이보다 길면 체크포인트가 영상 밖으로 나가
+    '시청 검증이 0회인 강의'가 조용히 만들어진다(3분 강의 + '보통' 설정이면 실측
+    66%가 0회). 강사는 간격만 골랐을 뿐 검증을 끄려던 게 아니므로, 아직 한 번도
+    확인하지 않은 강의(watched_max=0)에서는 간격을 영상 안으로 접어 최소 1회는
+    반드시 뜨게 한다. 이미 한 번이라도 확인했다면(watched_max>0) 남은 구간이
+    짧은 건 정상이므로 None을 그대로 돌려준다."""
+    duration = int(lec.duration_sec or 0)
     lo = max(1, int(lec.check_min_sec or 60))
     hi = max(lo, int(lec.check_max_sec or 180))
     s = max(0, int(suspicion or 0))
@@ -73,8 +81,15 @@ def next_checkpoint(watched_max: int, lec: Lecture, suspicion: int = 0) -> int |
         floor = min(CHECKPOINT_FLOOR_SEC, lo)  # 축소가 원래 최소 간격보다 커지지 않게
         lo = max(lo // (1 + s), floor)
         hi = max(hi // (1 + s), lo)
-    cp = int(watched_max) + random.randint(lo, hi)
-    if cp >= int(lec.duration_sec or 0):
+    watched = int(watched_max)
+    # 아직 한 번도 확인 안 한 강의는 반드시 영상 안에서 뽑는다.
+    # lo만 접으면 hi 쪽에서 큰 값이 뽑혀 여전히 영상을 벗어난다(3분+보통 66% 0회) —
+    # 상한을 duration-1로 함께 잘라야 0회가 사라진다.
+    if watched <= 0 and duration > 1:
+        hi = min(hi, duration - 1)
+        lo = min(lo, hi)
+    cp = watched + random.randint(lo, hi)
+    if cp >= duration:
         return None
     return cp
 
