@@ -350,18 +350,33 @@ def _lecture_challenge(db: Session, request: Request, api: ApiKey, lecture_id: s
             detail="이 강의에 출제할 확인 문항이 없어요. 운영자에게 문항 등록을 요청해 주세요.",
         )
     q = random.choice(candidates)
+    from app.api.v1.endpoints.lectures import _question_image_url
+
     payload = q.payload or {}
+    # 이미지 문항 — 화면 캡처 보기는 실제로 본 사람만 고를 수 있다(시청 검증의 핵심).
+    # 이미지가 있을 때만 키를 실어 텍스트 전용 문항의 페이로드는 종전과 동일(하위호환).
+    # URL은 무인증 서빙 엔드포인트 경로뿐 — 어떤 보기 이미지도 정오 신호를 담지 않는다
+    # (answer는 지금처럼 서명 토큰에만 들어간다).
+    opt_imgs = payload.get("option_images") or {}
+    options = []
+    for i, t in enumerate(payload.get("options", [])):
+        opt = {"id": str(i), "text": str(t)}
+        ref = opt_imgs.get(str(i))
+        if isinstance(ref, dict) and ref.get("id"):
+            opt["image"] = _question_image_url(lec.id, q.id, ref)
+        options.append(opt)
     public = {
         "type": "single",  # 위젯 기본(단일 선택) 렌더러 — prompt + options
         "subject": lec.subject,
         "prompt": payload.get("prompt", ""),
         "hint": payload.get("explain") or "",
-        "options": [
-            {"id": str(i), "text": str(t)} for i, t in enumerate(payload.get("options", []))
-        ],
+        "options": options,
         "lecture": lec.id,
         "checkpoint_sec": cp,
     }
+    prompt_ref = payload.get("prompt_image")
+    if isinstance(prompt_ref, dict) and prompt_ref.get("id"):
+        public["prompt_image"] = _question_image_url(lec.id, q.id, prompt_ref)
     meta = {"subj": lec.subject, "lec": lec.id, "cp": cp, "bank": True}
     ch = cs._wrap("single", str(int(q.answer_index)), public, meta)
     return _emit_challenge(db, api, lec.subject, ch)

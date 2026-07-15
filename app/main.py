@@ -91,6 +91,12 @@ _UPLOAD_PATH = "/api/v1/ops/lectures"  # 정확 일치(하위 경로 PUT/questio
 # multipart일 때만 예외 — 같은 경로의 link 생성(JSON 본문)은 1MB로 충분하며,
 # JSON 파서는 본문 전체를 메모리에 올리므로 예외를 주면 안 된다.
 _MATERIAL_UPLOAD_RE = re.compile(r"^/api/v1/ops/lectures/[^/]+/materials$")
+# 확인 문항 이미지(강의 화면 캡처) 업로드 — POST /ops/lectures/{id}/questions/{qid}/images
+# 정확 형태만. 상한은 자료(50MB)보다 훨씬 작은 MAX_QUESTION_IMAGE_BYTES(5MB): 캡처 PNG는
+# 1~3MB 수준이라 충분하고, multipart일 때만 예외(같은 경로에 JSON을 보내는 시도는 1MB 유지).
+_QUESTION_IMAGE_UPLOAD_RE = re.compile(
+    r"^/api/v1/ops/lectures/[^/]+/questions/[^/]+/images$"
+)
 
 
 @app.middleware("http")
@@ -106,6 +112,12 @@ async def _limit_body_size(request: Request, call_next):
             and _MATERIAL_UPLOAD_RE.match(request.url.path)
         ):
             limit = settings.MAX_MATERIAL_UPLOAD_BYTES
+        elif (
+            request.method == "POST"
+            and content_type.startswith("multipart/form-data")
+            and _QUESTION_IMAGE_UPLOAD_RE.match(request.url.path)
+        ):
+            limit = settings.MAX_QUESTION_IMAGE_BYTES
         else:
             limit = MAX_BODY_BYTES
         if int(cl) > limit:

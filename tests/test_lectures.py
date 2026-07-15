@@ -1252,3 +1252,335 @@ def test_lecture_order_no_auto_assign_and_reorder(client, db, seed_org, media_di
     tok = _student_token(client, seed_org)
     rows = client.get("/api/v1/lectures", headers=auth(tok)).json()
     assert [r["title"] for r in rows] == ["나", "가"]
+
+
+# ================================================================ 문항 이미지(화면 캡처 보기)
+def _attach_image(
+    client, ops_tok, lecture_id, question_id, *, slot="prompt", option_index=None,
+    filename="캡처.png", size=4096, content_type="image/png",
+):
+    data = {"slot": slot}
+    if option_index is not None:
+        data["option_index"] = str(option_index)
+    return client.post(
+        f"/api/v1/ops/lectures/{lecture_id}/questions/{question_id}/images",
+        data=data,
+        files={"file": (filename, b"\x02" * size, content_type)},
+        headers=auth(ops_tok),
+    )
+
+
+def _image_id_from_url(url: str) -> str:
+    return url.rsplit("/", 1)[-1]
+
+
+def test_question_image_attach_serve_and_replace(client, db, seed_org, media_dir):
+    """프롬프트·보기 이미지 첨부 → 서빙 200(인라인·무인증) + 교체 시 옛 파일 물리 삭제."""
+    ops_tok = _ops(client, db)
+    lec = _upload_lecture(client, ops_tok).json()
+    q = _add_question(client, ops_tok, lec["id"])
+    qdir = media_dir / "questions"
+
+    # 프롬프트 이미지 첨부 — 파일이 최종 경로에 존재, 임시파일 없음
+    r = _attach_image(client, ops_tok, lec["id"], q["id"], slot="prompt")
+    assert r.status_code == 200, r.text
+    row = r.json()
+    assert row["prompt_image_url"]
+    assert row["option_image_urls"] == [None, None, None, None]
+    img1 = _image_id_from_url(row["prompt_image_url"])
+    assert (qdir / f"{img1}.png").is_file()
+    assert not list(qdir.glob(".upload-*")), "임시파일이 남았다"
+
+    # 보기 1번 이미지 첨부 — 해당 인덱스만 채워진다
+    r2 = _attach_image(client, ops_tok, lec["id"], q["id"], slot="option", option_index=1)
+    assert r2.status_code == 200, r2.text
+    urls = r2.json()["option_image_urls"]
+    assert urls[1] and urls[0] is None and urls[2] is None and urls[3] is None
+
+    # 서빙 — <img>는 Authorization을 못 실으므로 무인증 200 + 인라인 이미지 타입
+    sv = client.get(row["prompt_image_url"])
+    assert sv.status_code == 200, sv.text
+    assert sv.headers["content-type"].startswith("image/png")
+    assert sv.content == b"\x02" * 4096
+
+    # 같은 슬롯 재첨부 = 교체 — 새 id 발급, 옛 파일은 물리 삭제
+    r3 = _attach_image(client, ops_tok, lec["id"], q["id"], slot="prompt", filename="새캡처.webp",
+                       content_type="image/webp")
+    assert r3.status_code == 200, r3.text
+    img2 = _image_id_from_url(r3.json()["prompt_image_url"])
+    assert img2 != img1
+    assert (qdir / f"{img2}.webp").is_file()
+    assert not (qdir / f"{img1}.png").exists(), "교체된 옛 이미지가 남았다"
+    # 교체 후 옛 URL은 404 (payload 참조 기준 서빙)
+    assert client.get(row["prompt_image_url"]).status_code == 404
+
+    # 감사기록 — 첨부 3회
+    assert (
+        db.query(AuditLog).filter(AuditLog.action == "lecture.question.image.create").count()
+        == 3
+    )
+
+    # ops 문항 목록에도 이미지 URL이 실린다
+    ls = client.get(f"/api/v1/ops/lectures/{lec['id']}/questions", headers=auth(ops_tok)).json()
+    assert ls[0]["prompt_image_url"].endswith(img2)
+
+
+def test_question_image_rejects_executable_svg_and_bad_slot(client, db, seed_org, media_dir):
+    """실행파일·SVG·비이미지 Content-Type 거절 + 슬롯 지정 오류 400 — 파일을 남기지 않는다."""
+    ops_tok = _ops(client, db)
+    lec = _upload_lecture(client, ops_tok).json()
+    q = _add_question(client, ops_tok, lec["id"])
+
+    for bad in ("x.exe", "s.svg", "p.html", "r.bat", "noext"):
+        r = _attach_image(client, ops_tok, lec["id"], q["id"], filename=bad)
+        assert r.status_code == 400, f"{bad}: {r.status_code}"
+    ct = _attach_image(client, ops_tok, lec["id"], q["id"], content_type="application/octet-stream")
+    assert ct.status_code == 400
+    bad_slot = _attach_image(client, ops_tok, lec["id"], q["id"], slot="banner")
+    assert bad_slot.status_code == 400
+    out_of_range = _attach_image(client, ops_tok, lec["id"], q["id"], slot="option", option_index=9)
+    assert out_of_range.status_code == 400
+    no_index = _attach_image(client, ops_tok, lec["id"], q["id"], slot="option")
+    assert no_index.status_code == 400
+
+    qdir = media_dir / "questions"
+    assert not qdir.exists() or list(qdir.iterdir()) == []
+    # 문항 payload도 오염되지 않았다
+    row = db.get(LectureQuestion, q["id"])
+    assert "prompt_image" not in (row.payload or {})
+    assert "option_images" not in (row.payload or {})
+
+
+def test_question_image_replace_failure_leaves_no_tmp(client, db, seed_org, media_dir, monkeypatch):
+    """os.replace 실패(디스크 풀·잠금) — 임시파일을 남기지 않고 payload도 오염되지 않는다."""
+    import app.api.v1.endpoints.lectures as lectures_mod
+
+    ops_tok = _ops(client, db)
+    lec = _upload_lecture(client, ops_tok).json()
+    q = _add_question(client, ops_tok, lec["id"])
+
+    real_replace = lectures_mod.os.replace
+
+    def boom(src, dst):
+        raise OSError("disk error")
+
+    monkeypatch.setattr(lectures_mod.os, "replace", boom)
+    with pytest.raises(OSError):
+        _attach_image(client, ops_tok, lec["id"], q["id"], slot="prompt")
+    monkeypatch.setattr(lectures_mod.os, "replace", real_replace)
+
+    qdir = media_dir / "questions"
+    assert not qdir.exists() or not list(qdir.iterdir()), "replace 실패 후 임시파일이 남았다"
+    row = db.get(LectureQuestion, q["id"])
+    assert "prompt_image" not in (row.payload or {})
+
+
+def test_question_image_delete_and_question_delete_cascade(client, db, seed_org, media_dir):
+    """이미지 제거·문항 삭제 시 파일 물리 삭제 + 레코드(payload 참조 포함) 보존."""
+    ops_tok = _ops(client, db)
+    lec = _upload_lecture(client, ops_tok).json()
+    q = _add_question(client, ops_tok, lec["id"])
+    qdir = media_dir / "questions"
+
+    pi = _attach_image(client, ops_tok, lec["id"], q["id"], slot="prompt").json()
+    oi = _attach_image(client, ops_tok, lec["id"], q["id"], slot="option", option_index=0).json()
+    prompt_img = _image_id_from_url(pi["prompt_image_url"])
+    opt_img = _image_id_from_url(oi["option_image_urls"][0])
+
+    # 보기 이미지 제거(DELETE) — 참조·파일 모두 정리, 서빙 404
+    rm = client.delete(
+        f"/api/v1/ops/lectures/{lec['id']}/questions/{q['id']}/images",
+        params={"slot": "option", "option_index": 0},
+        headers=auth(ops_tok),
+    )
+    assert rm.status_code == 200, rm.text
+    assert rm.json()["option_image_urls"][0] is None
+    assert not (qdir / f"{opt_img}.png").exists()
+    assert client.get(oi["option_image_urls"][0]).status_code == 404
+    assert (
+        db.query(AuditLog).filter(AuditLog.action == "lecture.question.image.delete").count()
+        == 1
+    )
+    # 없는 슬롯 재삭제 → 404
+    rm2 = client.delete(
+        f"/api/v1/ops/lectures/{lec['id']}/questions/{q['id']}/images",
+        params={"slot": "option", "option_index": 0},
+        headers=auth(ops_tok),
+    )
+    assert rm2.status_code == 404
+
+    # 문항 삭제 — 남은 프롬프트 이미지 파일 물리 삭제, 행·payload 참조는 이력으로 보존
+    assert (qdir / f"{prompt_img}.png").is_file()
+    dq = client.delete(
+        f"/api/v1/ops/lectures/{lec['id']}/questions/{q['id']}", headers=auth(ops_tok)
+    )
+    assert dq.status_code == 200
+    assert not (qdir / f"{prompt_img}.png").exists(), "문항 삭제가 이미지를 정리하지 않았다"
+    row = db.get(LectureQuestion, q["id"])
+    db.refresh(row)
+    assert row.status == "deleted"
+    assert (row.payload or {}).get("prompt_image", {}).get("id") == prompt_img  # 이력 보존
+    # deleted 문항의 이미지는 서빙도 닫힌다
+    assert client.get(pi["prompt_image_url"]).status_code == 404
+
+
+def test_lecture_delete_cascades_question_images(client, db, seed_org, media_dir):
+    """강의 삭제 — 문항 이미지 파일도 연쇄 물리 삭제(고아 파일 방지), 문항 행은 보존."""
+    ops_tok = _ops(client, db)
+    lec = _upload_lecture(client, ops_tok).json()
+    q = _add_question(client, ops_tok, lec["id"])
+    pi = _attach_image(client, ops_tok, lec["id"], q["id"], slot="prompt").json()
+    img = _image_id_from_url(pi["prompt_image_url"])
+    qdir = media_dir / "questions"
+    assert (qdir / f"{img}.png").is_file()
+
+    rm = client.delete(f"/api/v1/ops/lectures/{lec['id']}", headers=auth(ops_tok))
+    assert rm.status_code == 200
+    assert not (qdir / f"{img}.png").exists(), "강의 삭제가 문항 이미지를 정리하지 않았다"
+    assert db.get(LectureQuestion, q["id"]).status != "deleted"  # 문항 행은 보존(강의만 deleted)
+    assert client.get(pi["prompt_image_url"]).status_code == 404  # deleted 강의 — 서빙 차단
+
+
+def test_question_image_size_exception_and_other_paths_413(
+    client, db, seed_org, media_dir, monkeypatch
+):
+    """이미지 업로드 예외는 'POST images + multipart'만 — 상한 초과·JSON·타 경로는 413."""
+    from app.core.config import get_settings
+
+    ops_tok = _ops(client, db)
+    lec = _upload_lecture(client, ops_tok).json()
+    q = _add_question(client, ops_tok, lec["id"])
+
+    # 2MB multipart 이미지 → 전역 1MB를 넘지만 이미지 예외(5MB)로 통과·정상 저장
+    ok = _attach_image(client, ops_tok, lec["id"], q["id"], size=2 * 1024 * 1024)
+    assert ok.status_code == 200, ok.text
+
+    # 이미지 상한 초과 multipart → 413 (상한을 낮춰 실측 — 미들웨어가 이미지 상한을 실제로 본다)
+    monkeypatch.setattr(get_settings(), "MAX_QUESTION_IMAGE_BYTES", 10_000)
+    over = _attach_image(client, ops_tok, lec["id"], q["id"], size=20_000)
+    assert over.status_code == 413
+
+    # 같은 경로라도 JSON(비 multipart) 대용량 본문은 1MB에서 413 — 예외는 multipart 한정
+    big_json = client.post(
+        f"/api/v1/ops/lectures/{lec['id']}/questions/{q['id']}/images",
+        content=b"x" * 1_100_000,
+        headers={"Content-Type": "application/json", **auth(ops_tok)},
+    )
+    assert big_json.status_code == 413
+
+    # 전혀 다른 경로는 여전히 413
+    other = client.post(
+        "/api/v1/auth/login",
+        content=b"x" * 1_100_000,
+        headers={"Content-Type": "application/json"},
+    )
+    assert other.status_code == 413
+
+
+def test_text_only_question_challenge_backward_compat(client, db, seed_org, media_dir):
+    """기존 텍스트 전용 문항 — 챌린지 페이로드가 종전과 동일(이미지 키 자체가 없다)."""
+    ops_tok = _ops(client, db)
+    lec = _upload_lecture(client, ops_tok).json()
+    _add_question(client, ops_tok, lec["id"])
+    site_key = _edu_key(client, db, seed_org, ops_tok, first_party=True)
+    tok = _student_token(client, seed_org)
+    _reach_checkpoint(client, tok, lec["id"])
+
+    ch = client.post(
+        f"/api/v1/captcha/v1/challenge?lecture={lec['id']}",
+        headers={"X-Site-Key": site_key, **auth(tok)},
+    )
+    assert ch.status_code == 200, ch.text
+    body = ch.json()
+    assert "prompt_image" not in body
+    assert all("image" not in o for o in body["options"])
+    # ops 문항 목록의 이미지 필드도 빈 상태로 하위호환(None/None 리스트)
+    row = client.get(f"/api/v1/ops/lectures/{lec['id']}/questions", headers=auth(ops_tok)).json()[0]
+    assert row["prompt_image_url"] is None
+    assert row["option_image_urls"] == [None, None, None, None]
+
+
+def test_challenge_with_images_serves_and_never_leaks_answer(client, db, seed_org, media_dir):
+    """이미지 문항 챌린지 — prompt_image·보기 image URL 전달, 정답 신호는 어디에도 없다."""
+    ops_tok = _ops(client, db)
+    lec = _upload_lecture(client, ops_tok).json()
+    q = _add_question(client, ops_tok, lec["id"], answer=2)
+    _attach_image(client, ops_tok, lec["id"], q["id"], slot="prompt")
+    _attach_image(client, ops_tok, lec["id"], q["id"], slot="option", option_index=0)
+    _attach_image(client, ops_tok, lec["id"], q["id"], slot="option", option_index=2)
+    site_key = _edu_key(client, db, seed_org, ops_tok, first_party=True)
+    tok = _student_token(client, seed_org)
+    _reach_checkpoint(client, tok, lec["id"])
+
+    ch = client.post(
+        f"/api/v1/captcha/v1/challenge?lecture={lec['id']}",
+        headers={"X-Site-Key": site_key, **auth(tok)},
+    )
+    assert ch.status_code == 200, ch.text
+    body = ch.json()
+    assert body["prompt_image"].startswith(f"/api/v1/lectures/{lec['id']}/questions/")
+    assert "image" in body["options"][0] and "image" in body["options"][2]
+    assert "image" not in body["options"][1] and "image" not in body["options"][3]
+    # 정답 미노출 — 응답 키 어디에도 정오 신호가 없다(이미지 URL은 모든 보기가 같은 형태,
+    # 정답은 Fernet 암호화 토큰 안에만 존재해 클라이언트가 복호화할 수 없다)
+    assert "answer" not in body and "answer_index" not in body
+    assert all(set(o) <= {"id", "text", "image"} for o in body["options"])
+
+    # 학생(무인증 <img>)이 챌린지의 이미지 URL을 그대로 로드할 수 있다
+    assert client.get(body["prompt_image"]).status_code == 200
+    assert client.get(body["options"][0]["image"]).status_code == 200
+
+    # 정답 제출은 종전과 동일하게 동작(이미지 확장이 채점 경로를 건드리지 않는다)
+    vr = client.post(
+        "/api/v1/captcha/v1/verify",
+        json={"challenge_token": body["challenge_token"], "answer": "2"},
+        headers={"X-Site-Key": site_key, **auth(tok)},
+    )
+    assert vr.status_code == 200 and vr.json()["success"] is True
+
+
+def test_option_shrink_cleans_image_files_and_empty_text_rules(client, db, seed_org, media_dir):
+    """보기 축소 시 범위 밖 이미지 정리 + 이미지 있는 보기만 빈 텍스트 허용."""
+    ops_tok = _ops(client, db)
+    lec = _upload_lecture(client, ops_tok).json()
+    q = _add_question(client, ops_tok, lec["id"])  # 보기 4개
+    qdir = media_dir / "questions"
+
+    r = _attach_image(client, ops_tok, lec["id"], q["id"], slot="option", option_index=3).json()
+    img = _image_id_from_url(r["option_image_urls"][3])
+    assert (qdir / f"{img}.png").is_file()
+
+    # 보기 4개 → 2개 축소 — 3번 보기 이미지 파일이 함께 정리된다(고아 파일 방지)
+    up = client.put(
+        f"/api/v1/ops/lectures/{lec['id']}/questions/{q['id']}",
+        json={"options": ["가", "나"], "answer_index": 0},
+        headers=auth(ops_tok),
+    )
+    assert up.status_code == 200, up.text
+    assert up.json()["option_image_urls"] == [None, None]
+    assert not (qdir / f"{img}.png").exists(), "축소로 빠진 보기의 이미지가 남았다"
+
+    # 이미지 없는 보기의 빈 텍스트 → 400 (종전 규칙 유지)
+    bad = client.put(
+        f"/api/v1/ops/lectures/{lec['id']}/questions/{q['id']}",
+        json={"options": ["가", "  "], "answer_index": 0},
+        headers=auth(ops_tok),
+    )
+    assert bad.status_code == 400
+
+    # 이미지가 붙은 보기는 텍스트를 비울 수 있다(그림 보기 문항) —
+    r2 = _attach_image(client, ops_tok, lec["id"], q["id"], slot="option", option_index=1)
+    assert r2.status_code == 200
+    ok = client.put(
+        f"/api/v1/ops/lectures/{lec['id']}/questions/{q['id']}",
+        json={"options": ["가", ""], "answer_index": 0},
+        headers=auth(ops_tok),
+    )
+    assert ok.status_code == 200, ok.text
+    # 빈 텍스트 보기의 이미지 삭제는 400 — 내용 없는 보기를 만들지 않는다
+    rm = client.delete(
+        f"/api/v1/ops/lectures/{lec['id']}/questions/{q['id']}/images",
+        params={"slot": "option", "option_index": 1},
+        headers=auth(ops_tok),
+    )
+    assert rm.status_code == 400

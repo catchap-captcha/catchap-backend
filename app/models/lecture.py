@@ -68,7 +68,10 @@ class LectureQuestion(Base, UUIDPk, Timestamps):
 
     lecture_id: Mapped[str] = mapped_column(CHAR(36), ForeignKey("lectures.id"), index=True)
     position_sec: Mapped[int] = mapped_column(default=0)  # 이 시점 이전 내용에서 출제
-    payload: Mapped[dict] = mapped_column(JSON)  # {prompt, options[], explain}
+    # {prompt, options[], explain} + 이미지 문항 확장(선택): prompt_image={id, ext},
+    # option_images={"<보기 인덱스>": {id, ext}}. 파일 경로는 저장하지 않고
+    # LECTURE_MEDIA_DIR/questions/{id}{ext}로 유도한다(영상·자료와 동일 — 경로조작 원천 차단).
+    payload: Mapped[dict] = mapped_column(JSON)
     answer_index: Mapped[int] = mapped_column()  # options 내 정답 인덱스 — payload와 분리
     source: Mapped[str] = mapped_column(String(20), default="manual")  # manual|llm
     status: Mapped[str] = mapped_column(String(20), default="active")  # draft|active|deleted

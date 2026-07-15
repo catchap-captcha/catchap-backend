@@ -6,6 +6,8 @@
                                       (순수 조회 — 세션·스트림 URL 없음)
     GET  /lectures/{id}/materials/{mid}/download
                                       file 자료 다운로드(FileResponse attachment) — 경로는 자료 id로만 유도
+    GET  /lectures/{id}/questions/{qid}/images/{img}
+                                      문항 이미지 인라인 서빙(<img>용 — 무인증·UUID 3중 경로, 정답 미노출)
     POST /lectures/{id}/session       재생 시작 — 서버가 session_id 발급(서명 토큰) + 서명 stream_url.
                                       다른 활성 세션이 있으면 409(active_elsewhere)
     POST /lectures/{id}/progress      하트비트 — X-Lecture-Session 토큰으로 세션 식별, 서버 검증
@@ -18,6 +20,8 @@
     GET/POST /ops/lectures            목록 / 업로드(multipart, 청크 복사·누적 바이트 재검사)
     PUT/DELETE /ops/lectures/{id}     메타 수정 / 소프트 삭제
     GET/POST/PUT/DELETE /ops/lectures/{id}/questions[/{qid}]  확인 문항 CRUD
+    POST/DELETE /ops/lectures/{id}/questions/{qid}/images     문항 이미지 첨부/제거
+                                      (slot=prompt|option — 강의 화면 캡처를 보기로 출제)
     POST /ops/lectures/{id}/questions/generate                LLM 자동 생성(키 없으면 503)
     GET/POST/PUT/DELETE /ops/lectures/{id}/materials[/{mid}]  자료실 CRUD
                                       (POST: kind=link는 JSON, kind=file은 multipart 업로드)
@@ -71,6 +75,16 @@ _MATERIAL_EXTS = {
     ".hwp", ".hwpx", ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx", ".txt",
 }
 
+# 확인 문항 이미지(강의 화면 캡처) 확장자·Content-Type 화이트리스트 — 래스터 이미지만.
+# SVG는 인라인 렌더 시 스크립트 삽입(XSS) 위험이 있어 금지하고(자료실과 달리 문항 이미지는
+# <img>로 '인라인' 서빙된다), 실행파일류는 목록에 없어 구조적으로 거절된다.
+_QUESTION_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+_QUESTION_IMAGE_CONTENT_TYPES = {"image/png", "image/jpeg", "image/gif", "image/webp"}
+_QUESTION_IMAGE_MEDIA = {
+    ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+    ".gif": "image/gif", ".webp": "image/webp",
+}
+
 _UPLOAD_CHUNK = 1024 * 1024  # 1MB 단위 청크 복사 — 영상 전체를 RAM에 올리지 않는다
 _STREAM_TOKEN_TTL_SEC = 6 * 60 * 60  # 스트림 서명 토큰 유효기간 6시간
 # 세션 토큰 유효기간 — 스트림 토큰과 동일 6시간. 만료보다 중요한 무효화 수단은
@@ -80,6 +94,9 @@ _SESSION_TOKEN_TTL_SEC = 6 * 60 * 60
 RATE_HEARTBEAT_PER_HOUR = 720  # 하트비트 — 5초 간격 시청 기준 여유
 RATE_UPLOAD_PER_HOUR = 20
 RATE_MATERIAL_UPLOAD_PER_HOUR = 40  # 자료 '파일' 업로드만 — link 생성(JSON)은 대상 아님
+# 문항 이미지 업로드 상한 — 문항당 최대 7장(프롬프트 1 + 보기 6)이라 자료(40)보다 넉넉히.
+# 시간당 문항 ~17개 분량의 실무 등록을 수용하면서 업로드 스팸(디스크 소모)은 억제한다.
+RATE_QUESTION_IMAGE_UPLOAD_PER_HOUR = 120
 # 세션 발급 상한 — 정상 사용(재생 시작·새로고침)은 시간당 수 회. 발급 스팸으로 자기
 # session_id를 회전시키며 진행 행을 흔드는 것을 억제한다.
 RATE_SESSION_PER_HOUR = 60
@@ -108,6 +125,34 @@ def _materials_dir() -> Path:
 def _material_path(mat: LectureMaterial) -> Path:
     # 영상과 동일 원칙 — 자료 파일 경로도 id(UUID)+화이트리스트 확장자로만 유도
     return _materials_dir() / f"{mat.id}{mat.file_ext}"
+
+
+def _question_images_dir() -> Path:
+    return _media_dir() / "questions"
+
+
+def _question_image_path(ref: dict) -> Path:
+    # 영상·자료와 동일 원칙 — 문항 이미지 경로도 payload에 기록된 id(UUID·서버 발급)와
+    # 화이트리스트 확장자로만 유도. 클라이언트 입력이 경로에 끼어들 자리가 없다.
+    # ext는 .get — 손상된 참조(ext 누락)여도 삭제 연쇄(unlink missing_ok)가 500 없이 지나간다.
+    return _question_images_dir() / f"{ref['id']}{ref.get('ext') or ''}"
+
+
+def _question_image_url(lecture_id: str, question_id: str, ref: dict) -> str:
+    """학생·콘솔 <img>가 로드할 서빙 경로 — 내부 파일 경로는 어디에도 노출하지 않는다."""
+    return f"/api/v1/lectures/{lecture_id}/questions/{question_id}/images/{ref['id']}"
+
+
+def _question_image_refs(payload: dict) -> list[dict]:
+    """payload의 이미지 참조 전부(prompt_image + option_images 값들) — 삭제 연쇄·서빙 검증용."""
+    refs: list[dict] = []
+    pi = (payload or {}).get("prompt_image")
+    if isinstance(pi, dict) and pi.get("id"):
+        refs.append(pi)
+    for ref in ((payload or {}).get("option_images") or {}).values():
+        if isinstance(ref, dict) and ref.get("id"):
+            refs.append(ref)
+    return refs
 
 
 # ---------------------------------------------------------------- 세션·스트림 서명 토큰
@@ -498,6 +543,49 @@ def lecture_material_download(
     )
 
 
+@router.get("/lectures/{lecture_id}/questions/{question_id}/images/{image_id}")
+def lecture_question_image(
+    lecture_id: str,
+    question_id: str,
+    image_id: str,
+    db: Session = Depends(get_db),
+):
+    """확인 문항 이미지 서빙(인라인) — 캡차 위젯·운영자 콘솔의 <img src>가 로드한다.
+
+    인증 의존성이 없다: <img> 태그는 Authorization 헤더를 싣지 못하고, 경로가 강의·문항·
+    이미지 세 UUID 조합이라 추측 불가하다(공개 캡차 /captcha/v1/img·audio와 동일한 공개
+    서빙 원칙). 정답은 새지 않는다 — answer_index는 payload 밖 분리 컬럼이고 URL·응답
+    어디에도 정오 신호가 없다(모든 보기 이미지가 같은 형태의 URL).
+
+    경로는 payload에 기록된 참조(id는 서버 발급 UUID)+화이트리스트 확장자로만 유도한다
+    (경로조작 원천 차단). 화이트리스트가 래스터 이미지뿐이라 인라인 렌더가 안전하다(SVG 금지).
+    draft 문항·hidden 강의도 서빙한다(운영자 콘솔 미리보기) — deleted만 차단. 이미지 id는
+    교체 시에도 새로 발급되어 불변이므로 캐시를 허용한다."""
+    lec = db.get(Lecture, lecture_id)
+    if lec is None or lec.status == "deleted":
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="이미지를 찾을 수 없습니다.")
+    q = db.get(LectureQuestion, question_id)
+    if q is None or q.lecture_id != lecture_id or q.status == "deleted":
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="이미지를 찾을 수 없습니다.")
+    ref = next(
+        (r for r in _question_image_refs(q.payload or {}) if r.get("id") == image_id),
+        None,
+    )
+    if ref is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="이미지를 찾을 수 없습니다.")
+    media_type = _QUESTION_IMAGE_MEDIA.get(str(ref.get("ext") or "").lower())
+    if media_type is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="이미지를 찾을 수 없습니다.")
+    path = _question_image_path(ref)
+    if not path.is_file():
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="이미지 파일을 찾을 수 없습니다.")
+    return FileResponse(
+        str(path),
+        media_type=media_type,
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
+
+
 # ================================================================ 운영자
 def _lecture_row(db: Session, lec: Lecture) -> dict:
     total = (
@@ -811,6 +899,18 @@ def ops_delete_lecture(
         m.status = "deleted"
         m.file_bytes = 0
 
+    # 문항 이미지도 함께 물리 삭제 — 부모 강의가 deleted면 문항 CRUD 경로가 전부 404가 되어
+    # 이미지를 개별로 지울 방법이 사라진다(자료실 고아 파일 버그와 동형). 문항 행·payload는
+    # 보존한다. deleted 문항의 파일은 이미 지워졌지만 unlink가 멱등이라 전수 수집이 단순·안전하다.
+    question_rows = (
+        db.query(LectureQuestion).filter(LectureQuestion.lecture_id == lec.id).all()
+    )
+    question_image_paths: list[Path] = [
+        _question_image_path(r)
+        for qr in question_rows
+        for r in _question_image_refs(qr.payload or {})
+    ]
+
     before = {"status": lec.status, "video_bytes": int(lec.video_bytes or 0)}
     lec.status = "deleted"
     lec.video_bytes = 0
@@ -825,11 +925,14 @@ def ops_delete_lecture(
             "status": "deleted",
             "video_file_removed": file_existed,
             "materials_deleted": len(materials),
+            "question_images_removed": len(question_image_paths),
         },
     )
     db.commit()
     video_path.unlink(missing_ok=True)  # 이미 없어도 무해(멱등)
     for p in material_paths:
+        p.unlink(missing_ok=True)
+    for p in question_image_paths:
         p.unlink(missing_ok=True)
     return {"ok": True}
 
@@ -845,17 +948,35 @@ def _get_ops_lecture(db: Session, lecture_id: str) -> Lecture:
 def _question_row(q: LectureQuestion) -> dict:
     # 운영자 편집 화면용 — answer_index 포함(학생 노출 경로가 아님)
     payload = q.payload or {}
+    options = payload.get("options", [])
+    opt_imgs = payload.get("option_images") or {}
+    pi = payload.get("prompt_image")
     return {
         "id": q.id,
         "lecture_id": q.lecture_id,
         "position_sec": q.position_sec,
         "prompt": payload.get("prompt"),
-        "options": payload.get("options", []),
+        "options": options,
         "explain": payload.get("explain"),
         "answer_index": q.answer_index,
         "source": q.source,
         "status": q.status,
         "order_no": q.order_no,
+        # 이미지 문항 — 내부 경로·id 원문 대신 서빙 엔드포인트 URL만 노출(자료실 download_url과 동일 원칙)
+        "prompt_image_url": (
+            _question_image_url(q.lecture_id, q.id, pi)
+            if isinstance(pi, dict) and pi.get("id")
+            else None
+        ),
+        # 보기와 같은 길이의 리스트(이미지 없는 보기는 None) — 콘솔이 인덱스로 바로 그린다
+        "option_image_urls": [
+            (
+                _question_image_url(q.lecture_id, q.id, opt_imgs[str(i)])
+                if isinstance(opt_imgs.get(str(i)), dict) and opt_imgs[str(i)].get("id")
+                else None
+            )
+            for i in range(len(options))
+        ],
     }
 
 
@@ -868,11 +989,22 @@ class _QuestionCreate(BaseModel):
     status: str = "active"  # draft|active
 
 
-def _validate_question_body(prompt: str, options: list[str], answer_index: int) -> None:
+def _validate_question_body(
+    prompt: str, options: list[str], answer_index: int, option_images: dict | None = None
+) -> None:
     if not prompt.strip():
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="문제(prompt)가 비어 있습니다.")
-    if not (2 <= len(options) <= 6) or any(not str(o).strip() for o in options):
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="보기는 2~6개의 비어있지 않은 문자열이어야 합니다.")
+    if not (2 <= len(options) <= 6):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="보기는 2~6개여야 합니다.")
+    # 보기 텍스트는 원칙 필수 — 이미지가 붙은 보기만 텍스트 생략 허용(그림 보기 문항:
+    # "방금 화면에 나온 도형은?"에 텍스트 라벨을 강제하면 안 본 사람도 상식으로 찍는다).
+    # 생성 시점엔 이미지가 없으므로(첨부는 별도 엔드포인트) 사실상 종전과 동일하게 강제된다.
+    imgs = option_images or {}
+    if any(not str(o).strip() and str(i) not in imgs for i, o in enumerate(options)):
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            detail="이미지가 없는 보기는 텍스트가 비어 있으면 안 됩니다.",
+        )
     if not (0 <= answer_index < len(options)):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="answer_index가 보기 범위를 벗어납니다.")
 
@@ -951,10 +1083,10 @@ def ops_update_question(
     principal: Principal = Depends(require_ops),
     db: Session = Depends(get_db),
 ):
-    _get_ops_lecture(db, lecture_id)
-    q = db.get(LectureQuestion, question_id)
-    if q is None or q.lecture_id != lecture_id or q.status == "deleted":
-        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="문항을 찾을 수 없습니다.")
+    # FOR UPDATE(_get_ops_question) — 이 PUT도 payload(JSON)를 통째로 읽고-고쳐-재할당하므로
+    # 이미지 첨부/삭제와 같은 잠금 아래 있어야 한다. 잠금 없이는 동시 첨부가 커밋한 참조를
+    # 이 핸들러의 스냅샷이 덮어써 파일이 어떤 삭제 연쇄로도 못 닿는 영구 고아가 된다.
+    q = _get_ops_question(db, lecture_id, question_id)
     if req.status is not None and req.status not in ("draft", "active"):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="status는 draft|active만 가능합니다.")
 
@@ -962,7 +1094,22 @@ def ops_update_question(
     new_prompt = req.prompt if req.prompt is not None else payload.get("prompt", "")
     new_options = req.options if req.options is not None else payload.get("options", [])
     new_answer = req.answer_index if req.answer_index is not None else q.answer_index
-    _validate_question_body(str(new_prompt), list(new_options), int(new_answer))
+
+    # 보기 축소 시 범위 밖 보기의 이미지 참조를 함께 정리한다 — 참조만 지우고 파일을 두면
+    # 고아 파일(자료실에서 겪은 디스크 누수)이 되므로 commit '성공 후' 물리 삭제한다.
+    removed_image_paths: list[Path] = []
+    opt_imgs = dict(payload.get("option_images") or {})
+    if req.options is not None and opt_imgs:
+        for k in list(opt_imgs):
+            if not str(k).isdigit() or int(k) >= len(new_options):
+                removed_image_paths.append(_question_image_path(opt_imgs.pop(k)))
+        if opt_imgs:
+            payload["option_images"] = opt_imgs
+        else:
+            payload.pop("option_images", None)
+    _validate_question_body(
+        str(new_prompt), list(new_options), int(new_answer), option_images=opt_imgs
+    )
 
     before = {"position_sec": q.position_sec, "status": q.status, "answer_index": q.answer_index}
     payload["prompt"] = str(new_prompt).strip()
@@ -986,6 +1133,8 @@ def ops_update_question(
         after={"position_sec": q.position_sec, "status": q.status, "answer_index": q.answer_index},
     )
     db.commit()
+    for p in removed_image_paths:
+        p.unlink(missing_ok=True)  # commit 성공 후 — 실패 시 참조·파일 정합 유지(멱등)
     return _question_row(q)
 
 
@@ -996,10 +1145,12 @@ def ops_delete_question(
     principal: Principal = Depends(require_ops),
     db: Session = Depends(get_db),
 ):
-    _get_ops_lecture(db, lecture_id)
-    q = db.get(LectureQuestion, question_id)
-    if q is None or q.lecture_id != lecture_id or q.status == "deleted":
-        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="문항을 찾을 수 없습니다.")
+    # FOR UPDATE(_get_ops_question) — payload에서 이미지 경로를 수집한 뒤 상태를 바꾸므로,
+    # 잠금 없이 동시 첨부와 겹치면 stale payload에서 수집해 새 파일을 놓친다(고아).
+    q = _get_ops_question(db, lecture_id, question_id)
+    # 문항 이미지는 물리 삭제(강의·자료와 동일 원칙) — 레코드·payload(참조 포함)는 이력으로
+    # 보존한다. deleted 문항은 서빙·출제 경로가 전부 status 필터로 닫혀 파일 부재가 무해하다.
+    image_paths = [_question_image_path(r) for r in _question_image_refs(q.payload or {})]
     q.status = "deleted"
     audit(
         db,
@@ -1007,10 +1158,186 @@ def ops_delete_question(
         actor_user_id=principal.id,
         target_type="lecture_question",
         target_id=q.id,
-        after={"status": "deleted"},
+        after={"status": "deleted", "image_files_removed": len(image_paths)},
     )
     db.commit()
+    for p in image_paths:
+        p.unlink(missing_ok=True)  # commit 성공 후 — 이미 없어도 무해(멱등)
     return {"ok": True}
+
+
+# ---------------------------------------------------------------- 문항 이미지 첨부
+def _get_ops_question(db: Session, lecture_id: str, question_id: str) -> LectureQuestion:
+    _get_ops_lecture(db, lecture_id)
+    # FOR UPDATE — 같은 문항의 이미지 첨부/삭제가 동시에 오면 payload(JSON) 재할당이
+    # last-write-wins로 먼저 붙인 참조를 덮어 그 파일이 영구 고아가 된다. 행 잠금으로
+    # 문항 단위 직렬화(코인 지갑 lost update와 동일 처치). SQLite(테스트)에선 no-op.
+    q = db.get(LectureQuestion, question_id, with_for_update=True)
+    if q is None or q.lecture_id != lecture_id or q.status == "deleted":
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="문항을 찾을 수 없습니다.")
+    return q
+
+
+def _resolve_image_slot(
+    payload: dict, slot: str, option_index: int | None
+) -> tuple[str, str | None]:
+    """이미지 슬롯 지정 검증 → (slot, option_images 키). prompt는 키 None.
+
+    업로드 선행(고아 파일 창) 대신 '기존 문항의 슬롯'에 직접 첨부하는 방식이라,
+    이미지 파일은 항상 문항 payload의 참조와 같은 트랜잭션에서 태어나고 죽는다."""
+    if slot not in ("prompt", "option"):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="slot은 prompt|option만 가능합니다.")
+    if slot == "prompt":
+        return slot, None
+    options = payload.get("options", [])
+    if option_index is None or not (0 <= option_index < len(options)):
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST, detail="option_index가 보기 범위를 벗어납니다."
+        )
+    return slot, str(option_index)
+
+
+@router.post("/ops/lectures/{lecture_id}/questions/{question_id}/images")
+def ops_attach_question_image(
+    lecture_id: str,
+    question_id: str,
+    request: Request,
+    slot: str = Form(...),  # prompt|option — 문항의 어느 자리에 붙는 이미지인가
+    option_index: int | None = Form(default=None),  # slot=option일 때 보기 인덱스
+    file: UploadFile = File(...),
+    principal: Principal = Depends(require_ops),
+    db: Session = Depends(get_db),
+):
+    """문항 이미지 첨부(multipart) — 영상·자료와 동일 패턴: 임시파일 청크 복사(누적 바이트
+    재검사) → 원자적 이동 → payload 참조 갱신 → DB commit. 실패 시 파일·참조를 남기지 않는다.
+
+    같은 슬롯에 이미 이미지가 있으면 교체 — 새 파일은 새 id로 저장하고, 이전 파일은
+    commit '성공 후' 물리 삭제한다(commit 실패 시 옛 참조·파일 정합 유지)."""
+    auth_service.rate_limit(
+        db,
+        f"lect-qimg-upload:{_client_ip(request)}",
+        limit=RATE_QUESTION_IMAGE_UPLOAD_PER_HOUR,
+        window_seconds=3600,
+    )
+    q = _get_ops_question(db, lecture_id, question_id)
+    payload = dict(q.payload or {})
+    slot, opt_key = _resolve_image_slot(payload, slot, option_index)
+
+    ext = os.path.splitext(file.filename or "")[1].lower()
+    if ext not in _QUESTION_IMAGE_EXTS:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            detail="이미지 파일만 업로드할 수 있습니다(png/jpg/jpeg/gif/webp — svg 금지).",
+        )
+    if (file.content_type or "").lower() not in _QUESTION_IMAGE_CONTENT_TYPES:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST, detail="이미지 Content-Type(image/png 등)이 아닙니다."
+        )
+
+    ref = {"id": new_uuid(), "ext": ext}  # 서버 발급 id — 교체 시에도 항상 새 id(URL 불변성)
+    qdir = _question_images_dir()
+    qdir.mkdir(parents=True, exist_ok=True)
+    tmp_path = qdir / f".upload-{ref['id']}.tmp"
+    final_path = _question_image_path(ref)
+    try:
+        total = _copy_upload_to_tmp(file, tmp_path, get_settings().MAX_QUESTION_IMAGE_BYTES)
+        if total == 0:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="빈 파일은 업로드할 수 없습니다.")
+        os.replace(tmp_path, final_path)  # 같은 디렉터리 내 원자적 이동
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)  # replace 실패 포함 — 임시파일을 남기지 않는다(영상·자료와 동일)
+        raise
+
+    old_ref = None
+    if slot == "prompt":
+        old_ref = payload.get("prompt_image")
+        payload["prompt_image"] = ref
+    else:
+        opt_imgs = dict(payload.get("option_images") or {})
+        old_ref = opt_imgs.get(opt_key)
+        opt_imgs[opt_key] = ref
+        payload["option_images"] = opt_imgs
+    try:
+        q.payload = payload  # JSON 컬럼은 재할당으로만 변경 감지된다(in-place 수정 금지)
+        audit(
+            db,
+            action="lecture.question.image.create",
+            actor_user_id=principal.id,
+            target_type="lecture_question",
+            target_id=q.id,
+            after={
+                "lecture_id": lecture_id,
+                "slot": slot,
+                "option_index": option_index if slot == "option" else None,
+                "image_id": ref["id"],
+                "ext": ext,
+                "bytes": total,
+                "replaced": bool(old_ref),
+            },
+        )
+        db.commit()
+    except BaseException:
+        db.rollback()  # 참조도 함께 폐기 — 파일 없는 유령 참조를 만들지 않는다
+        final_path.unlink(missing_ok=True)
+        raise
+    if isinstance(old_ref, dict) and old_ref.get("id"):
+        _question_image_path(old_ref).unlink(missing_ok=True)  # 교체된 옛 파일 정리(멱등)
+    return _question_row(q)
+
+
+@router.delete("/ops/lectures/{lecture_id}/questions/{question_id}/images")
+def ops_delete_question_image(
+    lecture_id: str,
+    question_id: str,
+    slot: str,
+    option_index: int | None = None,
+    principal: Principal = Depends(require_ops),
+    db: Session = Depends(get_db),
+):
+    """문항 이미지 제거 — payload 참조 삭제 + commit '성공 후' 파일 물리 삭제.
+
+    텍스트가 빈 보기의 이미지는 지울 수 없다(이미지마저 빼면 내용 없는 보기가 남는다) —
+    먼저 보기 텍스트를 채우고 지우게 400으로 안내한다."""
+    q = _get_ops_question(db, lecture_id, question_id)
+    payload = dict(q.payload or {})
+    slot, opt_key = _resolve_image_slot(payload, slot, option_index)
+
+    if slot == "prompt":
+        old_ref = payload.pop("prompt_image", None)
+    else:
+        opt_imgs = dict(payload.get("option_images") or {})
+        old_ref = opt_imgs.pop(opt_key, None)
+        if old_ref is not None:
+            option_text = str(payload.get("options", [])[option_index] or "")
+            if not option_text.strip():
+                raise HTTPException(
+                    status.HTTP_400_BAD_REQUEST,
+                    detail="텍스트가 빈 보기의 이미지는 삭제할 수 없습니다. 먼저 보기 텍스트를 채워 주세요.",
+                )
+        if opt_imgs:
+            payload["option_images"] = opt_imgs
+        else:
+            payload.pop("option_images", None)
+    if not (isinstance(old_ref, dict) and old_ref.get("id")):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="해당 슬롯에 이미지가 없습니다.")
+
+    q.payload = payload
+    audit(
+        db,
+        action="lecture.question.image.delete",
+        actor_user_id=principal.id,
+        target_type="lecture_question",
+        target_id=q.id,
+        after={
+            "lecture_id": lecture_id,
+            "slot": slot,
+            "option_index": option_index if slot == "option" else None,
+            "image_id": old_ref["id"],
+        },
+    )
+    db.commit()
+    _question_image_path(old_ref).unlink(missing_ok=True)  # commit 성공 후(멱등)
+    return _question_row(q)
 
 
 class _GenerateReq(BaseModel):

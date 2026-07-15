@@ -53,6 +53,9 @@ class Settings(BaseSettings):
     # 강의 자료(자료실) 파일 상한 — 영상 상한(500MB)과 분리. 자료는 문서류(pdf/pptx/zip 등)라
     # 50MB면 충분하고, 영상 상한을 그대로 열면 자료 경로가 대용량 업로드 표면(디스크 소모)이 된다.
     MAX_MATERIAL_UPLOAD_BYTES: int = 50_000_000
+    # 확인 문항 이미지(강의 화면 캡처) 상한 — 캡처 PNG가 보통 1~3MB라 5MB면 충분하다.
+    # 자료 상한(50MB)을 그대로 열면 문항 경로가 또 하나의 대용량 업로드 표면이 된다.
+    MAX_QUESTION_IMAGE_BYTES: int = 5_000_000
 
     # LLM 문항 자동 생성(Anthropic Messages API). 키가 비면 생성 기능은 503으로 정직하게
     # 거절한다 — stub 문제를 만들어 성공처럼 반환하지 않는다(가짜 성공 금지).

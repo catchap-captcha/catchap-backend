@@ -68,7 +68,13 @@
       // 오디오 재생중 이퀄라이저 막대 — 위아래로 출렁
       + '@keyframes ccWave{0%,100%{transform:scaleY(.32)}50%{transform:scaleY(1)}}'
       // 카드 뒤집기 — Y축 회전(memory/puzzle 스냅)
-      + '@keyframes ccPop{0%{transform:scale(.6);opacity:.2}60%{transform:scale(1.08)}100%{transform:scale(1);opacity:1}}';
+      + '@keyframes ccPop{0%{transform:scale(.6);opacity:.2}60%{transform:scale(1.08)}100%{transform:scale(1);opacity:1}}'
+      // 로딩 스켈레톤 펄스 — reduced-motion이면 아래 미디어쿼리가 정지시킨다
+      + '@keyframes ccPulse{0%,100%{opacity:.45}50%{opacity:.95}}'
+      + '@media (prefers-reduced-motion: reduce){[data-catchap-root] .cc-skel{animation:none !important}}'
+      // 키보드 포커스 링 — 키보드 탐색(focus-visible)에만 또렷하게, 마우스 클릭엔 안 뜬다
+      + '[data-catchap-root] button:focus-visible,[data-catchap-root] [tabindex]:focus-visible,'
+      + '[data-catchap-root] input:focus-visible{outline:3px solid #FF5A4D;outline-offset:2px}';
     document.head.appendChild(st);
   }
 
@@ -162,23 +168,33 @@
       } catch (e) { return Promise.resolve(authStatic); }
     }
 
+    // 강의 모드(data-lecture) — 시청 검증 게이트 임베드 전용 프레젠테이션:
+    // 이미 CatChap 강의실 카드 안이라 헤더·풋터(다음 문제/잘 모르겠어요)를 걷어내고
+    // 높이를 콘텐츠에 맞춰 게이트 카드에 스크롤이 생기지 않게 한다. 채점·이벤트 계약은 동일.
+    var lectureMode = !!lecture;
     // data-size="full" → 컨테이너 꽉 채움(앱 게임 화면용), 기본은 420px 컴팩트(외부 임베드용)
     var full = box.getAttribute('data-size') === 'full';
     css(box, {
       display: full ? 'flex' : 'block', flexDirection: full ? 'column' : '',
       maxWidth: full ? '100%' : '420px', width: '100%',
       border: full ? 'none' : '1px solid #F0E4D8', borderRadius: '16px',
-      padding: full ? '30px 26px 20px' : '18px', fontFamily: "'Pretendard','Malgun Gothic',sans-serif",
+      padding: lectureMode ? '2px 2px 0' : full ? '30px 26px 20px' : '18px',
+      fontFamily: "'Pretendard','Malgun Gothic',sans-serif",
       background: full ? 'transparent' : '#fff',
       boxShadow: full ? 'none' : '0 10px 30px -20px rgba(120,90,70,.4)', boxSizing: 'border-box',
     });
     box.__full = full;
+    box.setAttribute('data-catchap-root', '1'); // 포커스 링·스켈레톤 CSS 스코프
+    box.setAttribute('role', 'group');
+    box.setAttribute('aria-label', lectureMode ? '강의 확인 문제' : 'CatChap 문제');
 
     var head = h('div'); css(head, { display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '12px' });
+    if (lectureMode) head.style.display = 'none'; // 강의실 안 — 브랜드 헤더 중복 제거
     var logo = h('span'); logo.textContent = '🐱'; css(logo, { fontSize: '20px' });
     var brand = h('span'); brand.textContent = 'CatChap'; css(brand, { fontWeight: '800', color: C, fontSize: '15px' });
     var spacer = h('span'); css(spacer, { flex: '1' });
     var status = h('span'); css(status, { fontSize: '12px', fontWeight: '700', color: '#B0A79B' });
+    status.setAttribute('aria-live', 'polite'); // 확인 중/불러오는 중 상태를 스크린리더에 안내
     head.appendChild(logo); head.appendChild(brand); head.appendChild(spacer); head.appendChild(status);
 
     var body = h('div');
@@ -342,7 +358,36 @@
     window.addEventListener('blur', function () { if (box.isConnected) timerPause(); });
     window.addEventListener('focus', function () { if (box.isConnected && !idleGate && !document.hidden) { timerResume(); armIdle(); } });
 
-    function fail(msg) { body.innerHTML = ''; var p = h('div'); p.textContent = msg || '문제를 불러오지 못했어요.'; css(p, { color: '#C25', fontSize: '13px' }); body.appendChild(p); refreshBtn(); if (footerOn) footerReset(); }
+    // 에러 상태 — 실패를 성공처럼 꾸미지 않는다: 원인 문구 + 재시도 버튼(role=alert로 즉시 안내)
+    function fail(msg) {
+      body.innerHTML = '';
+      var wrap = h('div'); css(wrap, { textAlign: 'center', padding: '14px 8px 4px' });
+      var ic = h('div'); ic.textContent = '😿'; ic.setAttribute('aria-hidden', 'true');
+      css(ic, { fontSize: '32px', marginBottom: '8px', lineHeight: '1' });
+      var p = h('div'); p.textContent = msg || '문제를 불러오지 못했어요.';
+      p.setAttribute('role', 'alert');
+      css(p, { color: '#C25', fontSize: '13px', fontWeight: '700', lineHeight: '1.6' });
+      wrap.appendChild(ic); wrap.appendChild(p);
+      body.appendChild(wrap);
+      refreshBtn(); if (footerOn) footerReset();
+    }
+    // 로딩 스켈레톤 — '불러오는 중…' 텍스트만으로는 빈 화면처럼 보인다. 문항 골격을 미리
+    // 그려 로딩을 체감시킨다(순수 표시용, aria-hidden — 상태는 status aria-live가 안내).
+    function showSkeleton() {
+      var sk = h('div');
+      sk.setAttribute('aria-hidden', 'true');
+      css(sk, { width: '100%', maxWidth: '440px', margin: '0 auto', padding: '4px 0' });
+      [['62%', '20px'], ['100%', (full && !lectureMode) ? '132px' : '88px'], ['100%', '44px'], ['78%', '44px']].forEach(function (s) {
+        var b = h('div', 'cc-skel');
+        css(b, { width: s[0], height: s[1], borderRadius: '10px', background: '#F3EAE0',
+          margin: '0 auto 10px', animation: 'ccPulse 1.2s ease-in-out infinite' });
+        sk.appendChild(b);
+      });
+      var t = h('div'); t.textContent = '문제를 불러오는 중…';
+      css(t, { textAlign: 'center', fontSize: '12px', fontWeight: '700', color: '#B0A79B' });
+      sk.appendChild(t);
+      body.appendChild(sk);
+    }
     function refreshBtn() {
       var b = h('button'); b.textContent = '다시 시도'; css(b, btnStyle('#eee', '#555'));
       b.onclick = load; body.appendChild(b);
@@ -443,6 +488,18 @@
       var fb = h('div');
       var okAns = res.success;
       sfx(okAns ? 'correct' : 'wrong');
+      if (lectureMode) {
+        // 강의 시청 검증 — 간결 피드백만. 다음 문제/결과 버튼 없음(진행은 플레이어가
+        // catchap:answer로 담당), 정답·해설 텍스트도 미노출(오답은 새 문항으로 재도전).
+        var lf = h('div');
+        lf.setAttribute('role', 'status');
+        lf.textContent = okAns ? '정답이에요! 이어서 볼게요 🎉' : '아쉬워요! 새 문제로 다시 도전해요';
+        css(lf, { display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '8px',
+          marginTop: '12px', padding: '12px 14px', borderRadius: T.radius.md, fontWeight: '800',
+          fontSize: '14px', background: okAns ? T.color.okSoft : T.color.errSoft, color: okAns ? OK : T.color.err });
+        body.appendChild(lf);
+        return;
+      }
       var msg;
       if (lastType === 'drag_drop') {
         msg = okAns ? '정확히 쏙 넣었어요! 🎯' : '조금 빗나갔어요. 다시 한 번 해볼까요?';
@@ -480,6 +537,7 @@
       css(fb, { display: 'flex', alignItems: 'center', gap: '8px', marginTop: '12px', padding: '13px 15px',
         borderRadius: T.radius.md, fontWeight: '800', fontSize: '14px',
         background: okAns ? T.color.okSoft : T.color.errSoft, color: okAns ? OK : T.color.err });
+      fb.setAttribute('role', 'status'); // 채점 결과를 스크린리더에 즉시 안내
       fb.textContent = msg;
       body.appendChild(fb);
       // 오답·'잘 모르겠어요' 시 해설을 보여준다(공부 자료) — 서버가 explain(없으면 hint)을 내려준다
@@ -511,8 +569,8 @@
       if (!text) return;
       var hint = h('div'); hint.textContent = '💡 ' + text;
       css(hint, { fontSize: T.font.sm, lineHeight: '1.5', color: T.color.inkSoft, fontWeight: '600',
-        textAlign: footerOn ? 'center' : 'left', maxWidth: '480px',
-        margin: footerOn ? '0 auto 16px' : '0 0 12px' });
+        textAlign: (footerOn || lectureMode) ? 'center' : 'left', maxWidth: '480px',
+        margin: footerOn ? '0 auto 16px' : lectureMode ? '0 auto 12px' : '0 0 12px' });
       if (hintSlot) { hintSlot.textContent = ''; hintSlot.appendChild(hint); }
       else body.appendChild(hint);
     }
@@ -537,23 +595,42 @@
       body.appendChild(area);
       hintLine(d.hint);
       var dropAt = null; // 풋터 모드: 놓은 위치를 기억해 두고 다음 문제 버튼이 제출
-      function itemHome() { item.style.left = (d.start.x * 100) + '%'; item.style.top = (d.start.y * 100) + '%'; }
+      var kp = { x: d.start.x, y: d.start.y }; // 현재 위치(키보드 이동과 포인터 드래그 공유)
+      function itemAt() { item.style.left = (kp.x * 100) + '%'; item.style.top = (kp.y * 100) + '%'; }
+      function itemHome() { kp.x = d.start.x; kp.y = d.start.y; itemAt(); }
+      function dropHere(p) {
+        if (answered) return;
+        var ans = { x: Math.round(p.x * 1000) / 1000, y: Math.round(p.y * 1000) / 1000 };
+        if (footerOn) { dropAt = ans; footerState(true, true); }
+        else verify(token, ans);
+      }
       makeDnd().dragFree(item, {
         area: area,
         disabled: function () { return answered; },
-        onMove: function (p) { item.style.left = (p.x * 100) + '%'; item.style.top = (p.y * 100) + '%'; },
+        onMove: function (p) { kp.x = p.x; kp.y = p.y; itemAt(); },
         onCancel: itemHome, // 제스처 취소(스크롤 등) — 제출 없이 원위치
-        onDrop: function (p) {
-          if (answered) return;
-          var ans = { x: Math.round(p.x * 1000) / 1000, y: Math.round(p.y * 1000) / 1000 };
-          if (footerOn) { dropAt = ans; footerState(true, true); }
-          else verify(token, ans);
-        },
+        onDrop: dropHere,
+      });
+      // 키보드 대안(WCAG 2.1.1) — 방향키로 옮기고 Enter/Space로 놓는다(드래그 불가 사용자)
+      item.tabIndex = 0; item.setAttribute('role', 'button');
+      item.setAttribute('aria-label', (d.item || '카드') + ' — 방향키로 옮기고 엔터를 눌러 놓아요');
+      item.addEventListener('keydown', function (e) {
+        if (answered) return;
+        var s2 = 0.05;
+        if (e.key === 'ArrowLeft') kp.x = Math.max(0, kp.x - s2);
+        else if (e.key === 'ArrowRight') kp.x = Math.min(1, kp.x + s2);
+        else if (e.key === 'ArrowUp') kp.y = Math.max(0, kp.y - s2);
+        else if (e.key === 'ArrowDown') kp.y = Math.min(1, kp.y + s2);
+        else if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); dropHere(kp); return; }
+        else return;
+        e.preventDefault(); itemAt();
+        // 이동 = 이전 드롭 무효 — 화면 위치와 제출 좌표가 어긋난 채(스테일 dropAt) 제출되지 않게
+        if (footerOn && dropAt) { dropAt = null; footerState(true, false); }
       });
       if (footerOn) {
         pendingRedo = function () {
           dropAt = null;
-          item.style.left = (d.start.x * 100) + '%'; item.style.top = (d.start.y * 100) + '%';
+          itemHome();
           footerState(false, false);
         };
         pendingSubmit = function () { if (dropAt) verify(token, dropAt); };
@@ -808,25 +885,44 @@
           padding: '8px 10px', minWidth: '44px', minHeight: '44px', boxSizing: 'border-box',
           background: T.color.card, border: '2px solid ' + T.color.line, borderRadius: T.radius.md,
           boxShadow: '0 3px 8px -4px rgba(120,90,70,.5)' });
-        function cardHome() { card.style.left = (sx * 100) + '%'; card.style.top = (sy * 100) + '%'; }
+        var kpc = { x: sx, y: sy }; // 현재 위치 — 키보드 이동과 포인터 드래그 공유
+        function cardAt() { card.style.left = (kpc.x * 100) + '%'; card.style.top = (kpc.y * 100) + '%'; }
+        function cardHome() { kpc.x = sx; kpc.y = sy; cardAt(); }
+        function cardDrop(p) {
+          card.style.zIndex = '1';
+          if (answered) return;
+          // 원본과 동일: 존 밖 릴리즈 = 무판정, 카드 원위치(손 미끄러짐이 오답이 되지 않게)
+          var dx = p.x - d.zone.cx, dy = p.y - d.zone.cy;
+          if (Math.sqrt(dx * dx + dy * dy) > d.zone.r) { cardHome(); return; }
+          dropAt = { item: it.id, x: Math.round(p.x * 1000) / 1000, y: Math.round(p.y * 1000) / 1000 };
+          if (footerOn) footerState(true, true);
+          else verify(token, dropAt);
+        }
         pickDnd.dragFree(card, {
           area: area,
           disabled: function () { return answered; },
           onStart: function () { card.style.zIndex = '5'; },
-          onMove: function (p) { card.style.left = (p.x * 100) + '%'; card.style.top = (p.y * 100) + '%'; },
+          onMove: function (p) { kpc.x = p.x; kpc.y = p.y; cardAt(); },
           onCancel: function () { card.style.zIndex = '1'; cardHome(); }, // 취소 = 무판정 원위치
-          onDrop: function (p) {
-            card.style.zIndex = '1';
-            if (answered) return;
-            // 원본과 동일: 존 밖 릴리즈 = 무판정, 카드 원위치(손 미끄러짐이 오답이 되지 않게)
-            var dx = p.x - d.zone.cx, dy = p.y - d.zone.cy;
-            if (Math.sqrt(dx * dx + dy * dy) > d.zone.r) { cardHome(); return; }
-            dropAt = { item: it.id, x: Math.round(p.x * 1000) / 1000, y: Math.round(p.y * 1000) / 1000 };
-            if (footerOn) footerState(true, true);
-            else verify(token, dropAt);
-          },
+          onDrop: cardDrop,
         });
-        els[it.id] = { el: card, sx: sx, sy: sy };
+        // 키보드 대안(WCAG 2.1.1) — 방향키로 옮기고 Enter/Space로 놓기
+        card.tabIndex = 0; card.setAttribute('role', 'button');
+        card.setAttribute('aria-label', (it.label || it.e || '카드') + ' — 방향키로 옮기고 엔터를 눌러 놓아요');
+        card.addEventListener('keydown', function (e) {
+          if (answered) return;
+          var s2 = 0.05;
+          if (e.key === 'ArrowLeft') kpc.x = Math.max(0, kpc.x - s2);
+          else if (e.key === 'ArrowRight') kpc.x = Math.min(1, kpc.x + s2);
+          else if (e.key === 'ArrowUp') kpc.y = Math.max(0, kpc.y - s2);
+          else if (e.key === 'ArrowDown') kpc.y = Math.min(1, kpc.y + s2);
+          else if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); cardDrop(kpc); return; }
+          else return;
+          e.preventDefault(); cardAt();
+          // 이동 = 이전 드롭 무효 — 다른 카드의 스테일 dropAt이 제출되지 않게
+          if (footerOn && dropAt) { dropAt = null; footerState(true, false); }
+        });
+        els[it.id] = { el: card, sx: sx, sy: sy, home: cardHome };
         area.appendChild(card);
       });
       body.appendChild(area);
@@ -834,8 +930,7 @@
       if (footerOn) {
         pendingRedo = function () {
           dropAt = null;
-          d.items.forEach(function (it) { var s = els[it.id];
-            s.el.style.left = (s.sx * 100) + '%'; s.el.style.top = (s.sy * 100) + '%'; });
+          d.items.forEach(function (it) { els[it.id].home(); }); // 키보드 위치(kpc)도 함께 원위치
           footerState(false, false);
         };
         pendingSubmit = function () { if (dropAt) verify(token, dropAt); };
@@ -885,7 +980,9 @@
               width: r.width + 'px', height: r.height + 'px', margin: '0', zIndex: '99999',
               pointerEvents: 'none', opacity: '0.92', boxShadow: '0 10px 24px rgba(80,50,30,.35)',
               transform: 'scale(1.06)', boxSizing: 'border-box' });
-            document.body.appendChild(ghost);
+            // 전체화면(강의 게이트 등)에서는 fullscreen 서브트리 밖(document.body)이 렌더되지
+            // 않는다 — 고스트를 전체화면 요소 안에 붙여야 드래그 중에도 보인다.
+            (document.fullscreenElement || document.body).appendChild(ghost);
             prevOpacity = handle.style.opacity; // 원래 값 보존(퍼즐 사용조각 0.25 등)
             handle.style.opacity = '0.3';
           }
@@ -908,6 +1005,11 @@
         }
         handle.addEventListener('pointerup', end);
         handle.addEventListener('pointercancel', end);
+        // 키보드 접근성 — Enter/Space의 합성 click(detail 0)을 탭 폴백으로 연결한다.
+        // 포인터 탭은 pointerup(end)이 이미 처리하고 그 뒤 click은 detail>=1이라 중복 없음.
+        handle.addEventListener('click', function (e) {
+          if (e.detail === 0 && !(opts.disabled && opts.disabled()) && opts.onTap) opts.onTap();
+        });
       }
       // 자유 드래그 — 존 판정 없이 '놓은 좌표'가 답인 유형(drag_drop·drag_pick)용 공용 엔진.
       // forest 캡차의 검증된 포인터 패턴(drag-rotate.js)과 동일: pointerdown/move/up +
@@ -1100,9 +1202,12 @@
             border: '2px solid ' + T.color.line, background: T.color.card, color: T.color.inkFaint,
             fontSize: '18px', fontWeight: '800', cursor: 'pointer', lineHeight: '1', padding: '0',
             flexShrink: '0', touchAction: 'manipulation', transition: 'border-color .12s, background .12s' });
+          g.setAttribute('aria-pressed', 'false');
+          g.setAttribute('aria-label', '문장부호 자리 ' + (i + 1));
           g.onclick = function () {
             if (answered) return;
             picked[i] = !picked[i];
+            g.setAttribute('aria-pressed', picked[i] ? 'true' : 'false');
             g.textContent = picked[i] ? '✓' : '_';
             g.style.borderColor = picked[i] ? C : T.color.line;
             g.style.background = picked[i] ? T.color.brandSoft : T.color.card;
@@ -1126,7 +1231,8 @@
         pendingRedo = function () {
           picked = {};
           Object.keys(gapEls).forEach(function (k) { var g = gapEls[k];
-            g.textContent = '_'; g.style.borderColor = T.color.line; g.style.background = T.color.card; g.style.color = T.color.inkFaint; });
+            g.textContent = '_'; g.style.borderColor = T.color.line; g.style.background = T.color.card; g.style.color = T.color.inkFaint;
+            g.setAttribute('aria-pressed', 'false'); });
           footerState(false, false);
         };
         pendingSubmit = subG;
@@ -1804,7 +1910,9 @@
       timerStart();  // 활성 시간(방치 제외) 계측 — answered 리셋 뒤라야 idle 타이머가 켜진다
       lastOptions = []; // 이전 문항 보기가 새 문항 피드백(정답 텍스트 매칭)에 누출되지 않게
       onAnswered = null;
-      footerOn = full && product === 'edu';
+      // 강의 모드는 풋터(다음 문제·다시 고르기·잘 모르겠어요) 없이 즉시 제출 흐름 —
+      // 시청 검증은 한 문제 단위라 진행 버튼이 없고, 오답 재도전은 플레이어가 재마운트한다.
+      footerOn = full && product === 'edu' && !lectureMode;
       curToken = d.challenge_token; // '잘 모르겠어요'가 참조 (오늘의 퀴즈·전체학습 등 학습 세션)
       if (footerOn) {
         ensureFooter(); footerReset();
@@ -1818,7 +1926,8 @@
       // 과목은 서버가 내려준 d.subject 우선(문항별 정확), 없으면 요청 subject 폴백.
       var scrSubj = String(d.subject || subject || '');
       var scrMath = scrSubj.indexOf('수학') !== -1 || /math/i.test(scrSubj);
-      if (full && scrMath) { ensureScratch(); scrReset(); scr.wrap.style.display = ''; if (scr.open) setTimeout(scrResize, 30); }
+      // 강의 게이트에서는 연습장 미노출 — 시청 검증 맥락엔 불필요하고 게이트 높이를 아낀다
+      if (full && scrMath && !lectureMode) { ensureScratch(); scrReset(); scr.wrap.style.display = ''; if (scr.open) setTimeout(scrResize, 30); }
       else if (scr.wrap) scr.wrap.style.display = 'none';
       var token = d.challenge_token;
       var prompt = h('div');
@@ -1836,7 +1945,11 @@
         prompt.textContent = d.prompt;
       }
       // 타이포 위계(3단계 정비): 프롬프트=L1(최상위). full 22px, 읽기 줄길이 위해 maxWidth 제한.
-      css(prompt, footerOn
+      // 강의 모드: 게이트 카드 폭에 맞춘 컴팩트 중앙 정렬(18px) — 스크롤 없이 다 보이게.
+      css(prompt, lectureMode
+        ? { fontWeight: '800', fontSize: '18px', lineHeight: '1.45', color: T.color.ink,
+            marginBottom: '14px', textAlign: 'center', maxWidth: '32ch', marginLeft: 'auto', marginRight: 'auto' }
+        : footerOn
         ? { fontWeight: '800', fontSize: '22px', lineHeight: '1.4', color: T.color.ink,
             marginBottom: '18px', textAlign: 'center', maxWidth: '30ch', marginLeft: 'auto', marginRight: 'auto' }
         : { fontWeight: '800', fontSize: T.font.md, lineHeight: '1.5', color: T.color.ink, marginBottom: '12px' });
@@ -1925,12 +2038,14 @@
         if (footerOn) css(grid, { maxWidth: '420px', margin: '0 auto', width: '100%' });
         d.cells.forEach(function (c) {
           var cell = h('button'); cell.textContent = c.emoji;
+          cell.setAttribute('aria-pressed', 'false'); // 토글 상태를 보조기기에 노출
           css(cell, { fontSize: '32px', padding: '16px 0', minHeight: T.tap, border: '2px solid ' + T.color.line,
             borderRadius: T.radius.md, background: T.color.card, cursor: 'pointer', touchAction: 'manipulation',
             transition: 'border-color .12s, background .12s, transform .08s' });
           cell.onclick = function () {
             if (answered) return;
             picked[c.id] = !picked[c.id];
+            cell.setAttribute('aria-pressed', picked[c.id] ? 'true' : 'false');
             cell.style.borderColor = picked[c.id] ? C : T.color.line;
             cell.style.background = picked[c.id] ? T.color.brandSoft : T.color.card;
             cell.style.transform = picked[c.id] ? 'scale(0.96)' : 'scale(1)';
@@ -1951,7 +2066,7 @@
         if (footerOn) {
           pendingRedo = function () {
             picked = {};
-            cellEls.forEach(function (cell) { cell.style.borderColor = T.color.line; cell.style.background = T.color.card; cell.style.transform = 'scale(1)'; });
+            cellEls.forEach(function (cell) { cell.style.borderColor = T.color.line; cell.style.background = T.color.card; cell.style.transform = 'scale(1)'; cell.setAttribute('aria-pressed', 'false'); });
             footerState(false, false);
           };
           pendingSubmit = submitCells;
@@ -1987,6 +2102,7 @@
           mPicked[o.id] = on == null ? !mPicked[o.id] : on;
           var mb = mBtns[lastOptions.indexOf(o)];
           if (mb) { mb.style.borderColor = mPicked[o.id] ? C : T.color.line; mb.style.background = mPicked[o.id] ? T.color.brandSoft : T.color.card;
+            mb.setAttribute('aria-pressed', mPicked[o.id] ? 'true' : 'false');
             if (mBoxChips) mb.style.display = mPicked[o.id] ? 'none' : ''; }
           mPaintBox();
           if (footerOn) {
@@ -2013,6 +2129,7 @@
             : { display: 'grid', gap: '8px' }));
         lastOptions.forEach(function (o) {
           var mb = h('button');
+          mb.setAttribute('aria-pressed', 'false');
           setOpt(mb, o);
           css(mb, mFrame && d.screenStyle === 'chat'
             ? { textAlign: 'left', padding: '10px 14px', border: '2px solid #F0E4D8', borderRadius: '4px 16px 16px 16px',
@@ -2058,7 +2175,7 @@
         if (footerOn) {
           pendingRedo = function () {
             mPicked = {};
-            mBtns.forEach(function (mb) { mb.style.borderColor = T.color.line; mb.style.background = T.color.card; mb.style.display = ''; });
+            mBtns.forEach(function (mb) { mb.style.borderColor = T.color.line; mb.style.background = T.color.card; mb.style.display = ''; mb.setAttribute('aria-pressed', 'false'); });
             mPaintBox();
             footerState(false, false);
           };
@@ -2170,6 +2287,12 @@
           var chips = h('div'); css(chips, { display: 'flex', flexWrap: 'wrap', justifyContent: 'center' });
           box2.appendChild(lab); box2.appendChild(chips); box2.chips = chips;
           box2.onclick = function () { if (answered || sSel == null) return; sMap[sSel] = b.id; sSel = null; sPaint(); };
+          // 키보드 접근성 — div 바구니를 포커스 가능하게(칩 선택 → 바구니 Enter로 담기)
+          box2.setAttribute('tabindex', '0'); box2.setAttribute('role', 'button');
+          box2.setAttribute('aria-label', b.label + ' 바구니에 담기');
+          box2.addEventListener('keydown', function (e) {
+            if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); box2.click(); }
+          });
           sDnd.addZone(box2, b.id, function (on) { box2.style.borderColor = on ? C : T.color.lineSoft; box2.style.background = on ? '#FFF6F3' : ''; });
           sBinEls[b.id] = box2; binRow.appendChild(box2); });
         body.appendChild(itRow); body.appendChild(binRow);
@@ -2320,6 +2443,12 @@
         d.slots.forEach(function (sl) {
           var slot = h('div'); css(slot, { border: '1px dashed #D8C8B4', cursor: 'pointer', backgroundRepeat: 'no-repeat' });
           slot.onclick = function () { if (answered || zSel == null) return; pzAssign(sl.id, zSel); };
+          // 키보드 접근성 — div 슬롯을 포커스 가능하게(조각 선택 → 슬롯 Enter로 배치)
+          slot.setAttribute('tabindex', '0'); slot.setAttribute('role', 'button');
+          slot.setAttribute('aria-label', '퍼즐 칸에 놓기');
+          slot.addEventListener('keydown', function (e) {
+            if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); slot.click(); }
+          });
           pzDnd.addZone(slot, sl.id, function (on) { if (placed[sl.id]) return; slot.style.borderColor = on ? C : '#D8C8B4'; slot.style.borderStyle = on ? 'solid' : 'dashed'; });
           slotEls[sl.id] = slot; gridBox.appendChild(slot);
         });
@@ -2459,8 +2588,9 @@
           if (answered) return;
           chosen = o.id;
           if (gGap) { gGap.textContent = (o.emoji ? o.emoji + ' ' : '') + o.text; gGap.style.color = C; }
-          optBtns.forEach(function (x) { x.style.borderColor = T.color.line; x.style.background = T.color.card; });
+          optBtns.forEach(function (x) { x.style.borderColor = T.color.line; x.style.background = T.color.card; x.setAttribute('aria-pressed', 'false'); });
           b.style.borderColor = C; b.style.background = T.color.brandSoft;
+          b.setAttribute('aria-pressed', 'true');
           if (footerOn) footerState(true, true);
           else verify(token, o.id);
         }
@@ -2470,6 +2600,7 @@
           : { display: 'grid', gap: '8px' });
         d.options.forEach(function (o) {
           var b = h('button');
+          b.setAttribute('aria-pressed', 'false'); // 선택 상태를 보조기기에 노출
           if (d.type === 'listen' && o.emoji && o.text) {
             // 원본(듣기 1~3단계): 그림 카드 아래 단어 라벨 — 소리·그림·단어를 함께 학습
             var lem = h('div'); lem.textContent = o.emoji; css(lem, { fontSize: '34px', lineHeight: '1.2' });
@@ -2525,7 +2656,7 @@
         if (footerOn) {
           pendingRedo = function () {
             chosen = null;
-            optBtns.forEach(function (x) { x.style.borderColor = T.color.line; x.style.background = T.color.card; });
+            optBtns.forEach(function (x) { x.style.borderColor = T.color.line; x.style.background = T.color.card; x.setAttribute('aria-pressed', 'false'); });
             if (gGap) { gGap.textContent = '____'; gGap.style.color = T.color.inkMute; }
             footerState(false, false);
           };
@@ -2595,6 +2726,7 @@
       status.textContent = '불러오는 중…'; status.style.color = '#B0A79B';
       stopSounds();
       body.innerHTML = '';
+      showSkeleton();
       var qs = [];
       if (subject) qs.push('subject=' + encodeURIComponent(subject));
       if (day) qs.push('day=' + encodeURIComponent(day));
