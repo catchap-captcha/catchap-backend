@@ -70,15 +70,13 @@ def _edu_key(client, db, seed_org, ops_tok, *, first_party=True, subject="국어
 
 def _upload_lecture(
     client, ops_tok, *, title="분수의 덧셈", subject="국어", duration=600,
-    check_min=1, check_max=1, size=2 * 1024 * 1024, filename="v.mp4",
+    size=2 * 1024 * 1024, filename="v.mp4",
     content_type="video/mp4", order_no=None,
 ):
     data = {
         "title": title,
         "subject": subject,
         "duration_sec": str(duration),
-        "check_min_sec": str(check_min),
-        "check_max_sec": str(check_max),
         "description": "테스트 강의",
     }
     if order_no is not None:
@@ -114,17 +112,18 @@ def _hb(client, tok, lecture_id, position, *, st, **extra):
 
 
 def _add_question(
-    client, ops_tok, lecture_id, *, position=0, answer=2, answer_indexes=None,
-    status="active", pinned=False,
+    client, ops_tok, lecture_id, *, position=1, answer=2, answer_indexes=None,
+    status="active", window=0, prompt="강의에서 설명한 내용은?",
 ):
+    """핀 문항 추가 — 기본은 1초 고정(하트비트 헤드룸 5초 안이라 한 비트로 닿는다)."""
     body = {
         "position_sec": position,
-        "prompt": "강의에서 설명한 내용은?",
+        "window_sec": window,
+        "prompt": prompt,
         "options": ["가", "나", "다", "라"],
         "answer_index": answer,
         "explain": "강의 앞부분에서 설명했어요.",
         "status": status,
-        "pinned": pinned,
     }
     if answer_indexes is not None:
         body["answer_indexes"] = answer_indexes
@@ -203,11 +202,11 @@ def test_heartbeat_normal_advance_and_speed_clamp(client, db, seed_org, media_di
     직전 하트비트는 앱 쓰기 경로(POST /progress → _now() 로컬 naive)로 만들어진다 —
     픽스처가 시간 경로를 우회하면 이 테스트의 통과는 신호가 아니다."""
     ops_tok = _ops(client, db)
-    lec = _upload_lecture(client, ops_tok, check_min=60, check_max=60).json()
-    _add_question(client, ops_tok, lec["id"])  # 낼 문항이 있어야 체크포인트가 잡힌다
+    lec = _upload_lecture(client, ops_tok).json()
+    _add_question(client, ops_tok, lec["id"], position=60)  # 60초 핀 → 첫 체크포인트 60
     tok = _student_token(client, seed_org)
 
-    # 상세 진입 → 진행 행 생성(첫 체크포인트 60초). 순수 조회 — 세션·stream_url 없음
+    # 상세 진입 → 진행 행 생성(첫 체크포인트 = 핀 60초). 순수 조회 — 세션·stream_url 없음
     d = client.get(f"/api/v1/lectures/{lec['id']}", headers=auth(tok))
     assert d.status_code == 200, d.text
     assert d.json()["next_checkpoint_sec"] == 60
@@ -232,8 +231,8 @@ def test_heartbeat_clamps_at_checkpoint_until_captcha(client, db, seed_org, medi
     from app.services.lecture_service import GRACE_SEC
 
     ops_tok = _ops(client, db)
-    lec = _upload_lecture(client, ops_tok, check_min=1, check_max=1).json()
-    _add_question(client, ops_tok, lec["id"])  # 낼 문항이 있어야 체크포인트가 잡힌다
+    lec = _upload_lecture(client, ops_tok).json()
+    _add_question(client, ops_tok, lec["id"])  # 1초 핀 — 낼 문항이 있어야 체크포인트가 잡힌다
     tok = _student_token(client, seed_org)
     client.get(f"/api/v1/lectures/{lec['id']}", headers=auth(tok))  # cp=1 예약
     st = _session_token(client, tok, lec["id"])
@@ -260,7 +259,7 @@ def test_mutation_utcnow_breaks_normal_watch(client, db, seed_org, media_dir, mo
         pytest.skip("로컬 TZ가 UTC라 utcnow 변이가 무해 — 판별 불가 환경")
 
     ops_tok = _ops(client, db)
-    lec = _upload_lecture(client, ops_tok, check_min=60, check_max=60).json()
+    lec = _upload_lecture(client, ops_tok).json()
     tok = _student_token(client, seed_org)
     client.get(f"/api/v1/lectures/{lec['id']}", headers=auth(tok))
     st = _session_token(client, tok, lec["id"])  # 세션 발급은 변이 주입 전(정상 경로)
@@ -287,7 +286,9 @@ def test_lecture_checkpoint_gate_no_learning_side_effects(client, db, seed_org, 
     """게이트 전체 흐름 + meta.lec verify는 코인·LearningAttempt를 전혀 만들지 않는다."""
     ops_tok = _ops(client, db)
     lec = _upload_lecture(client, ops_tok).json()
-    _add_question(client, ops_tok, lec["id"], answer=2)
+    _add_question(client, ops_tok, lec["id"], answer=2)  # 1초 핀 — 첫 게이트
+    # 두 번째 핀(300초) — 첫 핀 통과 후 재예약이 다음 핀으로 잡히는지 본다
+    _add_question(client, ops_tok, lec["id"], position=300, answer=1, prompt="뒤 핀")
     site_key = _edu_key(client, db, seed_org, ops_tok, first_party=True)
     tok = _student_token(client, seed_org)
     _reach_checkpoint(client, tok, lec["id"])
@@ -382,6 +383,52 @@ def _gate_verify(client, site_key, tok, token, answer):
     )
     assert r.status_code == 200, r.text
     return r.json()
+
+
+def test_lecture_checkpoint_fail_cap_rewinds_and_blocks_challenge(
+    client, db, seed_org, media_dir
+):
+    """연속 오답 상한 도달 → watched_max 되감기 → 새 챌린지 409(다시 시청 요구).
+
+    되감기가 없으면 오답 → 새 랜덤 문항 무한 반복으로 풀을 대가 없이 브루트포스할 수
+    있다. 상한에 닿으면 watched_max가 cp 아래로 내려가 _lecture_challenge가 새 문항
+    발급을 거부한다(다시 시청해 cp까지 올라와야 다음 문항)."""
+    from app.services.lecture_service import MAX_CHECKPOINT_FAILS, REWIND_SEC
+
+    ops_tok = _ops(client, db)
+    lec = _upload_lecture(client, ops_tok).json()
+    _add_question(client, ops_tok, lec["id"], answer=2)
+    site_key = _edu_key(client, db, seed_org, ops_tok, first_party=True)
+    tok = _student_token(client, seed_org)
+    _reach_checkpoint(client, tok, lec["id"])
+
+    # 상한 직전까지 오답 — 게이트 유지, fails 누적, 되감기 없음
+    for _ in range(MAX_CHECKPOINT_FAILS - 1):
+        ch = _gate_challenge(client, site_key, tok, lec["id"])
+        res = _gate_verify(client, site_key, tok, ch["challenge_token"], ["0"])
+        assert res["success"] is False
+        assert res["lecture"]["next_checkpoint_sec"] == 1
+    db.expire_all()
+    row = _progress_row(db, lec["id"])
+    assert int(row.checkpoint_fails) == MAX_CHECKPOINT_FAILS - 1
+    assert int(row.watched_max_sec) >= 1, "상한 전에 되감기면 안 된다"
+
+    # 상한 도달 오답 — 되감기 발동
+    ch = _gate_challenge(client, site_key, tok, lec["id"])
+    res = _gate_verify(client, site_key, tok, ch["challenge_token"], ["0"])
+    assert res["success"] is False
+    db.expire_all()
+    row = _progress_row(db, lec["id"])
+    assert int(row.checkpoint_fails) == 0, "되감기 후 카운터 리셋"
+    assert int(row.watched_max_sec) == max(0, 1 - REWIND_SEC), "그 대목 앞으로 되감겨야 한다"
+    assert int(row.next_checkpoint_sec) == 1, "같은 체크포인트 유지"
+
+    # 되감겼으니 새 챌린지는 거부 — 다시 시청해야 다음 문항을 받는다
+    blocked = client.post(
+        f"/api/v1/captcha/v1/challenge?lecture={lec['id']}",
+        headers={"X-Site-Key": site_key, **auth(tok)},
+    )
+    assert blocked.status_code == 409, blocked.text
 
 
 def test_lecture_challenge_is_multi_drag_and_never_leaks_explain(
@@ -555,7 +602,7 @@ def test_multi_answer_validation_400(client, db, seed_org, media_dir):
         return client.post(
             f"/api/v1/ops/lectures/{lec['id']}/questions",
             json={
-                "position_sec": 0,
+                "position_sec": 5,
                 "prompt": "다답 검증",
                 "options": ["가", "나", "다", "라"],
                 "answer_index": 0,
@@ -596,8 +643,8 @@ def test_multi_answer_validation_400(client, db, seed_org, media_dir):
 
 def test_challenge_before_checkpoint_409(client, db, seed_org, media_dir):
     ops_tok = _ops(client, db)
-    lec = _upload_lecture(client, ops_tok, check_min=60, check_max=60).json()
-    _add_question(client, ops_tok, lec["id"])
+    lec = _upload_lecture(client, ops_tok).json()
+    _add_question(client, ops_tok, lec["id"], position=60)  # 60초 핀
     site_key = _edu_key(client, db, seed_org, ops_tok, first_party=True)
     tok = _student_token(client, seed_org)
     client.get(f"/api/v1/lectures/{lec['id']}", headers=auth(tok))  # cp=60, watched=0
@@ -645,8 +692,8 @@ def test_deleting_last_question_does_not_strand_student(client, db, seed_org, me
     from app.services.lecture_service import GRACE_SEC
 
     ops_tok = _ops(client, db)
-    lec = _upload_lecture(client, ops_tok, check_min=1, check_max=1, duration=600).json()
-    q = _add_question(client, ops_tok, lec["id"])
+    lec = _upload_lecture(client, ops_tok, duration=600).json()
+    q = _add_question(client, ops_tok, lec["id"])  # 1초 핀
     tok = _student_token(client, seed_org)
     client.get(f"/api/v1/lectures/{lec['id']}", headers=auth(tok))  # cp=1 예약
     st = _session_token(client, tok, lec["id"])  # 세션은 학생당 하나 — 끝까지 재사용
@@ -674,7 +721,7 @@ def test_no_questions_schedules_no_checkpoint(client, db, seed_org, media_dir):
     제보의 직접 원인). 낼 문제가 없으면 검증을 걸 수 없다는 사실을 예약 단계에서 인정하고,
     문항 0개는 운영자 콘솔의 문항 수로 드러낸다."""
     ops_tok = _ops(client, db)
-    lec = _upload_lecture(client, ops_tok, check_min=1, check_max=1).json()  # 문항 없음
+    lec = _upload_lecture(client, ops_tok).json()  # 문항 없음
     tok = _student_token(client, seed_org)
 
     d = client.get(f"/api/v1/lectures/{lec['id']}", headers=auth(tok))
@@ -895,8 +942,8 @@ def test_concurrent_session_409_and_takeover(client, db, seed_org, media_dir):
 
     다른 강의여도 같은 학생이면 동시 재생이다(한 사람이 두 강의를 동시에 볼 수 없음)."""
     ops_tok = _ops(client, db)
-    lec1 = _upload_lecture(client, ops_tok, check_min=60, check_max=60).json()
-    lec2 = _upload_lecture(client, ops_tok, title="다른 강의", check_min=60, check_max=60).json()
+    lec1 = _upload_lecture(client, ops_tok).json()
+    lec2 = _upload_lecture(client, ops_tok, title="다른 강의").json()
     tok = _student_token(client, seed_org)
     client.get(f"/api/v1/lectures/{lec1['id']}", headers=auth(tok))
     client.get(f"/api/v1/lectures/{lec2['id']}", headers=auth(tok))
@@ -933,7 +980,7 @@ def test_forged_session_id_in_body_is_ignored(client, db, seed_org, media_dir):
 
     (구계약 회귀 방지: session_id 본문 필드를 다시 읽기 시작하면 담합 우회가 부활한다.)"""
     ops_tok = _ops(client, db)
-    lec = _upload_lecture(client, ops_tok, check_min=60, check_max=60).json()
+    lec = _upload_lecture(client, ops_tok).json()
     tok = _student_token(client, seed_org)
     s = _start_session(client, tok, lec["id"]).json()
 
@@ -957,7 +1004,7 @@ def test_collusion_and_forged_tokens_blocked(client, db, seed_org, media_dir):
     전부 403. 남는 한계: 발급된 '세션 토큰 자체'를 두 기기가 실시간 공유하면 서버에겐
     한 세션으로 보인다 — 기기 구분 수단이 없는 한 원리적으로 판별 불가(보고서에 명시)."""
     ops_tok = _ops(client, db)
-    lec = _upload_lecture(client, ops_tok, check_min=60, check_max=60).json()
+    lec = _upload_lecture(client, ops_tok).json()
     tok = _student_token(client, seed_org)
 
     # 기기 A 정상 시작
@@ -981,7 +1028,7 @@ def test_collusion_and_forged_tokens_blocked(client, db, seed_org, media_dir):
     assert wrong_type.status_code == 403
 
     # 다른 강의용 세션 토큰 → 403 (lec 바인딩)
-    lec2 = _upload_lecture(client, ops_tok, title="둘", check_min=60, check_max=60).json()
+    lec2 = _upload_lecture(client, ops_tok, title="둘").json()
     assert _hb(client, tok, lec2["id"], 3, st=st_a).status_code == 403
 
 
@@ -996,7 +1043,7 @@ def test_dead_session_auto_reclaimed_after_ttl(client, db, seed_org, media_dir):
     from app.services.lecture_service import SESSION_TTL_SEC
 
     ops_tok = _ops(client, db)
-    lec = _upload_lecture(client, ops_tok, check_min=60, check_max=60).json()
+    lec = _upload_lecture(client, ops_tok).json()
     tok = _student_token(client, seed_org)
     client.get(f"/api/v1/lectures/{lec['id']}", headers=auth(tok))
     old = _start_session(client, tok, lec["id"]).json()
@@ -1037,7 +1084,7 @@ def test_mutation_utcnow_breaks_dead_session_reclaim(client, db, seed_org, media
         pytest.skip("로컬 TZ가 UTC라 utcnow 변이가 무해 — 판별 불가 환경")
 
     ops_tok = _ops(client, db)
-    lec = _upload_lecture(client, ops_tok, check_min=60, check_max=60).json()
+    lec = _upload_lecture(client, ops_tok).json()
     tok = _student_token(client, seed_org)
     client.get(f"/api/v1/lectures/{lec['id']}", headers=auth(tok))
     old = _start_session(client, tok, lec["id"]).json()
@@ -1059,7 +1106,7 @@ def test_takeover_spam_rate_limited(client, db, seed_org, media_dir):
     from app.api.v1.endpoints.lectures import RATE_TAKEOVER_PER_HOUR
 
     ops_tok = _ops(client, db)
-    lec = _upload_lecture(client, ops_tok, check_min=60, check_max=60).json()
+    lec = _upload_lecture(client, ops_tok).json()
     tok = _student_token(client, seed_org)
     client.get(f"/api/v1/lectures/{lec['id']}", headers=auth(tok))
 
@@ -1070,7 +1117,7 @@ def test_takeover_spam_rate_limited(client, db, seed_org, media_dir):
     assert over.status_code == 429
 
 
-# ================================================================ 캡차 면제 없음·의심 가중
+# ================================================================ 캡차 면제 없음
 def test_interacted_self_report_grants_no_exemption(client, db, seed_org, media_dir):
     """★ 상호작용 자기신고로는 캡차를 건너뛸 수 없다 — 면제 장치 제거의 회귀 고정.
 
@@ -1079,17 +1126,17 @@ def test_interacted_self_report_grants_no_exemption(client, db, seed_org, media_
     자기신고라 위조 가능해 봇·딴짓만 이득을 봤다(방향이 거꾸로). 실제로 위조 한 줄로
     강사 지정 고정 문항을 건너뛰는 것이 실증됐다. 이제 체크포인트에 닿으면 예외 없이 캡차다.
 
-    구버전 플레이어가 interacted를 계속 보내도 무해해야 한다(조용히 무시)."""
+    구버전 플레이어가 interacted·tab_hidden을 계속 보내도 무해해야 한다(조용히 무시)."""
     ops_tok = _ops(client, db)
-    lec = _upload_lecture(client, ops_tok, check_min=1, check_max=1).json()
-    _add_question(client, ops_tok, lec["id"])  # 낼 문항이 있어야 체크포인트가 잡힌다
+    lec = _upload_lecture(client, ops_tok).json()
+    _add_question(client, ops_tok, lec["id"])  # 1초 핀 — 낼 문항이 있어야 체크포인트가 잡힌다
     tok = _student_token(client, seed_org)
     client.get(f"/api/v1/lectures/{lec['id']}", headers=auth(tok))
     st = _session_token(client, tok, lec["id"])
 
-    # interacted=true를 계속 보내도 매번 캡차를 요구한다
+    # interacted/tab_hidden(구계약 자기신고)을 계속 보내도 매번 캡차를 요구한다
     for _ in range(3):
-        r = _hb(client, tok, lec["id"], 1, st=st, interacted=True)
+        r = _hb(client, tok, lec["id"], 1, st=st, interacted=True, tab_hidden=True)
         assert r.status_code == 200, r.text  # 구버전 필드가 422를 내지 않는다
         assert r.json()["checkpoint_due"] is True, "interacted 자기신고로 캡차가 면제됐다"
         assert "exempted" not in r.json(), "면제 개념이 응답에 남아 있다"
@@ -1103,79 +1150,59 @@ def test_interacted_self_report_grants_no_exemption(client, db, seed_org, media_
     )
 
 
-# ================================================================ 고정 문항(강사 지정 시점)
-def test_pin_unit_beats_random_interval_and_respects_watched():
-    """단위 — 고정 시점은 무작위 간격보다 먼저 잡히고, 이미 지나온 시점은 다시 안 잡는다."""
+# ================================================================ 핀(출제 시점) 예약
+def test_pin_unit_fires_in_order_and_respects_watched():
+    """단위 — 아직 안 닿은 가장 이른 핀에 잡히고, 지나온 핀은 다시 안 잡는다."""
     from app.services.lecture_service import next_checkpoint
 
-    lec = Lecture(check_min_sec=100, check_max_sec=100, duration_sec=1000)
-    # 고정 30초가 무작위 100초보다 앞 → 30에 잡힌다
-    assert next_checkpoint(0, lec, pool_min=0, pins=[(30, 30)]) == 30
-    # 고정을 지나온 뒤(watched=30)엔 다시 안 잡고 무작위로 복귀
-    assert next_checkpoint(30, lec, pool_min=0, pins=[(30, 30)]) == 130
-    # 고정이 무작위보다 뒤면 무작위가 먼저
-    assert next_checkpoint(0, lec, pool_min=0, pins=[(500, 500)]) == 100
-    # 영상 밖 고정은 무시(무작위만)
-    assert next_checkpoint(0, lec, pool_min=0, pins=[(5000, 5000)]) == 100
-    # 여러 고정 중 가장 이른 것
-    assert next_checkpoint(0, lec, pool_min=0, pins=[(80, 80), (30, 30), (50, 50)]) == 30
+    # 가장 이른 핀부터(정렬 무관), 지나온 핀은 소진
+    assert next_checkpoint(0, 1000, [(80, 80), (30, 30), (50, 50)]) == 30
+    assert next_checkpoint(30, 1000, [(80, 80), (30, 30), (50, 50)]) == 50
+    assert next_checkpoint(80, 1000, [(80, 80), (30, 30), (50, 50)]) is None  # 전부 소진
+    # 영상 밖 핀은 무시 — 낼 수 없는 지점을 예약하지 않는다
+    assert next_checkpoint(0, 1000, [(5000, 5000)]) is None
+    # 0초 핀은 잡히지 않는다(watched < start 판정 — 아직 아무것도 안 본 지점).
+    # 생성/수정 검증이 active 문항의 position>=1을 강제해 이 상태 자체를 막는다.
+    assert next_checkpoint(0, 1000, [(0, 0)]) is None
+    # 핀이 없으면 예약도 없다 — 낼 문제 없는 예약은 조용한 실패가 된다
+    assert next_checkpoint(0, 1000, []) is None
 
 
 def test_pin_window_unit_picks_inside_range_and_consumes_once():
-    """단위 — 구간 고정은 [start, end] 안의 무작위 시점에 잡히고, 구간당 한 번만 잡힌다."""
+    """단위 — 구간 핀은 [start, end] 안의 무작위 시점에 잡히고, 구간당 한 번만 잡힌다."""
     from app.services.lecture_service import next_checkpoint
 
-    lec = Lecture(check_min_sec=600, check_max_sec=600, duration_sec=1000)
-    # 구간 [200, 300] 안에서만 뽑힌다(무작위 600보다 앞)
-    picks = {next_checkpoint(0, lec, pool_min=0, pins=[(200, 300)]) for _ in range(200)}
+    # 구간 [200, 300] 안에서만 뽑힌다 — 매번 같은 초면 학생이 지점을 외운다
+    picks = {next_checkpoint(0, 1000, [(200, 300)]) for _ in range(200)}
     assert picks and all(200 <= p <= 300 for p in picks), picks
     assert len(picks) > 1, "구간인데 항상 같은 초면 학생이 지점을 외운다"
 
     # 소진 판정은 start 기준 — 구간 안에서 캡차를 푼 뒤 같은 구간이 다시 잡히면
     # 같은 문항이 반복된다(end 기준으로 하면 그렇게 된다)
-    assert next_checkpoint(250, lec, pool_min=0, pins=[(200, 300)]) == 850
-    assert next_checkpoint(200, lec, pool_min=0, pins=[(200, 300)]) == 800
+    assert next_checkpoint(250, 1000, [(200, 300)]) is None
+    assert next_checkpoint(200, 1000, [(200, 300)]) is None
+    # 아직 start 전이면(watched=199) 같은 구간이 유효하다
+    assert 200 <= next_checkpoint(199, 1000, [(200, 300)]) <= 300
 
-    # 구간 끝이 영상을 넘으면 영상 안으로 자른다("3:20부터 끝까지"는 정상 의도).
-    # pool_min=None으로 무작위 확인을 빼고 고정만 본다 — 풀이 있으면 600초 무작위가 먼저다.
-    tail = {next_checkpoint(0, lec, pool_min=None, pins=[(900, 5000)]) for _ in range(100)}
+    # 구간 끝이 영상을 넘으면 영상 안으로 자른다("3:20부터 끝까지"는 정상 의도)
+    tail = {next_checkpoint(0, 1000, [(900, 5000)]) for _ in range(100)}
     assert all(900 <= p <= 999 for p in tail), tail
-
-
-def test_pin_unit_without_pool_only_fires_at_pins():
-    """단위 — 풀 문항이 없으면(pool_min=None) 고정 시점에서만 잡히고, 고정도 없으면 안 잡힌다."""
-    from app.services.lecture_service import next_checkpoint
-
-    lec = Lecture(check_min_sec=100, check_max_sec=100, duration_sec=1000)
-    assert next_checkpoint(0, lec, pool_min=None, pins=[(30, 30)]) == 30
-    assert next_checkpoint(30, lec, pool_min=None, pins=[(30, 30)]) is None  # 고정 소진
-    assert next_checkpoint(0, lec, pool_min=None, pins=[]) is None  # 낼 문제 자체가 없음
-
-
-def test_pin_unit_random_waits_for_pool_to_open():
-    """단위 — 풀 문항이 늦게 열리면 무작위 지점을 그때까지 민다(낼 문제 없는 예약 금지)."""
-    from app.services.lecture_service import next_checkpoint
-
-    lec = Lecture(check_min_sec=10, check_max_sec=10, duration_sec=1000)
-    assert next_checkpoint(0, lec, pool_min=300, pins=[]) == 300
 
 
 def test_pinned_question_fires_at_its_position_and_is_served(
     client, db, seed_org, media_dir
 ):
-    """통합 — 강사가 고정한 시점에 체크포인트가 잡히고, 그 시점엔 그 문항이 나온다."""
+    """통합 — 핀 시점에 체크포인트가 잡히고, 그 시점엔 '그 구간의' 문항만 나온다.
+
+    뒤(500초) 핀 문항이 앞(3초) 게이트에 새어나오면 안 된다 — 미리 소진되면
+    정작 지정 시점에 낼 문제가 사라진다."""
     ops_tok = _ops(client, db)
-    # 무작위 간격은 600초(영상 끝까지 한 번도 안 뜰 만큼) — 고정이 없으면 30초에 뜰 리 없다
-    lec = _upload_lecture(
-        client, ops_tok, check_min=600, check_max=600, duration=1000
-    ).json()
-    pooled = _add_question(client, ops_tok, lec["id"], answer=1)
-    # 고정 시점은 하트비트 헤드룸(5초) 안 — 속도 상한 때문에 먼 지점은 한 비트로 못 닿는다
+    lec = _upload_lecture(client, ops_tok, duration=1000).json()
+    # 핀 시점은 하트비트 헤드룸(5초) 안 — 속도 상한 때문에 먼 지점은 한 비트로 못 닿는다
     r = client.post(
         f"/api/v1/ops/lectures/{lec['id']}/questions",
         json={
             "position_sec": 3,
-            "pinned": True,
             "prompt": "방금 화면에 나온 그래프의 색은?",
             "options": ["빨강", "파랑", "초록", "노랑"],
             "answer_index": 2,
@@ -1184,13 +1211,14 @@ def test_pinned_question_fires_at_its_position_and_is_served(
         headers=auth(ops_tok),
     )
     assert r.status_code == 200, r.text
-    pin = r.json()
-    assert pin["pinned"] is True
+    later = _add_question(
+        client, ops_tok, lec["id"], position=500, answer=0, prompt="뒤 시점 전용 문항"
+    )
 
     site_key = _edu_key(client, db, seed_org, ops_tok, first_party=True)
     tok = _student_token(client, seed_org)
     d = client.get(f"/api/v1/lectures/{lec['id']}", headers=auth(tok))
-    assert d.json()["next_checkpoint_sec"] == 3, "고정 시점이 무작위 간격(600초)을 이기지 못했다"
+    assert d.json()["next_checkpoint_sec"] == 3, "가장 이른 핀 시점에 잡혀야 한다"
 
     st = _session_token(client, tok, lec["id"])
     r = _hb(client, tok, lec["id"], 3, st=st)
@@ -1201,60 +1229,25 @@ def test_pinned_question_fires_at_its_position_and_is_served(
         headers={"X-Site-Key": site_key, **auth(tok)},
     )
     assert ch.status_code == 200, ch.text
-    # 그 시점엔 고정 문항이 나온다 — 풀 문항이 아니라
+    # 그 시점엔 그 구간의 문항이 나온다 — 뒤 핀 문항이 새어나오지 않는다
     assert ch.json()["prompt"] == "방금 화면에 나온 그래프의 색은?"
-    assert pooled["prompt"] != ch.json()["prompt"]
-
-
-def test_pinned_question_never_leaks_into_random_checkpoint(
-    client, db, seed_org, media_dir
-):
-    """고정 문항은 무작위 확인에 새어나오지 않는다 — 미리 소진되면 지정 시점에 낼 게 없다."""
-    ops_tok = _ops(client, db)
-    lec = _upload_lecture(client, ops_tok, check_min=1, check_max=1, duration=1000).json()
-    _add_question(client, ops_tok, lec["id"], answer=1)  # 풀 문항(position 0)
-    r = client.post(
-        f"/api/v1/ops/lectures/{lec['id']}/questions",
-        json={
-            "position_sec": 500,
-            "pinned": True,
-            "prompt": "고정 전용 문항",
-            "options": ["가", "나", "다", "라"],
-            "answer_index": 0,
-            "status": "active",
-        },
-        headers=auth(ops_tok),
-    )
-    assert r.status_code == 200, r.text
-
-    site_key = _edu_key(client, db, seed_org, ops_tok, first_party=True)
-    tok = _student_token(client, seed_org)
-    _reach_checkpoint(client, tok, lec["id"])  # 무작위 cp=1 (고정 500보다 훨씬 앞)
-    ch = client.post(
-        f"/api/v1/captcha/v1/challenge?lecture={lec['id']}",
-        headers={"X-Site-Key": site_key, **auth(tok)},
-    )
-    assert ch.status_code == 200, ch.text
-    assert ch.json()["prompt"] != "고정 전용 문항", "고정 문항이 무작위 확인에서 소진됐다"
+    assert later["prompt"] != ch.json()["prompt"]
 
 
 def test_pin_added_later_reclaims_stale_reservation(client, db, seed_org, media_dir):
-    """강사가 나중에 고정 문항을 추가하면, 그 지점을 지나칠 예약이 다시 잡힌다."""
+    """강사가 나중에 더 이른 핀을 추가하면, 그 지점을 지나칠 예약이 다시 잡힌다."""
     ops_tok = _ops(client, db)
-    lec = _upload_lecture(
-        client, ops_tok, check_min=600, check_max=600, duration=1000
-    ).json()
-    _add_question(client, ops_tok, lec["id"])
+    lec = _upload_lecture(client, ops_tok, duration=1000).json()
+    _add_question(client, ops_tok, lec["id"], position=600)
     tok = _student_token(client, seed_org)
     d = client.get(f"/api/v1/lectures/{lec['id']}", headers=auth(tok))
-    assert d.json()["next_checkpoint_sec"] == 600  # 옛 예약 — 고정 시점을 지나쳐 버린다
+    assert d.json()["next_checkpoint_sec"] == 600  # 옛 예약 — 새 핀 시점을 지나쳐 버린다
 
     r = client.post(
         f"/api/v1/ops/lectures/{lec['id']}/questions",
         json={
             "position_sec": 40,
-            "pinned": True,
-            "prompt": "나중에 추가한 고정 문항",
+            "prompt": "나중에 추가한 핀 문항",
             "options": ["가", "나"],
             "answer_index": 0,
             "status": "active",
@@ -1265,11 +1258,15 @@ def test_pin_added_later_reclaims_stale_reservation(client, db, seed_org, media_
 
     st = _session_token(client, tok, lec["id"])
     hb = _hb(client, tok, lec["id"], 4, st=st)
-    assert hb.json()["next_checkpoint_sec"] == 40, "고정 추가 후에도 옛 예약이 남았다"
+    assert hb.json()["next_checkpoint_sec"] == 40, "핀 추가 후에도 옛 예약이 남았다"
 
 
 def test_pin_validation_rejects_unreachable_positions(client, db, seed_org, media_dir):
-    """뜰 수 없는 고정은 조용히 죽는 대신 거절한다 — 0초(시청 전)·영상 밖."""
+    """뜰 수 없는 공개 문항은 조용히 죽는 대신 거절한다 — 0초(시청 전)·영상 밖.
+
+    핀은 watched < start 판정이라 0초 핀은 영영 안 뜨고, 영상 밖(100초 강의에 900 오타)
+    시점은 예약 자체가 안 잡힌다. 유일 문항이면 그 강의의 시청 검증이 통째로 꺼지는데
+    목록에는 멀쩡한 active로 보여 알아챌 방법이 없다(적대적 검토에서 실증)."""
     ops_tok = _ops(client, db)
     lec = _upload_lecture(client, ops_tok, duration=600).json()
     body = {
@@ -1277,7 +1274,6 @@ def test_pin_validation_rejects_unreachable_positions(client, db, seed_org, medi
         "options": ["가", "나"],
         "answer_index": 0,
         "status": "active",
-        "pinned": True,
     }
     r0 = client.post(
         f"/api/v1/ops/lectures/{lec['id']}/questions",
@@ -1294,27 +1290,40 @@ def test_pin_validation_rejects_unreachable_positions(client, db, seed_org, medi
     assert r1.status_code == 400 and "영상 길이를 벗어" in r1.json()["detail"]
 
 
-def test_pool_question_beyond_duration_rejected(client, db, seed_org, media_dir):
-    """★ 영상 밖 시점은 풀 문항도 거절한다 — 오타 하나로 검증이 조용히 꺼지면 안 된다.
+def test_draft_at_zero_allowed_until_activation(client, db, seed_org, media_dir):
+    """draft는 '시점 미배치'(position 0)로 존재할 수 있다 — LLM 생성 문항의 기본 상태.
 
-    100초 강의에 position 900을 넣으면 pool_min이 영상 밖이라 체크포인트가 아예 안 잡히고,
-    그게 유일한 문항이면 그 강의의 시청 검증이 통째로 꺼진다. 목록에는 멀쩡한 active 문항으로
-    보여 알아챌 방법이 없다(적대적 검토에서 실증)."""
+    단 공개(활성화)하려면 시점을 지정해야 한다: 0초 핀은 활성화돼도 영영 안 떠서,
+    승인만 하고 배치를 잊으면 검증이 조용히 꺼진 문항이 생기기 때문이다."""
     ops_tok = _ops(client, db)
-    lec = _upload_lecture(client, ops_tok, duration=100).json()
-    r = client.post(
-        f"/api/v1/ops/lectures/{lec['id']}/questions",
-        json={
-            "position_sec": 900,  # 90의 오타
-            "prompt": "문항",
-            "options": ["가", "나"],
-            "answer_index": 0,
-            "status": "active",
-        },
+    lec = _upload_lecture(client, ops_tok, duration=600).json()
+
+    # 시점 미배치 draft 생성 OK
+    q = _add_question(client, ops_tok, lec["id"], position=0, status="draft")
+    assert q["status"] == "draft" and q["position_sec"] == 0
+
+    # 시점을 그대로 두고 문구만 고치는 draft 수정도 OK(검수 작업 흐름)
+    up = client.put(
+        f"/api/v1/ops/lectures/{lec['id']}/questions/{q['id']}",
+        json={"prompt": "검수하며 문구 수정"},
         headers=auth(ops_tok),
     )
-    assert r.status_code == 400, r.text
-    assert "영상 길이를 벗어" in r.json()["detail"]
+    assert up.status_code == 200, up.text
+
+    # 시점 없이 승인(활성화) → 400, 시점을 지정하면 통과
+    bad = client.put(
+        f"/api/v1/ops/lectures/{lec['id']}/questions/{q['id']}",
+        json={"status": "active"},
+        headers=auth(ops_tok),
+    )
+    assert bad.status_code == 400 and "1초 이상" in bad.json()["detail"]
+    ok = client.put(
+        f"/api/v1/ops/lectures/{lec['id']}/questions/{q['id']}",
+        json={"status": "active", "position_sec": 30},
+        headers=auth(ops_tok),
+    )
+    assert ok.status_code == 200, ok.text
+    assert ok.json()["status"] == "active" and ok.json()["position_sec"] == 30
 
 
 def test_shrinking_duration_rejects_orphaned_questions(client, db, seed_org, media_dir):
@@ -1352,29 +1361,28 @@ def test_shrinking_duration_rejects_orphaned_questions(client, db, seed_org, med
 
 
 def test_duplicate_pin_at_same_position_rejected(client, db, seed_org, media_dir):
-    """★ 같은 시점에 고정 둘 — 하나만 뜨고 나머지는 영구 사문이 되므로 거절한다."""
+    """★ 같은 시점에 공개 문항 둘 — 하나만 뜨고 나머지는 영구 사문이 되므로 거절한다."""
     ops_tok = _ops(client, db)
     lec = _upload_lecture(client, ops_tok, duration=1000).json()
     body = {
         "position_sec": 300,
-        "pinned": True,
         "options": ["가", "나"],
         "answer_index": 0,
         "status": "active",
     }
     r1 = client.post(
         f"/api/v1/ops/lectures/{lec['id']}/questions",
-        json={**body, "prompt": "고정 A"},
+        json={**body, "prompt": "핀 A"},
         headers=auth(ops_tok),
     )
     assert r1.status_code == 200, r1.text
     r2 = client.post(
         f"/api/v1/ops/lectures/{lec['id']}/questions",
-        json={**body, "prompt": "고정 B"},
+        json={**body, "prompt": "핀 B"},
         headers=auth(ops_tok),
     )
     assert r2.status_code == 400, r2.text
-    assert "같은 시점에 고정된" in r2.json()["detail"]
+    assert "같은 시점에 출제되는" in r2.json()["detail"]
 
 
 def test_ops_preview_stream_is_isolated_from_student_stream(
@@ -1423,99 +1431,29 @@ def test_ops_preview_does_not_steal_student_session(client, db, seed_org, media_
 
 
 def test_cleared_reservation_is_rescheduled(client, db, seed_org, media_dir):
-    """회귀 — 운영자가 간격을 바꿔 예약이 해제되면 다음 하트비트가 다시 잡는다.
+    """회귀 — 문항 시점 이동으로 예약이 해제되면 다음 하트비트가 다시 잡는다.
 
-    예전에는 next_checkpoint_sec=None을 되돌릴 경로가 없어, 간격을 바꾸는 순간 그 강의를
-    보던 학생은 남은 내내 캡차가 한 번도 안 떴다 = 시청 검증이 조용히 꺼졌다. 주석은
-    '다음 하트비트가 다시 잡는다'고 적혀 있었지만 그런 코드가 없었다."""
+    예전에는 next_checkpoint_sec=None을 되돌릴 경로가 없어, 예약이 해제되는 순간 그
+    강의를 보던 학생은 남은 내내 캡차가 한 번도 안 떴다 = 시청 검증이 조용히 꺼졌다.
+    주석은 '다음 하트비트가 다시 잡는다'고 적혀 있었지만 그런 코드가 없었다."""
     ops_tok = _ops(client, db)
-    lec = _upload_lecture(
-        client, ops_tok, check_min=300, check_max=300, duration=1000
-    ).json()
-    _add_question(client, ops_tok, lec["id"])
+    lec = _upload_lecture(client, ops_tok, duration=1000).json()
+    q = _add_question(client, ops_tok, lec["id"], position=300)
     tok = _student_token(client, seed_org)
     d = client.get(f"/api/v1/lectures/{lec['id']}", headers=auth(tok))
     assert d.json()["next_checkpoint_sec"] == 300
 
-    # 강사가 '촘촘히'로 변경 — 300초 예약은 새 간격(최대 10초)으로 도달 불가라 해제된다
+    # 강사가 문항 시점을 40초로 이동 — 300초 예약은 어떤 핀 구간도 안 덮어 해제된다
     u = client.put(
-        f"/api/v1/ops/lectures/{lec['id']}",
-        json={"check_min_sec": 10, "check_max_sec": 10},
+        f"/api/v1/ops/lectures/{lec['id']}/questions/{q['id']}",
+        json={"position_sec": 40},
         headers=auth(ops_tok),
     )
     assert u.status_code == 200, u.text
 
     st = _session_token(client, tok, lec["id"])
     hb = _hb(client, tok, lec["id"], 4, st=st)
-    assert hb.json()["next_checkpoint_sec"] is not None, "해제된 예약이 다시 안 잡혔다"
-    assert hb.json()["next_checkpoint_sec"] <= 10
-
-
-def test_suspicion_narrows_interval_with_floor(client, db, seed_org, media_dir):
-    """의심 누적 → 간격 축소 + 하한 준수.
-
-    ① 단위: next_checkpoint가 suspicion으로 좁아지되 CHECKPOINT_FLOOR_SEC(또는 더 작은
-       check_min) 아래로는 안 내려간다. ② API: seek 점프·tab_hidden 신고가 suspicion을
-       올린다. ③ 통합: 의심 누적 학생의 캡차 통과 재예약이 실제로 좁아진다."""
-    from app.services.lecture_service import CHECKPOINT_FLOOR_SEC, next_checkpoint
-
-    # ① 단위 — 좁힘과 하한
-    fake = Lecture(check_min_sec=100, check_max_sec=100, duration_sec=10_000)
-    assert next_checkpoint(0, fake, suspicion=0, pool_min=0) == 100
-    assert next_checkpoint(0, fake, suspicion=3, pool_min=0) == 25  # 100 // (1+3)
-    assert next_checkpoint(0, fake, suspicion=999, pool_min=0) == CHECKPOINT_FLOOR_SEC  # 하한
-    tiny = Lecture(check_min_sec=5, check_max_sec=5, duration_sec=10_000)
-    # 원래 간격이 하한보다 짧으면 그 값을 유지 — 축소가 간격을 '늘리지' 않는다
-    assert next_checkpoint(0, tiny, suspicion=999, pool_min=0) == 5
-    # 기본값은 '낼 문항 없음' — 인자를 깜빡한 호출이 조용히 예약을 만들면 안 된다
-    assert next_checkpoint(0, fake) is None
-
-    # ② API — seek 점프(속도상한 초과 신고)와 tab_hidden이 suspicion을 누적
-    ops_tok = _ops(client, db)
-    lec = _upload_lecture(client, ops_tok, check_min=100, check_max=100, duration=600).json()
-    _add_question(client, ops_tok, lec["id"], answer=2)
-    site_key = _edu_key(client, db, seed_org, ops_tok, first_party=True)
-    tok = _student_token(client, seed_org)
-    client.get(f"/api/v1/lectures/{lec['id']}", headers=auth(tok))  # cp=100
-    st = _session_token(client, tok, lec["id"])
-
-    _hb(client, tok, lec["id"], 590, st=st)  # 안 본 구간 seek 시도 → +1
-    db.expire_all()
-    assert int(_progress_row(db, lec["id"]).suspicion or 0) == 1
-    _hb(client, tok, lec["id"], 6, st=st, tab_hidden=True)  # 탭 백그라운드 자기신고 → +1
-    db.expire_all()
-    assert int(_progress_row(db, lec["id"]).suspicion or 0) == 2
-
-    # ③ 통합 — 점프를 반복하며 cp(100)까지 도달(그때마다 suspicion 누적),
-    #    캡차 통과 후 재예약 간격이 100이 아니라 하한(20) 근처로 좁아졌는지 본다.
-    due = False
-    for _ in range(40):
-        body = _hb(client, tok, lec["id"], 590, st=st).json()
-        if body["checkpoint_due"]:
-            due = True
-            break
-    assert due, "체크포인트에 도달하지 못했다"
-    ch = client.post(
-        f"/api/v1/captcha/v1/challenge?lecture={lec['id']}",
-        headers={"X-Site-Key": site_key, **auth(tok)},
-    ).json()
-    vr = client.post(
-        "/api/v1/captcha/v1/verify",
-        json={"challenge_token": ch["challenge_token"], "answer": ["2"]},
-        headers={"X-Site-Key": site_key, **auth(tok)},
-    )
-    assert vr.status_code == 200 and vr.json()["success"] is True
-    db.expire_all()
-    row = _progress_row(db, lec["id"])
-    suspicion = int(row.suspicion or 0)
-    # 반복 점프로 상한(SUSPICION_MAX=8)까지 누적 → 통과 시 반감(8//2=4). 무한 누적 금지 +
-    # 캡차 통과가 회복 경로라는 두 규약을 함께 단언한다.
-    from app.services.lecture_service import SUSPICION_MAX
-
-    assert suspicion == SUSPICION_MAX // 2, f"cap·반감 규약 위반: {suspicion}"
-    gap = int(row.next_checkpoint_sec) - int(row.watched_max_sec)
-    # 축소: max(100//(1+suspicion), 20) ≤ gap < 원래 간격 100
-    assert CHECKPOINT_FLOOR_SEC <= gap < 100, f"간격이 좁아지지 않았다: {gap}(suspicion={suspicion})"
+    assert hb.json()["next_checkpoint_sec"] == 40, "해제된 예약이 다시 안 잡혔다"
 
 
 # ================================================================ 자료실(강의 자료)
@@ -1803,12 +1741,11 @@ def test_lecture_toc_order(client, db, seed_org, media_dir):
     assert korean == ["1강", "2강", "3강"]
 
 
-def test_ops_list_pool_question_count(client, db, seed_org, media_dir):
-    """ops 목록의 pool_question_count = 공개(active)·풀(pinned=False) 문항 수.
+def test_ops_list_question_counts(client, db, seed_org, media_dir):
+    """ops 목록의 active_question_count — '검증 없음' 콘솔 경고의 근거.
 
-    고정 문항만 있으면(pool=0) 무작위 확인이 예약되지 않아, 고정 시점을 이미 지난
-    학생에게는 남은 강의 내내 확인이 안 뜬다(라이브 사고 사례) — 콘솔 경고의 근거라
-    active엔 잡히지만 pool엔 안 잡히는 상태를 구분해서 내려줘야 한다."""
+    0이면 확인(캡차)이 아예 안 떠서 그 강의는 시청 검증이 없다. draft는 안 잡히고,
+    승인해야 잡힌다. (풀 개념 제거로 pool_question_count 필드는 사라졌다 — 회귀 방지.)"""
     ops_tok = _ops(client, db)
     lec = _upload_lecture(client, ops_tok).json()
 
@@ -1816,39 +1753,35 @@ def test_ops_list_pool_question_count(client, db, seed_org, media_dir):
         ls = client.get("/api/v1/ops/lectures", headers=auth(ops_tok)).json()
         return next(r for r in ls if r["id"] == lec["id"])
 
-    # 문항 0개 — 둘 다 0
+    # 문항 0개 — 검증 없음 상태
     r = row()
-    assert r["active_question_count"] == 0 and r["pool_question_count"] == 0
+    assert r["active_question_count"] == 0
+    assert "pool_question_count" not in r  # 풀 개념 부활 회귀 방지
+    assert "check_min_sec" not in r and "check_max_sec" not in r  # 간격 설정도 함께 제거됨
 
-    # 고정(pinned) 문항만 — active 1이지만 pool은 여전히 0 (사고 상태 = 콘솔 경고 대상)
-    pinned_q = _add_question(client, ops_tok, lec["id"], position=18, pinned=True)
+    # draft 문항 — 아직 공개가 아니라 안 잡힌다
+    draft_q = _add_question(client, ops_tok, lec["id"], position=0, status="draft")
     r = row()
-    assert r["active_question_count"] == 1 and r["pool_question_count"] == 0
+    assert r["active_question_count"] == 0 and r["question_count"] == 1
 
-    # draft 풀 문항 — 아직 공개가 아니라 어느 카운트에도 안 잡힌다
-    draft_q = _add_question(client, ops_tok, lec["id"], status="draft")
-    r = row()
-    assert r["active_question_count"] == 1 and r["pool_question_count"] == 0
-
-    # draft 승인 → 비로소 pool에 잡힌다
+    # 시점 지정 + 승인 → 잡힌다
     up = client.put(
         f"/api/v1/ops/lectures/{lec['id']}/questions/{draft_q['id']}",
-        json={"status": "active"},
+        json={"status": "active", "position_sec": 18},
         headers=auth(ops_tok),
     )
     assert up.status_code == 200, up.text
     r = row()
-    assert r["active_question_count"] == 2 and r["pool_question_count"] == 1
+    assert r["active_question_count"] == 1
 
-    # 풀 문항 삭제 → pool 0으로 복귀(고정만 남은 사고 상태로 되돌아감)
+    # 삭제 → 검증 없음 상태로 복귀
     rm = client.delete(
         f"/api/v1/ops/lectures/{lec['id']}/questions/{draft_q['id']}",
         headers=auth(ops_tok),
     )
     assert rm.status_code == 200, rm.text
     r = row()
-    assert r["active_question_count"] == 1 and r["pool_question_count"] == 0
-    assert pinned_q["pinned"] is True  # 전제 확인 — 고정 문항이 실제로 pinned로 저장됐다
+    assert r["active_question_count"] == 0
 
 
 def test_lecture_order_no_auto_assign_and_reorder(client, db, seed_org, media_dir):

@@ -1,5 +1,5 @@
 """강의 시청 검증 도메인 서비스 — 진행(하트비트) 검증·체크포인트 예약/기록·
-동시접속 차단(claim_session)·행동 기반 캡차 트리거(상호작용 면제·의심 가중).
+동시접속 차단(claim_session). 출제 시점은 전부 핀(문항의 position_sec+window_sec 구간).
 
 시각 비교는 전부 로컬 naive(_now, app/db/base.py와 동일 소스)로 한다. utcnow()가 섞이면
 로컬(KST) created_at/updated_at과의 차이가 -32400초가 되어 wall-clock 전진 허용량이
@@ -56,118 +56,67 @@ SESSION_TTL_SEC = 30
 # 근본 제약: 웹에서 '집중하고 있는가'를 측정할 방법이 없다. 추정 가능한 신호는 전부
 # 위조 가능하다. 그래서 '봤는가'를 직접 묻는 콘텐츠 캡차가 유일한 수단이다.
 
-# ---- 의심 가중 ----
-# suspicion 누적 시 체크포인트 간격을 나눠 좁히되, 이 하한(초) 아래로는 절대 내리지 않는다 —
-# 오탐(정상 사용자의 실수 seek 등)이 쌓여도 '몇 초마다 캡차' 같은 징벌이 되지 않게 하는 안전판.
-CHECKPOINT_FLOOR_SEC = 20
-# 속도상한 클램프를 '의심 이벤트'로 셀 때의 여유(초) — 반올림·전송 지연으로 살짝 넘친
-# 정상 하트비트를 seek 시도로 오인하지 않기 위한 값.
-SEEK_TOLERANCE_SEC = 2
-# suspicion 상한 — seek 1회도 watched가 따라잡을 때까지 매 하트비트 카운트되므로(적대적
-# 검토에서 실측: seek 1회→+20) 무제한 누적을 막는다. 8이면 간격이 이미 하한까지 좁혀지는
-# 수준이라 탐지력 손실 없이, 아래 반감 회복이 캡차 3회(8→4→2→1) 안에 끝난다.
-SUSPICION_MAX = 8
+# ---- 랜덤 간격·의심 가중: 제거됨(0717) ----
+# 출제 시점은 이제 전부 핀이다 — 문항마다 position_sec(+window_sec) 구간이 있고,
+# 체크포인트는 그 구간 안에서만 잡힌다. '아무 때나 무작위 확인'(pinned=False 풀 +
+# check_min/max_sec 간격)은 옛 시청-감시 설계의 잔재로, 학습 설계에서는 강사(또는 LLM)가
+# "이 대목을 물어라"를 지정하므로 쓸 곳이 없었다. 거기 딸려 있던 suspicion(의심 누적 시
+# 간격 축소)과 tab_hidden 자기신고도 좁힐 간격이 사라져 함께 걷어냈다.
+# 속도 상한·체크포인트 클램프(위)는 position 위조 차단의 본체라 그대로 남는다.
+
+# ---- 오답 상한(되감기) ----
+# 한 체크포인트에서 이 횟수만큼 연속 오답하면, 그 대목을 다시 보도록 watched_max를
+# REWIND_SEC만큼 되감는다. 되감기 전에는 오답 → 재발급이 무한 반복돼 보기 전수 대입
+# (겹치는 핀이 여럿이면 정답 집합 수확)이 대가 없이 가능했다. 되감으면 watched_max < cp가
+# 되어 _lecture_challenge가 409로 새 문항 발급을 거부한다 — 실제로 다시 시청해 cp까지
+# 올라와야(실시간 하트비트) 다음 문항을 받는다. 학습적으로도 옳다: 세 번 틀렸다는 건
+# 그 대목을 다시 봐야 한다는 뜻이다. (프론트 상수 MAX_CHECKPOINT_FAILS와 맞춰 둘 것)
+MAX_CHECKPOINT_FAILS = 3
+# 되감기 폭(초) — 문항이 다루는 대목(cp 직전)을 다시 듣기에 충분한 길이.
+REWIND_SEC = 30
 
 
-def question_windows(
-    db: Session, lecture_id: str
-) -> tuple[int | None, list[tuple[int, int]]]:
-    """그 강의에서 '언제 무슨 문항을 낼 수 있는가' — (pool_min, pins).
+def question_windows(db: Session, lecture_id: str) -> list[tuple[int, int]]:
+    """그 강의의 출제 구간(핀) [start, end] 목록 — start 오름차순, 중복 제거.
 
-    pool_min: 무작위 확인에 쓸 수 있는 풀 문항(pinned=False) 중 가장 이른 position_sec.
-              풀 문항이 하나도 없으면 None — 무작위 지점을 예약해도 낼 문제가 없다.
-    pins:     강사가 고정한 문항의 출제 구간 [start, end] 목록(start 오름차순, 중복 제거).
-              window_sec=0인 고정은 start==end(정확히 그 시점).
-    """
+    모든 공개(active) 문항이 핀이다: window_sec=0이면 start==end(정확히 그 시점),
+    window_sec>0이면 [position, position+window] 구간(정확한 초는 예약 시 무작위)."""
     rows = (
-        db.query(
-            LectureQuestion.position_sec,
-            LectureQuestion.pinned,
-            LectureQuestion.window_sec,
-        )
+        db.query(LectureQuestion.position_sec, LectureQuestion.window_sec)
         .filter(
             LectureQuestion.lecture_id == lecture_id,
             LectureQuestion.status == "active",
         )
         .all()
     )
-    pool = [int(pos) for pos, pinned, _w in rows if not pinned]
-    pins = sorted(
-        {(int(pos), int(pos) + max(0, int(w or 0))) for pos, pinned, w in rows if pinned}
-    )
-    return (min(pool) if pool else None), pins
+    return sorted({(int(pos), int(pos) + max(0, int(w or 0))) for pos, w in rows})
 
 
 def next_checkpoint(
     watched_max: int,
-    lec: Lecture,
-    suspicion: int = 0,
-    *,
-    # 기본값은 '낼 문항이 없다' — pool_min=0을 기본으로 두면 새 호출부가 인자를 깜빡했을 때
-    # '0초부터 풀 문항이 있다'고 조용히 가정해 낼 문제 없는 예약을 만든다(고치려던 그 버그).
-    # 안전한 실패 쪽으로 기울인다: 모르면 예약하지 않는다.
-    pool_min: int | None = None,
-    pins: Sequence[tuple[int, int]] = (),
+    duration_sec: int,
+    pins: Sequence[tuple[int, int]],
 ) -> int | None:
-    """다음 체크포인트 지점 예약 — 고정 문항 구간과 무작위 간격 중 먼저 오는 쪽.
+    """다음 체크포인트 예약 — 아직 안 닿은 가장 이른 핀 구간 안의 무작위 1점, 없으면 None.
 
-    suspicion(의심 이벤트 누적)이 있으면 무작위 간격을 (1+suspicion)로 나눠 좁힌다.
-    단 CHECKPOINT_FLOOR_SEC(강의 설정 최소가 그보다 작으면 그 값) 아래로는 내리지
-    않는다 — 오탐 누적이 '몇 초마다 캡차' 지옥이 되는 것을 하한으로 차단.
-    영상 길이(duration_sec)를 넘으면 None(남은 체크포인트 없음).
-
-    ★ 고정 문항(pins): 강사가 "이 대목에서 이걸 물어라"라고 지정한 구간 [start, end].
-    무작위 간격보다 우선한다 — 지정 구간을 지나쳐 버리면 고정의 의미가 없다. 구간 안의
-    정확한 초는 여기서 무작위로 고른다(강사도 모른다 — 매번 같은 초면 학생이 외운다).
-    window_sec=0이면 start==end라 그 시점 그대로다.
+    ★ 구간 안의 정확한 초는 여기서 무작위로 고른다(강사도 모른다 — 매번 같은 초면
+    학생이 그 지점만 외워 대기한다). window_sec=0이면 start==end라 그 시점 그대로다.
+    구간 끝이 영상을 넘으면 duration-1로 잘라 쓴다("여기부터 끝까지"는 정상 의도).
 
     ★ 구간 소진 판정은 'start에 닿았는가'(watched < start)로 한다. end 기준으로 하면
     구간 안에서 캡차를 푼 뒤에도 watched < end라 같은 구간이 계속 다시 잡혀 같은 문항이
     반복된다. start에 닿았다는 것은 그 구간의 체크포인트를 이미 겪었다는 뜻이다 —
     클램프(cp+GRACE)가 있어 캡차를 풀지 않고는 start를 지날 수 없기 때문이다.
 
-    ★ 낼 문제가 없으면 예약하지 않는다(pool_min=None이고 pins도 없으면 None): 예약만
-    해두고 게이트 순간에 문항이 없어 4xx를 내면, 학생 화면에서는 '캡차가 그냥 안 뜨는'
-    조용한 실패가 된다(라이브에서 실제로 겪음 — 문항 0개 강의가 검증 없이 완주됐다).
-    pool_min이 있어도 그보다 이른 무작위 지점은 낼 풀 문항이 없으므로 pool_min까지 민다.
-
-    ★ 최소 1회 보장: 간격이 강의 길이보다 길면 체크포인트가 영상 밖으로 나가
-    '시청 검증이 0회인 강의'가 조용히 만들어진다(3분 강의 + '보통' 설정이면 실측
-    66%가 0회). 강사는 간격만 골랐을 뿐 검증을 끄려던 게 아니므로, 아직 한 번도
-    확인하지 않은 강의(watched_max=0)에서는 간격을 영상 안으로 접어 최소 1회는
-    반드시 뜨게 한다. 이미 한 번이라도 확인했다면(watched_max>0) 남은 구간이
-    짧은 건 정상이므로 None을 그대로 돌려준다."""
-    duration = int(lec.duration_sec or 0)
-    lo = max(1, int(lec.check_min_sec or 60))
-    hi = max(lo, int(lec.check_max_sec or 180))
-    s = max(0, int(suspicion or 0))
-    if s > 0:
-        floor = min(CHECKPOINT_FLOOR_SEC, lo)  # 축소가 원래 최소 간격보다 커지지 않게
-        lo = max(lo // (1 + s), floor)
-        hi = max(hi // (1 + s), lo)
+    ★ 낼 문제가 없으면(핀 없음·전부 소진·전부 영상 밖) 예약하지 않는다: 예약만 해두고
+    게이트 순간에 문항이 없어 4xx를 내면, 학생 화면에서는 '캡차가 그냥 안 뜨는데 진도도
+    안 나가는' 조용한 실패가 된다(라이브에서 실제로 겪음)."""
+    duration = int(duration_sec or 0)
     watched = int(watched_max)
-    # 아직 한 번도 확인 안 한 강의는 반드시 영상 안에서 뽑는다.
-    # lo만 접으면 hi 쪽에서 큰 값이 뽑혀 여전히 영상을 벗어난다(3분+보통 66% 0회) —
-    # 상한을 duration-1로 함께 잘라야 0회가 사라진다.
-    if watched <= 0 and duration > 1:
-        hi = min(hi, duration - 1)
-        lo = min(lo, hi)
-
-    candidates: list[int] = []
-    # 고정 문항 — 아직 안 닿은(watched < start), 영상 안에 있는 가장 이른 구간에서 무작위 1점
     for start, end in sorted(pins):
         if watched < start < duration:
-            candidates.append(random.randint(start, min(end, duration - 1)))
-            break
-    # 무작위 확인 — 낼 풀 문항이 열리는 시점 이후로만
-    if pool_min is not None:
-        candidates.append(max(watched + random.randint(lo, hi), int(pool_min)))
-    if not candidates:
-        return None
-    cp = min(candidates)
-    if cp >= duration:
-        return None
-    return cp
+            return random.randint(int(start), min(int(end), duration - 1))
+    return None
 
 
 def claim_session(
@@ -229,12 +178,12 @@ def ensure_progress(db: Session, student_id: str, lecture: Lecture) -> LectureWa
     )
     if row is not None:
         return row
-    pool_min, pins = question_windows(db, lecture.id)
+    pins = question_windows(db, lecture.id)
     row = LectureWatchProgress(
         student_id=student_id,
         lecture_id=lecture.id,
         watched_max_sec=0,
-        next_checkpoint_sec=next_checkpoint(0, lecture, pool_min=pool_min, pins=pins),
+        next_checkpoint_sec=next_checkpoint(0, int(lecture.duration_sec or 0), pins),
         checkpoints_passed=0,
         status="watching",
     )
@@ -263,8 +212,6 @@ def advance(
     progress: LectureWatchProgress,
     lec: Lecture,
     position_sec: int,
-    *,
-    tab_hidden: bool = False,
 ) -> dict:
     """하트비트 1건 검증 — 서버 정본 watched_max/next_checkpoint를 갱신해 반환.
 
@@ -272,9 +219,6 @@ def advance(
        + HEADROOM 이상으로는 전진 불가(클라이언트 position 자기신고 위조 차단).
     ② 체크포인트 클램프: next_checkpoint_sec + GRACE_SEC를 넘어서면 그 지점에서 정지
        (캡차를 풀기 전까지 진행 없음).
-    ③ 의심 가중: 속도상한을 유의미하게 넘긴 position 신고(안 본 구간 seek/과속)와
-       탭 백그라운드 자기신고(tab_hidden — 위조 가능, 참고용)를 suspicion에 누적한다.
-       suspicion은 다음 체크포인트 간격 축소에만 쓰이고 시청을 막지는 않는다.
     체크포인트에 도달하면 예외 없이 캡차를 요구한다 — 상호작용 면제는 제거됐다(위 주석).
     watched_max는 절대 감소하지 않는다.
     """
@@ -288,31 +232,14 @@ def advance(
     allowed = elapsed * SPEED_FACTOR + HEARTBEAT_HEADROOM_SEC
     new_max = min(position, int(watched + allowed))
 
-    # 의심 이벤트 ①: 속도상한을 여유(SEEK_TOLERANCE) 이상 넘긴 신고 — 안 본 구간
-    # seek 또는 과속 하트비트. 클램프는 위에서 이미 걸렸고, 여기서는 그 '사건'을 센다.
-    # SUSPICION_MAX 상한 — seek 지점을 계속 신고하는 정상 플레이어가 비트마다 누적돼
-    # 회복 불가 수준으로 치솟는 것을 막는다(통과 시 반감 회복과 짝, record_checkpoint).
-    if position > int(watched + allowed) + SEEK_TOLERANCE_SEC:
-        progress.suspicion = min(SUSPICION_MAX, int(progress.suspicion or 0) + 1)
-    # 의심 이벤트 ②: 탭 백그라운드 자기신고 — 위조(미신고) 가능하므로 참고용 가중일 뿐,
-    # 이 신호가 없다고 결백으로 치지 않는다.
-    if tab_hidden:
-        progress.suspicion = min(SUSPICION_MAX, int(progress.suspicion or 0) + 1)
-
     # 예약이 비어 있으면 여기서 다시 잡는다 — next_checkpoint_sec=None은 '검증 끝'이 아니라
-    # '아직 안 잡힘'일 수도 있다. 운영자가 강의 길이·확인 간격을 바꾸거나 문항을 새로 등록하면
+    # '아직 안 잡힘'일 수도 있다. 운영자가 강의 길이를 바꾸거나 문항을 새로 등록하면
     # 낡은 예약을 None으로 지우는데(lectures.py), 재예약 경로가 없으면 그 학생은 남은 강의
     # 내내 캡차가 한 번도 안 뜬다 = 시청 검증이 조용히 꺼진다(실제로 라이브에 나갔던 버그).
     # 영상을 끝까지 본 뒤에는 next_checkpoint가 다시 None을 돌려주므로 완주 판정은 그대로다.
     if progress.next_checkpoint_sec is None and watched < duration:
-        pool_min, pins = question_windows(db, progress.lecture_id)
-        progress.next_checkpoint_sec = next_checkpoint(
-            watched,
-            lec,
-            int(progress.suspicion or 0),
-            pool_min=pool_min,
-            pins=pins,
-        )
+        pins = question_windows(db, progress.lecture_id)
+        progress.next_checkpoint_sec = next_checkpoint(watched, duration, pins)
 
     cp = progress.next_checkpoint_sec
     if cp is not None and new_max > cp + GRACE_SEC:
@@ -370,16 +297,12 @@ def record_checkpoint(
     if passed:
         lec = db.get(Lecture, lecture_id)
         progress.checkpoints_passed = int(progress.checkpoints_passed or 0) + 1
-        # 캡차 통과 = 사람 확인 — suspicion 반감(회복 경로). 오탐이 쌓인 정상 학생이
-        # 캡차 몇 번(최대 8→4→2→1→0)으로 정상 간격을 되찾는다. 계속 seek하는 쪽은
-        # 다시 쌓이므로 탐지력은 유지된다.
-        progress.suspicion = int(progress.suspicion or 0) // 2
+        progress.checkpoint_fails = 0  # 통과 — 연속 오답 카운터 리셋
         base = max(int(progress.watched_max_sec or 0), int(position_sec))
-        # 재예약도 (반감된) suspicion 반영 — 의심이 남은 학생은 통과 후에도 좁은 간격
         if lec is not None:
-            pool_min, pins = question_windows(db, lecture_id)
+            pins = question_windows(db, lecture_id)
             progress.next_checkpoint_sec = next_checkpoint(
-                base, lec, int(progress.suspicion or 0), pool_min=pool_min, pins=pins
+                base, int(lec.duration_sec or 0), pins
             )
         else:
             progress.next_checkpoint_sec = None
@@ -389,4 +312,19 @@ def record_checkpoint(
             and int(progress.watched_max_sec or 0) >= int(lec.duration_sec or 0)
         ):
             progress.status = "done"
+    else:
+        # 오답 — 연속 실패 누적. 상한에 닿으면 그 대목을 다시 보도록 되감는다.
+        fails = int(progress.checkpoint_fails or 0) + 1
+        if fails >= MAX_CHECKPOINT_FAILS:
+            cp = int(position_sec)
+            progress.watched_max_sec = max(0, cp - REWIND_SEC)
+            progress.checkpoint_fails = 0
+            # 앵커 갱신 필수 — 없으면 게이트가 열려 있던 동안 늘어난 elapsed로 allowed가
+            # 부풀어, 되감긴 watched_max가 다음 하트비트 한 번에 cp로 다시 튀어 오른다
+            # (되감기 무력화 — 특히 프론트 없이 position=cp를 반복 신고하는 봇).
+            progress.updated_at = _now()
+            # next_checkpoint_sec는 cp 그대로 — 다시 시청해 cp에 닿으면 같은 체크포인트가
+            # 재트리거되고 그 구간의 핀 문항이 다시 나온다(재시청 후 재도전).
+        else:
+            progress.checkpoint_fails = fails
     return progress

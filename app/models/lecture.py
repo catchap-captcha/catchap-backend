@@ -4,7 +4,6 @@ from sqlalchemy import (
     CHAR,
     JSON,
     BigInteger,
-    Boolean,
     DateTime,
     ForeignKey,
     Index,
@@ -32,8 +31,8 @@ class Lecture(Base, UUIDPk, Timestamps):
     video_ext: Mapped[str] = mapped_column(String(10))  # .mp4|.webm
     video_bytes: Mapped[int] = mapped_column(BigInteger, default=0)
     duration_sec: Mapped[int] = mapped_column(default=0)
-    check_min_sec: Mapped[int] = mapped_column(default=60)  # 체크포인트 간격 최소(초)
-    check_max_sec: Mapped[int] = mapped_column(default=180)  # 체크포인트 간격 최대(초)
+    # (제거됨 0717) check_min_sec/check_max_sec — 무작위 확인 간격. 출제 시점이 전부
+    # 핀(문항의 position_sec+window_sec)이 되면서 간격 개념 자체가 사라졌다(lecture_pin_02).
     status: Mapped[str] = mapped_column(String(20), default="active")  # active|hidden|deleted
     # 과목 내 목차 순서(1강·2강…) — 목록·목차는 (subject, order_no, created_at) 오름차순.
     # 생성 시 미지정이면 그 과목의 max+1로 맨 뒤 배정(운영자가 PUT으로 재배열).
@@ -70,17 +69,15 @@ class LectureQuestion(Base, UUIDPk, Timestamps):
 
     lecture_id: Mapped[str] = mapped_column(CHAR(36), ForeignKey("lectures.id"), index=True)
     position_sec: Mapped[int] = mapped_column(default=0)  # 이 문항이 다루는 강의 시점
-    # 출제 시점 — 강사가 고르는 세 가지 방식
-    #   pinned=False(기본): position_sec 이후 아무 확인에서나 무작위로 뽑히는 '풀' 문항
-    #   pinned=True, window_sec=0: 학생이 position_sec에 닿는 순간 반드시 이 문항이 뜬다
-    #   pinned=True, window_sec>0: [position_sec, position_sec+window_sec] 구간 안에서
-    #     서버가 고른 무작위 시점에 뜬다
-    # 고정은 강사만 아는 정보를 쓴다 — "이 대목 직후에 물어야 방금 본 사람만 답한다".
-    # 구간은 거기에 예측 불가능성을 더한다: 강사는 '문제 풀이 대목'만 지정하고 정확한 초는
-    # 서버가 고른다. 매번 같은 초에 뜨면 학생이 그 지점만 외워 대기하는 학습이 생긴다.
-    # 풀 문항과 고정 문항은 서로 배타적으로 뽑힌다(고정이 무작위 확인에 새어나오면
-    # 지정 시점에 낼 문제가 사라진다).
-    pinned: Mapped[bool] = mapped_column(Boolean, default=False)
+    # 출제 시점 — 모든 문항이 핀(전부 핀 구조, 0717 lecture_pin_02)
+    #   window_sec=0: 학생이 position_sec에 닿는 순간 반드시 이 문항이 뜬다(고정)
+    #   window_sec>0: [position_sec, position_sec+window_sec] 구간 안에서 서버가 고른
+    #     무작위 시점에 뜬다(구간) — 매번 같은 초면 학생이 그 지점만 외워 대기한다
+    # 핀은 강사만 아는 정보를 쓴다 — "이 대목 직후에 물어야 방금 본 사람만 답한다".
+    # position_sec 규약: active면 1 이상·영상 안(생성/수정 시 검증). draft는 0 허용 —
+    # LLM 생성 문항이 '시점 미배치' 상태로 검수를 기다리는 자리다(활성화 때 강제된다).
+    # ('position 이후 아무 확인에서나'였던 pinned=False 풀 + check_min/max 무작위 간격은
+    #  옛 시청-감시 설계의 잔재로 제거 — lecture_service의 '랜덤 간격: 제거됨' 주석 참조.)
     window_sec: Mapped[int] = mapped_column(default=0)
     # {prompt, options[], explain} + 이미지 문항 확장(선택): prompt_image={id, ext},
     # option_images={"<보기 인덱스>": {id, ext}}. 파일 경로는 저장하지 않고
@@ -123,8 +120,14 @@ class LectureWatchProgress(Base, UUIDPk, Timestamps):
     # 컬럼은 남긴다: 드롭은 되돌릴 수 없고 마이그레이션만 하나 늘 뿐, 남겨도 무해하다.
     # 제거 이유는 lecture_service의 '상호작용 면제: 제거됨' 주석 참조.
     exempt_streak: Mapped[int] = mapped_column(default=0)
-    # 의심 이벤트 누적(안 본 구간 seek/과속 하트비트/탭 백그라운드 자기신고) — 체크포인트 간격 축소에 사용
-    suspicion: Mapped[int] = mapped_column(default=0)
+    # (제거됨 0717) suspicion — 의심 누적으로 무작위 확인 간격을 좁히던 값. 간격 자체가
+    # 사라져(전부 핀) 컬럼도 함께 드롭했다(lecture_pin_02). 값이 일시 카운터라 잃는 정보가 없다.
+    # 한 체크포인트에서 연속 오답 횟수 — MAX_CHECKPOINT_FAILS에 닿으면 그 대목을 다시
+    # 보도록 watched_max를 REWIND_SEC만큼 되감고 0으로 리셋한다. 되감기가 없으면 오답 →
+    # 새 랜덤 문항이 무한 반복돼(풀 브루트포스) 봇이 대가 없이 정답 집합을 수확할 수 있다.
+    # 되감기로 watched_max<cp가 되면 _lecture_challenge가 새 문항 발급을 409로 거부한다
+    # (다시 시청해 cp까지 올라와야 다음 문항). 통과 시에도 0으로 리셋한다.
+    checkpoint_fails: Mapped[int] = mapped_column(default=0)
 
 
 class LectureCheckpointEvent(Base, UUIDPk, Timestamps):

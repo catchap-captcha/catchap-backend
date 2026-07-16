@@ -343,18 +343,14 @@ def _lecture_challenge(db: Session, request: Request, api: ApiKey, lecture_id: s
         )
         .all()
     )
-    # 강사가 이 대목에서 내라고 고정한 문항이 있으면 그것부터 — 체크포인트가 그 구간 안에
-    # 잡혔다는 뜻이다(next_checkpoint가 고정 구간을 무작위 간격보다 우선해 예약한다).
-    # window_sec=0이면 구간이 한 점이라 '정확히 그 시점'이 된다. 겹치는 고정이 여럿이면 하나를 뽑는다.
-    pinned = [
+    # 모든 문항이 핀 — 체크포인트는 어떤 핀 구간 안에 잡혔고(next_checkpoint), 그 구간이
+    # cp를 덮는 문항만 출제 대상이다. window_sec=0이면 구간이 한 점이라 '정확히 그 시점'.
+    # 겹치는 구간이 여럿이면 하나를 무작위로 뽑는다(랜덤 선택 — 학생이 문항을 못 외운다).
+    choices = [
         q
         for q in candidates
-        if q.pinned and int(q.position_sec) <= cp <= int(q.position_sec) + int(q.window_sec or 0)
+        if int(q.position_sec) <= cp <= int(q.position_sec) + int(q.window_sec or 0)
     ]
-    # 고정 문항은 무작위 확인에 새어나오지 않게 풀에서 뺀다 — 미리 소진되면 정작 지정
-    # 시점에 낼 문제가 사라진다.
-    pool = [q for q in candidates if not q.pinned]
-    choices = pinned or pool
     if not choices:
         # 폴백 출제 금지 — 게이트를 열 문항이 없음을 정직하게 알린다
         raise HTTPException(
