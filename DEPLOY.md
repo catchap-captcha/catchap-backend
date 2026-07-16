@@ -31,7 +31,7 @@ Caddy가 인증서를 발급하려면 이 A 레코드가 먼저 전파돼 있어
 
 ## 3. DB 준비 (배포 전 1회)
 
-클라우드 DB(`catchap_dev_db`)는 스키마 57테이블 완비 · 데이터 0.
+클라우드 DB(`catchap_dev_db`)는 스키마 67테이블 완비(구조 덤프: `docs/schema.sql`) · 데이터 0.
 
 1. **alembic 마커 정렬** — 실제 스키마는 최신(코드와 56테이블/컬럼 일치, `invitations.teacher_code` 존재)인데 `alembic_version` 만 1리비전 뒤(`c4d5e6f7a8b9`). 마커만 head로 맞춘다(스키마 변경 아님 → DML, `catchap_backend` 로 가능):
    ```bash

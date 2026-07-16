@@ -1,5 +1,12 @@
 # CatChap MySQL DB 스키마
 
+> **이 문서는 개요입니다. 스키마의 정본은 두 곳입니다.**
+> - **`alembic/versions/`** (마이그레이션 40개) — `alembic upgrade head` 로 스키마를 그대로 재현합니다. 변경은 반드시 여기로.
+> - **`docs/schema.sql`** — 라이브(`catchap_dev_db`) 구조 덤프 67테이블. `mysqldump --no-data` 로 떠서 **데이터는 0건**(개인정보 미포함)입니다. 특정 시점 스냅샷이라 마이그레이션이 추가되면 낡습니다.
+>
+> 아래 본문은 2026-07-05 기준으로 작성돼 **강의 도메인 5테이블이 빠져 있습니다**(lectures · lecture_questions · lecture_watch_progress · lecture_materials · lecture_checkpoint_events). 현재 구조는 위 두 정본을 보세요.
+
+
 - MySQL 8.x / InnoDB / utf8mb4 (`utf8mb4_0900_ai_ci`)
 - 모든 주요 테이블: `CHAR(36)` UUID PK, `created_at`/`updated_at`
 - 멀티테넌트: `organization_id` 기준 분리 — API 단계에서 RBAC 검사 (`app/core/permissions.py`)

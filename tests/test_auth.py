@@ -8,19 +8,11 @@ def login(client, role, email, password, captcha_token=None):
     return client.post("/api/v1/auth/login", json=payload)
 
 
-def _elapse_cooldown(db, identifier):
-    """쿨다운 경과를 시뮬레이션 — LoginThrottle.updated_at을 쿨다운보다 과거로 백데이트."""
-    from datetime import datetime, timedelta
+def forest_token():
+    """캡차 요구 상태를 통과하기 위한 유효한 메인 캡차(forest) 토큰 — 단일사용."""
+    from app.services import forest_captcha as fc
 
-    from app.models import LoginThrottle
-    from app.services.auth_service import CAPTCHA_COOLDOWN_SECONDS
-
-    row = db.query(LoginThrottle).filter(LoginThrottle.identifier == identifier).first()
-    assert row is not None
-    backdated = datetime.now() - timedelta(seconds=CAPTCHA_COOLDOWN_SECONDS + 1)
-    row.updated_at = backdated
-    row.created_at = backdated
-    db.commit()
+    return fc.service.issue_token()
 
 
 def test_login_success_and_me(client, db, seed_org):
@@ -41,9 +33,8 @@ def test_login_wrong_password(client, seed_org):
     assert login(client, "teacher", "t1@test.dev", "wrong").status_code == 401
 
 
-def test_captcha_required_after_five_fails(client, db, seed_org):
-    """5회 이상 연속 실패 → 쿨다운(429). 시연용 임시 — 캡차 API 도입 전이라
-    캡차 토큰은 어떤 값도 통과하지 않고, 쿨다운 경과 후 정상 자격이면 성공·리셋."""
+def test_captcha_required_after_five_fails(client, seed_org):
+    """5회 이상 연속 실패 → captcha_required, 성공하면 리셋"""
     for i in range(1, 5):
         res = login(client, "teacher", "t1@test.dev", "wrong")
         assert res.status_code == 401
@@ -53,44 +44,43 @@ def test_captcha_required_after_five_fails(client, db, seed_org):
     assert res5.status_code == 401
     assert res5.json()["detail"]["captcha_required"] is True
 
-    # 6번째부터는 쿨다운 — 올바른 비밀번호도 즉시 재시도는 429로 막힌다
+    # 6번째도 계속 요구 — 캡차 토큰 없인 자격 검증 자체가 막힌다(카운트는 안 올라감)
+    res6 = login(client, "teacher", "t1@test.dev", "wrong")
+    assert res6.json()["detail"]["captcha_required"] is True
+
+    # 캡차 요구 상태에서는 올바른 비밀번호도 토큰 없이는 거부된다 (로그인 게이트)
     blocked = login(client, "teacher", "t1@test.dev", "Password123!")
-    assert blocked.status_code == 429
+    assert blocked.status_code == 401
     assert blocked.json()["detail"]["captcha_required"] is True
-    assert blocked.json()["detail"]["cooldown_seconds"] > 0
 
-    # 모의 토큰(임의 값)으로는 절대 통과 못 한다 — 프론트 'API 도입 안내 창'은 채점이 없다
-    forged = login(
-        client, "teacher", "t1@test.dev", "Password123!", captcha_token="fake-demo-token"
-    )
-    assert forged.status_code == 429
-
-    # 쿨다운 경과 후 정상 자격이면 성공 → 카운터 리셋(이후 1회 실패는 캡차 불필요)
-    _elapse_cooldown(db, "user:t1@test.dev")
-    ok = login(client, "teacher", "t1@test.dev", "Password123!")
+    # 캡차 통과 토큰과 함께 성공하면 리셋 → 이후 1회 실패는 캡차 불필요
+    ok = login(client, "teacher", "t1@test.dev", "Password123!", captcha_token=forest_token())
     assert ok.status_code == 200
     res_after = login(client, "teacher", "t1@test.dev", "wrong")
     assert res_after.json()["detail"]["captcha_required"] is False
 
 
-def test_student_captcha_counter(client, db, seed_org):
-    """학생 로그인도 실패 카운트/쿨다운/리셋 동작"""
+def test_student_captcha_counter(client, seed_org):
+    """학생 로그인도 실패 카운트/리셋 동작"""
     for _ in range(5):
         res = client.post(
             "/api/v1/auth/student-login",
             json={"student_login_id": "stu01", "password": "wrong"},
         )
     assert res.json()["detail"]["captcha_required"] is True
-    # 쿨다운 중엔 올바른 비밀번호도 429, 경과 후엔 성공(리셋)
+    # 캡차 요구 상태 — 올바른 비밀번호도 토큰 없이는 거부, 토큰과 함께면 성공(리셋)
     blocked = client.post(
         "/api/v1/auth/student-login",
         json={"student_login_id": "stu01", "password": "1234"},
     )
-    assert blocked.status_code == 429
-    _elapse_cooldown(db, "student:stu01")
+    assert blocked.status_code == 401
     ok = client.post(
         "/api/v1/auth/student-login",
-        json={"student_login_id": "stu01", "password": "1234"},
+        json={
+            "student_login_id": "stu01",
+            "password": "1234",
+            "captcha_token": forest_token(),
+        },
     )
     assert ok.status_code == 200
 
