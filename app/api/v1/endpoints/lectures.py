@@ -1077,6 +1077,9 @@ def _question_row(q: LectureQuestion) -> dict:
         "options": options,
         "explain": payload.get("explain"),
         "answer_index": q.answer_index,
+        # 콘솔 편집용 유효 정답 목록 — NULL(단일 정답 행)도 [answer_index]로 채워 내려
+        # 콘솔이 항상 이 필드 하나로 체크박스를 그린다(운영자 화면은 정답 노출이 정상 — 학생 경로 아님)
+        "answer_indexes": [int(i) for i in (q.answer_indexes or [q.answer_index])],
         "source": q.source,
         "status": q.status,
         "order_no": q.order_no,
@@ -1109,12 +1112,27 @@ class _QuestionCreate(BaseModel):
     prompt: str
     options: list[str]
     answer_index: int
+    # 다답형 정답 목록 — 보내면 이것이 정본(집합 정확 일치 채점, 부분 정답 없음)이고
+    # answer_index는 첫 값으로 함께 채워진다(구버전 읽기 경로 하위호환). 안 보내면 단일 정답.
+    answer_indexes: list[int] | None = None
     explain: str | None = None
     status: str = "active"  # draft|active
 
 
+def _effective_answer_indexes(
+    answer_indexes: list[int] | None, answer_index: int
+) -> list[int]:
+    """저장·검증에 쓰는 유효 정답 목록 — answer_indexes가 오면 그것, 없으면 [answer_index]."""
+    if answer_indexes is not None:
+        return [int(i) for i in answer_indexes]
+    return [int(answer_index)]
+
+
 def _validate_question_body(
-    prompt: str, options: list[str], answer_index: int, option_images: dict | None = None
+    prompt: str,
+    options: list[str],
+    answer_indexes: list[int],
+    option_images: dict | None = None,
 ) -> None:
     if not prompt.strip():
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="문제(prompt)가 비어 있습니다.")
@@ -1129,8 +1147,12 @@ def _validate_question_body(
             status.HTTP_400_BAD_REQUEST,
             detail="이미지가 없는 보기는 텍스트가 비어 있으면 안 됩니다.",
         )
-    if not (0 <= answer_index < len(options)):
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="answer_index가 보기 범위를 벗어납니다.")
+    if not answer_indexes:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="정답을 최소 1개 지정해야 합니다.")
+    if len(set(answer_indexes)) != len(answer_indexes):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="정답 목록에 같은 보기가 중복돼 있습니다.")
+    if any(not (0 <= i < len(options)) for i in answer_indexes):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="정답 인덱스가 보기 범위를 벗어납니다.")
 
 
 def _validate_question_timing(
@@ -1258,7 +1280,8 @@ def ops_create_question(
     db: Session = Depends(get_db),
 ):
     lec = _get_ops_lecture(db, lecture_id)
-    _validate_question_body(req.prompt, req.options, req.answer_index)
+    ans_ids = _effective_answer_indexes(req.answer_indexes, req.answer_index)
+    _validate_question_body(req.prompt, req.options, ans_ids)
     if req.status not in ("draft", "active"):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="status는 draft|active만 가능합니다.")
     position = max(0, req.position_sec)
@@ -1277,7 +1300,10 @@ def ops_create_question(
             "options": [str(o).strip() for o in req.options],
             "explain": (req.explain or "").strip(),
         },
-        answer_index=req.answer_index,
+        # answer_indexes를 받았을 때만 목록을 저장(NULL=단일 정답 하위호환 규약).
+        # answer_index는 항상 첫 값으로 채워 구버전 읽기 경로가 깨지지 않는다.
+        answer_index=ans_ids[0],
+        answer_indexes=ans_ids if req.answer_indexes is not None else None,
         source="manual",
         status=req.status,
         order_no=0,
@@ -1309,6 +1335,9 @@ class _QuestionUpdate(BaseModel):
     prompt: str | None = None
     options: list[str] | None = None
     answer_index: int | None = None
+    # 보내면 다답 정답 목록으로 교체(answer_index도 첫 값으로 동기화). 안 보내고
+    # answer_index만 보내면 단일 정답으로 전환(스테일 목록이 남지 않게 목록을 지운다).
+    answer_indexes: list[int] | None = None
     explain: str | None = None
     status: str | None = None  # draft|active
 
@@ -1331,7 +1360,25 @@ def ops_update_question(
     payload = dict(q.payload or {})
     new_prompt = req.prompt if req.prompt is not None else payload.get("prompt", "")
     new_options = req.options if req.options is not None else payload.get("options", [])
-    new_answer = req.answer_index if req.answer_index is not None else q.answer_index
+    # 유효 정답 목록 산출 — 우선순위: answer_indexes(다답 교체) > answer_index(단일 전환:
+    # 스테일 목록이 남아 채점과 어긋나지 않게 목록을 지운다) > 기존 값 유지.
+    if req.answer_indexes is not None:
+        new_answer_indexes: list[int] | None = [int(i) for i in req.answer_indexes]
+    elif req.answer_index is not None:
+        new_answer_indexes = None
+    else:
+        new_answer_indexes = list(q.answer_indexes) if q.answer_indexes else None
+    if req.answer_index is not None and req.answer_indexes is None:
+        new_answer = int(req.answer_index)
+    elif new_answer_indexes:
+        new_answer = new_answer_indexes[0]
+    else:
+        new_answer = int(q.answer_index)
+    # 검증 대상 — answer_indexes를 명시로 보냈으면 빈 목록도 그대로 태워 400으로 거절한다
+    # ([] or [단일값] 폴백이면 '정답 0개' 요청이 기존 정답으로 조용히 대체돼 검증을 우회한다)
+    eff_ids = (
+        new_answer_indexes if req.answer_indexes is not None else (new_answer_indexes or [new_answer])
+    )
 
     # 보기 축소 시 범위 밖 보기의 이미지 참조를 함께 정리한다 — 참조만 지우고 파일을 두면
     # 고아 파일(자료실에서 겪은 디스크 누수)이 되므로 commit '성공 후' 물리 삭제한다.
@@ -1346,7 +1393,7 @@ def ops_update_question(
         else:
             payload.pop("option_images", None)
     _validate_question_body(
-        str(new_prompt), list(new_options), int(new_answer), option_images=opt_imgs
+        str(new_prompt), list(new_options), eff_ids, option_images=opt_imgs
     )
 
     before = {
@@ -1354,6 +1401,7 @@ def ops_update_question(
         "pinned": q.pinned,
         "status": q.status,
         "answer_index": q.answer_index,
+        "answer_indexes": q.answer_indexes,
     }
     payload["prompt"] = str(new_prompt).strip()
     payload["options"] = [str(o).strip() for o in new_options]
@@ -1361,6 +1409,7 @@ def ops_update_question(
         payload["explain"] = req.explain.strip()
     q.payload = payload
     q.answer_index = int(new_answer)
+    q.answer_indexes = new_answer_indexes
     if req.position_sec is not None:
         q.position_sec = max(0, req.position_sec)
     if req.pinned is not None:
@@ -1390,7 +1439,12 @@ def ops_update_question(
         target_type="lecture_question",
         target_id=q.id,
         before=before,
-        after={"position_sec": q.position_sec, "status": q.status, "answer_index": q.answer_index},
+        after={
+            "position_sec": q.position_sec,
+            "status": q.status,
+            "answer_index": q.answer_index,
+            "answer_indexes": q.answer_indexes,
+        },
     )
     db.commit()
     for p in removed_image_paths:

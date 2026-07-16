@@ -377,12 +377,19 @@ def _lecture_challenge(db: Session, request: Request, api: ApiKey, lecture_id: s
         if isinstance(ref, dict) and ref.get("id"):
             opt["image"] = _question_image_url(lec.id, q.id, ref)
         options.append(opt)
+    # multi(끌어 담기) 렌더러 — boxLabel이 있으면 위젯이 보기를 상자로 드래그해 담는 모드로
+    # 그린다(탭 토글 폴백 공존 — 접근성 유지). 단일 정답 문항도 multi로 낸다: 클릭 한 점과
+    # 달리 드래그는 속도·경로 궤적이 남아 이상행동 판별 모델의 학습 데이터가 된다.
+    # ★ 해설(explain)은 여기서 내려보내지 않는다 — 강의 게이트는 학습이 아니라 검증이고,
+    # 화면 억제와 무관하게 네트워크 응답에 실리는 순간 봇이 읽는다(강사가 해설에 정답을
+    # 적으면 그대로 유출). explain은 운영자 기록용으로 DB에만 남는다.
     public = {
-        "type": "single",  # 위젯 기본(단일 선택) 렌더러 — prompt + options
+        "type": "multi",
         "subject": lec.subject,
         "prompt": payload.get("prompt", ""),
-        "hint": payload.get("explain") or "",
         "options": options,
+        "boxLabel": "정답을 여기로 끌어다 놓으세요",
+        "boxHint": "정답이 여러 개일 수도 있어요 — 맞는 보기를 모두 담아 주세요",
         "lecture": lec.id,
         "checkpoint_sec": cp,
     }
@@ -390,7 +397,10 @@ def _lecture_challenge(db: Session, request: Request, api: ApiKey, lecture_id: s
     if isinstance(prompt_ref, dict) and prompt_ref.get("id"):
         public["prompt_image"] = _question_image_url(lec.id, q.id, prompt_ref)
     meta = {"subj": lec.subject, "lec": lec.id, "cp": cp, "bank": True}
-    ch = cs._wrap("single", str(int(q.answer_index)), public, meta)
+    # NULL이면 [answer_index] — 하위호환 규약(기존 행 무변경). select_all은 집합 정확 일치
+    # 채점이라 부분 선택·초과 선택은 오답, 단일 정답이면 1개만 담아 제출하면 통과한다.
+    ids = q.answer_indexes or [q.answer_index]
+    ch = cs._wrap("select_all", sorted(str(int(i)) for i in ids), public, meta)
     return _emit_challenge(db, api, lec.subject, ch)
 
 
@@ -604,6 +614,19 @@ def verify(
                 status.HTTP_403_FORBIDDEN,
                 detail="이 키로는 다른 과목의 챌린지를 검증할 수 없어요.",
             )
+    # 강의 체크포인트 토큰 — 발급 게이트(_lecture_challenge: edu 1st-party 전용)와 대칭으로
+    # verify 자격도 강제한다. 이 검사가 없으면 아무 사이트키(무료 요금제가 자가 발급하는
+    # captcha 키로 충분)로 강의 토큰을 채점시킬 수 있고, 그 경로는 아래 edu 분기(정답·해설
+    # 제거 + 체크포인트 기록)를 통째로 건너뛰어 오답 응답에 정답 집합이 그대로 실린다.
+    # 실패 기록도 안 남아 대가 없이 정답을 수확한 뒤 게이트를 여는 우회가 성립한다
+    # (적대적 검토에서 PoC로 실증). 토큰 소비 전에 막아 채점 자체를 시키지 않는다.
+    if cs.peek_is_lecture(req.challenge_token) and (
+        api.product != "edu" or not api.first_party
+    ):
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            detail="이 키로는 강의 시청 검증을 사용할 수 없어요.",
+        )
     result = cs.verify_challenge(db, req.challenge_token, req.answer)
     meta = result.pop("meta", {})  # 발급 토큰에 서명된 문항 메타 — 클라이언트 응답에는 내리지 않음
     # 교육형 API는 통과/실패보다 '행동데이터 수집'이 목적 — 정답 여부와 무관하게 적재
@@ -621,6 +644,12 @@ def verify(
         if meta.get("lec"):
             # 강의 시청 체크포인트 — 학습 적립 경로(_credit_student)를 타지 않는다
             # (LearningAttempt·코인·오늘의퀴즈·오답노트 비생성). 이벤트 기록 + 재예약만.
+            # ★ 정답·해설 미반환 — 학습형 verify는 오답 피드백용으로 정답을 내리지만,
+            # 강의 게이트는 검증이라 위젯도 표시하지 않는다(eduFeedback lectureMode 규약).
+            # 풀 문항은 체크포인트마다 반복 출제되므로 오답 응답의 정답이 곧 파밍 재료다:
+            # 일부러 틀려 정답 집합을 수집한 봇이 같은 문항 재등장 때 통과하는 우회를 막는다.
+            result.pop("answer", None)
+            result.pop("explain", None)
             result["lecture"] = _verify_lecture_checkpoint(
                 db, api, student, meta, bool(result.get("success")), behavior
             )

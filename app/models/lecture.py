@@ -62,7 +62,8 @@ class LectureMaterial(Base, UUIDPk, Timestamps):
 
 
 class LectureQuestion(Base, UUIDPk, Timestamps):
-    """강의 확인 문항 — 정답(answer_index)은 payload와 분리 저장해 목록/상세 응답의 정답 유출을 구조적으로 차단"""
+    """강의 확인 문항 — 정답(answer_index/answer_indexes)은 payload와 분리 저장해
+    목록/상세 응답의 정답 유출을 구조적으로 차단"""
 
     __tablename__ = "lecture_questions"
     __table_args__ = (Index("ix_lq_lecture_pos", "lecture_id", "position_sec"),)
@@ -86,6 +87,10 @@ class LectureQuestion(Base, UUIDPk, Timestamps):
     # LECTURE_MEDIA_DIR/questions/{id}{ext}로 유도한다(영상·자료와 동일 — 경로조작 원천 차단).
     payload: Mapped[dict] = mapped_column(JSON)
     answer_index: Mapped[int] = mapped_column()  # options 내 정답 인덱스 — payload와 분리
+    # 다답형 정답 인덱스 목록(중복 없음, 전부 options 범위 안) — NULL이면 [answer_index]로
+    # 본다(하위호환 — 기존 행 무변경). 읽는 쪽 규약: ids = q.answer_indexes or [q.answer_index].
+    # answer_indexes를 쓸 때도 answer_index에는 첫 값을 함께 채워 구버전 읽기 경로가 깨지지 않게 한다.
+    answer_indexes: Mapped[list | None] = mapped_column(JSON, nullable=True)
     source: Mapped[str] = mapped_column(String(20), default="manual")  # manual|llm
     status: Mapped[str] = mapped_column(String(20), default="active")  # draft|active|deleted
     order_no: Mapped[int] = mapped_column(default=0)

@@ -114,19 +114,23 @@ def _hb(client, tok, lecture_id, position, *, st, **extra):
 
 
 def _add_question(
-    client, ops_tok, lecture_id, *, position=0, answer=2, status="active", pinned=False
+    client, ops_tok, lecture_id, *, position=0, answer=2, answer_indexes=None,
+    status="active", pinned=False,
 ):
+    body = {
+        "position_sec": position,
+        "prompt": "강의에서 설명한 내용은?",
+        "options": ["가", "나", "다", "라"],
+        "answer_index": answer,
+        "explain": "강의 앞부분에서 설명했어요.",
+        "status": status,
+        "pinned": pinned,
+    }
+    if answer_indexes is not None:
+        body["answer_indexes"] = answer_indexes
     r = client.post(
         f"/api/v1/ops/lectures/{lecture_id}/questions",
-        json={
-            "position_sec": position,
-            "prompt": "강의에서 설명한 내용은?",
-            "options": ["가", "나", "다", "라"],
-            "answer_index": answer,
-            "explain": "강의 앞부분에서 설명했어요.",
-            "status": status,
-            "pinned": pinned,
-        },
+        json=body,
         headers=auth(ops_tok),
     )
     assert r.status_code == 200, r.text
@@ -302,7 +306,7 @@ def test_lecture_checkpoint_gate_no_learning_side_effects(client, db, seed_org, 
     # 정답 제출 → 통과 + 다음 체크포인트 재예약, 학습 적립은 없음
     vr = client.post(
         "/api/v1/captcha/v1/verify",
-        json={"challenge_token": body["challenge_token"], "answer": "2"},
+        json={"challenge_token": body["challenge_token"], "answer": ["2"]},
         headers={"X-Site-Key": site_key, **auth(tok)},
     )
     assert vr.status_code == 200, vr.text
@@ -346,7 +350,7 @@ def test_lecture_checkpoint_wrong_answer_records_failed(client, db, seed_org, me
     ).json()
     vr = client.post(
         "/api/v1/captcha/v1/verify",
-        json={"challenge_token": ch["challenge_token"], "answer": "0"},
+        json={"challenge_token": ch["challenge_token"], "answer": ["0"]},
         headers={"X-Site-Key": site_key, **auth(tok)},
     )
     assert vr.status_code == 200
@@ -359,6 +363,235 @@ def test_lecture_checkpoint_wrong_answer_records_failed(client, db, seed_org, me
     # 오답이어도 학습기록·코인은 없다
     assert db.query(LearningAttempt).count() == 0
     assert db.query(CoinTransaction).count() == 0
+
+
+def _gate_challenge(client, site_key, tok, lecture_id):
+    r = client.post(
+        f"/api/v1/captcha/v1/challenge?lecture={lecture_id}",
+        headers={"X-Site-Key": site_key, **auth(tok)},
+    )
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def _gate_verify(client, site_key, tok, token, answer):
+    r = client.post(
+        "/api/v1/captcha/v1/verify",
+        json={"challenge_token": token, "answer": answer},
+        headers={"X-Site-Key": site_key, **auth(tok)},
+    )
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def test_lecture_challenge_is_multi_drag_and_never_leaks_explain(
+    client, db, seed_org, media_dir
+):
+    """강의 게이트는 드래그 담기(multi)로 나가고, 해설은 어떤 응답에도 실리지 않는다.
+
+    hint 유출 차단 회귀 고정 — 화면 억제와 무관하게 챌린지 응답에 explain이 실리면
+    봇이 네트워크에서 읽는다(강사가 해설에 정답을 적으면 그대로 유출). verify의
+    오답 응답도 마찬가지: 풀 문항은 반복 출제라 오답 응답의 정답이 파밍 재료가 된다."""
+    ops_tok = _ops(client, db)
+    lec = _upload_lecture(client, ops_tok).json()
+    _add_question(client, ops_tok, lec["id"], answer=2)  # explain="강의 앞부분에서 설명했어요."
+    site_key = _edu_key(client, db, seed_org, ops_tok, first_party=True)
+    tok = _student_token(client, seed_org)
+    _reach_checkpoint(client, tok, lec["id"])
+
+    ch = client.post(
+        f"/api/v1/captcha/v1/challenge?lecture={lec['id']}",
+        headers={"X-Site-Key": site_key, **auth(tok)},
+    )
+    assert ch.status_code == 200, ch.text
+    body = ch.json()
+    # 드래그 담기 모드 — type=multi + boxLabel(위젯이 이 키를 보고 드래그 모드로 그린다)
+    assert body["type"] == "multi"
+    assert body["boxLabel"]
+    # 해설 미유출 — hint 키 자체가 없고(빈 문자열도 아님), 해설 문구가 응답 어디에도 없다
+    assert "hint" not in body
+    assert "explain" not in body
+    assert "강의 앞부분에서 설명했어요" not in ch.text
+
+    # 오답 verify 응답에도 정답·해설이 없다(파밍 차단) — 게이트는 유지된다
+    vr = _gate_verify(client, site_key, tok, body["challenge_token"], ["0"])
+    assert vr["success"] is False
+    assert "answer" not in vr and "explain" not in vr
+    assert "강의 앞부분에서 설명했어요" not in str(vr)
+
+    # 정답 verify(통과) 응답에도 정답 키가 없다
+    ch2 = _gate_challenge(client, site_key, tok, lec["id"])
+    vr2 = _gate_verify(client, site_key, tok, ch2["challenge_token"], ["2"])
+    assert vr2["success"] is True
+    assert "answer" not in vr2 and "explain" not in vr2
+
+
+def test_lecture_token_verify_requires_first_party_edu_key(
+    client, db, seed_org, media_dir
+):
+    """강의 토큰 verify는 발급과 같은 자격(edu 1st-party)을 요구 — 정답 파밍 경로 차단.
+
+    적대적 검토에서 실증된 우회: 정답·해설 제거가 edu 분기 안에만 있으면, 아무 non-edu
+    사이트키(무료 요금제가 자가 발급하는 captcha 키로 충분)로 강의 토큰을 채점시켜
+    오답 응답의 정답 집합을 수확할 수 있다. 그 경로는 체크포인트 실패 기록도 남기지
+    않아 대가가 0이고, 파밍한 답으로 영상을 안 보고 게이트를 연다."""
+    ops_tok = _ops(client, db)
+    lec = _upload_lecture(client, ops_tok).json()
+    _add_question(client, ops_tok, lec["id"], answer_indexes=[1, 3])
+    site_key = _edu_key(client, db, seed_org, ops_tok, first_party=True)
+    tok = _student_token(client, seed_org)
+    _reach_checkpoint(client, tok, lec["id"])
+    ch = _gate_challenge(client, site_key, tok, lec["id"])
+
+    # 일반 캡차 키(non-edu) — 채점 자체를 거절, 정답 미노출
+    other = client.post(
+        "/api/v1/ops/api-keys",
+        json={"organization_id": seed_org["org"].id, "product": "captcha"},
+        headers=auth(ops_tok),
+    )
+    assert other.status_code == 200, other.text
+    vr = client.post(
+        "/api/v1/captcha/v1/verify",
+        json={"challenge_token": ch["challenge_token"], "answer": ["0"]},
+        headers={"X-Site-Key": other.json()["site_key"]},
+    )
+    assert vr.status_code == 403
+    assert "answer" not in vr.text and "explain" not in vr.text
+
+    # 외부 판매 edu 키(first_party=False)도 동일하게 거절
+    # (_edu_key는 Pro 플랜을 새로 만들어 재호출이 안 되므로 구독이 선 상태에서 직접 발급)
+    ext = client.post(
+        "/api/v1/ops/api-keys",
+        json={
+            "organization_id": seed_org["org"].id,
+            "product": "edu",
+            "subject": "국어",
+            "first_party": False,
+        },
+        headers=auth(ops_tok),
+    )
+    assert ext.status_code == 200, ext.text
+    ext_key = ext.json()["site_key"]
+    vr2 = client.post(
+        "/api/v1/captcha/v1/verify",
+        json={"challenge_token": ch["challenge_token"], "answer": ["0"]},
+        headers={"X-Site-Key": ext_key, **auth(tok)},
+    )
+    assert vr2.status_code == 403
+    assert "answer" not in vr2.text
+
+    # 거절된 시도는 체크포인트를 소비하지 않는다 — 정상 키로 원래 게이트를 그대로 통과
+    assert db.query(LectureCheckpointEvent).count() == 0
+    ch2 = _gate_challenge(client, site_key, tok, lec["id"])
+    vr3 = _gate_verify(client, site_key, tok, ch2["challenge_token"], ["1", "3"])
+    assert vr3["success"] is True
+
+
+def test_multi_answer_graded_as_exact_set(client, db, seed_org, media_dir):
+    """다답 문항 — 집합 정확 일치만 통과. 부분 선택·초과 선택은 오답(부분 정답 없음)."""
+    ops_tok = _ops(client, db)
+    lec = _upload_lecture(client, ops_tok).json()
+    q = _add_question(client, ops_tok, lec["id"], answer_indexes=[1, 3])
+    # answer_index는 첫 값으로 동기화(구버전 읽기 경로 하위호환)
+    assert q["answer_index"] == 1 and q["answer_indexes"] == [1, 3]
+    site_key = _edu_key(client, db, seed_org, ops_tok, first_party=True)
+    tok = _student_token(client, seed_org)
+    _reach_checkpoint(client, tok, lec["id"])
+
+    # 부분 선택 → 오답, 게이트 유지
+    ch = _gate_challenge(client, site_key, tok, lec["id"])
+    assert ch["type"] == "multi" and ch["boxLabel"]
+    vr = _gate_verify(client, site_key, tok, ch["challenge_token"], ["1"])
+    assert vr["success"] is False
+    assert vr["lecture"]["checkpoints_passed"] == 0
+
+    # 초과 선택 → 오답
+    ch = _gate_challenge(client, site_key, tok, lec["id"])
+    vr = _gate_verify(client, site_key, tok, ch["challenge_token"], ["1", "3", "0"])
+    assert vr["success"] is False
+
+    # 정확 일치(순서 무관) → 통과 + 재예약
+    ch = _gate_challenge(client, site_key, tok, lec["id"])
+    vr = _gate_verify(client, site_key, tok, ch["challenge_token"], ["3", "1"])
+    assert vr["success"] is True
+    assert vr["lecture"]["checkpoints_passed"] == 1
+
+    ev = db.query(LectureCheckpointEvent).order_by(LectureCheckpointEvent.created_at).all()
+    assert [e.result for e in ev] == ["failed", "failed", "passed"]
+
+
+def test_single_answer_row_backward_compat_as_multi(client, db, seed_org, media_dir):
+    """answer_indexes NULL(기존 단일 정답 행) — multi로 나가고 1개만 담아 제출하면 통과."""
+    ops_tok = _ops(client, db)
+    lec = _upload_lecture(client, ops_tok).json()
+    q = _add_question(client, ops_tok, lec["id"], answer=2)  # answer_indexes 미전송
+    site_key = _edu_key(client, db, seed_org, ops_tok, first_party=True)
+    tok = _student_token(client, seed_org)
+
+    # DB에 목록이 저장되지 않았다(NULL=[answer_index] 규약 — 기존 행과 동일 형태)
+    db.expire_all()
+    row = db.get(LectureQuestion, q["id"])
+    assert row.answer_indexes is None and row.answer_index == 2
+    # 운영자 행에는 유효 목록으로 채워 내려 콘솔이 체크박스를 그린다
+    assert q["answer_indexes"] == [2]
+
+    _reach_checkpoint(client, tok, lec["id"])
+    ch = _gate_challenge(client, site_key, tok, lec["id"])
+    assert ch["type"] == "multi" and ch["boxLabel"]
+    # 2개 담으면 오답(집합 일치), 정답 1개만 담으면 통과
+    vr = _gate_verify(client, site_key, tok, ch["challenge_token"], ["2", "0"])
+    assert vr["success"] is False
+    ch = _gate_challenge(client, site_key, tok, lec["id"])
+    vr = _gate_verify(client, site_key, tok, ch["challenge_token"], ["2"])
+    assert vr["success"] is True
+
+
+def test_multi_answer_validation_400(client, db, seed_org, media_dir):
+    """운영자 다답 검증 — 빈 배열·중복·범위 밖은 400 + 한국어 사유."""
+    ops_tok = _ops(client, db)
+    lec = _upload_lecture(client, ops_tok).json()
+
+    def _post(answer_indexes):
+        return client.post(
+            f"/api/v1/ops/lectures/{lec['id']}/questions",
+            json={
+                "position_sec": 0,
+                "prompt": "다답 검증",
+                "options": ["가", "나", "다", "라"],
+                "answer_index": 0,
+                "answer_indexes": answer_indexes,
+                "status": "active",
+            },
+            headers=auth(ops_tok),
+        )
+
+    r = _post([])
+    assert r.status_code == 400 and "최소 1개" in r.json()["detail"]
+    r = _post([1, 1])
+    assert r.status_code == 400 and "중복" in r.json()["detail"]
+    r = _post([0, 4])
+    assert r.status_code == 400 and "범위" in r.json()["detail"]
+
+    # 수정 경로도 같은 규칙 — 빈 배열이 기존 정답으로 조용히 대체되지 않는다
+    q = _add_question(client, ops_tok, lec["id"], answer_indexes=[0, 2])
+    for bad in ([], [2, 2], [9]):
+        r = client.put(
+            f"/api/v1/ops/lectures/{lec['id']}/questions/{q['id']}",
+            json={"answer_indexes": bad},
+            headers=auth(ops_tok),
+        )
+        assert r.status_code == 400, (bad, r.text)
+
+    # answer_index만 보내는 구버전 수정 — 단일 정답으로 전환(스테일 목록 잔존 금지)
+    r = client.put(
+        f"/api/v1/ops/lectures/{lec['id']}/questions/{q['id']}",
+        json={"answer_index": 3},
+        headers=auth(ops_tok),
+    )
+    assert r.status_code == 200
+    assert r.json()["answer_index"] == 3 and r.json()["answer_indexes"] == [3]
+    db.expire_all()
+    assert db.get(LectureQuestion, q["id"]).answer_indexes is None
 
 
 def test_challenge_before_checkpoint_409(client, db, seed_org, media_dir):
@@ -886,7 +1119,7 @@ def test_interaction_exemption_with_streak_cap(client, db, seed_org, media_dir):
     ).json()
     vr = client.post(
         "/api/v1/captcha/v1/verify",
-        json={"challenge_token": ch["challenge_token"], "answer": "2"},
+        json={"challenge_token": ch["challenge_token"], "answer": ["2"]},
         headers={"X-Site-Key": site_key, **auth(tok)},
     )
     assert vr.status_code == 200 and vr.json()["success"] is True
@@ -1392,7 +1625,7 @@ def test_suspicion_narrows_interval_with_floor(client, db, seed_org, media_dir):
     ).json()
     vr = client.post(
         "/api/v1/captcha/v1/verify",
-        json={"challenge_token": ch["challenge_token"], "answer": "2"},
+        json={"challenge_token": ch["challenge_token"], "answer": ["2"]},
         headers={"X-Site-Key": site_key, **auth(tok)},
     )
     assert vr.status_code == 200 and vr.json()["success"] is True
@@ -2042,7 +2275,7 @@ def test_challenge_with_images_serves_and_never_leaks_answer(client, db, seed_or
     # 정답 제출은 종전과 동일하게 동작(이미지 확장이 채점 경로를 건드리지 않는다)
     vr = client.post(
         "/api/v1/captcha/v1/verify",
-        json={"challenge_token": body["challenge_token"], "answer": "2"},
+        json={"challenge_token": body["challenge_token"], "answer": ["2"]},
         headers={"X-Site-Key": site_key, **auth(tok)},
     )
     assert vr.status_code == 200 and vr.json()["success"] is True

@@ -801,6 +801,19 @@ def peek_subject(challenge_token: str) -> str | None:
     return data.get("subj") if data else None
 
 
+def peek_is_lecture(challenge_token: str) -> bool:
+    """토큰을 소비하지 않고 '강의 체크포인트 토큰인지'만 확인 — verify 자격 검사용.
+
+    강의 게이트는 발급(_lecture_challenge)에서 edu 1st-party 키만 허용한다. verify에도
+    같은 자격을 대칭으로 걸지 않으면, 자격 없는 키(외부 판매 edu·일반 captcha 키)로
+    강의 토큰을 채점시켜 오답 응답의 정답을 수확할 수 있다 — 그 경로는 체크포인트
+    실패 기록조차 남기지 않아 파밍 대가가 0이다(적대적 검토에서 실증).
+    서명 검증 실패(위조·만료)는 False — 채점 단계에서 400으로 걸린다.
+    """
+    data = _unsign(challenge_token)
+    return bool(data and data.get("lec"))
+
+
 def verify_challenge(db: Session, challenge_token: str, answer) -> dict:
     """제출 답 서버 채점 → 통과 시 verdict 토큰(1회용) 발급.
 
