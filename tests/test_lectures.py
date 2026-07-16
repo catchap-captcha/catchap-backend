@@ -1070,118 +1070,37 @@ def test_takeover_spam_rate_limited(client, db, seed_org, media_dir):
     assert over.status_code == 429
 
 
-# ================================================================ 상호작용 면제·의심 가중
-def test_interaction_exemption_with_streak_cap(client, db, seed_org, media_dir):
-    """체크포인트 도달 시 interacted=true면 캡차 면제 + 재예약 — 단 연속 2회 상한,
-    세 번째는 무조건 캡차. 캡차 통과가 상한(streak)을 리셋한다.
+# ================================================================ 캡차 면제 없음·의심 가중
+def test_interacted_self_report_grants_no_exemption(client, db, seed_org, media_dir):
+    """★ 상호작용 자기신고로는 캡차를 건너뛸 수 없다 — 면제 장치 제거의 회귀 고정.
 
-    ⚠️ interacted는 클라 자기신고(위조 가능) — 이 테스트는 '면제가 상한으로 유한하다'는
-    남용 제한을 검증하는 것이지, 이 신호가 봇을 막는다는 뜻이 아니다."""
-    from app.services.lecture_service import EXEMPT_STREAK_MAX
+    면제는 '성실한 시청자를 덜 방해한다'는 명분이었으나 전제가 틀렸다: 강의에 집중하는
+    학생은 아무것도 만지지 않아 면제가 도우려던 사람을 못 돕고, interacted는 클라이언트
+    자기신고라 위조 가능해 봇·딴짓만 이득을 봤다(방향이 거꾸로). 실제로 위조 한 줄로
+    강사 지정 고정 문항을 건너뛰는 것이 실증됐다. 이제 체크포인트에 닿으면 예외 없이 캡차다.
 
-    ops_tok = _ops(client, db)
-    lec = _upload_lecture(client, ops_tok, check_min=1, check_max=1).json()
-    _add_question(client, ops_tok, lec["id"], answer=2)
-    site_key = _edu_key(client, db, seed_org, ops_tok, first_party=True)
-    tok = _student_token(client, seed_org)
-    client.get(f"/api/v1/lectures/{lec['id']}", headers=auth(tok))  # cp=1 예약
-    st = _session_token(client, tok, lec["id"])
-
-    # 면제 1·2회 — 캡차 없이 next 재예약(checkpoint_due=False)
-    for i in range(EXEMPT_STREAK_MAX):
-        cp = _progress_row(db, lec["id"]).next_checkpoint_sec
-        r = _hb(client, tok, lec["id"], cp, st=st, interacted=True)
-        body = r.json()
-        assert body["exempted"] is True, body
-        assert body["checkpoint_due"] is False
-        assert body["next_checkpoint_sec"] > cp
-        assert body["checkpoints_passed"] == 0  # 면제는 '캡차 통과'가 아니다
-
-    # 3번째 도달 — interacted=true여도 상한 초과라 무조건 캡차
-    db.expire_all()
-    cp3 = _progress_row(db, lec["id"]).next_checkpoint_sec
-    r3 = _hb(client, tok, lec["id"], cp3, st=st, interacted=True)
-    assert r3.json()["exempted"] is False
-    assert r3.json()["checkpoint_due"] is True
-
-    # 감사 이벤트 — exempted 2건
-    assert (
-        db.query(LectureCheckpointEvent)
-        .filter(LectureCheckpointEvent.result == "exempted")
-        .count()
-        == EXEMPT_STREAK_MAX
-    )
-
-    # 캡차 통과 → streak 리셋 — 다음 체크포인트는 다시 면제 가능
-    ch = client.post(
-        f"/api/v1/captcha/v1/challenge?lecture={lec['id']}",
-        headers={"X-Site-Key": site_key, **auth(tok)},
-    ).json()
-    vr = client.post(
-        "/api/v1/captcha/v1/verify",
-        json={"challenge_token": ch["challenge_token"], "answer": ["2"]},
-        headers={"X-Site-Key": site_key, **auth(tok)},
-    )
-    assert vr.status_code == 200 and vr.json()["success"] is True
-    db.expire_all()
-    row = _progress_row(db, lec["id"])
-    assert int(row.exempt_streak or 0) == 0
-    cp4 = row.next_checkpoint_sec
-    r4 = _hb(client, tok, lec["id"], cp4, st=st, interacted=True)
-    assert r4.json()["exempted"] is True
-
-    # 면제 경로에서도 학습 적립은 없다(보상축 비오염)
-    sid = seed_org["student"].id
-    assert db.query(CoinTransaction).filter(CoinTransaction.student_id == sid).count() == 0
-    assert db.query(LearningAttempt).filter(LearningAttempt.student_id == sid).count() == 0
-
-
-def test_exemption_refused_at_last_gate(client, db, seed_org, media_dir):
-    """마지막 체크포인트(재예약 후보 None)는 interacted=true여도 면제 불가 — 무조건 캡차.
-
-    적대적 검토에서 실증된 구멍의 회귀 테스트: check 60~60·duration 100이면 cp=60의
-    다음 후보가 120(≥100)=None이라, 여기서 면제해 주면 남은 게이트가 사라져
-    interacted 스팸만으로 캡차 0회 완주가 된다."""
-    ops_tok = _ops(client, db)
-    lec = _upload_lecture(
-        client, ops_tok, check_min=60, check_max=60, duration=100
-    ).json()
-    _add_question(client, ops_tok, lec["id"])  # 낼 문항이 있어야 체크포인트가 잡힌다
-    tok = _student_token(client, seed_org)
-    client.get(f"/api/v1/lectures/{lec['id']}", headers=auth(tok))  # cp=60
-    st = _session_token(client, tok, lec["id"])
-
-    # 정상 페이스로 cp까지 시청(suspicion 0 유지 — 좁힌 간격이 후보를 duration 안으로
-    # 되돌리면 이 테스트의 전제가 무너진다)
-    body = None
-    pos = 4
-    for _ in range(30):
-        r = _hb(client, tok, lec["id"], pos, st=st, interacted=True)
-        body = r.json()
-        if body["checkpoint_due"] or body["exempted"]:
-            break
-        pos = body["watched_max_sec"] + 4
-    assert body is not None and body["checkpoint_due"] is True, body
-    assert body["exempted"] is False  # interacted=true였는데도 면제 거부
-    assert (
-        db.query(LectureCheckpointEvent)
-        .filter(LectureCheckpointEvent.result == "exempted")
-        .count()
-        == 0
-    )
-
-
-def test_no_interaction_still_requires_captcha(client, db, seed_org, media_dir):
-    """interacted 미신고(기본 False)면 기존과 동일 — 체크포인트 도달 즉시 캡차."""
+    구버전 플레이어가 interacted를 계속 보내도 무해해야 한다(조용히 무시)."""
     ops_tok = _ops(client, db)
     lec = _upload_lecture(client, ops_tok, check_min=1, check_max=1).json()
     _add_question(client, ops_tok, lec["id"])  # 낼 문항이 있어야 체크포인트가 잡힌다
     tok = _student_token(client, seed_org)
     client.get(f"/api/v1/lectures/{lec['id']}", headers=auth(tok))
     st = _session_token(client, tok, lec["id"])
-    r = _hb(client, tok, lec["id"], 1, st=st)
-    assert r.json()["checkpoint_due"] is True
-    assert r.json()["exempted"] is False
+
+    # interacted=true를 계속 보내도 매번 캡차를 요구한다
+    for _ in range(3):
+        r = _hb(client, tok, lec["id"], 1, st=st, interacted=True)
+        assert r.status_code == 200, r.text  # 구버전 필드가 422를 내지 않는다
+        assert r.json()["checkpoint_due"] is True, "interacted 자기신고로 캡차가 면제됐다"
+        assert "exempted" not in r.json(), "면제 개념이 응답에 남아 있다"
+
+    # 면제 이벤트가 하나도 안 남는다 — 면제 경로 자체가 없다
+    assert (
+        db.query(LectureCheckpointEvent)
+        .filter(LectureCheckpointEvent.result == "exempted")
+        .count()
+        == 0
+    )
 
 
 # ================================================================ 고정 문항(강사 지정 시점)
@@ -1373,49 +1292,6 @@ def test_pin_validation_rejects_unreachable_positions(client, db, seed_org, medi
         headers=auth(ops_tok),
     )
     assert r1.status_code == 400 and "영상 길이를 벗어" in r1.json()["detail"]
-
-
-def test_interaction_exemption_never_skips_a_pinned_question(
-    client, db, seed_org, media_dir
-):
-    """★ 위조 가능한 interacted로 고정 문항을 건너뛸 수 없다.
-
-    면제 논리('성실한 시청자를 덜 방해하고 남용은 상한으로 유한')는 무작위 문항에만
-    성립한다 — 다음 게이트에서 등가의 다른 문항이 나오기 때문이다. 고정은 대체 불가라
-    한 번 면제되면 watched_max가 감소하지 않아 영영 안 뜬다. 적대적 검토에서 고정 3개 중
-    2개를 하트비트 본문의 "interacted": true 한 줄로 스킵하는 것이 실증됐다."""
-    ops_tok = _ops(client, db)
-    # 무작위 간격 600초 — 고정이 없으면 이 구간에 게이트가 뜰 일이 없다
-    lec = _upload_lecture(
-        client, ops_tok, check_min=600, check_max=600, duration=1000
-    ).json()
-    _add_question(client, ops_tok, lec["id"])  # 풀 문항 — 면제 후보가 존재하게 한다
-    r = client.post(
-        f"/api/v1/ops/lectures/{lec['id']}/questions",
-        json={
-            "position_sec": 3,
-            "pinned": True,
-            "prompt": "고정 문항",
-            "options": ["가", "나"],
-            "answer_index": 0,
-            "status": "active",
-        },
-        headers=auth(ops_tok),
-    )
-    assert r.status_code == 200, r.text
-
-    tok = _student_token(client, seed_org)
-    client.get(f"/api/v1/lectures/{lec['id']}", headers=auth(tok))
-    st = _session_token(client, tok, lec["id"])
-    hb = _hb(client, tok, lec["id"], 3, st=st, interacted=True)
-    assert hb.json()["exempted"] is False, "고정 문항이 interacted 한 줄로 면제됐다"
-    assert hb.json()["checkpoint_due"] is True
-    assert (
-        db.query(LectureCheckpointEvent)
-        .filter(LectureCheckpointEvent.result == "exempted")
-        .count()
-        == 0
-    )
 
 
 def test_pool_question_beyond_duration_rejected(client, db, seed_org, media_dir):

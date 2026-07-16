@@ -7,22 +7,27 @@ from app.db.base import Base, Timestamps, UUIDPk
 
 
 class StudentProfile(Base, UUIDPk, Timestamps):
-    """학생 (가명 중심 — 실명 대신 nickname). 로그인: 기관 선택 + student_login_id + PW."""
+    """학생 (가명 중심 — 실명 대신 nickname).
+
+    로그인: student_login_id + PW (기관 선택은 선택 — 미지정 시 아이디로 판별).
+    이메일 가입 전환(2026-07-16): 새 학생은 이메일이 곧 student_login_id이고
+    organization_id 없이(None) 가입한다. 기관 경유 가입 경로는 옵션으로 유지."""
 
     __tablename__ = "student_profiles"
 
     # 교사/기관이 비번 초기화하면 True → 첫 로그인 시 새 비번 설정 강제
     must_change_password: Mapped[bool] = mapped_column(Boolean, default=False)
 
-    organization_id: Mapped[str] = mapped_column(
-        CHAR(36), ForeignKey("organizations.id"), index=True
+    # 이메일 가입 학생은 무소속(None) — 기관 경유 가입에서만 채워진다 (student_email_01)
+    organization_id: Mapped[str | None] = mapped_column(
+        CHAR(36), ForeignKey("organizations.id"), nullable=True, index=True
     )
     class_id: Mapped[str | None] = mapped_column(
         CHAR(36), ForeignKey("classes.id"), nullable=True, index=True
     )
     # 전역 유일 (사용자 결정 2026-07-04: 기관 간 아이디+비밀번호 충돌로 타인 계정
-    # 접근 가능한 리스크 차단 — 가입 시 중복 확인 필수)
-    student_login_id: Mapped[str] = mapped_column(String(50), unique=True, index=True)
+    # 접근 가능한 리스크 차단 — 가입 시 중복 확인 필수). 이메일이 아이디가 될 수 있어 255자.
+    student_login_id: Mapped[str] = mapped_column(String(255), unique=True, index=True)
     student_code: Mapped[str] = mapped_column(String(20), unique=True, index=True)  # CAT-4823
     password_hash: Mapped[str] = mapped_column(String(255))
     nickname: Mapped[str] = mapped_column(String(50))  # 하은

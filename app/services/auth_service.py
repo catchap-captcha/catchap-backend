@@ -82,26 +82,43 @@ def _login_failed(db: Session, identifier: str, message: str) -> HTTPException:
     )
 
 
-def _require_captcha_if_needed(db: Session, identifier: str, captcha_token: str | None) -> None:
-    """5회 이상 실패한 identifier면, 메인 캡차(forest) 통과 토큰을 요구·소비한다.
+CAPTCHA_COOLDOWN_SECONDS = 300  # 5분 — 5회+ 실패 후 시도 간 쿨다운(자동 해제·복구 가능)
 
-    자격 검증 '전에' 막는다 — 토큰이 없거나 무효면 401(captcha_required)로 즉시 거부하되
-    실패 카운트는 올리지 않는다(캡차 미완료로 하드락까지 밀려 정당 사용자가 잠기는 것 방지).
-    유효 토큰은 단일 사용으로 소비되므로, 자격이 또 틀리면 다음 시도엔 새 캡차가 필요하다.
+
+def _require_captcha_if_needed(db: Session, identifier: str, captcha_token: str | None) -> None:
+    """5회 이상 실패한 identifier는 시도 간 쿨다운(5분)을 강제한다.
+
+    시연용 임시 — 캡차 API 도입 시 이 게이트를 실제 캡차 검증으로 교체할 것.
+    (종전: 메인 캡차(forest) 통과 토큰을 요구·소비 — fc.service.consume_token(captcha_token))
+
+    captcha_token은 지금 어떤 값이 와도 통과시키지 않는다: 프론트의 '캡차 API 도입 안내 창'은
+    채점이 없는 모의 화면이라, 모의 토큰을 인정하면 5회 실패 후 무제한 대입이 가능해진다.
+    파라미터 자체는 도입 시 재사용을 위해 남긴다(호출부 시그니처 유지).
+
+    자격 검증 '전에' 막되 실패 카운트는 올리지 않는다(쿨다운 대기가 하드락으로 번지지 않게).
+    마지막 실패(updated_at)로부터 쿨다운이 지나면 1회 자격 검증을 허용한다 — 성공하면
+    카운터가 리셋되고, 또 틀리면 실패 기록으로 쿨다운이 다시 시작된다(정당 사용자 복구 가능).
     """
+    del captcha_token  # 의도적 미사용 — 위 주석 참고(모의 토큰 위조 차단)
     if not captcha_required(db, identifier):
         return
     from app.models import LoginThrottle
-    from app.services import forest_captcha as fc
 
-    if fc.service.consume_token(captcha_token):
-        return  # 유효 토큰 소비 — 이 시도를 자격 검증으로 진행 허용
     row = db.query(LoginThrottle).filter(LoginThrottle.identifier == identifier).first()
+    last = (row.updated_at or row.created_at) if row else None
+    # updated_at은 로컬 시각(Timestamps) 저장 — 비교도 로컬(datetime.now)로 맞춘다(_check_locked와 동일)
+    elapsed = (datetime.now() - last).total_seconds() if last else None
+    if elapsed is None or elapsed >= CAPTCHA_COOLDOWN_SECONDS:
+        return  # 쿨다운 경과 — 이번 시도는 자격 검증으로 진행 허용
     raise HTTPException(
-        status.HTTP_401_UNAUTHORIZED,
+        status.HTTP_429_TOO_MANY_REQUESTS,
         detail={
-            "message": "보안 확인(캡차)을 완료해 주세요.",
+            "message": (
+                "로그인에 여러 번 실패했어요. 보안 확인(캡차)은 캡차 API로 추후 도입 예정이라, "
+                "잠시 후 다시 시도해 주세요."
+            ),
             "captcha_required": True,
+            "cooldown_seconds": int(CAPTCHA_COOLDOWN_SECONDS - elapsed),
             "fail_count": row.fail_count if row else CAPTCHA_FAIL_THRESHOLD,
         },
     )
@@ -175,7 +192,7 @@ def issue_tokens(db: Session, subject_id: str, role: str, subject_type: str) -> 
 def login(db: Session, req: s.LoginRequest) -> s.TokenPair:
     identifier = f"user:{req.email.strip().lower()}"
     _check_locked(db, identifier)  # H1: 과도한 실패 시 실제 차단
-    _require_captcha_if_needed(db, identifier, req.captcha_token)  # 5회+ 실패 → 메인 캡차 요구
+    _require_captcha_if_needed(db, identifier, req.captcha_token)  # 5회+ 실패 → 쿨다운(캡차 API 추후 도입)
     user = db.query(User).filter(User.email == req.email.strip().lower()).first()
     if user is None or not verify_password(req.password, user.password_hash):
         raise _login_failed(db, identifier, "이메일 또는 비밀번호가 올바르지 않습니다.")
@@ -271,7 +288,7 @@ def ops_login(db: Session, req: s.LoginRequest) -> s.TokenPair:
     """
     identifier = f"user:{req.email.strip().lower()}"
     _check_locked(db, identifier)  # H1: 과도한 실패 시 실제 차단
-    _require_captcha_if_needed(db, identifier, req.captcha_token)  # 5회+ 실패 → 메인 캡차 요구
+    _require_captcha_if_needed(db, identifier, req.captcha_token)  # 5회+ 실패 → 쿨다운(캡차 API 추후 도입)
     user = db.query(User).filter(User.email == req.email.strip().lower()).first()
     # 임시 비밀번호는 이메일에서 복사해 붙여넣는 흐름이라 앞뒤 공백·개행이 섞이기 쉽다.
     # 원문 실패 시 strip본을 한 번 더 대조한다(공백 패딩만 허용 — 보안 영향 무시 수준).
@@ -293,7 +310,7 @@ def student_login(db: Session, req: s.StudentLoginRequest) -> s.TokenPair:
     _check_locked(db, f"student:{req.student_login_id.strip()}")  # H1: 과도한 실패 시 차단
     _require_captcha_if_needed(
         db, f"student:{req.student_login_id.strip()}", req.captcha_token
-    )  # 5회+ 실패 → 메인 캡차 요구
+    )  # 5회+ 실패 → 쿨다운(캡차 API 추후 도입)
     # 탈퇴/비활성 학생은 로그인 차단 (B2) — 성인 로그인과 동일 정책
     query = db.query(StudentProfile).filter(
         StudentProfile.student_login_id == req.student_login_id.strip(),
@@ -627,20 +644,38 @@ def suggest_student_ids(db: Session, requested: str, n: int = 4) -> list[str]:
 
 
 def register_student(db: Session, req: s.RegisterStudentRequest) -> StudentProfile:
-    org = db.get(Organization, req.organization_id)
-    if org is None or org.code != req.org_code.strip().upper():
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="기관 코드가 올바르지 않습니다.")
-    _assert_org_code_not_expired(org)  # 만료된 코드로는 가입 불가
+    """학생 가입 — 이메일 가입 전환(2026-07-16): 학부모 가입과 동일 구성이 기본.
 
-    # 학생 아이디는 전역 유일 (기관 무관) — 가입 화면의 '중복 확인'과 동일 기준
-    if not student_id_available(db, req.student_login_id):
-        raise HTTPException(status.HTTP_409_CONFLICT, detail="이미 사용 중인 아이디예요. 다른 아이디를 골라 주세요.")
+    organization_id를 주면 종전 기관 코드 검증 가입 그대로(기관 경유 가입 부활 대비 유지),
+    안 주면 무소속(organization_id=None) 가입. student_login_id 미지정 시
+    이메일(소문자·strip)이 로그인 아이디가 된다 — 새 email 컬럼·로그인 경로 변경 없음.
+    """
+    email = req.email.strip().lower()
 
-    _consume_verified_code(db, req.email.strip().lower(), req.email_code, "signup")
+    org = None
+    if req.organization_id:
+        org = db.get(Organization, req.organization_id)
+        if org is None or org.code != (req.org_code or "").strip().upper():
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="기관 코드가 올바르지 않습니다.")
+        _assert_org_code_not_expired(org)  # 만료된 코드로는 가입 불가
+
+    # 학생 아이디는 전역 유일 (기관 무관) — 이메일 가입이면 이메일 자체가 아이디
+    login_id = (req.student_login_id or email).strip()
+    if not student_id_available(db, login_id):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail=(
+                "이미 사용 중인 아이디예요. 다른 아이디를 골라 주세요."
+                if req.student_login_id
+                else "이미 가입된 이메일이에요. 로그인하거나 다른 이메일을 사용해 주세요."
+            ),
+        )
+
+    _consume_verified_code(db, email, req.email_code, "signup")
 
     student = StudentProfile(
-        organization_id=org.id,
-        student_login_id=req.student_login_id.strip(),
+        organization_id=org.id if org else None,
+        student_login_id=login_id,
         student_code=_generate_student_code(db),
         password_hash=hash_password(req.password),
         nickname=req.name,
@@ -825,7 +860,8 @@ def verify_teacher_code(db: Session, organization_id: str, code: str) -> bool:
 def get_me(db: Session, principal) -> s.MeResponse:
     if principal.kind == "student":
         st: StudentProfile = principal.student
-        org = db.get(Organization, st.organization_id)
+        # 이메일 가입 학생은 무소속(organization_id=None) — db.get(None) 예외 방지
+        org = db.get(Organization, st.organization_id) if st.organization_id else None
         cls = db.get(ClassRoom, st.class_id) if st.class_id else None
         return s.MeResponse(
             id=st.id,

@@ -119,7 +119,9 @@ class LectureWatchProgress(Base, UUIDPk, Timestamps):
     # last_heartbeat_at 기준 SESSION_TTL_SEC(30초) 무하트비트면 죽은 세션으로 자동 간주.
     session_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     last_heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)  # _now() 로컬 naive
-    # 행동 기반 캡차 트리거 — 상호작용 면제 연속 횟수(캡차 통과 시 0으로 리셋)
+    # (사용 중단 0716) 상호작용 면제 연속 횟수 — 면제 장치를 걷어내 아무 코드도 읽지 않는다.
+    # 컬럼은 남긴다: 드롭은 되돌릴 수 없고 마이그레이션만 하나 늘 뿐, 남겨도 무해하다.
+    # 제거 이유는 lecture_service의 '상호작용 면제: 제거됨' 주석 참조.
     exempt_streak: Mapped[int] = mapped_column(default=0)
     # 의심 이벤트 누적(안 본 구간 seek/과속 하트비트/탭 백그라운드 자기신고) — 체크포인트 간격 축소에 사용
     suspicion: Mapped[int] = mapped_column(default=0)

@@ -14,7 +14,9 @@ class LoginRequest(BaseModel):
     role: str | None = None
     email: str
     password: str
-    # 5회 이상 실패해 캡차가 요구된 뒤, 메인 캡차(forest)를 통과하고 받은 단일사용 토큰.
+    # 시연용 임시 — 캡차 API 도입 전까지 서버가 사용하지 않는다(어떤 값도 통과 안 됨,
+    # 5회+ 실패 방어는 쿨다운). 도입 시 캡차 통과 토큰을 싣는 자리로 재사용
+    # (종전: 메인 캡차(forest) 통과 단일사용 토큰).
     captcha_token: str | None = None
 
 
@@ -23,7 +25,8 @@ class StudentLoginRequest(BaseModel):
     organization_id: str | None = None
     student_login_id: str
     password: str
-    captcha_token: str | None = None  # 캡차 요구 후 forest 캡차 통과 토큰(단일사용)
+    # 시연용 임시 — 캡차 API 도입 전까지 미사용(LoginRequest.captcha_token과 동일)
+    captcha_token: str | None = None
 
 
 class RefreshRequest(BaseModel):
@@ -68,12 +71,16 @@ class RegisterTeacherRequest(BaseModel):
 
 class RegisterStudentRequest(BaseModel):
     name: str
-    organization_id: str
-    org_code: str
+    # 이메일 가입 전환(2026-07-16): 기관 경유 가입에서만 사용 — 이메일 가입은 생략.
+    # 필드를 지우지 않고 옵셔널로 남겨 기관 경유 가입을 되살릴 수 있게 한다.
+    organization_id: str | None = None
+    org_code: str | None = None
     email: EmailStr
     email_code: str
-    student_login_id: str = Field(min_length=3)
-    password: str = Field(min_length=4)
+    # 미지정 시 이메일(소문자·strip)이 로그인 아이디가 된다.
+    student_login_id: str | None = Field(default=None, min_length=3)
+    # 학부모(RegisterParentRequest)와 동일 8자 기준으로 통일 (종전 4자)
+    password: str = Field(min_length=8)
 
 
 class RegisterOrgRequest(BaseModel):

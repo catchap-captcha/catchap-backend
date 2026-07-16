@@ -8,11 +8,19 @@ def login(client, role, email, password, captcha_token=None):
     return client.post("/api/v1/auth/login", json=payload)
 
 
-def forest_token():
-    """캡차 요구 상태를 통과하기 위한 유효한 메인 캡차(forest) 토큰 — 단일사용."""
-    from app.services import forest_captcha as fc
+def _elapse_cooldown(db, identifier):
+    """쿨다운 경과를 시뮬레이션 — LoginThrottle.updated_at을 쿨다운보다 과거로 백데이트."""
+    from datetime import datetime, timedelta
 
-    return fc.service.issue_token()
+    from app.models import LoginThrottle
+    from app.services.auth_service import CAPTCHA_COOLDOWN_SECONDS
+
+    row = db.query(LoginThrottle).filter(LoginThrottle.identifier == identifier).first()
+    assert row is not None
+    backdated = datetime.now() - timedelta(seconds=CAPTCHA_COOLDOWN_SECONDS + 1)
+    row.updated_at = backdated
+    row.created_at = backdated
+    db.commit()
 
 
 def test_login_success_and_me(client, db, seed_org):
@@ -33,8 +41,9 @@ def test_login_wrong_password(client, seed_org):
     assert login(client, "teacher", "t1@test.dev", "wrong").status_code == 401
 
 
-def test_captcha_required_after_five_fails(client, seed_org):
-    """5회 이상 연속 실패 → captcha_required, 성공하면 리셋"""
+def test_captcha_required_after_five_fails(client, db, seed_org):
+    """5회 이상 연속 실패 → 쿨다운(429). 시연용 임시 — 캡차 API 도입 전이라
+    캡차 토큰은 어떤 값도 통과하지 않고, 쿨다운 경과 후 정상 자격이면 성공·리셋."""
     for i in range(1, 5):
         res = login(client, "teacher", "t1@test.dev", "wrong")
         assert res.status_code == 401
@@ -44,43 +53,44 @@ def test_captcha_required_after_five_fails(client, seed_org):
     assert res5.status_code == 401
     assert res5.json()["detail"]["captcha_required"] is True
 
-    # 6번째도 계속 요구 — 캡차 토큰 없인 자격 검증 자체가 막힌다(카운트는 안 올라감)
-    res6 = login(client, "teacher", "t1@test.dev", "wrong")
-    assert res6.json()["detail"]["captcha_required"] is True
-
-    # 캡차 요구 상태에서는 올바른 비밀번호도 토큰 없이는 거부된다 (로그인 게이트)
+    # 6번째부터는 쿨다운 — 올바른 비밀번호도 즉시 재시도는 429로 막힌다
     blocked = login(client, "teacher", "t1@test.dev", "Password123!")
-    assert blocked.status_code == 401
+    assert blocked.status_code == 429
     assert blocked.json()["detail"]["captcha_required"] is True
+    assert blocked.json()["detail"]["cooldown_seconds"] > 0
 
-    # 캡차 통과 토큰과 함께 성공하면 리셋 → 이후 1회 실패는 캡차 불필요
-    ok = login(client, "teacher", "t1@test.dev", "Password123!", captcha_token=forest_token())
+    # 모의 토큰(임의 값)으로는 절대 통과 못 한다 — 프론트 'API 도입 안내 창'은 채점이 없다
+    forged = login(
+        client, "teacher", "t1@test.dev", "Password123!", captcha_token="fake-demo-token"
+    )
+    assert forged.status_code == 429
+
+    # 쿨다운 경과 후 정상 자격이면 성공 → 카운터 리셋(이후 1회 실패는 캡차 불필요)
+    _elapse_cooldown(db, "user:t1@test.dev")
+    ok = login(client, "teacher", "t1@test.dev", "Password123!")
     assert ok.status_code == 200
     res_after = login(client, "teacher", "t1@test.dev", "wrong")
     assert res_after.json()["detail"]["captcha_required"] is False
 
 
-def test_student_captcha_counter(client, seed_org):
-    """학생 로그인도 실패 카운트/리셋 동작"""
+def test_student_captcha_counter(client, db, seed_org):
+    """학생 로그인도 실패 카운트/쿨다운/리셋 동작"""
     for _ in range(5):
         res = client.post(
             "/api/v1/auth/student-login",
             json={"student_login_id": "stu01", "password": "wrong"},
         )
     assert res.json()["detail"]["captcha_required"] is True
-    # 캡차 요구 상태 — 올바른 비밀번호도 토큰 없이는 거부, 토큰과 함께면 성공(리셋)
+    # 쿨다운 중엔 올바른 비밀번호도 429, 경과 후엔 성공(리셋)
     blocked = client.post(
         "/api/v1/auth/student-login",
         json={"student_login_id": "stu01", "password": "1234"},
     )
-    assert blocked.status_code == 401
+    assert blocked.status_code == 429
+    _elapse_cooldown(db, "student:stu01")
     ok = client.post(
         "/api/v1/auth/student-login",
-        json={
-            "student_login_id": "stu01",
-            "password": "1234",
-            "captcha_token": forest_token(),
-        },
+        json={"student_login_id": "stu01", "password": "1234"},
     )
     assert ok.status_code == 200
 
@@ -221,7 +231,7 @@ def test_check_student_id_endpoint(client, db, seed_org):
 
 
 def test_register_student_rejects_duplicate_id(client, db, seed_org):
-    """가입 시 다른 기관에 존재하는 아이디도 409"""
+    """가입 시 다른 기관에 존재하는 아이디도 409 (기관 경유 가입 경로 유지 확인)"""
     from tests.conftest import get_email_code
 
     code = get_email_code(db, "guardian@test.dev")
@@ -234,10 +244,68 @@ def test_register_student_rejects_duplicate_id(client, db, seed_org):
             "email": "guardian@test.dev",
             "email_code": code,
             "student_login_id": "stu01",  # 이미 사용 중
-            "password": "1234",
+            "password": "Password123!",  # 이메일 가입 전환과 함께 최소 8자로 통일
         },
     )
     assert res.status_code == 409
+
+
+def test_register_student_email_only_and_login(client, db):
+    """학생 이메일 가입 전환(2026-07-16) — 기관 없이 이메일만으로 가입하고,
+    그 이메일이 로그인 아이디가 된다. organization_id는 None(무소속)."""
+    code = get_email_code(db, "stukid@test.dev")
+    res = client.post(
+        "/api/v1/auth/register/student",
+        json={
+            "name": "이메일학생",
+            "email": "stukid@test.dev",
+            "email_code": code,
+            "password": "Password123!",
+        },
+    )
+    assert res.status_code == 200, res.text
+
+    ok = client.post(
+        "/api/v1/auth/student-login",
+        json={"student_login_id": "stukid@test.dev", "password": "Password123!"},
+    )
+    assert ok.status_code == 200, ok.text
+    me = client.get(
+        "/api/v1/auth/me",
+        headers={"Authorization": f"Bearer {ok.json()['access_token']}"},
+    )
+    assert me.status_code == 200, me.text
+    assert me.json()["role"] == "student"
+    assert me.json()["organization_id"] is None
+    assert me.json()["student"]["student_login_id"] == "stukid@test.dev"
+
+    # 같은 이메일 재가입은 409 (이메일=아이디 전역 유일)
+    code2 = get_email_code(db, "stukid@test.dev")
+    dup = client.post(
+        "/api/v1/auth/register/student",
+        json={
+            "name": "중복학생",
+            "email": "stukid@test.dev",
+            "email_code": code2,
+            "password": "Password123!",
+        },
+    )
+    assert dup.status_code == 409
+
+
+def test_register_student_email_password_min_8(client, db):
+    """학생 비밀번호도 학부모와 동일 8자 미만이면 422"""
+    code = get_email_code(db, "shortpw@test.dev")
+    res = client.post(
+        "/api/v1/auth/register/student",
+        json={
+            "name": "짧은비번",
+            "email": "shortpw@test.dev",
+            "email_code": code,
+            "password": "1234",
+        },
+    )
+    assert res.status_code == 422
 
 
 def test_email_send_rejects_registered_account_email(client, db, seed_org):

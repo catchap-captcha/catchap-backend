@@ -40,17 +40,21 @@ GRACE_SEC = 15
 # 여유 배수 — 새로고침·일시 네트워크 단절이 성실한 사용자를 영영 잠그지 않게 하는 값.
 SESSION_TTL_SEC = 30
 
-# ---- 상호작용 면제 ----
-# 체크포인트 도달 시 최근 상호작용(interacted 자기신고)이 있으면 캡차를 건너뛰는 연속 상한.
-# 2회로 둔 근거: 기본 간격 60~180초 기준 최대 2×180초(약 6분)까지만 캡차 없이 지나가고,
-# 그다음 체크포인트는 무조건 캡차 — interacted=true를 계속 위조해 보내도 세 번째마다는
-# 반드시 캡차를 풀어야 하므로 남용 피해가 유한하다. 추가로 '마지막 체크포인트'(재예약
-# 후보가 None인 지점)는 streak와 무관하게 면제 불가 — 면제가 남은 게이트를 없애 캡차
-# 0회 완주가 되는 구멍(advance ④)을 막는다.
-# ⚠️ interacted는 클라이언트 자기신고라 위조 가능하다. 이 면제는 봇 차단 수단이 아니라
-# '성실한 시청자(입력이 있었던 사람)를 덜 방해'하는 UX 장치이고, 위조 남용은 이 상한으로만
-# 제한된다. 봇 차단의 정본은 캡차 자체와 서버 하트비트 검증(속도상한·클램프)이다.
-EXEMPT_STREAK_MAX = 2
+# ---- 상호작용 면제: 제거됨(0716) ----
+# 체크포인트 도달 시 interacted(자기신고)가 있으면 캡차를 건너뛰던 장치를 걷어냈다.
+# 명분은 '성실한 시청자를 덜 방해한다'였는데, 전제가 틀렸다:
+#   ① 강의에 집중하는 학생은 아무것도 만지지 않는다 — 그냥 본다. 즉 면제가 도우려던
+#      바로 그 사람이 면제를 못 받았다.
+#   ② interacted는 클라이언트 자기신고라 위조가 가능하다. 하트비트에 "interacted": true
+#      한 줄을 넣는 쪽(봇·딴짓)만 이득을 봤다 — 방향이 거꾸로였다.
+#   ③ 실제로 구멍을 만들었다: 위조 한 줄로 강사가 지정한 고정 문항을 건너뛰는 것이
+#      적대적 검토에서 실증됐다(고정 3개 중 2개 스킵).
+# 이 장치를 감싸던 예외들(streak 상한·마지막 게이트 면제 금지·고정 시점 면제 거부)도
+# 함께 사라진다 — 전부 잘못된 전제를 떠받치던 땜빵이었다.
+# 흐름 보호는 위조 불가능한 수단으로 한다: 강사가 고르는 확인 간격(느슨히=5~10분)과
+# 출제 구간(끊어도 되는 대목을 강사가 지정, 정확한 초는 서버가 무작위).
+# 근본 제약: 웹에서 '집중하고 있는가'를 측정할 방법이 없다. 추정 가능한 신호는 전부
+# 위조 가능하다. 그래서 '봤는가'를 직접 묻는 콘텐츠 캡차가 유일한 수단이다.
 
 # ---- 의심 가중 ----
 # suspicion 누적 시 체크포인트 간격을 나눠 좁히되, 이 하한(초) 아래로는 절대 내리지 않는다 —
@@ -260,7 +264,6 @@ def advance(
     lec: Lecture,
     position_sec: int,
     *,
-    interacted: bool = False,
     tab_hidden: bool = False,
 ) -> dict:
     """하트비트 1건 검증 — 서버 정본 watched_max/next_checkpoint를 갱신해 반환.
@@ -272,11 +275,7 @@ def advance(
     ③ 의심 가중: 속도상한을 유의미하게 넘긴 position 신고(안 본 구간 seek/과속)와
        탭 백그라운드 자기신고(tab_hidden — 위조 가능, 참고용)를 suspicion에 누적한다.
        suspicion은 다음 체크포인트 간격 축소에만 쓰이고 시청을 막지는 않는다.
-    ④ 상호작용 면제: 체크포인트 도달 시 interacted(자기신고 — 위조 가능, 아래 주석)면
-       캡차 없이 다음 지점을 재예약한다. 연속 EXEMPT_STREAK_MAX회까지만 — 그다음은
-       무조건 캡차(캡차 통과 시 streak 리셋). '입력이 있었다=사람이 있었다'는 참이지만
-       그 신고 자체는 클라이언트 위조가 가능하므로, 이 면제는 봇 차단이 아니라 성실한
-       시청자의 방해를 줄이는 장치이고 남용 피해는 상한으로만 제한된다.
+    체크포인트에 도달하면 예외 없이 캡차를 요구한다 — 상호작용 면제는 제거됐다(위 주석).
     watched_max는 절대 감소하지 않는다.
     """
     now = _now()
@@ -324,51 +323,8 @@ def advance(
     # 오래 머물면 다음 계산의 allowed가 부풀어, 체크포인트 통과 직후 점프 여지가 생긴다.
     progress.updated_at = now
 
+    # 체크포인트에 닿으면 예외 없이 캡차 — 면제 경로 없음(위 '상호작용 면제: 제거됨' 참조).
     checkpoint_due = cp is not None and progress.watched_max_sec >= cp
-    exempted = False
-    if (
-        checkpoint_due
-        and interacted
-        and int(progress.exempt_streak or 0) < EXEMPT_STREAK_MAX
-    ):
-        # 상호작용 면제 — 캡차 없이 통과 처리하되 checkpoints_passed는 올리지 않는다
-        # (그 카운트는 '캡차를 실제로 푼 횟수'). 감사용 이벤트는 exempted로 남긴다.
-        base = max(int(progress.watched_max_sec or 0), int(cp))
-        pool_min, pins = question_windows(db, progress.lecture_id)
-        # ★ 고정 문항은 면제 대상이 아니다. 면제 논리("성실한 시청자를 덜 방해하고, 남용
-        # 피해는 연속 상한으로 유한")는 무작위 문항에만 성립한다 — 그건 다음 게이트에서
-        # 등가의 다른 문항으로 다시 나오기 때문이다. 고정은 강사가 "이 대목 직후여야
-        # 방금 본 사람만 답한다"고 지정한 것이라 그 순간이 지나면 대체 불가고, watched_max는
-        # 감소하지 않으므로 그 문항은 영영 안 뜬다. 위조 가능한 interacted 한 줄로 강사가
-        # 지정한 검증이 사라지는 것을 막는다(적대적 검토에서 실증: 고정 3개 중 2개 스킵).
-        at_pin = any(s <= int(cp) <= e for s, e in pins)
-        candidate = (
-            None
-            if at_pin
-            else next_checkpoint(
-                base, lec, int(progress.suspicion or 0), pool_min=pool_min, pins=pins
-            )
-        )
-        if candidate is None:
-            # 면제 거부 — 두 경우다.
-            # ① 고정 시점(at_pin): 위 주석 참조. 대체 불가라 반드시 풀어야 한다.
-            # ② 마지막 체크포인트(재예약 후보 없음): 여기서 면제하면 남은 게이트가 없어져
-            #    interacted 스팸만으로 캡차 0회 완주가 된다(적대적 검토에서 실증:
-            #    기본 60~180초 설정의 9분 미만 강의 전부 노출).
-            pass
-        else:
-            exempted = True
-            progress.exempt_streak = int(progress.exempt_streak or 0) + 1
-            db.add(
-                LectureCheckpointEvent(
-                    student_id=progress.student_id,
-                    lecture_id=progress.lecture_id,
-                    position_sec=int(cp),
-                    result="exempted",
-                )
-            )
-            progress.next_checkpoint_sec = candidate
-            checkpoint_due = False
 
     if (
         progress.watched_max_sec >= duration
@@ -381,7 +337,6 @@ def advance(
         "watched_max_sec": int(progress.watched_max_sec),
         "next_checkpoint_sec": progress.next_checkpoint_sec,
         "checkpoint_due": bool(checkpoint_due),
-        "exempted": exempted,  # True면 프론트는 캡차를 띄우지 않고 계속 재생
         "checkpoints_passed": int(progress.checkpoints_passed or 0),
         "status": progress.status,
         "duration_sec": duration,
@@ -415,7 +370,6 @@ def record_checkpoint(
     if passed:
         lec = db.get(Lecture, lecture_id)
         progress.checkpoints_passed = int(progress.checkpoints_passed or 0) + 1
-        progress.exempt_streak = 0  # 캡차를 실제로 풀었다 — 상호작용 면제 연속 상한 리셋
         # 캡차 통과 = 사람 확인 — suspicion 반감(회복 경로). 오탐이 쌓인 정상 학생이
         # 캡차 몇 번(최대 8→4→2→1→0)으로 정상 간격을 되찾는다. 계속 seek하는 쪽은
         # 다시 쌓이므로 탐지력은 유지된다.

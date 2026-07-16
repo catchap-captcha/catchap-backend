@@ -460,9 +460,10 @@ def lecture_session_start(
 
 class _ProgressReq(BaseModel):
     position_sec: int
-    # 직전 하트비트 이후 pointermove/click/keydown이 있었나 — 자기신고(위조 가능).
-    # 체크포인트 도달 시 캡차 면제(연속 상한 있음)에만 쓰인다. 봇 차단 수단이 아니다.
-    interacted: bool = False
+    # (제거됨) interacted — 상호작용 자기신고. 캡차 면제에만 쓰였고 그 면제를 걷어냈다.
+    # 구버전 플레이어가 계속 보내도 pydantic이 조용히 무시한다(extra 무시가 기본).
+    # 이유는 lecture_service의 '상호작용 면제: 제거됨' 주석 참조 — 요약하면 집중해서 보는
+    # 학생은 아무것도 만지지 않아 면제가 도우려던 사람을 못 돕고, 위조 가능해 남용만 이득.
     # 탭이 백그라운드였나 — 자기신고(위조 가능, 참고용 의심 가중).
     tab_hidden: bool = False
     # (제거됨) session_id — 세션 식별은 X-Lecture-Session 서명 토큰으로만 한다.
@@ -492,7 +493,7 @@ def lecture_progress(
     lecture_service.claim_session(db, progress, session_id)  # 동시 세션이면 409
     state = lecture_service.advance(
         db, progress, lec, req.position_sec,
-        interacted=req.interacted, tab_hidden=req.tab_hidden,
+        tab_hidden=req.tab_hidden,
     )
     db.commit()
     return state

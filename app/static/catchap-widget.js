@@ -134,6 +134,19 @@
     ensureKeyframes();
     var key = box.getAttribute('data-site-key');
     var base = box.getAttribute('data-api') || '/api/v1';
+    // 서버가 주는 미디어 경로(/api/v1/lectures/.../images/xxx)를 API 오리진에 붙인다.
+    // 상대경로를 <img src>에 그대로 넣으면 브라우저가 '페이지 오리진'에 대고 푼다 — 운영은
+    // 프론트(catchap5.com)와 API(api.catchap5.com)의 오리진이 갈라져 있어 이미지가 깨진다.
+    // 더 고약한 건 그 요청이 SPA 폴백 탓에 200 text/html을 돌려줘 성공처럼 보인다는 것:
+    // 상태코드로 판정하면 속고 naturalWidth로만 잡힌다(실브라우저 검증에서 실측).
+    // base가 절대 URL이 아니면(기본 '/api/v1') 동일 오리진이므로 경로를 그대로 쓴다.
+    // audio·flag 등 다른 미디어는 'base + 상대경로' 형태라 이 함수를 쓰지 않는다.
+    function mediaUrl(p) {
+      if (!p) return p;
+      if (/^https?:\/\//i.test(p)) return p;
+      var o = /^(https?:\/\/[^/]+)/i.exec(base);
+      return o ? o[1] + p : p;
+    }
     // data-subject: 교육형 키로 과목별 챌린지를 요청할 때(우리 앱 과목별 게임화면 등)
     var subject = box.getAttribute('data-subject') || '';
     // 인앱 소비(1st-party) 전용 속성 — 외부 임베드는 전부 생략 가능
@@ -1955,6 +1968,22 @@
         : { fontWeight: '800', fontSize: T.font.md, lineHeight: '1.5', color: T.color.ink, marginBottom: '12px' });
       body.appendChild(prompt);
 
+      // 문제 이미지(prompt_image) — 강사가 강의 화면에서 잘라 붙인 조각. 시청 검증의 핵심:
+      // "방금 화면에 나온 그래프는?"을 텍스트로만 물으면 안 본 사람도 상식으로 찍지만,
+      // 실제 강의 화면은 그 강의를 본 사람만 알아본다. 서버가 무인증 서빙 URL만 내려주고
+      // 이미지 자체는 정오 신호를 담지 않는다(정답은 서명 토큰에만).
+      // src만 설정한다 — innerHTML로 조립하면 URL이 마크업으로 해석될 여지가 생긴다.
+      if (d.prompt_image) {
+        var pim = h('img');
+        pim.src = mediaUrl(d.prompt_image);
+        pim.alt = '문제 이미지';
+        pim.loading = 'lazy';
+        css(pim, { display: 'block', maxWidth: '100%', maxHeight: lectureMode ? '190px' : '260px',
+          margin: '0 auto 16px', borderRadius: T.radius.md, border: '1px solid ' + T.color.line,
+          objectFit: 'contain' });
+        body.appendChild(pim);
+      }
+
       // 공통 셸 수직 리듬: 맥락 블록(figure/image+meaning/scenario)은 하단 16px로 통일.
       // figure(문제 위 도형 그림) — 서버 뱅크의 신뢰된 SVG 마크업. 모든 유형 공통.
       if (d.figure) {
@@ -2019,6 +2048,24 @@
           el.innerHTML = '<span class="cc-svg" style="display:block">' + o.svg + '</span>'
             + (o.text ? '<span style="display:block;font-size:12px;margin-top:4px;color:#6B6157">' + o.text + '</span>' : '');
           var g = el.querySelector('svg'); if (g) { g.style.width = '84px'; g.style.height = 'auto'; g.style.maxWidth = '100%'; }
+        } else if (o.image) {
+          // 이미지 보기 — 강의 화면 조각. 이 보기는 텍스트가 비어 있을 수 있다(서버가 허용):
+          // "삼각형/사각형/원"처럼 라벨을 달면 안 본 사람도 상식으로 찍으므로, 그림만 두는 게
+          // 판별력의 핵심이다. 그래서 텍스트는 있을 때만 캡션으로 덧붙인다.
+          // innerHTML 조립 금지 — URL이 마크업으로 해석될 여지를 만들지 않는다.
+          el.textContent = '';
+          var oim = h('img');
+          oim.src = mediaUrl(o.image);
+          oim.alt = o.text || '보기 이미지';
+          oim.loading = 'lazy';
+          css(oim, { display: 'block', width: '100%', maxHeight: '120px', objectFit: 'contain',
+            borderRadius: T.radius.sm, pointerEvents: 'none' });
+          el.appendChild(oim);
+          if (o.text) {
+            var ocap = h('div'); ocap.textContent = o.text;
+            css(ocap, { display: 'block', fontSize: '12px', marginTop: '4px', color: '#6B6157' });
+            el.appendChild(ocap);
+          }
         } else {
           el.textContent = (o.emoji ? o.emoji + '  ' : '') + o.text;
         }
