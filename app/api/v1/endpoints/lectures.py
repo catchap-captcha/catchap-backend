@@ -273,6 +273,24 @@ def _active_question_count(db: Session, lecture_id: str) -> int:
     )
 
 
+def _pool_question_count(db: Session, lecture_id: str) -> int:
+    """공개(active)·풀(pinned=False) 문항 수 — 무작위 확인의 출제 재료.
+
+    0이면(고정·구간만 있으면) 무작위 확인이 예약되지 않아, 고정 시점을 이미 지난
+    학생에게는 남은 강의 내내 확인이 한 번도 뜨지 않는다(라이브 사고 사례).
+    운영 콘솔이 이 값으로 경고를 띄운다."""
+    return (
+        db.query(func.count(LectureQuestion.id))
+        .filter(
+            LectureQuestion.lecture_id == lecture_id,
+            LectureQuestion.status == "active",
+            LectureQuestion.pinned.is_(False),
+        )
+        .scalar()
+        or 0
+    )
+
+
 def _progress_dict(p: LectureWatchProgress | None) -> dict | None:
     if p is None:
         return None
@@ -689,6 +707,9 @@ def _lecture_row(db: Session, lec: Lecture) -> dict:
         "order_no": int(lec.order_no or 0),
         "question_count": int(total),
         "active_question_count": _active_question_count(db, lec.id),
+        # 풀(무작위) 문항 수 — active여도 이 값이 0이면 고정 시점을 지난 학생에겐
+        # 확인이 안 뜬다. 콘솔이 "무작위 확인 없음" 경고를 띄우는 근거.
+        "pool_question_count": _pool_question_count(db, lec.id),
         "created_at": lec.created_at.isoformat() if lec.created_at else None,
     }
 

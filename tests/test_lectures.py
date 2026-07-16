@@ -113,7 +113,9 @@ def _hb(client, tok, lecture_id, position, *, st, **extra):
     )
 
 
-def _add_question(client, ops_tok, lecture_id, *, position=0, answer=2, status="active"):
+def _add_question(
+    client, ops_tok, lecture_id, *, position=0, answer=2, status="active", pinned=False
+):
     r = client.post(
         f"/api/v1/ops/lectures/{lecture_id}/questions",
         json={
@@ -123,6 +125,7 @@ def _add_question(client, ops_tok, lecture_id, *, position=0, answer=2, status="
             "answer_index": answer,
             "explain": "강의 앞부분에서 설명했어요.",
             "status": status,
+            "pinned": pinned,
         },
         headers=auth(ops_tok),
     )
@@ -1689,6 +1692,54 @@ def test_lecture_toc_order(client, db, seed_org, media_dir):
     ops_ls = client.get("/api/v1/ops/lectures", headers=auth(ops_tok)).json()
     korean = [r["title"] for r in ops_ls if r["subject"] == "국어"]
     assert korean == ["1강", "2강", "3강"]
+
+
+def test_ops_list_pool_question_count(client, db, seed_org, media_dir):
+    """ops 목록의 pool_question_count = 공개(active)·풀(pinned=False) 문항 수.
+
+    고정 문항만 있으면(pool=0) 무작위 확인이 예약되지 않아, 고정 시점을 이미 지난
+    학생에게는 남은 강의 내내 확인이 안 뜬다(라이브 사고 사례) — 콘솔 경고의 근거라
+    active엔 잡히지만 pool엔 안 잡히는 상태를 구분해서 내려줘야 한다."""
+    ops_tok = _ops(client, db)
+    lec = _upload_lecture(client, ops_tok).json()
+
+    def row():
+        ls = client.get("/api/v1/ops/lectures", headers=auth(ops_tok)).json()
+        return next(r for r in ls if r["id"] == lec["id"])
+
+    # 문항 0개 — 둘 다 0
+    r = row()
+    assert r["active_question_count"] == 0 and r["pool_question_count"] == 0
+
+    # 고정(pinned) 문항만 — active 1이지만 pool은 여전히 0 (사고 상태 = 콘솔 경고 대상)
+    pinned_q = _add_question(client, ops_tok, lec["id"], position=18, pinned=True)
+    r = row()
+    assert r["active_question_count"] == 1 and r["pool_question_count"] == 0
+
+    # draft 풀 문항 — 아직 공개가 아니라 어느 카운트에도 안 잡힌다
+    draft_q = _add_question(client, ops_tok, lec["id"], status="draft")
+    r = row()
+    assert r["active_question_count"] == 1 and r["pool_question_count"] == 0
+
+    # draft 승인 → 비로소 pool에 잡힌다
+    up = client.put(
+        f"/api/v1/ops/lectures/{lec['id']}/questions/{draft_q['id']}",
+        json={"status": "active"},
+        headers=auth(ops_tok),
+    )
+    assert up.status_code == 200, up.text
+    r = row()
+    assert r["active_question_count"] == 2 and r["pool_question_count"] == 1
+
+    # 풀 문항 삭제 → pool 0으로 복귀(고정만 남은 사고 상태로 되돌아감)
+    rm = client.delete(
+        f"/api/v1/ops/lectures/{lec['id']}/questions/{draft_q['id']}",
+        headers=auth(ops_tok),
+    )
+    assert rm.status_code == 200, rm.text
+    r = row()
+    assert r["active_question_count"] == 1 and r["pool_question_count"] == 0
+    assert pinned_q["pinned"] is True  # 전제 확인 — 고정 문항이 실제로 pinned로 저장됐다
 
 
 def test_lecture_order_no_auto_assign_and_reorder(client, db, seed_org, media_dir):
