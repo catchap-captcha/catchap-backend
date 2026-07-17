@@ -326,7 +326,11 @@ def test_refresh_rotation(client, seed_org):
     assert res2.status_code == 401
 
 
-def test_register_parent_with_email_code(client, db):
+def test_register_parent_retired(client, db):
+    """제품 전환(학부모 역할 은퇴): 유효한 코드가 있어도 학부모 신규 가입은 410.
+
+    (종전 test_register_parent_with_email_code — 보호자 동의는 이제 학생 가입
+    게이트(guardian_email 코드)가 담당한다. 기존 학부모 로그인은 심층 정리까지 유지.)"""
     code = get_email_code(db, "newparent@test.dev")
     res = client.post(
         "/api/v1/auth/register/parent",
@@ -338,23 +342,14 @@ def test_register_parent_with_email_code(client, db):
             "email_code": code,
         },
     )
-    assert res.status_code == 200
-    # 코드 1회 사용 — 같은 코드 재사용 불가
-    res2 = client.post(
-        "/api/v1/auth/register/parent",
-        json={
-            "name": "또학부모",
-            "email": "newparent@test.dev",
-            "password": "Password123!",
-            "email_code": code,
-        },
-    )
-    assert res2.status_code in (400, 409)
-    # 가입한 계정 로그인
-    assert login(client, "parent", "newparent@test.dev", "Password123!").status_code == 200
+    assert res.status_code == 410
+    from app.models import User
+
+    assert db.query(User).filter(User.email == "newparent@test.dev").first() is None
 
 
-def test_register_parent_wrong_code(client, db):
+def test_register_parent_wrong_code_still_gone(client, db):
+    """은퇴 후에는 코드 유효성과 무관하게 410 — 코드 검증 경로 자체에 도달하지 않는다."""
     res = client.post(
         "/api/v1/auth/register/parent",
         json={
@@ -364,7 +359,7 @@ def test_register_parent_wrong_code(client, db):
             "email_code": "000000",
         },
     )
-    assert res.status_code == 400
+    assert res.status_code == 410
 
 
 def test_register_teacher_retired(client, db, seed_org):

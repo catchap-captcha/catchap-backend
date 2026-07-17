@@ -467,6 +467,14 @@ def _ensure_email_unused(db: Session, email: str) -> None:
 
 # --- 회원가입 4종 ---
 def register_parent(db: Session, req: s.RegisterParentRequest) -> User:
+    # 제품 전환(2026-07-18, 학부모 역할 은퇴): 학부모 신규 가입 접수 종료. 만 14세 미만의
+    # 법정대리인 동의는 학생 가입 게이트(보호자 이메일 코드 + Consent + guardian_email)가
+    # 담당한다 — 보호자 '계정'은 법적 요건이 아니다. 기존 학부모 계정 로그인·데이터는
+    # 심층 정리 단계까지 유지. 아래 기존 코드는 이력 보존용으로 남긴다.
+    raise HTTPException(
+        status.HTTP_410_GONE,
+        detail="학부모 가입 접수가 종료되었어요. 만 14세 미만 자녀의 가입 동의는 자녀 가입 화면에서 보호자 이메일 인증으로 진행돼요.",
+    )
     email = req.email.strip().lower()
     _ensure_email_unused(db, email)
     _consume_verified_code(db, email, req.email_code, "signup")
