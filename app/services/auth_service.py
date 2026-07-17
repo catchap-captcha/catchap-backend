@@ -180,11 +180,12 @@ def login(db: Session, req: s.LoginRequest) -> s.TokenPair:
     if user is None or not verify_password(req.password, user.password_hash):
         raise _login_failed(db, identifier, "이메일 또는 비밀번호가 올바르지 않습니다.")
     # 역할은 계정(이메일 유일)에서 판별한다 — 클라이언트가 보낸 req.role은 무시.
-    # 운영자(ops)는 일반 로그인 폼으로 인증할 수 없다 — 전용 경로(/auth/ops-login)만 허용.
-    # 존재 여부를 흘리지 않도록 자격 오류와 동일한 메시지로 거부하되, 실패 카운트는
-    # 올리지 않는다 — 그렇지 않으면 알려진 ops 이메일로 이 엔드포인트를 두드려
-    # ops 계정을 잠그는 교차 락아웃(DoS)이 가능하다.
-    if user.role == "ops":
+    # 운영자(ops)·강사(instructor)는 일반 로그인 폼으로 인증할 수 없다 — 전용
+    # 경로(/auth/ops-login)만 허용. 존재 여부를 흘리지 않도록 자격 오류와 동일한
+    # 메시지로 거부하고, 이 분기(비밀번호는 맞고 역할만 콘솔 계정)는 실패 카운트를
+    # 올리지 않는다. 단, 오답 자체는 위의 _login_failed가 공유 카운터(user:{email})를
+    # 이미 올린다 — 콘솔 이메일을 아는 공격자의 오답 스팸 잠금은 여기서 못 막는다(기존 속성).
+    if user.role in ("ops", "instructor"):
         raise HTTPException(
             status.HTTP_401_UNAUTHORIZED,
             detail={"message": "이메일 또는 비밀번호가 올바르지 않습니다.", "captcha_required": False},
@@ -264,10 +265,11 @@ def _assert_org_approved(db: Session, user: User) -> None:
 
 
 def ops_login(db: Session, req: s.LoginRequest) -> s.TokenPair:
-    """운영자 전용 로그인 — 숨겨진 경로(/ops/login → /auth/ops-login)에서만 호출.
+    """운영자·강사 전용 로그인 — 숨겨진 경로(/ops/login → /auth/ops-login)에서만 호출.
 
     일반 사용자 계정으로는 여기서 토큰을 받을 수 없고(존재 여부도 흘리지 않음),
-    운영자 계정은 일반 로그인 폼(/auth/login)으로는 인증되지 않는다.
+    운영자·강사 계정은 일반 로그인 폼(/auth/login)으로는 인증되지 않는다.
+    강사(instructor)는 운영자가 초대·발급하는 내부 계정이라 같은 진입구를 쓴다.
     """
     identifier = f"user:{req.email.strip().lower()}"
     _check_locked(db, identifier)  # H1: 과도한 실패 시 실제 차단
@@ -279,7 +281,7 @@ def ops_login(db: Session, req: s.LoginRequest) -> s.TokenPair:
         verify_password(req.password, user.password_hash)
         or (req.password.strip() != req.password and verify_password(req.password.strip(), user.password_hash))
     )
-    if user is None or user.role != "ops" or not pw_ok:
+    if user is None or user.role not in ("ops", "instructor") or not pw_ok:
         raise _login_failed(db, identifier, "이메일 또는 비밀번호가 올바르지 않습니다.")
     if user.status == "disabled":
         raise HTTPException(status.HTTP_403_FORBIDDEN, detail="비활성화된 계정입니다.")

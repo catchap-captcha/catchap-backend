@@ -2190,3 +2190,182 @@ def ops_put_ai_settings(
     )
     db.commit()
     return _ai_settings_payload(db)
+
+
+# ---------------------------------------------------------------- 강사 계정 관리 (초대·승인제)
+# 강사(instructor)는 공개 가입이 없다 — 운영자가 여기서 발급(초대)해야만 계정이 생긴다.
+# 로그인은 운영자와 같은 숨겨진 진입구(/ops/login)를 쓰고, 콘솔에서는 자기 강의만 보인다
+# (lectures.py의 require_lecture_manager + uploaded_by 스코프).
+def _instructor_row(u: User) -> dict:
+    return {
+        "id": u.id,
+        "name": u.name,
+        "email": u.email,
+        "status": u.status,
+        "last_login_at": u.last_login_at.isoformat() if u.last_login_at else None,
+        "created_at": u.created_at.isoformat() if u.created_at else None,
+    }
+
+
+@router.get("/instructors")
+def list_instructors(
+    principal: Principal = Depends(require_ops), db: Session = Depends(get_db)
+):
+    rows = (
+        db.query(User).filter(User.role == "instructor").order_by(User.created_at).all()
+    )
+    return [_instructor_row(u) for u in rows]
+
+
+@router.post("/instructors")
+def create_instructor(
+    req: _OperatorCreateReq,  # {name, email} — 운영자 발급과 동일 형태
+    principal: Principal = Depends(require_ops),
+    db: Session = Depends(get_db),
+):
+    """강사 계정 초대 발급 — 임시 비밀번호를 본인 이메일로 통보, 첫 로그인 시 변경 강제.
+
+    임시 비번은 응답에서도 1회 노출한다(이메일 dry-run/실패 시 수동 전달용 — 운영자 발급과
+    동일 규약). 강사는 강의 제작 콘솔(자기 강의만)에 접근하고 운영 메뉴에는 접근 불가."""
+    email = req.email.strip().lower()
+    if db.query(User).filter(User.email == email).first():
+        raise HTTPException(status.HTTP_409_CONFLICT, detail="이미 가입된 이메일입니다.")
+    temp_password = secrets.token_urlsafe(9)
+    inst = User(
+        email=email,
+        password_hash=hash_password(temp_password),
+        name=req.name,
+        role="instructor",
+        status="active",
+        email_verified_at=datetime.now(),  # 사용자 기록 시각 — 로컬(KST) 규약
+        must_change_password=True,  # 첫 로그인 시 새 비번 강제 (전역 ForcePasswordGate)
+    )
+    db.add(inst)
+    db.flush()
+
+    pw = escape(temp_password)
+    html = (
+        "<div style='font-family:sans-serif;line-height:1.7;color:#333'>"
+        f"<p>{escape(inst.name)}님, 안녕하세요. CatChap 운영팀입니다.</p>"
+        "<p>CatChap <b>강사 계정</b>이 발급되었습니다. 강의 업로드와 확인 문항 제작을 "
+        "직접 하실 수 있어요.</p>"
+        "<div style='margin:16px 0;padding:14px 16px;background:#fff1e9;border-radius:10px'>"
+        f"<b>로그인 이메일</b><br>{escape(inst.email)}<br><br>"
+        f"<b>임시 비밀번호</b><br>"
+        f"<span style='font-size:18px;font-weight:700;color:#ff5a4d;letter-spacing:1px'>{pw}</span>"
+        "</div>"
+        "<p>강사 로그인 화면(주소창에 /ops/login 입력)에서 접속하고, 보안을 위해 "
+        "<b>첫 로그인 후 반드시 새 비밀번호로 변경</b>해 주세요.</p>"
+        "<p>감사합니다. 🐾</p></div>"
+    )
+    sent = send_email(
+        db, to_email=inst.email, subject="[CatChap] 강사 계정이 발급되었습니다", html=html, user_id=inst.id
+    )
+    email_status = "dry_run" if not get_settings().smtp_enabled else ("sent" if sent else "failed")
+    db.add(
+        AuditLog(
+            actor_user_id=principal.id,
+            action="ops.instructor_create",
+            target_type="user",
+            target_id=inst.id,
+            after_json={"name": inst.name, "email": email, "email_status": email_status},
+        )
+    )
+    db.commit()
+    return {
+        "ok": True,
+        **_instructor_row(inst),
+        "temp_password": temp_password,  # 이메일 실패/dry-run 시 수동 전달용 (1회 노출)
+        "email_status": email_status,
+    }
+
+
+@router.post("/instructors/{inst_id}/reset-password")
+def reset_instructor_password(
+    inst_id: str,
+    principal: Principal = Depends(require_ops),
+    db: Session = Depends(get_db),
+):
+    """강사 임시 비밀번호 재설정 — 기존 세션 즉시 폐기 + 첫 로그인 시 변경 강제."""
+    from app.services import auth_service
+
+    inst = db.get(User, inst_id)
+    if inst is None or inst.role != "instructor":
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="강사를 찾을 수 없습니다.")
+    if inst.status == "disabled":
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail="중지된 계정이에요. 먼저 계정을 재개한 뒤 비밀번호를 재설정해 주세요.",
+        )
+    temp_password = secrets.token_urlsafe(9)
+    inst.password_hash = hash_password(temp_password)
+    inst.must_change_password = True
+    auth_service.logout(db, inst.id)  # 기존 모든 세션 폐기
+    db.flush()
+    pw = escape(temp_password)
+    html = (
+        "<div style='font-family:sans-serif;line-height:1.7;color:#333'>"
+        f"<p>{escape(inst.name or '강사')}님, 안녕하세요. CatChap 운영팀입니다.</p>"
+        "<p>강사 계정의 <b>임시 비밀번호가 재설정</b>되었습니다.</p>"
+        "<div style='margin:16px 0;padding:14px 16px;background:#fff1e9;border-radius:10px'>"
+        f"<b>로그인 이메일</b><br>{escape(inst.email)}<br><br><b>임시 비밀번호</b><br>"
+        f"<span style='font-size:18px;font-weight:700;color:#ff5a4d;letter-spacing:1px'>{pw}</span></div>"
+        "<p>강사 로그인 화면(/ops/login)에서 접속 후 <b>새 비밀번호로 변경</b>해 주세요.</p>"
+        "<p>감사합니다. 🐾</p></div>"
+    )
+    sent = send_email(
+        db, to_email=inst.email, subject="[CatChap] 강사 임시 비밀번호 재설정", html=html, user_id=inst.id
+    )
+    email_status = "dry_run" if not get_settings().smtp_enabled else ("sent" if sent else "failed")
+    db.add(
+        AuditLog(
+            actor_user_id=principal.id,
+            action="ops.instructor_password_reset",
+            target_type="user",
+            target_id=inst.id,
+            after_json={"email": inst.email, "email_status": email_status},
+        )
+    )
+    db.commit()
+    return {
+        "ok": True,
+        "name": inst.name,
+        "email": inst.email,
+        "temp_password": temp_password,
+        "email_status": email_status,
+    }
+
+
+@router.patch("/instructors/{inst_id}")
+def update_instructor(
+    inst_id: str,
+    req: _OperatorUpdateReq,  # {name?, status?} — 운영자 수정과 동일 형태
+    principal: Principal = Depends(require_ops),
+    db: Session = Depends(get_db),
+):
+    """강사 계정 수정 — 이름 변경 / 활성화·중지. 중지해도 강의·데이터는 남는다
+    (강의 소유권은 uploaded_by — 계정 중지는 로그인 차단일 뿐 콘텐츠 소거가 아니다)."""
+    inst = db.get(User, inst_id)
+    if inst is None or inst.role != "instructor":
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="강사 계정을 찾을 수 없습니다.")
+    before = {"name": inst.name, "status": inst.status}
+    if req.name is not None:
+        inst.name = req.name
+    if req.status is not None:
+        inst.status = req.status
+        if req.status == "disabled":
+            from app.services import auth_service
+
+            auth_service.logout(db, inst.id)  # 중지 즉시 기존 세션 폐기
+    db.add(
+        AuditLog(
+            actor_user_id=principal.id,
+            action="ops.instructor_update",
+            target_type="user",
+            target_id=inst.id,
+            before_json=before,
+            after_json={"name": inst.name, "status": inst.status},
+        )
+    )
+    db.commit()
+    return _instructor_row(inst)

@@ -87,6 +87,10 @@ require_grade_head = require_roles("grade_head", "org_admin")
 # 기관 전체 관리(교장 전용): 학년부장·운영자는 제외
 require_org_admin = require_roles("org_admin")
 require_ops = require_roles("ops")
+# 강의 제작 도메인(업로드·문항·자료·AI 생성) — 운영자는 전체, 강사(instructor)는 자기
+# 강의(uploaded_by)만. 스코프 강제는 엔드포인트의 _get_ops_lecture/목록 필터가 담당한다.
+# 강사는 초대·승인제(운영자가 /ops/instructors에서 발급) — 공개 가입 경로가 없다.
+require_lecture_manager = require_roles("ops", "instructor")
 
 
 def check_org_scope(principal: Principal, organization_id: str) -> None:

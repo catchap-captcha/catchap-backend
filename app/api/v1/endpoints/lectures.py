@@ -16,7 +16,8 @@
     GET  /lectures/{id}/stream?t=     서명 토큰(세션 바인딩) 검증 후 FileResponse(Range 네이티브).
                                       takeover로 세션이 무효화되면 이전 토큰은 403
 
-  운영자(require_ops) — 학생 실명·개별 기록은 노출하지 않는다(ops PII 금지)
+  제작(require_lecture_manager: 운영자=전체 / 강사=자기 강의만) — 학생 실명·개별 기록은
+  노출하지 않는다(PII 금지). 강사 스코프는 _get_ops_lecture(소유권 404)와 목록 필터가 강제.
     GET/POST /ops/lectures            목록 / 업로드(multipart, 청크 복사·누적 바이트 재검사)
     PUT/DELETE /ops/lectures/{id}     메타 수정 / 소프트 삭제
     GET/POST/PUT/DELETE /ops/lectures/{id}/questions[/{qid}]  확인 문항 CRUD
@@ -53,7 +54,7 @@ from sqlalchemy import func, not_
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
-from app.core.permissions import Principal, require_ops, require_student
+from app.core.permissions import Principal, require_lecture_manager, require_student
 from app.core.security import decode_token, new_uuid
 from app.db.session import get_db
 from app.models import (
@@ -552,14 +553,14 @@ def lecture_stream(
 @router.post("/ops/lectures/{lecture_id}/preview")
 def ops_lecture_preview(
     lecture_id: str,
-    principal: Principal = Depends(require_ops),
+    principal: Principal = Depends(require_lecture_manager),
     db: Session = Depends(get_db),
 ):
     """운영자 미리보기 URL 발급 — 문항 시점을 눈으로 찾고 화면을 따오기 위한 재생.
 
     학생 재생과 달리 세션을 만들지 않는다: 운영자는 시청 검증 대상이 아니고, 여기서 세션을
     점유하면 같은 계정으로 강의를 보던 학생 세션을 걷어차게 된다."""
-    lec = _get_ops_lecture(db, lecture_id)
+    lec = _get_ops_lecture(db, lecture_id, principal)
     if not lec.video_ext:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="업로드된 영상이 없습니다.")
     token = _sign_ops_stream_token(lec.id, principal.id)
@@ -698,15 +699,14 @@ def _lecture_row(db: Session, lec: Lecture) -> dict:
 
 @router.get("/ops/lectures")
 def ops_list_lectures(
-    principal: Principal = Depends(require_ops), db: Session = Depends(get_db)
+    principal: Principal = Depends(require_lecture_manager), db: Session = Depends(get_db)
 ):
-    # 운영자 목록도 목차순 — 콘솔에서 보이는 순서가 학생 목차와 일치해야 재배열이 예측 가능하다
-    rows = (
-        db.query(Lecture)
-        .filter(Lecture.status != "deleted")
-        .order_by(Lecture.subject, Lecture.order_no, Lecture.created_at)
-        .all()
-    )
+    # 운영자 목록도 목차순 — 콘솔에서 보이는 순서가 학생 목차와 일치해야 재배열이 예측 가능하다.
+    # 강사는 자기 강의(uploaded_by)만 — 남의 강의는 목록에서부터 존재하지 않는다.
+    q = db.query(Lecture).filter(Lecture.status != "deleted")
+    if principal.role == "instructor":
+        q = q.filter(Lecture.uploaded_by == principal.id)
+    rows = q.order_by(Lecture.subject, Lecture.order_no, Lecture.created_at).all()
     return [_lecture_row(db, lec) for lec in rows]
 
 
@@ -744,7 +744,7 @@ def ops_create_lecture(
     description: str | None = Form(default=None),
     order_no: int | None = Form(default=None),  # 미지정 → 과목 맨 뒤(max+1)
     file: UploadFile = File(...),
-    principal: Principal = Depends(require_ops),
+    principal: Principal = Depends(require_lecture_manager),
     db: Session = Depends(get_db),
 ):
     """강의 업로드(multipart) — 임시파일 청크 기록 → 원자적 이동 → DB commit.
@@ -844,13 +844,11 @@ class _LectureUpdate(BaseModel):
 def ops_update_lecture(
     lecture_id: str,
     req: _LectureUpdate,
-    principal: Principal = Depends(require_ops),
+    principal: Principal = Depends(require_lecture_manager),
     db: Session = Depends(get_db),
 ):
     """메타만 수정 — 영상 파일 교체는 별도 업로드(새 강의)로 처리한다."""
-    lec = db.get(Lecture, lecture_id)
-    if lec is None or lec.status == "deleted":
-        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="강의를 찾을 수 없습니다.")
+    lec = _get_ops_lecture(db, lecture_id, principal)  # 강사는 자기 강의만(스코프)
     if req.subject is not None and req.subject not in EDU_SUBJECTS:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="지원하지 않는 과목입니다.")
     if req.status is not None and req.status not in ("active", "hidden"):
@@ -927,7 +925,7 @@ def ops_update_lecture(
 @router.delete("/ops/lectures/{lecture_id}")
 def ops_delete_lecture(
     lecture_id: str,
-    principal: Principal = Depends(require_ops),
+    principal: Principal = Depends(require_lecture_manager),
     db: Session = Depends(get_db),
 ):
     """소프트 삭제 + 영상·자료 파일 물리 삭제 — 레코드·시청 이력·문항·자료 행은 보존
@@ -941,9 +939,7 @@ def ops_delete_lecture(
     파일 삭제는 commit '성공 후'에 한다 — commit 전에 지우면 commit 실패 시 파일은 없는데
     레코드는 active로 남는 최악이 된다. 파일 부재는 status=deleted + *_bytes=0으로
     나타내고, 원래 크기는 감사 로그 before에 남긴다."""
-    lec = db.get(Lecture, lecture_id)
-    if lec is None or lec.status == "deleted":
-        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="강의를 찾을 수 없습니다.")
+    lec = _get_ops_lecture(db, lecture_id, principal)  # 강사는 자기 강의만(스코프)
     video_path = _video_path(lec)  # commit 후에는 속성이 만료되므로 경로를 미리 확정
     file_existed = video_path.is_file()
 
@@ -1002,9 +998,15 @@ def ops_delete_lecture(
 
 
 # ---------------------------------------------------------------- 문항 CRUD
-def _get_ops_lecture(db: Session, lecture_id: str) -> Lecture:
+def _get_ops_lecture(db: Session, lecture_id: str, principal: Principal) -> Lecture:
+    """강의 제작 도메인 공통 로더 — 운영자는 전체, 강사는 자기 강의(uploaded_by)만.
+
+    강사에게 남의 강의는 403이 아니라 404다 — 존재 여부 자체를 흘리지 않는다
+    (id는 UUID지만 로그·링크 유출 시 열거 단서가 되지 않게)."""
     lec = db.get(Lecture, lecture_id)
     if lec is None or lec.status == "deleted":
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="강의를 찾을 수 없습니다.")
+    if principal.role == "instructor" and lec.uploaded_by != principal.id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="강의를 찾을 수 없습니다.")
     return lec
 
@@ -1231,10 +1233,10 @@ def _reconcile_progress(db: Session, lecture_id: str) -> None:
 @router.get("/ops/lectures/{lecture_id}/questions")
 def ops_list_questions(
     lecture_id: str,
-    principal: Principal = Depends(require_ops),
+    principal: Principal = Depends(require_lecture_manager),
     db: Session = Depends(get_db),
 ):
-    _get_ops_lecture(db, lecture_id)
+    _get_ops_lecture(db, lecture_id, principal)
     rows = (
         db.query(LectureQuestion)
         .filter(
@@ -1251,10 +1253,10 @@ def ops_list_questions(
 def ops_create_question(
     lecture_id: str,
     req: _QuestionCreate,
-    principal: Principal = Depends(require_ops),
+    principal: Principal = Depends(require_lecture_manager),
     db: Session = Depends(get_db),
 ):
-    lec = _get_ops_lecture(db, lecture_id)
+    lec = _get_ops_lecture(db, lecture_id, principal)
     ans_ids = _effective_answer_indexes(req.answer_indexes, req.answer_index)
     _validate_question_body(req.prompt, req.options, ans_ids)
     if req.status not in ("draft", "active"):
@@ -1323,13 +1325,13 @@ def ops_update_question(
     lecture_id: str,
     question_id: str,
     req: _QuestionUpdate,
-    principal: Principal = Depends(require_ops),
+    principal: Principal = Depends(require_lecture_manager),
     db: Session = Depends(get_db),
 ):
     # FOR UPDATE(_get_ops_question) — 이 PUT도 payload(JSON)를 통째로 읽고-고쳐-재할당하므로
     # 이미지 첨부/삭제와 같은 잠금 아래 있어야 한다. 잠금 없이는 동시 첨부가 커밋한 참조를
     # 이 핸들러의 스냅샷이 덮어써 파일이 어떤 삭제 연쇄로도 못 닿는 영구 고아가 된다.
-    q = _get_ops_question(db, lecture_id, question_id)
+    q = _get_ops_question(db, lecture_id, question_id, principal)
     if req.status is not None and req.status not in ("draft", "active"):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="status는 draft|active만 가능합니다.")
 
@@ -1433,12 +1435,12 @@ def ops_update_question(
 def ops_delete_question(
     lecture_id: str,
     question_id: str,
-    principal: Principal = Depends(require_ops),
+    principal: Principal = Depends(require_lecture_manager),
     db: Session = Depends(get_db),
 ):
     # FOR UPDATE(_get_ops_question) — payload에서 이미지 경로를 수집한 뒤 상태를 바꾸므로,
     # 잠금 없이 동시 첨부와 겹치면 stale payload에서 수집해 새 파일을 놓친다(고아).
-    q = _get_ops_question(db, lecture_id, question_id)
+    q = _get_ops_question(db, lecture_id, question_id, principal)
     # 문항 이미지는 물리 삭제(강의·자료와 동일 원칙) — 레코드·payload(참조 포함)는 이력으로
     # 보존한다. deleted 문항은 서빙·출제 경로가 전부 status 필터로 닫혀 파일 부재가 무해하다.
     image_paths = [_question_image_path(r) for r in _question_image_refs(q.payload or {})]
@@ -1462,8 +1464,10 @@ def ops_delete_question(
 
 
 # ---------------------------------------------------------------- 문항 이미지 첨부
-def _get_ops_question(db: Session, lecture_id: str, question_id: str) -> LectureQuestion:
-    _get_ops_lecture(db, lecture_id)
+def _get_ops_question(
+    db: Session, lecture_id: str, question_id: str, principal: Principal
+) -> LectureQuestion:
+    _get_ops_lecture(db, lecture_id, principal)
     # FOR UPDATE — 같은 문항의 이미지 첨부/삭제가 동시에 오면 payload(JSON) 재할당이
     # last-write-wins로 먼저 붙인 참조를 덮어 그 파일이 영구 고아가 된다. 행 잠금으로
     # 문항 단위 직렬화(코인 지갑 lost update와 동일 처치). SQLite(테스트)에선 no-op.
@@ -1500,7 +1504,7 @@ def ops_attach_question_image(
     slot: str = Form(...),  # prompt|option — 문항의 어느 자리에 붙는 이미지인가
     option_index: int | None = Form(default=None),  # slot=option일 때 보기 인덱스
     file: UploadFile = File(...),
-    principal: Principal = Depends(require_ops),
+    principal: Principal = Depends(require_lecture_manager),
     db: Session = Depends(get_db),
 ):
     """문항 이미지 첨부(multipart) — 영상·자료와 동일 패턴: 임시파일 청크 복사(누적 바이트
@@ -1514,7 +1518,7 @@ def ops_attach_question_image(
         limit=RATE_QUESTION_IMAGE_UPLOAD_PER_HOUR,
         window_seconds=3600,
     )
-    q = _get_ops_question(db, lecture_id, question_id)
+    q = _get_ops_question(db, lecture_id, question_id, principal)
     payload = dict(q.payload or {})
     slot, opt_key = _resolve_image_slot(payload, slot, option_index)
 
@@ -1586,14 +1590,14 @@ def ops_delete_question_image(
     question_id: str,
     slot: str,
     option_index: int | None = None,
-    principal: Principal = Depends(require_ops),
+    principal: Principal = Depends(require_lecture_manager),
     db: Session = Depends(get_db),
 ):
     """문항 이미지 제거 — payload 참조 삭제 + commit '성공 후' 파일 물리 삭제.
 
     텍스트가 빈 보기의 이미지는 지울 수 없다(이미지마저 빼면 내용 없는 보기가 남는다) —
     먼저 보기 텍스트를 채우고 지우게 400으로 안내한다."""
-    q = _get_ops_question(db, lecture_id, question_id)
+    q = _get_ops_question(db, lecture_id, question_id, principal)
     payload = dict(q.payload or {})
     slot, opt_key = _resolve_image_slot(payload, slot, option_index)
 
@@ -1643,7 +1647,7 @@ class _GenerateReq(BaseModel):
 def ops_generate_questions(
     lecture_id: str,
     req: _GenerateReq,
-    principal: Principal = Depends(require_ops),
+    principal: Principal = Depends(require_lecture_manager),
     db: Session = Depends(get_db),
 ):
     """AI 문항 자동 생성 — STT 전사(키 설정 시) → LLM 출제, source=llm·status=draft 저장.
@@ -1664,7 +1668,7 @@ def ops_generate_questions(
     from app.clients.stt_client import SttError, transcribe_video
     from app.services import settings_service
 
-    lec = _get_ops_lecture(db, lecture_id)
+    lec = _get_ops_lecture(db, lecture_id, principal)
     llm_key = settings_service.resolve_anthropic_key(db)
     if not llm_key:
         raise HTTPException(
@@ -1782,10 +1786,10 @@ def _next_material_order(db: Session, lecture_id: str) -> int:
 @router.get("/ops/lectures/{lecture_id}/materials")
 def ops_list_materials(
     lecture_id: str,
-    principal: Principal = Depends(require_ops),
+    principal: Principal = Depends(require_lecture_manager),
     db: Session = Depends(get_db),
 ):
-    _get_ops_lecture(db, lecture_id)
+    _get_ops_lecture(db, lecture_id, principal)
     rows = (
         db.query(LectureMaterial)
         .filter(
@@ -1948,14 +1952,14 @@ async def _create_file_material(
 async def ops_create_material(
     lecture_id: str,
     request: Request,
-    principal: Principal = Depends(require_ops),
+    principal: Principal = Depends(require_lecture_manager),
     db: Session = Depends(get_db),
 ):
     """자료 생성 — kind=file은 multipart(title+file), kind=link는 JSON(title+url).
 
     FastAPI 시그니처는 본문 형식을 하나로 고정하므로(폼·JSON 동시 선언 불가) Content-Type으로
     직접 분기한다. 전역 본문 상한 예외(main.py)도 같은 기준(multipart일 때만 50MB)이다."""
-    lec = _get_ops_lecture(db, lecture_id)
+    lec = _get_ops_lecture(db, lecture_id, principal)
     content_type = (request.headers.get("content-type") or "").lower()
     if content_type.startswith("multipart/form-data"):
         return await _create_file_material(request, lec, principal, db)
@@ -1972,11 +1976,11 @@ def ops_update_material(
     lecture_id: str,
     material_id: str,
     req: _MaterialUpdate,
-    principal: Principal = Depends(require_ops),
+    principal: Principal = Depends(require_lecture_manager),
     db: Session = Depends(get_db),
 ):
     """메타만 수정(title·order_no) — 파일 교체·URL 변경은 삭제 후 재등록으로 처리한다."""
-    _get_ops_lecture(db, lecture_id)
+    _get_ops_lecture(db, lecture_id, principal)
     mat = db.get(LectureMaterial, material_id)
     if mat is None or mat.lecture_id != lecture_id or mat.status == "deleted":
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="자료를 찾을 수 없습니다.")
@@ -2008,7 +2012,7 @@ def ops_update_material(
 def ops_delete_material(
     lecture_id: str,
     material_id: str,
-    principal: Principal = Depends(require_ops),
+    principal: Principal = Depends(require_lecture_manager),
     db: Session = Depends(get_db),
 ):
     """소프트 삭제 + file 종류는 파일 물리 삭제 — 레코드·이력은 보존(status=deleted로
@@ -2016,7 +2020,7 @@ def ops_delete_material(
 
     파일 삭제는 commit '성공 후'(강의 삭제와 동일 원칙 — commit 실패 시 파일·레코드 정합 유지).
     파일 부재는 status=deleted + file_bytes=0으로 나타내고 원래 크기는 감사 before에 남긴다."""
-    _get_ops_lecture(db, lecture_id)
+    _get_ops_lecture(db, lecture_id, principal)
     mat = db.get(LectureMaterial, material_id)
     if mat is None or mat.lecture_id != lecture_id or mat.status == "deleted":
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="자료를 찾을 수 없습니다.")
