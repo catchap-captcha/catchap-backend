@@ -1,5 +1,7 @@
 from fastapi import APIRouter
 
+# 은퇴 라우터(제품 전환): parents·teacher·orgs — 학교/학부모 콘솔 은퇴(0717~18)로
+# 프론트 소비자가 0이 되어 제거. 종전 코드는 git 이력 참고.
 from app.api.v1.endpoints import (
     auth,
     captcha_api,
@@ -10,11 +12,8 @@ from app.api.v1.endpoints import (
     misc,
     notifications,
     ops,
-    orgs,
-    parents,
     settings as settings_ep,
     students,
-    teacher,
     widget,
 )
 
@@ -26,9 +25,6 @@ for _mod in (
     auth,
     institutions,
     students,
-    parents,
-    teacher,
-    orgs,
     notifications,
     settings_ep,
     misc,

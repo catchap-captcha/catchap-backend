@@ -281,39 +281,6 @@ def test_assert_entitled_bypasses_first_party(db, seed_org):
     cs.assert_entitled(db, fp)
 
 
-def test_org_admin_self_service_scoped_to_purchase(client, db, seed_org):
-    """기관 관리자(교장)는 구매 과목 내에서만 키 발급 — 교사는 접근 불가."""
-    org = seed_org["org"]
-    _, pro = _plans(db)
-    db.add(Subscription(organization_id=org.id, plan_id=pro.id, status="active"))
-    org.edu_subjects = ["국어"]  # 국어만 구매
-    db.commit()
-    admin = _org_admin(client, db, org)
-
-    ent = client.get(f"/api/v1/orgs/{org.id}/api-entitlements", headers=auth(admin)).json()
-    assert "edu" in ent["products"] and ent["edu_subjects"] == ["국어"]
-
-    ok = client.post(f"/api/v1/orgs/{org.id}/api-keys",
-                     json={"product": "edu", "subject": "국어", "label": "우리학교"},
-                     headers=auth(admin))
-    assert ok.status_code == 200, ok.text
-    assert ok.json()["secret_key"] and ok.json()["first_party"] is False
-    assert ok.json()["subject"] == "국어"
-
-    denied = client.post(f"/api/v1/orgs/{org.id}/api-keys",
-                         json={"product": "edu", "subject": "수학"}, headers=auth(admin))
-    assert denied.status_code == 402  # 구매 안 한 과목
-
-    keys = client.get(f"/api/v1/orgs/{org.id}/api-keys", headers=auth(admin)).json()
-    assert len(keys) >= 1
-    assert client.delete(f"/api/v1/orgs/{org.id}/api-keys/{keys[0]['id']}",
-                         headers=auth(admin)).status_code == 200
-
-    # 교사 토큰(비교장) → 403
-    tt = client.post("/api/v1/auth/login",
-                     json={"role": "teacher", "email": "t1@test.dev", "password": "Password123!"}
-                     ).json()["access_token"]
-    assert client.get(f"/api/v1/orgs/{org.id}/api-keys", headers=auth(tt)).status_code == 403
 
 
 def test_verify_rejects_cross_subject_token(client, db, seed_org):
@@ -410,3 +377,5 @@ def test_scratch_access_scope(db, seed_org):
     rec.purged = True
     db.commit()
     assert scratch_access.get_scratch(db, student.id, rec.id)["strokes"] == []
+
+# (기관 셀프서비스 API키 테스트는 기관 콘솔 은퇴로 제거 — 키 발급은 /ops/api-keys가 전담)

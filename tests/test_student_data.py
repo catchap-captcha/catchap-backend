@@ -25,75 +25,8 @@ def auth(token):
     return {"Authorization": f"Bearer {token}"}
 
 
-def test_patch_profile_updates_nickname_and_dashboard(client, db, seed_org):
-    token = _student_token(client, seed_org)
-
-    res = client.patch(
-        "/api/v1/students/me/profile",
-        json={"nickname": "새별명", "age": 8},
-        headers=auth(token),
-    )
-    assert res.status_code == 200
-    assert res.json()["nickname"] == "새별명"
-
-    # DB 행 자체가 바뀌었는지
-    db.refresh(seed_org["student"])
-    assert seed_org["student"].nickname == "새별명"
-    assert seed_org["student"].age == 8
-
-    # 대시보드(홈)에도 즉시 반영
-    dash = client.get("/api/v1/students/me/dashboard", headers=auth(token))
-    assert dash.status_code == 200
-    assert dash.json()["nickname"] == "새별명"
-
-    # 지갑(마이페이지)에도 반영
-    wallet = client.get("/api/v1/students/me/wallet", headers=auth(token))
-    assert wallet.json()["nickname"] == "새별명"
 
 
-def test_badges_reflect_student_badges_table(client, db, seed_org):
-    from app.models import Badge, StudentBadge
-
-    b1 = Badge(
-        name="첫 걸음", description="첫 학습", icon="i", color="#000",
-        condition_text="첫 학습", order_no=0,
-    )
-    b2 = Badge(
-        name="계산 왕", description="30문제", icon="i", color="#000",
-        condition_text="30문제", order_no=1,
-    )
-    db.add_all([b1, b2])
-    db.flush()
-    sb = StudentBadge(
-        student_id=seed_org["student"].id,
-        badge_id=b1.id,
-        earned_at=datetime(2026, 6, 12),
-        progress=1.0,
-    )
-    db.add(sb)
-    db.commit()
-
-    token = _student_token(client, seed_org)
-    res = client.get("/api/v1/students/me/badges", headers=auth(token))
-    assert res.status_code == 200
-    body = res.json()
-    assert body["earned"] == 1
-    assert body["locked"] == 1
-    by_name = {b["name"]: b for b in body["badges"]}
-    assert by_name["첫 걸음"]["earned"] is True
-    assert by_name["첫 걸음"]["foot"] == "6월 12일 획득"  # earned_at 실데이터 기준
-    assert by_name["계산 왕"]["earned"] is False
-
-    # student_badges 행을 지우면 earned 감소
-    db.delete(sb)
-    db.commit()
-    res2 = client.get("/api/v1/students/me/badges", headers=auth(token))
-    assert res2.json()["earned"] == 0
-    assert res2.json()["locked"] == 2
-
-    # 대시보드 배지 카운트도 실테이블 기준
-    dash = client.get("/api/v1/students/me/dashboard", headers=auth(token))
-    assert dash.json()["badges"] == {"earned": 0, "total": 2}
 
 
 def test_daily_quiz_reflects_daily_quiz_status(client, db, seed_org):
@@ -237,31 +170,6 @@ def test_self_report_attempts_grant_no_score(client, db, seed_org):
     assert dash["today"]["done"] == 0
 
 
-def test_self_report_does_not_inflate_ranking(client, db, seed_org):
-    """적대적검토 후속(#4b): 이미 완료한 과목이라도 무채점 자기신고로 랭킹 점수(정답률·속도)를
-    부풀릴 수 없다. _grade_scores는 graded(서버채점)·오늘의퀴즈(chapter_no NULL)만 집계한다."""
-    from app.api.v1.endpoints.students import _grade_scores
-
-    token = _student_token(client, seed_org)
-    sid = seed_org["student"].id
-    # 국어를 서버 채점으로 완료하되 60% 정답(3/5, 5번째 정답 → done)
-    q = _single_q("국어")
-    for c in [False, False, True, True, True]:
-        _game_answer(client, token, "국어", correct=c, q=q)
-    db.expire_all()
-    score1 = _grade_scores(db, [sid]).get(sid, 0)
-    assert score1 > 0  # 완료로 랭킹 점수 생성
-
-    # 자기신고 국어 정답 대량(solve_time_ms:1)으로 정답률·속도 부풀리기 시도
-    for _ in range(20):
-        client.post(
-            "/api/v1/learning/attempts",
-            json={"subject": "국어", "result": "correct", "solve_time_ms": 1, "daily": True},
-            headers=auth(token),
-        )
-    db.expire_all()
-    score2 = _grade_scores(db, [sid]).get(sid, 0)
-    assert score2 == score1  # 자기신고로 랭킹 점수 불변
 
 
 def test_chapter_stats_two_axis(client, db, seed_org):
@@ -349,52 +257,6 @@ def test_wrong_note_chapter_link_and_review(client, db, seed_org):
     assert note3["reviewed"] is True and notes3["summary"]["reviewed"] >= 1
 
 
-def test_grade_ranking_daily_completion(client, db, seed_org):
-    """랭킹: 학년별 풀 + 일일 완료 점수(정답률·속도 + 6과목 완주 보너스 30 + 연속) + 상위3 보너스 코인."""
-    from app.core.security import hash_password
-    from app.models import ClassRoom, DailyQuizStatus, StudentProfile
-
-    # 같은 학년 다른 반 친구 (grade=1인 1-9반) — 학년 풀에 포함돼야 함
-    other_cls = ClassRoom(organization_id=seed_org["org"].id, name="1-9반", grade=1, status="active")
-    db.add(other_cls)
-    db.flush()
-    mate = StudentProfile(
-        organization_id=seed_org["org"].id,
-        class_id=other_cls.id,
-        student_login_id="stu02",
-        student_code="CAT-2222",
-        password_hash=hash_password("1234"),
-        nickname="친구닉",
-        coins=999,  # 코인은 더 많지만 — 랭킹은 이제 코인이 아니라 일일 완료 점수
-    )
-    db.add(mate)
-    db.flush()
-    # 내(테스트학생)가 이틀 완료: 어제 2과목, 오늘 전과목(6과목)
-    me_id = seed_org["student"].id
-    yesterday = date.today() - __import__("datetime").timedelta(days=1)
-    for subj in ["국어", "수학"]:
-        db.add(DailyQuizStatus(student_id=me_id, quiz_date=yesterday, subject=subj, status="done"))
-    for subj in ["국어", "영어", "수학", "과학", "사회", "생활"]:
-        db.add(DailyQuizStatus(student_id=me_id, quiz_date=date.today(), subject=subj, status="done"))
-    db.commit()
-
-    token = _student_token(client, seed_org)
-    res = client.get("/api/v1/students/me/class-ranking", headers=auth(token))
-    assert res.status_code == 200
-    body = res.json()
-    assert body["class_size"] == 2  # 다른 반이어도 같은 학년이면 풀에 포함
-    assert body["grade"] == 1
-    names = [r["name"] for r in body["board"]]
-    assert "친구닉" in names  # 닉네임만 노출
-    me_row = next(r for r in body["board"] if r["me"])
-    # 시도(learning_attempts) 기록이 없어 정답률·속도 0점. 오늘 6과목 완주 → 완주 보너스 30.
-    # 어제는 2과목뿐(완주 아님), 연속 완주도 아님 → 총 30점.
-    assert me_row["score"] == 30
-    assert me_row["rank"] == 1  # 코인 999인 친구보다 위 (완료 기반 점수)
-    # 1위 보너스 코인 30 지급 (하루 1회)
-    assert body["bonus_coins"] == 30
-    res2 = client.get("/api/v1/students/me/class-ranking", headers=auth(token))
-    assert res2.json()["bonus_coins"] == 0  # 같은 날 중복 지급 없음
 
 
 def test_replay_attempt_no_status_no_coins(client, db, seed_org):
@@ -707,96 +569,9 @@ def test_curriculum_lock_and_replay(client, db, seed_org):
     if past["available"]:
         assert past["is_replay"] is True
 
-def test_grade_ranking_score_formula(client, db, seed_org):
-    """랭킹 산식(0708): 정답률·풀이속도 + 6과목 완주 보너스 + 연속 완주 보너스 + 상위3 코인."""
-    import datetime as _dt
-
-    from app.core.security import hash_password
-    from app.models import ClassRoom, DailyQuizStatus, LearningAttempt, StudentProfile
-
-    org_id = seed_org["org"].id
-    me_id = seed_org["student"].id
-    subjects = ["국어", "영어", "수학", "과학", "사회", "생활"]
-
-    # 같은 학년 다른 반 친구 (grade=1인 1-9반) — 학년 풀에 포함돼야 함
-    other_cls = ClassRoom(organization_id=org_id, name="1-9반", grade=1, status="active")
-    db.add(other_cls)
-    db.flush()
-    mate = StudentProfile(
-        organization_id=org_id,
-        class_id=other_cls.id,
-        student_login_id="stu02",
-        student_code="CAT-2222",
-        password_hash=hash_password("1234"),
-        nickname="친구닉",
-        coins=999,  # 코인은 더 많지만 — 랭킹은 코인이 아니라 정답률·완주 점수
-    )
-    db.add(mate)
-    db.flush()
-
-    yesterday = date.today() - _dt.timedelta(days=1)
-    # 어제·오늘 모두 6과목 완주 + 각 과목 1문항 정답을 2초(=속도만점)에 풀었다고 기록.
-    for day in (yesterday, date.today()):
-        created = _dt.datetime.combine(day, _dt.time(9, 0))
-        for subj in subjects:
-            db.add(DailyQuizStatus(student_id=me_id, quiz_date=day, subject=subj, status="done"))
-            db.add(
-                LearningAttempt(
-                    organization_id=org_id,
-                    student_id=me_id,
-                    subject=subj,
-                    result="correct",
-                    solve_time_ms=2000,  # <=4000 → 속도 만점 5
-                    created_at=created,
-                )
-            )
-    db.commit()
-
-    token = _student_token(client, seed_org)
-    res = client.get("/api/v1/students/me/class-ranking", headers=auth(token))
-    assert res.status_code == 200
-    body = res.json()
-    assert body["class_size"] == 2  # 다른 반이어도 같은 학년이면 풀에 포함
-    assert body["grade"] == 1
-    names = [r["name"] for r in body["board"]]
-    assert "친구닉" in names  # 닉네임만 노출
-    me_row = next(r for r in body["board"] if r["me"])
-    # 하루당: 6과목 × (정답률10 + 속도5) + 완주보너스30 = 120. 이틀 = 240.
-    # 연속 보너스: 오늘의 전날(어제)도 6과목 완주 → +10. 총 250.
-    assert me_row["score"] == 250, body
-    assert me_row["rank"] == 1  # 코인 999인 친구보다 위 (정답률·완주 기반 점수)
-    # 1위 보너스 코인 30 지급 (하루 1회)
-    assert body["bonus_coins"] == 30
-    res2 = client.get("/api/v1/students/me/class-ranking", headers=auth(token))
-    assert res2.json()["bonus_coins"] == 0  # 같은 날 중복 지급 없음
 
 
 
-def test_grade_ranking_incorrect_no_speed_points(client, db, seed_org):
-    """오답은 정답률·속도 점수를 못 받는다 — 빠른 찍기로 점수 위조 불가."""
-    import datetime as _dt
-
-    from app.models import DailyQuizStatus, LearningAttempt, StudentProfile
-
-    org_id = seed_org["org"].id
-    me_id = seed_org["student"].id
-    created = _dt.datetime.combine(date.today(), _dt.time(9, 0))
-    # 국어만 완료 처리했지만 시도는 전부 오답(1ms) — 정답률 0%, 속도 0점.
-    db.add(DailyQuizStatus(student_id=me_id, quiz_date=date.today(), subject="국어", status="done"))
-    for _ in range(3):
-        db.add(
-            LearningAttempt(
-                organization_id=org_id, student_id=me_id, subject="국어",
-                result="incorrect", solve_time_ms=1, created_at=created,
-            )
-        )
-    db.commit()
-    _ = db.get(StudentProfile, me_id)
-
-    token = _student_token(client, seed_org)
-    body = client.get("/api/v1/students/me/class-ranking", headers=auth(token)).json()
-    me_row = next(r for r in body["board"] if r["me"])
-    assert me_row["score"] == 0  # 오답만 → 정답률/속도 0, 완주(6과목)도 아님 → 0점
 
 
 
@@ -880,3 +655,5 @@ def test_chapter_replay_server_side_no_coin_farming(client, db, seed_org):
     s2 = _credit_student(db, student, {"subj": "수학", "chapter": 1, "stage": 4}, True, "o1")
     db.commit()
     assert s2["replay"] is False and s2["coins_earned"] > 0
+
+# (배지·학년랭킹·프로필 편집 테스트는 게임화 은퇴(0718)로 대상 엔드포인트와 함께 제거)

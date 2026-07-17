@@ -387,18 +387,8 @@ def test_register_teacher_retired(client, db, seed_org):
     assert db.query(User).filter(User.email == "newteacher@test.dev").first() is None
 
 
-def test_verify_org_code(client, seed_org):
-    org = seed_org["org"]
-    ok = client.post(
-        "/api/v1/auth/verify-org-code",
-        json={"organization_id": org.id, "code": "TS-EDU-1000"},
-    )
-    assert ok.json()["valid"] is True
-    bad = client.post(
-        "/api/v1/auth/verify-org-code",
-        json={"organization_id": org.id, "code": "WRONG-0000"},
-    )
-    assert bad.json()["valid"] is False
+# (test_verify_org_code 은퇴 — 기관 코드 검증 엔드포인트가 학교 은퇴로 제거됨.
+#  기관 코드 경유 학생 가입의 코드 검증은 register_student 내부 검사로 계속 동작한다.)
 
 
 def test_email_verification_expiry(client, db):

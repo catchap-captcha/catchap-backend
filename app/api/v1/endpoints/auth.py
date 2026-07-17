@@ -1,11 +1,11 @@
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from app.core.permissions import Principal, get_current_principal
 from app.db.session import get_db
 from app.schemas import auth as s
-from app.services import auth_service, invite_service, onboarding_service
+from app.services import auth_service
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -16,35 +16,22 @@ def _client_ip(request: Request) -> str:
 
 class ActivateStudentRequest(BaseModel):
     code: str = Field(min_length=1, max_length=40)
-    # 학생이 직접 정하는 로그인 아이디 (전역 유일). 컬럼이 String(50)이라 상한을 두어
-    # 초과 입력이 DB DataError(500)로 새지 않고 422로 정직히 거부되게 한다.
     student_login_id: str = Field(min_length=3, max_length=50)
     nickname: str = Field(min_length=1, max_length=50)
     password: str = Field(min_length=1, max_length=200)
 
 
-@router.post("/activate-student", response_model=s.TokenPair)
-def activate_student(
-    req: ActivateStudentRequest, request: Request, db: Session = Depends(get_db)
-):
-    """학교 발급 가입 코드로 학생 계정 활성화 → 즉시 로그인(토큰 발급).
+@router.post("/activate-student")
+def activate_student(req: ActivateStudentRequest, db: Session = Depends(get_db)):
+    """학교 발급 가입 코드 활성화 — 제품 전환(학교 은퇴, 2026-07-18)으로 접수 종료.
 
-    이메일·인증코드 없음. 아이는 코드 입력 후 별명·비밀번호만 정하면 가입 완료.
-    코드 대입(brute-force) 방지: IP 기준 과도한 실패 시 차단(H1).
-    """
-    ip = request.client.host if request.client else "unknown"
-    ident = f"activate:{ip}"
-    auth_service._check_locked(db, ident)
-    try:
-        profile, _ = onboarding_service.activate_student(
-            db, req.code, req.student_login_id, req.nickname, req.password
-        )
-    except HTTPException as e:
-        if e.status_code in (404, 409, 410):  # 코드 오류·만료·재사용 = 실패로 집계
-            auth_service._record_fail(db, ident)
-        raise
-    auth_service._reset_fails(db, ident)
-    return auth_service.issue_tokens(db, profile.id, "student", "student")
+    이 통로는 생년월일·연령을 수집하지 않아(저학년용 설계) 연령 게이트(만 14세 미만
+    보호자 동의)를 우회한다 — 학교 은퇴로 코드 공급도 끊겼으므로 미사용 코드로도
+    가입되지 않게 여기서 봉쇄한다. 이메일 가입(/register/student)이 유일한 통로."""
+    raise HTTPException(
+        status.HTTP_410_GONE,
+        detail="학교 코드 가입이 종료되었어요. 이메일 가입으로 시작해 주세요.",
+    )
 
 
 @router.post("/login", response_model=s.TokenPair)
@@ -144,39 +131,5 @@ def password_reset_confirm(req: s.PasswordResetConfirm, db: Session = Depends(ge
     return {"ok": True}
 
 
-@router.post("/verify-join-code")
-def verify_join_code(
-    req: s.JoinCodeVerifyRequest, request: Request, db: Session = Depends(get_db)
-):
-    """학생 가입 코드를 소비하지 않고 상태만 확인 — 아이디/비번 입력 전에 먼저 막기.
-    저엔트로피 코드 열거 완화를 위해 IP 기준 시도 상한."""
-    auth_service.rate_limit(db, f"verifyjoinip:{_client_ip(request)}", limit=40)
-    return onboarding_service.check_join_code(db, req.code)
-
-
-@router.post("/verify-org-code")
-def verify_org_code(
-    req: s.OrgCodeVerifyRequest, request: Request, db: Session = Depends(get_db)
-):
-    # 저엔트로피 기관코드 열거 완화 — IP 기준 시도 상한
-    auth_service.rate_limit(db, f"verifyorgip:{_client_ip(request)}", limit=40)
-    org = auth_service.verify_org_code(db, req.organization_id, req.code)
-    if org:
-        return {"valid": True, "organization_name": org.name}
-    return {"valid": False}
-
-
-@router.post("/verify-teacher-code")
-def verify_teacher_code(
-    req: s.OrgCodeVerifyRequest, request: Request, db: Session = Depends(get_db)
-):
-    # 교사 개별코드 열거 완화 — IP 기준 시도 상한
-    auth_service.rate_limit(db, f"verifyteacherip:{_client_ip(request)}", limit=40)
-    return {"valid": auth_service.verify_teacher_code(db, req.organization_id, req.code)}
-
-
-@router.get("/invite/{token}")
-def get_invite(token: str, request: Request, db: Session = Depends(get_db)):
-    """교사 초대링크 검증 → 가입화면 프리필용 기관·교사코드 반환. 토큰이 곧 인증(무인증)."""
-    auth_service.rate_limit(db, f"inviteip:{_client_ip(request)}", limit=60)
-    return invite_service.get_invite(db, token)
+# (verify-join-code · verify-org-code · verify-teacher-code · invite/{token} 는
+#  학교/교사 은퇴(0717~18)로 제거 — 소비 화면이 없다. 종전 코드는 git 이력 참고.)

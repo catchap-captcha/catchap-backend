@@ -53,7 +53,7 @@ def test_wrong_note_recorded_for_manipulation_type_via_verify(client, db, seed_o
     from app.models import WrongAnswer
     from app.services import captcha_service as cs
     from app.services import subject_banks
-    from tests.test_wallet_shop import _first_party_key, _student_token
+    from tests.test_bank_mode import _first_party_key, _student_token
 
     _first_party_key(db)
     tok = _student_token(client)

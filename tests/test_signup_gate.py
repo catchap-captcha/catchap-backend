@@ -148,32 +148,6 @@ def test_thirteen_years_old_is_minor(client, db):
     assert "보호자" in res.json()["detail"]
 
 
-def test_signup_guardian_consent_not_counted_as_link_consent(client, db, seed_org):
-    """skeptic 실증 회귀(2026-07-17): 기관 코드 경유 미성년 가입의 signup_guardian 동의가
-    기관 '보호자 동의(연결) 완료율'에 잡히면 연결 0건인데 100%가 된다 — 지표는
-    personal_info(학부모 연결 동의)만 세야 한다(#58 허위지표 부활 방지)."""
-    from tests.test_teacher_invite import _make_org_admin, _login, auth as _auth
-
-    org = seed_org["org"]
-    body = {
-        "name": "기관경유아동",
-        "organization_id": org.id,
-        "org_code": "TS-EDU-1000",
-        "email": "orgkid@test.dev",
-        "email_code": get_email_code(db, "orgkid@test.dev"),
-        "password": "Password123!",
-        "student_login_id": "orgkid01",
-        "birth_date": _iso_years_ago(9),
-        "guardian_email": "orgmom@test.dev",
-        "guardian_email_code": _code_for(db, "orgmom@test.dev", "guardian"),
-    }
-    assert client.post("/api/v1/auth/register/student", json=body).status_code == 200
-
-    _make_org_admin(db, seed_org)
-    tok = _login(client, "principal@test.dev")
-    stats = client.get(f"/api/v1/orgs/{org.id}/security-stats", headers=_auth(tok)).json()
-    # signup_guardian 동의는 있어도 '연결 동의'는 0건 — 100% 허위가 아니어야 한다
-    assert stats["consented"] == 0, stats
 
 
 def test_guardian_email_send_allows_registered_account(client, db, seed_org):
@@ -183,3 +157,5 @@ def test_guardian_email_send_allows_registered_account(client, db, seed_org):
         json={"email": "t1@test.dev", "purpose": "guardian"},
     )
     assert res.status_code == 200, res.text
+
+# (동의율 지표 회귀 테스트는 지표 표면(/orgs/{id}/security-stats) 은퇴와 함께 제거)

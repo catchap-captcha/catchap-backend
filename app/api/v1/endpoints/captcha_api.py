@@ -505,10 +505,9 @@ def _store_scratch(db: Session, student: StudentProfile, meta: dict, scratch) ->
     if not strokes:
         return  # 그린 게 없으면 저장하지 않는다(빈 레코드 방지)
     try:
-        from app.services import scratch_access
-
-        # 새 레코드의 보존 여부는 저장 시점의 보호자 동의로 결정 — 동의 상태면 탈퇴 후에도 유지.
-        retain = scratch_access.has_retain_consent(db, student.id)
+        # 보존 동의 부여자(학부모)가 은퇴(0718)해 신규 레코드는 항상 retain=False —
+        # 탈퇴 시 원본 파기 정책이 기본으로 적용된다(집계 지표는 익명으로 남음).
+        retain = False
         db.add(
             ScratchRecord(
                 student_id=student.id,

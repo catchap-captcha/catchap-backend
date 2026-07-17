@@ -3,6 +3,34 @@
 from app.services import bank_mode, subject_banks
 
 
+# --- 공용 헬퍼 (은퇴한 test_wallet_shop에서 이식 — 은행/오답 테스트가 공유) ---
+def _student_token(client):
+    r = client.post(
+        "/api/v1/auth/student-login",
+        json={"student_login_id": "stu01", "password": "1234"},
+    )
+    assert r.status_code == 200, r.text
+    return r.json()["access_token"]
+
+
+def _first_party_key(db):
+    from app.models import ApiKey, Organization, Site
+
+    platform = Organization(name="CatChap플랫폼", code="TS-CAT-9100", org_type="플랫폼")
+    db.add(platform)
+    db.flush()
+    site = Site(organization_id=platform.id, name="inapp", domain="")
+    db.add(site)
+    db.flush()
+    key = ApiKey(
+        organization_id=platform.id, site_id=site.id, product="edu", subject="국어",
+        site_key="ck_edu_testfp", secret_key_hash="x", first_party=True,
+    )
+    db.add(key)
+    db.commit()
+    return key
+
+
 def _mk_attempt(db, student, subject, qid, result):
     from app.models import LearningAttempt
 
@@ -56,7 +84,6 @@ def test_bank_attempt_no_coin_no_quiz(client, db, seed_org):
     """은행 모드 적립: 기록·정답률·오답노트는 남고 코인·오늘의퀴즈는 불변."""
     from app.models import CoinTransaction, DailyQuizStatus
     from app.services import captcha_service as cs
-    from tests.test_wallet_shop import _first_party_key, _student_token
 
     _first_party_key(db)
     tok = _student_token(client)
@@ -98,7 +125,6 @@ def test_chapter_hybrid_priority_and_no_coin(client, db, seed_org):
     """주차 커리큘럼 하이브리드 — 챕터 풀 안에서 안 푼 우선 출제 + 무보상 + 챕터번호 기록."""
     from app.models import CoinTransaction, LearningAttempt
     from app.services import chapters as ch_mod
-    from tests.test_wallet_shop import _first_party_key, _student_token
 
     _first_party_key(db)
     tok = _student_token(client)
@@ -155,7 +181,6 @@ def test_verify_long_qid_and_answerless_wrong(client, db, seed_org):
     from app.models import LearningAttempt
     from app.services import captcha_service as cs
     from app.services import subject_banks
-    from tests.test_wallet_shop import _first_party_key, _student_token
 
     _first_party_key(db)
     tok = _student_token(client)
@@ -211,7 +236,6 @@ def test_dont_know_marks_wrong_with_explain(client, db, seed_org):
     from app.models import WrongAnswer
     from app.services import captcha_service as cs
     from app.services import subject_banks
-    from tests.test_wallet_shop import _first_party_key, _student_token
 
     _first_party_key(db)
     tok = _student_token(client)
@@ -247,7 +271,6 @@ def test_dont_know_marks_wrong_with_explain(client, db, seed_org):
 def test_chapter_clamp_on_subject_without_that_week(client, db, seed_org):
     """과목 이동 자동 보정 — 그 과목에 없는 주차를 요청하면 마지막 열린 주차로 clamp(404 아님)."""
     from app.services import chapters as _ch
-    from tests.test_wallet_shop import _first_party_key, _student_token
 
     _first_party_key(db)
     tok = _student_token(client)
@@ -274,7 +297,6 @@ def test_chapter_clamp_on_subject_without_that_week(client, db, seed_org):
 
 def test_bank_challenge_http_and_progress(client, db, seed_org):
     """?bank=true 챌린지 발급 + 진도 API가 출제 분류와 일치."""
-    from tests.test_wallet_shop import _first_party_key, _student_token
 
     _first_party_key(db)
     tok = _student_token(client)

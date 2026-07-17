@@ -460,12 +460,7 @@ def _consume_verified_code(db: Session, email: str, code: str, purpose: str) -> 
     db.commit()
 
 
-def _ensure_email_unused(db: Session, email: str) -> None:
-    if db.query(User).filter(User.email == email).first():
-        raise HTTPException(status.HTTP_409_CONFLICT, detail="이미 가입된 이메일입니다.")
-
-
-# --- 회원가입 4종 ---
+# --- 회원가입 — 학생(이메일+연령 게이트)만 live. 학부모/교사/기관은 은퇴(410 스텁) ---
 def register_parent(db: Session, req: s.RegisterParentRequest) -> User:
     # 제품 전환(2026-07-18, 학부모 역할 은퇴): 학부모 신규 가입 접수 종료. 만 14세 미만의
     # 법정대리인 동의는 학생 가입 게이트(보호자 이메일 코드 + Consent + guardian_email)가
@@ -475,129 +470,15 @@ def register_parent(db: Session, req: s.RegisterParentRequest) -> User:
         status.HTTP_410_GONE,
         detail="학부모 가입 접수가 종료되었어요. 만 14세 미만 자녀의 가입 동의는 자녀 가입 화면에서 보호자 이메일 인증으로 진행돼요.",
     )
-    email = req.email.strip().lower()
-    _ensure_email_unused(db, email)
-    _consume_verified_code(db, email, req.email_code, "signup")
-    user = User(
-        email=email,
-        password_hash=hash_password(req.password),
-        name=req.name,
-        phone=req.phone,
-        role="parent",
-        email_verified_at=_now(),
-    )
-    db.add(user)
-    db.commit()
-    return user
-
-
-def _assign_pending_class(db: Session, org_id: str, membership: Membership, user_id: str) -> None:
-    """교사 초대 시 예약된 담당 반(pending_class)에 담임/보조로 연결. 반이 없으면 생성."""
-    from app.models import ClassRoom
-    from app.utils.helpers import parse_grade
-
-    cname = (membership.pending_class or "").strip()
-    if not cname:
-        return
-    cls = (
-        db.query(ClassRoom)
-        .filter(ClassRoom.organization_id == org_id, ClassRoom.name == cname)
-        .first()
-    )
-    if cls is None:
-        cls = ClassRoom(organization_id=org_id, name=cname, grade=parse_grade(cname), status="active")
-        db.add(cls)
-        db.flush()
-    if membership.position == "보조":
-        cls.assistant_teacher_id = user_id
-    else:  # 담임(기본)
-        # 담임은 반당 1명 — 가입 시점에 이미 다른(해제 안 된) 담임이 있으면 덮어쓰지 않는다.
-        # (예약한 반을 남이 먼저 맡은 경우) 배정만 건너뛰고 가입은 정상 완료 → 관리자가 정리.
-        if cls.teacher_id and cls.teacher_id != user_id:
-            existing = db.get(User, cls.teacher_id)
-            if existing is not None and existing.status != "disabled":
-                return
-        cls.teacher_id = user_id
 
 
 def register_teacher(db: Session, req: s.RegisterTeacherRequest) -> User:
-    # 제품 전환(2026-07-17, 학교 기능 은퇴): 교사 신규 가입 접수 종료. 기존 교사 계정
-    # 로그인·데이터는 유지(정리는 3단계). 강의 제작자는 강사(instructor) — 운영자 초대 발급.
-    # 아래 기존 코드는 이력 보존용으로 남긴다(3단계에서 일괄 제거).
+    # 제품 전환(2026-07-17, 학교 기능 은퇴): 교사 신규 가입 접수 종료.
+    # 강의 제작자는 강사(instructor) — 운영자 초대 발급. 종전 클레임 코드는 git 이력 참고.
     raise HTTPException(
         status.HTTP_410_GONE,
         detail="교사 신규 가입 접수가 종료되었어요. CatChap은 개인 학습자 대상 강의 서비스로 전환되었습니다.",
     )
-    email = req.email.strip().lower()
-    membership = (
-        db.query(Membership)
-        .filter(
-            Membership.organization_id == req.organization_id,
-            Membership.teacher_code == req.teacher_code.strip().upper(),
-        )
-        .first()
-    )
-    if membership is None:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="교사 개별 코드가 올바르지 않습니다.")
-
-    # 초대 시 이메일을 입력했으면 add_teacher가 pending(placeholder) 계정을 미리 만들어 둔다.
-    # 그 경우 새 계정을 만들지 않고 이 placeholder를 '클레임'(비번·이름 설정, 활성화)해야
-    # self-가입이 409로 막히지 않는다. 이미 활성 계정이면(코드 재사용) 409.
-    placeholder = db.get(User, membership.user_id) if membership.user_id else None
-    if placeholder is not None and placeholder.status != "pending":
-        raise HTTPException(status.HTTP_409_CONFLICT, detail="이미 사용된 교사 코드입니다.")
-
-    # 이메일 중복 검사 — 클레임할 placeholder 자신은 제외(자기 이메일과의 충돌 방지)
-    dup = db.query(User).filter(User.email == email)
-    if placeholder is not None:
-        dup = dup.filter(User.id != placeholder.id)
-    if dup.first() is not None:
-        raise HTTPException(status.HTTP_409_CONFLICT, detail="이미 가입된 이메일입니다.")
-
-    # 초대 링크로 가입하면 초대 메일 수신으로 이메일 소유가 이미 증명됐으므로 인증코드를 생략한다.
-    # 그 외(코드로 직접 가입)에는 종전대로 인증된 이메일 코드를 1회 소비한다.
-    from app.services import invite_service
-
-    invited = invite_service.check_invite_token(
-        db,
-        req.invite_token,
-        email=email,
-        organization_id=req.organization_id,
-        teacher_code=req.teacher_code,
-    )
-    if not invited:
-        _consume_verified_code(db, email, req.email_code, "signup")
-    if placeholder is not None:
-        placeholder.email = email
-        placeholder.password_hash = hash_password(req.password)
-        placeholder.name = req.name
-        placeholder.role = "teacher"
-        placeholder.status = "active"
-        placeholder.organization_id = req.organization_id
-        placeholder.email_verified_at = _now()
-        user = placeholder
-    else:
-        user = User(
-            email=email,
-            password_hash=hash_password(req.password),
-            name=req.name,
-            role="teacher",
-            organization_id=req.organization_id,
-            email_verified_at=_now(),
-        )
-        db.add(user)
-        db.flush()
-        membership.user_id = user.id
-    # position(담임/교과 등 담당 직책)은 초대는 None, 직접추가는 관리자가 지정한 값 그대로 둔다.
-    # (초대는 placeholder User에 이름을 보관하므로 position에 이름이 섞이지 않는다.)
-    membership.status = "active"
-    membership.joined_at = _now()
-    # 초대 시 예약된 담당 반이 있으면 가입 시점에 자동 배정(담임/보조)
-    if membership.pending_class:
-        _assign_pending_class(db, req.organization_id, membership, user.id)
-        membership.pending_class = None
-    db.commit()
-    return user
 
 
 def student_id_available(db: Session, login_id: str) -> bool:
@@ -780,98 +661,8 @@ def register_org(db: Session, req: s.RegisterOrgRequest) -> Organization:
         status.HTTP_410_GONE,
         detail="기관(학교) 신규 등록 접수가 종료되었어요. CatChap은 개인 학습자 대상 강의 서비스로 전환되었습니다.",
     )
-    email = req.contact_email.strip().lower()
-    _ensure_email_unused(db, email)
-    if req.business_number:
-        if (
-            db.query(Organization)
-            .filter(Organization.business_number == req.business_number)
-            .first()
-        ):
-            raise HTTPException(status.HTTP_409_CONFLICT, detail="이미 등록된 고유번호입니다.")
+    email = req.contact_email.strip()
 
-    # 신청 단계 이메일 인증은 선택 — 코드를 함께 보냈을 때만 소비(검증). 신청서 흐름에선 생략.
-    if req.email_code:
-        _consume_verified_code(db, email, req.email_code, "signup")
-
-    request = OrgRegistrationRequest(
-        org_name=req.org_name,
-        org_type=req.org_type,
-        business_number=req.business_number,
-        address=req.address,
-        contact_name=req.contact_name,
-        contact_email=email,
-        contact_phone=req.contact_phone,
-        expected_students=req.expected_students,
-        plan_interest=req.plan_interest,
-    )
-    db.add(request)
-
-    # 운영진 승인 대기: 기관·관리자 계정은 만들되 status=pending으로 두고,
-    # ops가 승인(approve)해야 active가 되어 로그인·이용 가능. (승인 흐름: ops.py)
-    org = Organization(
-        name=req.org_name,
-        code=_generate_org_code(db, req.org_name),
-        org_type=req.org_type,
-        status="pending",
-        contact_email=email,
-        contact_phone=req.contact_phone,
-        address=req.address,
-        business_number=req.business_number,
-        code_expires_at=_now() + timedelta(days=365),
-    )
-    db.add(org)
-    db.flush()
-
-    # 신청서는 pending 유지 — 승인 시 approved로 전환
-    request.organization_id = org.id
-
-    # 신청서 흐름: 관리자 계정은 만들되 로그인 불가(pending) 상태로 둔다.
-    # 비번을 함께 받았으면(검증 흐름) 그대로 쓰고, 아니면 사용 불가한 임시 해시를 넣는다.
-    # email_verified_at 이 None 이면 '자격증명 미발급' 표식 — 승인 시 임시 비번을 발급한다.
-    has_password = bool(req.password)
-    admin = User(
-        email=email,
-        password_hash=hash_password(req.password if has_password else secrets.token_urlsafe(24)),
-        name=req.contact_name,
-        phone=req.contact_phone,
-        role="org_admin",
-        status="pending",
-        organization_id=org.id,
-        email_verified_at=_now() if has_password else None,
-    )
-    db.add(admin)
-    db.flush()
-    db.add(
-        Membership(
-            user_id=admin.id,
-            organization_id=org.id,
-            role="org_admin",
-            status="pending",
-            joined_at=_now(),
-        )
-    )
-
-    # 요금제 연결 (관심 요금제 → 구독, 기본 Basic)
-    from app.models import Plan
-
-    plan_key = (req.plan_interest or "basic").lower()
-    plan = db.query(Plan).filter(Plan.key == plan_key).first() or (
-        db.query(Plan).filter(Plan.key == "basic").first()
-    )
-    if plan:
-        db.add(Subscription(organization_id=org.id, plan_id=plan.id))
-
-    db.commit()
-    return org
-
-
-# --- 비밀번호 재설정 ---
-def password_reset_request(db: Session, email: str) -> None:
-    user = db.query(User).filter(User.email == email.strip().lower()).first()
-    # 계정 존재 여부를 노출하지 않기 위해 항상 성공 응답, 존재할 때만 발송
-    if user:
-        send_email_code(db, email, "reset")
 
 
 def password_reset_confirm(db: Session, req: s.PasswordResetConfirm) -> None:
@@ -902,27 +693,6 @@ def _assert_org_code_not_expired(org: Organization) -> None:
             status.HTTP_400_BAD_REQUEST,
             detail="기관 코드가 만료되었어요. 기관 담당자에게 새 코드를 요청해 주세요.",
         )
-
-
-def verify_org_code(db: Session, organization_id: str, code: str) -> Organization | None:
-    org = db.get(Organization, organization_id)
-    if org and org.code == code.strip().upper():
-        _assert_org_code_not_expired(org)
-        return org
-    return None
-
-
-def verify_teacher_code(db: Session, organization_id: str, code: str) -> bool:
-    membership = (
-        db.query(Membership)
-        .filter(
-            Membership.organization_id == organization_id,
-            Membership.teacher_code == code.strip().upper(),
-            Membership.user_id.is_(None),
-        )
-        .first()
-    )
-    return membership is not None
 
 
 def get_me(db: Session, principal) -> s.MeResponse:

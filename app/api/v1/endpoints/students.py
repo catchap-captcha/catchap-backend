@@ -135,12 +135,6 @@ def _quiz_done_set(db: Session, student_id: str, played: dict[str, int] | None =
     return done | {r.subject for r in rows}
 
 
-def _my_grade(db: Session, me: StudentProfile) -> int | None:
-    """학생의 학년 — 소속 반(classes.grade) 기준. 무반이면 None."""
-    if not me.class_id:
-        return None
-    cls = db.get(ClassRoom, me.class_id)
-    return cls.grade if cls else None
 
 
 # 랭킹 점수 산식(사용자 결정 2026-07-08): 정답률·풀이속도 + 6과목 완주 보너스 + 연속 완주 보너스.
@@ -157,117 +151,10 @@ RANK_FULLDAY_BONUS = 30  # 하루 6과목 완주 보너스
 RANK_STREAK_STEP = 10  # 6과목 완주 연속 하루당 추가
 
 
-def _speed_points(avg_ms: float) -> int:
-    """정답 평균 풀이시간 → 속도 점수(0~RANK_SPEED_MAX). 빠를수록 높음."""
-    if avg_ms <= 0:
-        return 0
-    if avg_ms <= RANK_SPEED_FAST_MS:
-        return RANK_SPEED_MAX
-    if avg_ms >= RANK_SPEED_SLOW_MS:
-        return 0
-    span = RANK_SPEED_SLOW_MS - RANK_SPEED_FAST_MS
-    return round(RANK_SPEED_MAX * (RANK_SPEED_SLOW_MS - avg_ms) / span)
 
 
-def _grade_scores(db: Session, student_ids: list[str]) -> dict[str, int]:
-    """학생별 랭킹 점수 = 정답률·풀이속도(완료 과목·일) + 6과목 완주 보너스 + 연속 완주 보너스."""
-    if not student_ids:
-        return {}
-    full = len(D.SUBJECT_ORDER)  # 전 과목 수 (6)
-
-    # 1) 완료(done) 과목 집합 — 일자별. 점수 부여 대상 + 완주/연속 보너스 판정 근거.
-    done_rows = (
-        db.query(DailyQuizStatus.student_id, DailyQuizStatus.quiz_date, DailyQuizStatus.subject)
-        .filter(DailyQuizStatus.student_id.in_(student_ids), DailyQuizStatus.status == "done")
-        .all()
-    )
-    done: dict[str, dict[date, set[str]]] = {}
-    for sid, day, subj in done_rows:
-        done.setdefault(sid, {}).setdefault(day, set()).add(subj)
-
-    # 2) 과목·일별 정답률/정답 평균 풀이시간 (learning_attempts 실집계).
-    #    (sid, day, subject) → [시도수, 정답수, 정답 풀이시간 합].
-    att_rows = (
-        db.query(
-            LearningAttempt.student_id,
-            func.date(LearningAttempt.created_at),
-            LearningAttempt.subject,
-            LearningAttempt.result,
-            LearningAttempt.solve_time_ms,
-        )
-        .filter(
-            LearningAttempt.student_id.in_(student_ids),
-            # 랭킹 정답률·속도는 서버 채점(graded)·오늘의퀴즈(chapter_no NULL) 시도만 센다.
-            # 무채점 자기신고(/learning/attempts)로 이미 완료한 과목의 정답률·속도를 부풀리는
-            # 것을 차단한다(적대적검토 후속 #4b). 챕터/은행 플레이도 습관 랭킹에서 제외.
-            LearningAttempt.graded.is_(True),
-            LearningAttempt.chapter_no.is_(None),
-        )
-        .all()
-    )
-    stat: dict[tuple[str, date, str], list[int]] = {}
-    for sid, day, subj, result, solve_ms in att_rows:
-        d = day if isinstance(day, date) else date.fromisoformat(str(day)[:10])
-        s = stat.setdefault((sid, d, subj), [0, 0, 0])
-        s[0] += 1
-        if result == "correct":
-            s[1] += 1
-            s[2] += int(solve_ms or 0)
-
-    scores: dict[str, int] = {}
-    for sid, day_map in done.items():
-        total = 0
-        all6: set[date] = set()
-        for day, subs in day_map.items():
-            for subj in subs:
-                s = stat.get((sid, day, subj))
-                if s and s[0] > 0:
-                    acc_pts = round(s[1] / s[0] * RANK_ACC_MAX)
-                    avg_ms = (s[2] / s[1]) if s[1] else 0
-                    total += acc_pts + _speed_points(avg_ms)
-                # 시도 기록 없이 완료만 있으면 정답률·속도 0점 — 완주/연속 보너스로만 반영.
-            if len(subs) >= full:
-                total += RANK_FULLDAY_BONUS
-                all6.add(day)
-        # 연속 완주 보너스: 6과목 완주일의 '전날'도 6과목 완주면 그 날마다 +STEP.
-        total += RANK_STREAK_STEP * sum(1 for d in all6 if (d - timedelta(days=1)) in all6)
-        scores[sid] = total
-    return scores
 
 
-def _class_board(db: Session, me: StudentProfile) -> list[dict]:
-    """같은 학년 학생들의 랭킹 (학년별로만 합산 — 반이 달라도 같은 학년이면 함께 경쟁).
-
-    개인정보 보호: 타 학생은 닉네임만 노출한다 (실명 절대 금지).
-    """
-    grade = _my_grade(db, me)
-    if grade is not None:
-        peers = (
-            db.query(StudentProfile)
-            .join(ClassRoom, StudentProfile.class_id == ClassRoom.id)
-            .filter(
-                StudentProfile.organization_id == me.organization_id,
-                StudentProfile.status != "disabled",
-                ClassRoom.grade == grade,
-            )
-            .all()
-        )
-    else:
-        peers = [me]  # 무반 학생은 학년 풀 없음 — 본인만
-    if all(s.id != me.id for s in peers):
-        peers.append(me)
-    scores = _grade_scores(db, [s.id for s in peers])
-    ranked = sorted(
-        (
-            {"name": s.nickname, "score": scores.get(s.id, 0), "me": s.id == me.id}
-            for s in peers
-        ),
-        key=lambda r: (-r["score"], r["name"]),
-    )
-    return [
-        {"rank": i + 1, "name": r["name"], "score": r["score"], "me": r["me"]}
-        for i, r in enumerate(ranked)
-    ]
 
 
 # ---------------------------------------------------------------- 학습 홈
@@ -278,11 +165,6 @@ def dashboard(
     me = _me(principal)
     quiz = _today_quiz_rows(db, me.id)
     today_total = len(quiz)
-    earned = (
-        db.query(StudentBadge)
-        .filter(StudentBadge.student_id == me.id, StudentBadge.earned_at.isnot(None))
-        .count()
-    )
     # 과목 카드·진행바: '오늘의 퀴즈 현황' 단일 기준 = 오늘 시도 수(_played_today).
     # 5문항 다 풀면 완료로 본다(마지막 오답이어도) — 홈·오늘의퀴즈 페이지·결과화면 다음 과목이
     # 같은 기준을 써 서로 어긋나지 않게. 전체학습 주간 챕터(chapter_no 있음)는 제외해 습관 축과 분리.
@@ -301,11 +183,8 @@ def dashboard(
         subjects.append(
             {**card, "done": done, "state": state, "meta": D.SUBJECT_META[sub]}
         )
-    # 학년 랭킹 밴드: 같은 학년 실데이터 기준 (일일 과제 완료 점수, 학기 누적)
-    board = _class_board(db, me)
-    my_rank = next(r["rank"] for r in board if r["me"])
-    band = f"상위 {max(1, round(my_rank / len(board) * 100))}%"
     growth = aggregate.student_growth(db, me)  # 시도 없으면 None → 성장 그래프 데모
+    # 배지·학년랭킹·AI코멘트 필드는 게임화 은퇴(0718)로 응답에서 제거 — 프론트도 안 읽는다.
     return {
         "nickname": me.nickname,
         "level": me.level,
@@ -317,9 +196,6 @@ def dashboard(
         "growth": fb(growth, D.HOME_GROWTH),
         # 성장 그래프가 데모값(시도 없음)이면 demo=True. 코인·레벨·오늘상태 등은 항상 실데이터.
         "demo": growth is None,
-        "badges": {"earned": earned, "total": db.query(Badge).count()},
-        "class_rank": {"band": band, "note": D.HOME_CLASS_RANK_NOTE},
-        "ai_comment": D.HOME_AI_COMMENT,
         "mascot_message": D.HOME_MASCOT_MESSAGE,
     }
 
@@ -469,158 +345,13 @@ def wrong_notes(
 
 
 # ---------------------------------------------------------------- 연습장 필기 재생 (본인)
-@router.get("/students/me/scratch")
-def my_scratch(
-    subject: str | None = Query(default=None),
-    principal: Principal = Depends(require_student),
-    db: Session = Depends(get_db),
-):
-    """본인 연습장 필기 목록 — 과목별. 원본 획은 목록에 미포함(용량↓), 재생은 detail에서."""
-    me = _me(principal)
-    from app.services import scratch_access
-
-    return {
-        "subjects": scratch_access.subject_summary(db, me.id),
-        "items": scratch_access.list_scratch(db, me.id, subject),
-    }
 
 
-@router.get("/students/me/scratch/{record_id}")
-def my_scratch_detail(
-    record_id: str,
-    principal: Principal = Depends(require_student),
-    db: Session = Depends(get_db),
-):
-    """본인 연습장 필기 재생 — strokes 포함(자기 것만)."""
-    me = _me(principal)
-    from app.services import scratch_access
-
-    d = scratch_access.get_scratch(db, me.id, record_id)
-    if d is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="필기 기록을 찾을 수 없어요.")
-    return d
 
 
 # ---------------------------------------------------------------- 배지
-def _earned_foot(earned_at: datetime | date) -> str:
-    """획득일 → 화면 하단 라벨 (student_badges.earned_at 실데이터 기준)."""
-    d = earned_at.date() if isinstance(earned_at, datetime) else earned_at
-    days = (date.today() - d).days
-    if days <= 0:
-        return "오늘 획득"
-    if days == 1:
-        return "어제 획득"
-    return f"{d.month}월 {d.day}일 획득"
 
 
-@router.get("/students/me/badges")
-def badges(principal: Principal = Depends(require_student), db: Session = Depends(get_db)):
-    me = _me(principal)
-    all_badges = db.query(Badge).order_by(Badge.order_no).all()
-    mine = {
-        sb.badge_id: sb
-        for sb in db.query(StudentBadge).filter(StudentBadge.student_id == me.id).all()
-    }
-    # 연속 학습 배지(불꽃 학습왕)는 홈/기록과 같은 실 streak으로 —
-    # 디자인 상수 "12/14일"이 남아 화면 간 연속 일수가 갈리던 원인
-    streak_rows = (
-        db.query(LearningAttempt)
-        .filter(
-            LearningAttempt.student_id == me.id,
-            LearningAttempt.created_at
-            >= datetime.combine(date.today() - timedelta(days=60), time.min),
-        )
-        .all()
-    )
-    live_streak = aggregate._streak_days({r.created_at.date() for r in streak_rows if r.created_at})
-    out = []
-    for b in all_badges:
-        sb = mine.get(b.id)
-        earned = bool(sb and sb.earned_at)
-        progress = sb.progress if sb else 0.0
-        if earned:
-            foot = _earned_foot(sb.earned_at)
-        elif b.name == "불꽃 학습왕":
-            foot = f"{min(live_streak, 14)}/14일"
-            progress = round(min(live_streak / 14, 1.0), 3)
-        else:
-            # 도전 중 문구는 디자인 카피 유지 (단, 디자인이 '획득'으로 표기한 항목은 제외)
-            state = D.BADGE_STATE.get(b.name, {})
-            foot = state.get("foot", "도전 중") if not state.get("earned") else "도전 중"
-        out.append(
-            {
-                "id": b.id,
-                "name": b.name,
-                "desc": b.description,
-                "icon": b.icon,
-                "color": b.color,
-                "earned": earned,
-                "locked": not earned,
-                "progress": progress,
-                "foot": foot,
-            }
-        )
-    earned_count = sum(1 for b in out if b["earned"])
-
-    # 히어로 쇼케이스: 가장 최근 획득 배지 (student_badges.earned_at 실데이터, 문구는 D)
-    recent = None
-    latest: tuple | None = None
-    for b in all_badges:
-        sb = mine.get(b.id)
-        if sb and sb.earned_at and (latest is None or sb.earned_at > latest[0].earned_at):
-            latest = (sb, b)
-    if latest:
-        sb, b = latest
-        hero = D.BADGE_HERO.get(b.name, {})
-        recent = {
-            "name": b.name,
-            "icon": b.icon,
-            "color": b.color,
-            "title": hero.get("title", b.name),
-            "desc": hero.get("desc", b.description),
-            "foot": _earned_foot(sb.earned_at),
-        }
-
-    # '다음 배지' 진행 카드: 미획득 중 progress 최고 배지
-    next_badge = None
-    best: tuple | None = None
-    for item, b in zip(out, all_badges):
-        if item["earned"]:
-            continue
-        prog = float(item["progress"] or 0.0)
-        if best is None or prog > best[0]:
-            best = (prog, item, b)
-    if best:
-        prog, item, b = best
-        cur = total = None
-        unit = ""
-        m = re.match(r"\s*(\d+)\s*/\s*(\d+)\s*(\S*)", str(item["foot"] or ""))
-        if m:
-            cur, total, unit = int(m.group(1)), int(m.group(2)), m.group(3)
-            if total:
-                prog = cur / total
-        next_badge = {
-            "name": b.name,
-            "desc": b.description,
-            "icon": b.icon,
-            "color": b.color,
-            "progress": round(prog, 3),
-            "foot": item["foot"],
-            "chip": D.BADGE_NEXT_CHIP,
-            "current": cur,
-            "total": total,
-            "unit": unit,
-            "remain": f"{total - cur}{unit}" if total is not None and cur is not None else None,
-        }
-
-    return {
-        "badges": out,
-        "earned": earned_count,
-        "locked": len(out) - earned_count,
-        "level": me.level,
-        "recent": recent,
-        "next": next_badge,
-    }
 
 
 # ---------------------------------------------------------------- 추천
@@ -776,220 +507,22 @@ def daily_quiz(
 
 
 # ---------------------------------------------------------------- 지갑/상점
-def _catalog_rows(db: Session) -> list[ShopItem]:
-    return db.query(ShopItem).order_by(ShopItem.category, ShopItem.order_no).all()
 
 
-def _design_meta(item: ShopItem) -> dict:
-    for entry in D.SHOP_CATALOG.get(item.category, []):
-        if entry["name"] == item.name:
-            return entry
-    return {}
 
 
-@router.get("/students/me/wallet")
-def wallet(principal: Principal = Depends(require_student), db: Session = Depends(get_db)):
-    me = _me(principal)
-    owned_rows = db.query(StudentItem).filter(StudentItem.student_id == me.id).all()
-    owned_ids = [r.item_id for r in owned_rows]
-    items = {i.id: i for i in _catalog_rows(db)}
-    owned_keys: dict[str, list[str]] = {"hat": [], "bg": [], "sticker": []}
-    for item_id in owned_ids:
-        item = items.get(item_id)
-        if item is None:
-            continue
-        meta = _design_meta(item)
-        if meta:
-            owned_keys.setdefault(item.category, []).append(meta["key"])
-    return {
-        "coins": me.coins,
-        "items": owned_ids,
-        "owned": owned_keys,
-        "avatar": me.avatar or {},
-        "nickname": me.nickname,
-        "age": me.age,
-        "student_code": me.student_code,
-        "level": me.level,
-        # 마이페이지 '주간 활동 요약' — 실집계 (데이터 없으면 null → 프론트 fallback)
-        "week_summary": _week_summary(db, me),
-        # '함께한 지 N일' — student_profiles.created_at 실데이터
-        "days_together": (
-            max(1, (date.today() - me.created_at.date()).days + 1) if me.created_at else None
-        ),
-        # 주간 목표 — 이번 주 학습일 실집계 (없으면 D)
-        "week_goal": _week_goal(db, me),
-    }
 
 
-def _week_goal(db: Session, me) -> dict:
-    g = dict(D.PROFILE_WEEK_GOAL)
-    total = int(g.get("total", 5))
-    ws = date.today() - timedelta(days=date.today().weekday())
-    rows = (
-        db.query(LearningAttempt)
-        .filter(
-            LearningAttempt.student_id == me.id,
-            LearningAttempt.created_at >= datetime.combine(ws, time.min),
-        )
-        .all()
-    )
-    days = {r.created_at.date() for r in rows if r.created_at}
-    done = len(days) if rows else int(g.get("done", 0))
-    remain = max(0, total - done)
-    if remain == 0:
-        hint = g.get("hint_done", "")
-    elif remain == 1:
-        hint = g.get("hint_one", "")
-    else:
-        hint = str(g.get("hint_many", "")).replace("{n}", str(remain))
-    return {"done": min(done, total), "total": total, "hint": hint}
 
 
-def _week_summary(db: Session, me) -> dict | None:
-    """이번 주: 연속 학습일 / 푼 문제 / 모은 냥코인 / 완료한 놀이(과목×날짜 세션 수)"""
-    from datetime import date, datetime, time, timedelta
-
-    from app.models import CoinTransaction, LearningAttempt
-    from app.services import aggregate as agg
-
-    growth = agg.student_growth(db, me)
-    if growth is None:
-        return None
-
-    week_start = datetime.combine(
-        date.today() - timedelta(days=date.today().weekday()), time.min
-    )
-    coins_earned = sum(
-        t.amount
-        for t in db.query(CoinTransaction)
-        .filter(
-            CoinTransaction.student_id == me.id,
-            CoinTransaction.amount > 0,
-            CoinTransaction.created_at >= week_start,
-        )
-        .all()
-    )
-    week_rows = (
-        db.query(LearningAttempt)
-        .filter(LearningAttempt.student_id == me.id, LearningAttempt.created_at >= week_start)
-        .all()
-    )
-    games_done = len(
-        {(r.created_at.date(), r.subject) for r in week_rows if r.created_at and r.subject}
-    )
-    return {
-        "streak_days": growth.get("streak_days", 0),
-        "solved": growth.get("week_solved", 0),
-        "coins_earned": coins_earned,
-        "games_done": games_done,
-    }
 
 
-@router.get("/shop/catalog")
-def shop_catalog(
-    principal: Principal = Depends(require_student), db: Session = Depends(get_db)
-):
-    out: dict[str, list[dict]] = {"hat": [], "bg": [], "sticker": []}
-    for item in _catalog_rows(db):
-        meta = _design_meta(item)
-        out.setdefault(item.category, []).append(
-            {
-                "id": item.id,
-                "key": meta.get("key", item.id),
-                "category": item.category,
-                "name": item.name,
-                "icon": item.icon,
-                "price": item.price,
-                "color": meta.get("color"),
-                "css": meta.get("css"),
-            }
-        )
-    return out
 
 
-@router.post("/students/me/shop/purchase")
-def purchase(
-    req: PurchaseRequest,
-    principal: Principal = Depends(require_student),
-    db: Session = Depends(get_db),
-):
-    me = _me(principal)
-    item = db.get(ShopItem, req.item_id)
-    if item is None:
-        # 디자인 키('crown' 등)로도 조회 허용
-        for row in _catalog_rows(db):
-            if _design_meta(row).get("key") == req.item_id:
-                item = row
-                break
-    if item is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="아이템을 찾을 수 없습니다.")
-    exists = (
-        db.query(StudentItem)
-        .filter(StudentItem.student_id == me.id, StudentItem.item_id == item.id)
-        .first()
-    )
-    if exists:
-        raise HTTPException(status.HTTP_409_CONFLICT, detail="이미 보유한 아이템입니다.")
-    from sqlalchemy.exc import IntegrityError
-
-    # 소유 레코드를 UNIQUE(student_id,item_id)로 먼저 확보 → 동시 구매 race를 원자적으로 차단
-    # (차감 뒤 중복 삽입이 실패하면 코인만 빠지는 사태 방지 — 확보 성공 후에만 차감).
-    db.add(StudentItem(student_id=me.id, item_id=item.id))
-    try:
-        db.flush()
-    except IntegrityError:
-        db.rollback()
-        raise HTTPException(status.HTTP_409_CONFLICT, detail="이미 보유한 아이템입니다.")
-    # 원자적 차감: 동시 구매 요청이 잔액 검사를 함께 통과해 코인이 음수가 되는 것을 방지
-    if item.price > 0:
-        updated = (
-            db.query(StudentProfile)
-            .filter(StudentProfile.id == me.id, StudentProfile.coins >= item.price)
-            .update(
-                {StudentProfile.coins: StudentProfile.coins - item.price},
-                synchronize_session=False,
-            )
-        )
-        if not updated:
-            db.rollback()  # 잔액 부족 → 방금 확보한 소유 레코드도 함께 되돌림
-            raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="냥코인이 부족해요.")
-        db.add(CoinTransaction(student_id=me.id, amount=-item.price, reason=f"{item.name} 구매"))
-    db.commit()
-    db.refresh(me)
-    return {"ok": True, "coins": me.coins, "item_id": item.id}
 
 
-@router.put("/students/me/avatar")
-def save_avatar(
-    req: AvatarRequest,
-    principal: Principal = Depends(require_student),
-    db: Session = Depends(get_db),
-):
-    me = _me(principal)
-    # 허용 키/문자열 값만 저장 — 임의·거대 JSON 저장(스토리지 남용) 차단
-    allowed = ("hat", "background", "sticker", "face", "outfit")
-    clean: dict[str, str] = {}
-    for k, v in (req.avatar or {}).items():
-        if k in allowed and isinstance(v, str) and len(v) <= 50:
-            clean[k] = v
-    me.avatar = clean
-    db.commit()
-    return {"ok": True, "avatar": me.avatar}
 
 
-@router.patch("/students/me/profile")
-def update_profile(
-    req: StudentProfileUpdate,
-    principal: Principal = Depends(require_student),
-    db: Session = Depends(get_db),
-):
-    me = _me(principal)
-    if req.nickname is not None and req.nickname.strip():
-        me.nickname = req.nickname.strip()[:8]
-    if req.age is not None:
-        me.age = req.age
-    db.commit()
-    return {"ok": True, "nickname": me.nickname, "age": me.age, "gender": me.gender}
 
 
 # ---------------------------------------------------------------- 학년 랭킹
@@ -997,55 +530,6 @@ def update_profile(
 RANK_TOP3_COINS = {1: 30, 2: 20, 3: 10}
 
 
-@router.get("/students/me/class-ranking")
-def class_ranking(
-    principal: Principal = Depends(require_student), db: Session = Depends(get_db)
-):
-    me = _me(principal)
-    rows = _class_board(db, me)
-    mine = next(r for r in rows if r["me"])
-    top_score = rows[0]["score"] or 1
-    grade = _my_grade(db, me)
-
-    # 상위 3위 추가 코인: 오늘 아직 안 받았으면 지급 (학기 누적 랭킹이라 '매일 유지' 보상)
-    # 멱등 지급: daily_rewards(UNIQUE student_id,kind,reward_date)에 INSERT 성공 시에만 지급.
-    # SELECT-then-INSERT 였던 과거엔 동시요청이 둘 다 통과해 이중 지급됐다.
-    bonus = 0
-    if mine["rank"] in RANK_TOP3_COINS and mine["score"] > 0:
-        from sqlalchemy.exc import IntegrityError
-
-        from app.models import DailyReward
-
-        amount = RANK_TOP3_COINS[mine["rank"]]
-        db.add(DailyReward(student_id=me.id, kind="rank_bonus", reward_date=date.today(), amount=amount))
-        try:
-            db.flush()  # 오늘치 최초 지급이면 통과, 중복이면 IntegrityError
-            granted = True
-        except IntegrityError:
-            db.rollback()
-            granted = False
-        if granted:
-            bonus = amount
-            db.query(StudentProfile).filter(StudentProfile.id == me.id).update(
-                {StudentProfile.coins: StudentProfile.coins + bonus},
-                synchronize_session=False,
-            )
-            db.add(
-                CoinTransaction(
-                    student_id=me.id, amount=bonus, reason=f"{mine['rank']}위 랭킹 보상"
-                )
-            )
-            db.commit()
-
-    return {
-        "rank": mine["rank"],
-        "score": mine["score"],
-        "grade": grade,
-        "class_size": len(rows),  # (호환) 랭킹 풀 크기 = 같은 학년 인원
-        "board": rows[:20],  # 상위 20명까지만 노출
-        "top_pct": round(mine["score"] / top_score * 100),
-        "bonus_coins": bonus,  # 방금 지급된 상위 3위 보너스 (0이면 없음)
-    }
 
 
 # ---------------------------------------------------------------- 상장 · 개근 뱃지
@@ -1053,101 +537,8 @@ ATTENDANCE_BADGE_NAME = "개근왕"
 ATTENDANCE_STREAK_DAYS = 30  # 30일 연속 학습 = 개근상
 
 
-def _semester_label(d: date) -> str:
-    # 한국 학기: 3~8월 = 1학기, 9~2월 = 2학기(연도는 학기 시작 연도)
-    if 3 <= d.month <= 8:
-        return f"{d.year}년 1학기"
-    year = d.year if d.month >= 9 else d.year - 1
-    return f"{year}년 2학기"
 
 
-@router.get("/students/me/awards")
-def my_awards(
-    principal: Principal = Depends(require_student), db: Session = Depends(get_db)
-):
-    """상장(다운로드용) 목록 — 학년 랭킹 상위 3위 + 개근상. 개근 뱃지는 여기서 자동 지급."""
-    me = _me(principal)
-    awards: list[dict] = []
-    today = date.today()
-    semester = _semester_label(today)
-
-    # 학년 랭킹 상장 (학기 누적 상위 3위)
-    board = _class_board(db, me)
-    mine = next(r for r in board if r["me"])
-    grade = _my_grade(db, me)
-    if grade is not None and mine["rank"] in (1, 2, 3) and mine["score"] > 0:
-        awards.append(
-            {
-                "type": "rank",
-                "title": f"{grade}학년 랭킹 {mine['rank']}위",
-                "detail": f"{semester} · {grade}학년 {len(board)}명 중 {mine['rank']}위 · {mine['score']}점",
-                "rank": mine["rank"],
-                "grade": grade,
-                "semester": semester,
-            }
-        )
-
-    # 개근상 — 연속 학습 30일 이상이면 상장 + '개근왕' 뱃지 자동 지급
-    growth = aggregate.student_growth(db, me) or {}
-    streak = int(growth.get("streak_days") or 0)
-    if streak >= ATTENDANCE_STREAK_DAYS:
-        awards.append(
-            {
-                "type": "attendance",
-                "title": "개근상",
-                "detail": f"{semester} · {streak}일 연속으로 하루도 빠짐없이 학습했어요",
-                "streak_days": streak,
-                "semester": semester,
-            }
-        )
-        from sqlalchemy.exc import IntegrityError
-
-        # 배지 find-or-create — badges.name UNIQUE로 동시요청 중복 배지 생성 차단
-        badge = db.query(Badge).filter(Badge.name == ATTENDANCE_BADGE_NAME).first()
-        if badge is None:
-            badge = Badge(
-                name=ATTENDANCE_BADGE_NAME,
-                description=f"{ATTENDANCE_STREAK_DAYS}일 연속 학습 개근",
-                icon="ph-fill ph-calendar-check",
-                color="#17B08C",
-                condition_text=f"{ATTENDANCE_STREAK_DAYS}일 연속 학습하기",
-                order_no=99,
-            )
-            db.add(badge)
-            try:
-                db.flush()
-            except IntegrityError:  # 경쟁 요청이 먼저 만듦 → 재조회
-                db.rollback()
-                badge = db.query(Badge).filter(Badge.name == ATTENDANCE_BADGE_NAME).first()
-        earned = (
-            db.query(StudentBadge)
-            .filter(StudentBadge.student_id == me.id, StudentBadge.badge_id == badge.id)
-            .first()
-        )
-        if earned is None:
-            # student_badges(student_id,badge_id) UNIQUE로 동시요청 이중지급 차단
-            db.add(
-                StudentBadge(
-                    student_id=me.id, badge_id=badge.id, earned_at=datetime.now(), progress=1
-                )
-            )
-            try:
-                db.commit()
-            except IntegrityError:
-                db.rollback()
-        elif earned.earned_at is None:
-            earned.earned_at = datetime.now()
-            earned.progress = 1
-            db.commit()
-
-    return {
-        "nickname": me.nickname,
-        "grade": grade,
-        "semester": semester,
-        "streak_days": streak,
-        "attendance_target": ATTENDANCE_STREAK_DAYS,
-        "awards": awards,
-    }
 
 
 # ---------------------------------------------------------------- 학습 시도 저장

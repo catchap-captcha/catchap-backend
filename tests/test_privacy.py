@@ -66,22 +66,20 @@ def test_retention_batch_anonymizes_only_stale(db, seed_org):
     assert s2.real_name == "살아있는이름"  # 미파기
 
 
-def test_withdraw_endpoint_blocks_login(client, db, seed_org):
-    """org_admin 탈퇴 → PII 파기 + 로그인 차단."""
+def test_anonymize_blocks_login(client, db, seed_org):
+    """익명화(파기) → PII 소거 + 로그인 차단.
+
+    (종전 test_withdraw_endpoint_blocks_login — 기관 콘솔의 탈퇴 엔드포인트가 학교
+    은퇴로 제거돼 서비스 함수(privacy_service.anonymize_student, 보존만료 배치와
+    운영 파기가 공유하는 단일 경로)를 직접 검증한다.)"""
+    from app.services.privacy_service import anonymize_student
+
     org = seed_org["org"]
     seed_org["student"].real_name = "김실명"
     db.commit()
-    _org_admin(db, org)
-    admin_tok = client.post(
-        "/api/v1/auth/login", json={"email": "principal@test.dev", "password": "Password123!"}
-    ).json()["access_token"]
 
-    r = client.post(
-        f"/api/v1/orgs/{org.id}/students/{seed_org['student'].id}/withdraw",
-        headers=auth(admin_tok),
-    )
-    assert r.status_code == 200, r.text
-    assert r.json()["anonymized"] is True
+    assert anonymize_student(db, seed_org["student"]) is True
+    db.commit()
 
     db.expire_all()
     st = db.get(StudentProfile, seed_org["student"].id)
