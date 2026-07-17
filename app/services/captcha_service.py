@@ -1080,6 +1080,32 @@ def _behavior_risk_level(
     return "low"
 
 
+def _actor_band(db: Session, student_id: str | None) -> str | None:
+    """행위자 연령대 태그(adult|minor|None) — 아동 데이터 파기 시 성인 생성분 보존 판별 축.
+
+    생년월일(가입 수집)이 있으면 만 나이로 판정(경계 14세 = auth_service.GUARDIAN_CONSENT_AGE
+    와 동일 — 순환 import라 상수만 재기술). 없으면 학교 입력 age(3~13)로 미성년만 확정.
+    익명·정보 없음은 None(미상) — 'adult'로 추정하지 않는다(파기 판별에서 보수적으로 다룸)."""
+    if not student_id:
+        return None
+    from app.models import StudentProfile
+
+    st = db.get(StudentProfile, student_id)
+    if st is None:
+        return None
+    if st.birth_date is not None:
+        today = datetime.now().date()
+        age = (
+            today.year
+            - st.birth_date.year
+            - ((today.month, today.day) < (st.birth_date.month, st.birth_date.day))
+        )
+        return "adult" if age >= 14 else "minor"
+    if st.age is not None:  # 학교가 입력하는 age는 3~13 범위 — 미성년 확정
+        return "minor"
+    return None
+
+
 def record_behavior_event(
     db: Session,
     *,
@@ -1139,6 +1165,8 @@ def record_behavior_event(
             ),
             # 실트래픽은 'organic'(미검증), 레드팀 봇 주입만 'bot' — 지도학습 정답표
             sample_label=label,
+            # 행위자 연령대(adult|minor|None) — 아동 파기에서 성인 생성분을 지키는 축
+            actor_band=_actor_band(db, student_id),
             solve_time_ms=solve_ms,
             # 자기신고 값도 상한 — 통계(그룹 평균) 부풀리기 차단
             path_length=m["path_length"] if m else min(PATH_LENGTH_CAP, max(0.0, _f("path_length"))),

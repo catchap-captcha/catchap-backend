@@ -190,6 +190,11 @@ class BehaviorSummary(Base, UUIDPk, Timestamps):
     sample_label: Mapped[str] = mapped_column(
         String(12), default="organic", server_default="organic"
     )
+    # 행위자 연령대(behavior_actor_01) — 아동 데이터 파기 시 성인 생성분 보존 판별 축.
+    # adult=만 14세 이상 / minor=만 14세 미만(아동, PIPA 동의 기준) / NULL=미상(익명 등).
+    # 기존 축적분은 전부 성인(팀원) 생성이라는 사용자 확정(2026-07-17)으로 'adult' 백필.
+    # sample_label(지도학습 정답표)과는 다른 축 — 재사용하지 않는다(bot 잠금과 충돌).
+    actor_band: Mapped[str | None] = mapped_column(String(10), nullable=True)
     occurred_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     # 아동용 캡차 판정 모델 학습셋 큐레이션 상태 (운영 콘솔에서 관리)
     # server_default: seed의 bulk_insert_mappings처럼 ORM 기본값을 안 타는 INSERT도 안전하게
