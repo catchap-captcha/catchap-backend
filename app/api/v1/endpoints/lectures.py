@@ -49,7 +49,7 @@ from fastapi import (
 from fastapi.responses import FileResponse
 from jwt import PyJWTError
 from pydantic import BaseModel
-from sqlalchemy import and_, func, not_, or_
+from sqlalchemy import func, not_
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
@@ -1013,7 +1013,6 @@ def _question_row(q: LectureQuestion) -> dict:
         "id": q.id,
         "lecture_id": q.lecture_id,
         "position_sec": q.position_sec,
-        "window_sec": int(q.window_sec or 0),
         "prompt": payload.get("prompt"),
         "options": options,
         "explain": payload.get("explain"),
@@ -1046,10 +1045,9 @@ class _QuestionCreate(BaseModel):
     # 출제 시점(핀) — active면 1 이상·영상 안이어야 한다. draft는 0 허용(시점 미배치 —
     # LLM 생성 문항이 검수를 기다리는 상태. 활성화할 때 시점 지정이 강제된다).
     position_sec: int = 0
-    # 출제 구간 길이(초). 0이면 정확히 position_sec(고정), >0이면
-    # [position_sec, position_sec+window_sec] 안의 무작위 시점(강사도 정확한 초는 모른다).
-    window_sec: int = 0
     # (제거됨 0717) pinned — 이제 모든 문항이 핀이다. 구버전 콘솔이 보내도 조용히 무시된다.
+    # (제거됨 0717) window_sec — 구간 출제. 되감기(cp-REWIND_SEC) 기준과 내용 시점이
+    # 어긋나는 버그로 고정만 남겼다(lecture_service '구간 출제: 제거됨' 주석). 역시 무시.
     prompt: str
     options: list[str]
     answer_index: int
@@ -1097,7 +1095,7 @@ def _validate_question_body(
 
 
 def _validate_question_timing(
-    position_sec: int, window_sec: int, duration_sec: int, *, active: bool
+    position_sec: int, duration_sec: int, *, active: bool
 ) -> None:
     """출제 시점(핀)이 실제로 도달 가능한지 — 뜰 수 없는 문항은 조용히 죽는 대신 거절한다.
 
@@ -1107,20 +1105,13 @@ def _validate_question_timing(
     active 문항으로 보이므로 알아챌 방법이 없다.
 
     ★ 1초 이상은 active일 때만 강제한다 — draft는 '시점 미배치'(position 0)로 두고
-    검수를 기다릴 수 있다(LLM 생성 문항의 기본 상태). 핀은 watched < start 판정이라
+    검수를 기다릴 수 있다(LLM 생성 문항의 기본 상태). 핀은 watched < pin 판정이라
     0초 핀은 활성화돼도 영영 안 뜨므로, 공개 전에 반드시 걸러야 한다.
-
-    구간 끝(position+window)이 영상을 넘는 건 거절하지 않는다 — "3:20부터 끝까지"는
-    강사의 정상적인 의도이고, 예약 시 duration-1로 잘라 쓴다. 시작점만 영상 안이면 된다.
     """
     if duration_sec and position_sec >= duration_sec:
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
             detail="출제 시점이 영상 길이를 벗어났습니다. 영상 안의 시점을 지정해 주세요.",
-        )
-    if window_sec < 0:
-        raise HTTPException(
-            status.HTTP_400_BAD_REQUEST, detail="출제 구간 길이는 0초 이상이어야 합니다."
         )
     if active and position_sec < 1:
         raise HTTPException(
@@ -1135,8 +1126,8 @@ def _reject_duplicate_pin(
 
     한 시점에는 하나만 출제되고(random.choice), 통과하면 그 시점은 다시 안 잡히므로
     나머지는 영구 사문이 된다. 강사 목록에는 active로 멀쩡히 보여 알 수 없다
-    (적대적 검토에서 실증). 같은 대목을 여러 문항으로 묻고 싶으면 구간(window_sec)을
-    써서 시작점을 달리 두면 된다.
+    (적대적 검토에서 실증). 같은 대목을 여러 문항으로 묻고 싶으면 시점을 몇 초씩
+    달리 두면 된다(각각 별도 체크포인트로 순서대로 뜬다).
     """
     dup = (
         db.query(func.count(LectureQuestion.id))
@@ -1167,28 +1158,27 @@ def _reconcile_progress(db: Session, lecture_id: str) -> None:
     ② 핀 시점을 지나쳐 버릴 예약: 예약이 핀 시점보다 뒤에 있으면 학생은 지정 시점을
        그냥 통과해 핀이 무의미해진다.
     """
-    pins = lecture_service.question_windows(db, lecture_id)
+    pins = lecture_service.question_pins(db, lecture_id)
     cp_col = LectureWatchProgress.next_checkpoint_sec
 
-    # ① 그 지점에 낼 수 있는 문항이 없는 예약 — 핀 문항은 자기 구간 안에서만 나온다.
-    #    어느 구간에도 안 걸치면 그 예약으로는 게이트를 열 수 없다.
-    servable = [and_(cp_col >= s, cp_col <= e) for s, e in pins]
+    # ① 그 지점에 낼 수 있는 문항이 없는 예약 — 핀 문항은 정확히 자기 시점에서만 나온다.
+    #    어느 핀과도 일치하지 않으면 그 예약으로는 게이트를 열 수 없다.
     unservable = db.query(LectureWatchProgress).filter(
         LectureWatchProgress.lecture_id == lecture_id, cp_col.isnot(None)
     )
-    if servable:
-        unservable = unservable.filter(not_(or_(*servable)))
+    if pins:
+        unservable = unservable.filter(not_(cp_col.in_(pins)))
     unservable.update({"next_checkpoint_sec": None}, synchronize_session=False)
 
-    # ② 아직 안 닿은 핀 구간을 통째로 건너뛰는 예약 — 구간 안에 있는 예약은 유효하니 둔다
-    for s, e in pins:
+    # ② 아직 안 닿은 핀을 통째로 건너뛰는 예약 — 핀에 정확히 걸린 예약은 유효하니 둔다
+    for pin in pins:
         (
             db.query(LectureWatchProgress)
             .filter(
                 LectureWatchProgress.lecture_id == lecture_id,
                 cp_col.isnot(None),
-                cp_col > e,
-                LectureWatchProgress.watched_max_sec < s,
+                cp_col > pin,
+                LectureWatchProgress.watched_max_sec < pin,
             )
             .update({"next_checkpoint_sec": None}, synchronize_session=False)
         )
@@ -1227,15 +1217,13 @@ def ops_create_question(
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="status는 draft|active만 가능합니다.")
     position = max(0, req.position_sec)
     _validate_question_timing(
-        position, int(req.window_sec or 0), int(lec.duration_sec or 0),
-        active=req.status == "active",
+        position, int(lec.duration_sec or 0), active=req.status == "active"
     )
     if req.status == "active":
         _reject_duplicate_pin(db, lec.id, position)
     q = LectureQuestion(
         lecture_id=lec.id,
         position_sec=position,
-        window_sec=max(0, int(req.window_sec or 0)),
         payload={
             "prompt": req.prompt.strip(),
             "options": [str(o).strip() for o in req.options],
@@ -1261,7 +1249,6 @@ def ops_create_question(
         after={
             "lecture_id": lec.id,
             "position_sec": q.position_sec,
-            "window_sec": int(q.window_sec or 0),
             "status": q.status,
         },
     )
@@ -1271,7 +1258,6 @@ def ops_create_question(
 
 class _QuestionUpdate(BaseModel):
     position_sec: int | None = None
-    window_sec: int | None = None
     prompt: str | None = None
     options: list[str] | None = None
     answer_index: int | None = None
@@ -1351,14 +1337,11 @@ def ops_update_question(
     q.answer_indexes = new_answer_indexes
     if req.position_sec is not None:
         q.position_sec = max(0, req.position_sec)
-    if req.window_sec is not None:
-        q.window_sec = max(0, int(req.window_sec))
     if req.status is not None:
         q.status = req.status
     lec = db.get(Lecture, lecture_id)
     _validate_question_timing(
         int(q.position_sec),
-        int(q.window_sec or 0),
         int(lec.duration_sec or 0) if lec else 0,
         active=q.status == "active",
     )

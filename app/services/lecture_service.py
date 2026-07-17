@@ -1,5 +1,5 @@
 """강의 시청 검증 도메인 서비스 — 진행(하트비트) 검증·체크포인트 예약/기록·
-동시접속 차단(claim_session). 출제 시점은 전부 핀(문항의 position_sec+window_sec 구간).
+동시접속 차단(claim_session). 출제 시점은 전부 고정 핀(문항의 position_sec 정각).
 
 시각 비교는 전부 로컬 naive(_now, app/db/base.py와 동일 소스)로 한다. utcnow()가 섞이면
 로컬(KST) created_at/updated_at과의 차이가 -32400초가 되어 wall-clock 전진 허용량이
@@ -9,7 +9,6 @@
 commit은 호출자(엔드포인트) 책임 — audit()와 같은 규약.
 """
 
-import random
 from collections.abc import Sequence
 from datetime import timedelta
 
@@ -57,17 +56,25 @@ SESSION_TTL_SEC = 30
 # 위조 가능하다. 그래서 '봤는가'를 직접 묻는 콘텐츠 캡차가 유일한 수단이다.
 
 # ---- 랜덤 간격·의심 가중: 제거됨(0717) ----
-# 출제 시점은 이제 전부 핀이다 — 문항마다 position_sec(+window_sec) 구간이 있고,
-# 체크포인트는 그 구간 안에서만 잡힌다. '아무 때나 무작위 확인'(pinned=False 풀 +
-# check_min/max_sec 간격)은 옛 시청-감시 설계의 잔재로, 학습 설계에서는 강사(또는 LLM)가
-# "이 대목을 물어라"를 지정하므로 쓸 곳이 없었다. 거기 딸려 있던 suspicion(의심 누적 시
-# 간격 축소)과 tab_hidden 자기신고도 좁힐 간격이 사라져 함께 걷어냈다.
+# 출제 시점은 이제 전부 핀이다 — 문항마다 position_sec이 있고, 체크포인트는 그 시점에만
+# 잡힌다. '아무 때나 무작위 확인'(pinned=False 풀 + check_min/max_sec 간격)은 옛
+# 시청-감시 설계의 잔재로, 학습 설계에서는 강사(또는 LLM)가 "이 대목을 물어라"를
+# 지정하므로 쓸 곳이 없었다. 거기 딸려 있던 suspicion(의심 누적 시 간격 축소)과
+# tab_hidden 자기신고도 좁힐 간격이 사라져 함께 걷어냈다.
 # 속도 상한·체크포인트 클램프(위)는 position 위조 차단의 본체라 그대로 남는다.
+
+# ---- 구간 출제(window_sec): 제거됨(0717 lecture_pin_03) ----
+# [position, position+window] 안 무작위 초에 내던 구간 모드를 걷어내고 고정 핀만 남겼다.
+# 되감기(아래 오답 상한)가 cp-REWIND_SEC 기준인데, 구간은 cp가 내용 시점(position)에서
+# 최대 window만큼 멀어질 수 있어 문항과 무관한 대목을 되감았다(position=200·window=300이면
+# cp=480에서 450~480을 다시 보게 되지만 내용은 200 근처). 고정만 남기면 cp == position이라
+# 이 어긋남이 구조적으로 성립하지 않는다. 구간의 목적이던 '매번 같은 초면 학생이 지점을
+# 외운다' 방어는 의도적으로 버린다 — 학습 강화 설계에선 지점을 외워도 내용을 봐야 답한다.
 
 # ---- 오답 상한(되감기) ----
 # 한 체크포인트에서 이 횟수만큼 연속 오답하면, 그 대목을 다시 보도록 watched_max를
-# REWIND_SEC만큼 되감는다. 되감기 전에는 오답 → 재발급이 무한 반복돼 보기 전수 대입
-# (겹치는 핀이 여럿이면 정답 집합 수확)이 대가 없이 가능했다. 되감으면 watched_max < cp가
+# REWIND_SEC만큼 되감는다. 되감기 전에는 오답 → 재발급이 무한 반복돼 보기 전수 대입이
+# 대가 없이 가능했다. 되감으면 watched_max < cp가
 # 되어 _lecture_challenge가 409로 새 문항 발급을 거부한다 — 실제로 다시 시청해 cp까지
 # 올라와야(실시간 하트비트) 다음 문항을 받는다. 학습적으로도 옳다: 세 번 틀렸다는 건
 # 그 대목을 다시 봐야 한다는 뜻이다. (프론트 상수 MAX_CHECKPOINT_FAILS와 맞춰 둘 것)
@@ -76,46 +83,45 @@ MAX_CHECKPOINT_FAILS = 3
 REWIND_SEC = 30
 
 
-def question_windows(db: Session, lecture_id: str) -> list[tuple[int, int]]:
-    """그 강의의 출제 구간(핀) [start, end] 목록 — start 오름차순, 중복 제거.
+def question_pins(db: Session, lecture_id: str) -> list[int]:
+    """그 강의의 출제 시점(핀) 목록 — 오름차순, 중복 제거.
 
-    모든 공개(active) 문항이 핀이다: window_sec=0이면 start==end(정확히 그 시점),
-    window_sec>0이면 [position, position+window] 구간(정확한 초는 예약 시 무작위)."""
+    모든 공개(active) 문항이 고정 핀이다: 학생이 position_sec에 닿는 순간 그 문항이 뜬다.
+    (구간(window_sec) 출제는 제거됨 — 위 '구간 출제: 제거됨' 주석 참조.)"""
     rows = (
-        db.query(LectureQuestion.position_sec, LectureQuestion.window_sec)
+        db.query(LectureQuestion.position_sec)
         .filter(
             LectureQuestion.lecture_id == lecture_id,
             LectureQuestion.status == "active",
         )
         .all()
     )
-    return sorted({(int(pos), int(pos) + max(0, int(w or 0))) for pos, w in rows})
+    return sorted({int(pos) for (pos,) in rows})
 
 
 def next_checkpoint(
     watched_max: int,
     duration_sec: int,
-    pins: Sequence[tuple[int, int]],
+    pins: Sequence[int],
 ) -> int | None:
-    """다음 체크포인트 예약 — 아직 안 닿은 가장 이른 핀 구간 안의 무작위 1점, 없으면 None.
+    """다음 체크포인트 예약 — 아직 안 닿은 가장 이른 핀, 없으면 None.
 
-    ★ 구간 안의 정확한 초는 여기서 무작위로 고른다(강사도 모른다 — 매번 같은 초면
-    학생이 그 지점만 외워 대기한다). window_sec=0이면 start==end라 그 시점 그대로다.
-    구간 끝이 영상을 넘으면 duration-1로 잘라 쓴다("여기부터 끝까지"는 정상 의도).
+    ★ 핀 소진 판정은 'watched < pin'으로 한다. 클램프(cp+GRACE)가 있어 캡차를 풀지
+    않고는 핀을 지날 수 없으므로, watched가 핀에 닿았다는 것은 그 체크포인트를 이미
+    겪었다는 뜻이다. (0초 핀이 영영 안 잡히는 것도 이 판정의 귀결 — 생성/수정 검증이
+    active 문항의 position>=1을 강제해 그 상태 자체를 막는다.)
 
-    ★ 구간 소진 판정은 'start에 닿았는가'(watched < start)로 한다. end 기준으로 하면
-    구간 안에서 캡차를 푼 뒤에도 watched < end라 같은 구간이 계속 다시 잡혀 같은 문항이
-    반복된다. start에 닿았다는 것은 그 구간의 체크포인트를 이미 겪었다는 뜻이다 —
-    클램프(cp+GRACE)가 있어 캡차를 풀지 않고는 start를 지날 수 없기 때문이다.
+    ★ 영상 밖(pin >= duration) 핀은 예약하지 않는다 — 도달 불가한 예약은 게이트가
+    영영 안 열려 완주를 막는다(운영자 길이 수정·오타 방어).
 
     ★ 낼 문제가 없으면(핀 없음·전부 소진·전부 영상 밖) 예약하지 않는다: 예약만 해두고
     게이트 순간에 문항이 없어 4xx를 내면, 학생 화면에서는 '캡차가 그냥 안 뜨는데 진도도
     안 나가는' 조용한 실패가 된다(라이브에서 실제로 겪음)."""
     duration = int(duration_sec or 0)
     watched = int(watched_max)
-    for start, end in sorted(pins):
-        if watched < start < duration:
-            return random.randint(int(start), min(int(end), duration - 1))
+    for pin in sorted(pins):
+        if watched < pin < duration:
+            return int(pin)
     return None
 
 
@@ -178,7 +184,7 @@ def ensure_progress(db: Session, student_id: str, lecture: Lecture) -> LectureWa
     )
     if row is not None:
         return row
-    pins = question_windows(db, lecture.id)
+    pins = question_pins(db, lecture.id)
     row = LectureWatchProgress(
         student_id=student_id,
         lecture_id=lecture.id,
@@ -238,7 +244,7 @@ def advance(
     # 내내 캡차가 한 번도 안 뜬다 = 시청 검증이 조용히 꺼진다(실제로 라이브에 나갔던 버그).
     # 영상을 끝까지 본 뒤에는 next_checkpoint가 다시 None을 돌려주므로 완주 판정은 그대로다.
     if progress.next_checkpoint_sec is None and watched < duration:
-        pins = question_windows(db, progress.lecture_id)
+        pins = question_pins(db, progress.lecture_id)
         progress.next_checkpoint_sec = next_checkpoint(watched, duration, pins)
 
     cp = progress.next_checkpoint_sec
@@ -300,7 +306,7 @@ def record_checkpoint(
         progress.checkpoint_fails = 0  # 통과 — 연속 오답 카운터 리셋
         base = max(int(progress.watched_max_sec or 0), int(position_sec))
         if lec is not None:
-            pins = question_windows(db, lecture_id)
+            pins = question_pins(db, lecture_id)
             progress.next_checkpoint_sec = next_checkpoint(
                 base, int(lec.duration_sec or 0), pins
             )
@@ -324,7 +330,7 @@ def record_checkpoint(
             # (되감기 무력화 — 특히 프론트 없이 position=cp를 반복 신고하는 봇).
             progress.updated_at = _now()
             # next_checkpoint_sec는 cp 그대로 — 다시 시청해 cp에 닿으면 같은 체크포인트가
-            # 재트리거되고 그 구간의 핀 문항이 다시 나온다(재시청 후 재도전).
+            # 재트리거되고 그 시점의 핀 문항이 다시 나온다(재시청 후 재도전).
         else:
             progress.checkpoint_fails = fails
     return progress

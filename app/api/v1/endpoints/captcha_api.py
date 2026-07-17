@@ -334,23 +334,19 @@ def _lecture_challenge(db: Session, request: Request, api: ApiKey, lecture_id: s
         raise HTTPException(
             status.HTTP_409_CONFLICT, detail="아직 확인 문제 지점까지 시청하지 않았어요."
         )
-    candidates = (
+    # 모든 문항이 고정 핀 — 체크포인트는 어떤 핀 시점에 잡혔고(next_checkpoint), 정확히
+    # 그 시점(position_sec == cp)의 문항만 출제 대상이다. 같은 시점의 공개 문항 중복은
+    # _reject_duplicate_pin이 막지만, 가드 이전의 레거시 중복이 남아 있으면 무작위로
+    # 하나를 낸다(나머지는 사문 — 강사가 콘솔에서 시점을 옮겨 살린다).
+    choices = (
         db.query(LectureQuestion)
         .filter(
             LectureQuestion.lecture_id == lec.id,
             LectureQuestion.status == "active",
-            LectureQuestion.position_sec <= cp,
+            LectureQuestion.position_sec == cp,
         )
         .all()
     )
-    # 모든 문항이 핀 — 체크포인트는 어떤 핀 구간 안에 잡혔고(next_checkpoint), 그 구간이
-    # cp를 덮는 문항만 출제 대상이다. window_sec=0이면 구간이 한 점이라 '정확히 그 시점'.
-    # 겹치는 구간이 여럿이면 하나를 무작위로 뽑는다(랜덤 선택 — 학생이 문항을 못 외운다).
-    choices = [
-        q
-        for q in candidates
-        if int(q.position_sec) <= cp <= int(q.position_sec) + int(q.window_sec or 0)
-    ]
     if not choices:
         # 폴백 출제 금지 — 게이트를 열 문항이 없음을 정직하게 알린다
         raise HTTPException(

@@ -32,7 +32,7 @@ class Lecture(Base, UUIDPk, Timestamps):
     video_bytes: Mapped[int] = mapped_column(BigInteger, default=0)
     duration_sec: Mapped[int] = mapped_column(default=0)
     # (제거됨 0717) check_min_sec/check_max_sec — 무작위 확인 간격. 출제 시점이 전부
-    # 핀(문항의 position_sec+window_sec)이 되면서 간격 개념 자체가 사라졌다(lecture_pin_02).
+    # 핀(문항의 position_sec)이 되면서 간격 개념 자체가 사라졌다(lecture_pin_02).
     status: Mapped[str] = mapped_column(String(20), default="active")  # active|hidden|deleted
     # 과목 내 목차 순서(1강·2강…) — 목록·목차는 (subject, order_no, created_at) 오름차순.
     # 생성 시 미지정이면 그 과목의 max+1로 맨 뒤 배정(운영자가 PUT으로 재배열).
@@ -69,16 +69,17 @@ class LectureQuestion(Base, UUIDPk, Timestamps):
 
     lecture_id: Mapped[str] = mapped_column(CHAR(36), ForeignKey("lectures.id"), index=True)
     position_sec: Mapped[int] = mapped_column(default=0)  # 이 문항이 다루는 강의 시점
-    # 출제 시점 — 모든 문항이 핀(전부 핀 구조, 0717 lecture_pin_02)
-    #   window_sec=0: 학생이 position_sec에 닿는 순간 반드시 이 문항이 뜬다(고정)
-    #   window_sec>0: [position_sec, position_sec+window_sec] 구간 안에서 서버가 고른
-    #     무작위 시점에 뜬다(구간) — 매번 같은 초면 학생이 그 지점만 외워 대기한다
-    # 핀은 강사만 아는 정보를 쓴다 — "이 대목 직후에 물어야 방금 본 사람만 답한다".
+    # 출제 시점 — 모든 문항이 고정 핀(전부 핀 lecture_pin_02 → 고정만 lecture_pin_03, 0717):
+    # 학생이 position_sec에 닿는 순간 반드시 이 문항이 뜬다. 핀은 강사만 아는 정보를
+    # 쓴다 — "이 대목 직후에 물어야 방금 본 사람만 답한다".
     # position_sec 규약: active면 1 이상·영상 안(생성/수정 시 검증). draft는 0 허용 —
     # LLM 생성 문항이 '시점 미배치' 상태로 검수를 기다리는 자리다(활성화 때 강제된다).
+    # (제거됨 0717) window_sec — [position, position+window] 안 무작위 초 출제(구간).
+    #  되감기(cp-REWIND_SEC)가 cp 기준인데 구간은 cp가 내용 시점과 멀 수 있어 엉뚱한
+    #  대목을 되감았다. 고정만 남기면 cp == position이라 어긋남이 구조적으로 사라진다
+    #  (lecture_service '구간 출제: 제거됨' 주석 참조).
     # ('position 이후 아무 확인에서나'였던 pinned=False 풀 + check_min/max 무작위 간격은
     #  옛 시청-감시 설계의 잔재로 제거 — lecture_service의 '랜덤 간격: 제거됨' 주석 참조.)
-    window_sec: Mapped[int] = mapped_column(default=0)
     # {prompt, options[], explain} + 이미지 문항 확장(선택): prompt_image={id, ext},
     # option_images={"<보기 인덱스>": {id, ext}}. 파일 경로는 저장하지 않고
     # LECTURE_MEDIA_DIR/questions/{id}{ext}로 유도한다(영상·자료와 동일 — 경로조작 원천 차단).

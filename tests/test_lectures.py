@@ -113,12 +113,11 @@ def _hb(client, tok, lecture_id, position, *, st, **extra):
 
 def _add_question(
     client, ops_tok, lecture_id, *, position=1, answer=2, answer_indexes=None,
-    status="active", window=0, prompt="강의에서 설명한 내용은?",
+    status="active", prompt="강의에서 설명한 내용은?",
 ):
     """핀 문항 추가 — 기본은 1초 고정(하트비트 헤드룸 5초 안이라 한 비트로 닿는다)."""
     body = {
         "position_sec": position,
-        "window_sec": window,
         "prompt": prompt,
         "options": ["가", "나", "다", "라"],
         "answer_index": answer,
@@ -1152,47 +1151,34 @@ def test_interacted_self_report_grants_no_exemption(client, db, seed_org, media_
 
 # ================================================================ 핀(출제 시점) 예약
 def test_pin_unit_fires_in_order_and_respects_watched():
-    """단위 — 아직 안 닿은 가장 이른 핀에 잡히고, 지나온 핀은 다시 안 잡는다."""
+    """단위 — 아직 안 닿은 가장 이른 핀에 잡히고, 지나온 핀은 다시 안 잡는다.
+
+    (구간(window_sec) 출제는 제거됨 0717 — 되감기(cp-REWIND) 기준이 cp라, cp가 내용
+    시점과 멀어질 수 있는 구간은 엉뚱한 대목을 되감았다. 이제 cp == position_sec.)"""
     from app.services.lecture_service import next_checkpoint
 
     # 가장 이른 핀부터(정렬 무관), 지나온 핀은 소진
-    assert next_checkpoint(0, 1000, [(80, 80), (30, 30), (50, 50)]) == 30
-    assert next_checkpoint(30, 1000, [(80, 80), (30, 30), (50, 50)]) == 50
-    assert next_checkpoint(80, 1000, [(80, 80), (30, 30), (50, 50)]) is None  # 전부 소진
+    assert next_checkpoint(0, 1000, [80, 30, 50]) == 30
+    assert next_checkpoint(30, 1000, [80, 30, 50]) == 50
+    assert next_checkpoint(80, 1000, [80, 30, 50]) is None  # 전부 소진
+    # 예약은 정확히 핀 시점 — 무작위 없음(cp == position이 되감기 정합의 전제)
+    assert next_checkpoint(199, 1000, [200]) == 200
+    # 소진 판정은 watched < pin — 핀에 닿았다는 것은 그 체크포인트를 이미 겪었다는 뜻
+    # (클램프 때문에 캡차 없이 핀을 지날 수 없다)
+    assert next_checkpoint(200, 1000, [200]) is None
     # 영상 밖 핀은 무시 — 낼 수 없는 지점을 예약하지 않는다
-    assert next_checkpoint(0, 1000, [(5000, 5000)]) is None
-    # 0초 핀은 잡히지 않는다(watched < start 판정 — 아직 아무것도 안 본 지점).
+    assert next_checkpoint(0, 1000, [5000]) is None
+    # 0초 핀은 잡히지 않는다(watched < pin 판정 — 아직 아무것도 안 본 지점).
     # 생성/수정 검증이 active 문항의 position>=1을 강제해 이 상태 자체를 막는다.
-    assert next_checkpoint(0, 1000, [(0, 0)]) is None
+    assert next_checkpoint(0, 1000, [0]) is None
     # 핀이 없으면 예약도 없다 — 낼 문제 없는 예약은 조용한 실패가 된다
     assert next_checkpoint(0, 1000, []) is None
-
-
-def test_pin_window_unit_picks_inside_range_and_consumes_once():
-    """단위 — 구간 핀은 [start, end] 안의 무작위 시점에 잡히고, 구간당 한 번만 잡힌다."""
-    from app.services.lecture_service import next_checkpoint
-
-    # 구간 [200, 300] 안에서만 뽑힌다 — 매번 같은 초면 학생이 지점을 외운다
-    picks = {next_checkpoint(0, 1000, [(200, 300)]) for _ in range(200)}
-    assert picks and all(200 <= p <= 300 for p in picks), picks
-    assert len(picks) > 1, "구간인데 항상 같은 초면 학생이 지점을 외운다"
-
-    # 소진 판정은 start 기준 — 구간 안에서 캡차를 푼 뒤 같은 구간이 다시 잡히면
-    # 같은 문항이 반복된다(end 기준으로 하면 그렇게 된다)
-    assert next_checkpoint(250, 1000, [(200, 300)]) is None
-    assert next_checkpoint(200, 1000, [(200, 300)]) is None
-    # 아직 start 전이면(watched=199) 같은 구간이 유효하다
-    assert 200 <= next_checkpoint(199, 1000, [(200, 300)]) <= 300
-
-    # 구간 끝이 영상을 넘으면 영상 안으로 자른다("3:20부터 끝까지"는 정상 의도)
-    tail = {next_checkpoint(0, 1000, [(900, 5000)]) for _ in range(100)}
-    assert all(900 <= p <= 999 for p in tail), tail
 
 
 def test_pinned_question_fires_at_its_position_and_is_served(
     client, db, seed_org, media_dir
 ):
-    """통합 — 핀 시점에 체크포인트가 잡히고, 그 시점엔 '그 구간의' 문항만 나온다.
+    """통합 — 핀 시점에 체크포인트가 잡히고, 그 시점엔 '그 시점의' 문항만 나온다.
 
     뒤(500초) 핀 문항이 앞(3초) 게이트에 새어나오면 안 된다 — 미리 소진되면
     정작 지정 시점에 낼 문제가 사라진다."""
@@ -1229,7 +1215,7 @@ def test_pinned_question_fires_at_its_position_and_is_served(
         headers={"X-Site-Key": site_key, **auth(tok)},
     )
     assert ch.status_code == 200, ch.text
-    # 그 시점엔 그 구간의 문항이 나온다 — 뒤 핀 문항이 새어나오지 않는다
+    # 그 시점엔 그 시점의 문항이 나온다 — 뒤 핀 문항이 새어나오지 않는다
     assert ch.json()["prompt"] == "방금 화면에 나온 그래프의 색은?"
     assert later["prompt"] != ch.json()["prompt"]
 
