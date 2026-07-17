@@ -5,7 +5,7 @@ import hashlib
 import io
 import secrets
 from collections import defaultdict
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timedelta
 from html import escape
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -51,7 +51,10 @@ router = APIRouter(prefix="/ops", tags=["ops"])
 
 
 def _now() -> datetime:
-    return datetime.now(timezone.utc).replace(tzinfo=None)
+    # 로컬(KST) naive — created_at(app/db/base.py `_now`)과 같은 규약.
+    # 이 파일은 이미 곳곳에서 datetime.now()(KST)를 쓰고 있었다 — _now()만 UTC라
+    # 같은 컬럼(email_verified_at·joined_at)에 9시간 다른 값이 섞였다.
+    return datetime.now()
 
 
 @router.get("/dashboard")

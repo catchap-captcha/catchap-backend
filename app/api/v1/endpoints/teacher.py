@@ -29,7 +29,7 @@ from app.schemas.teacher import (
 from app.services import aggregate, auth_service, onboarding_service
 from app.services.aggregate import fb
 from app.services.stats import D  # DB(stat_blobs) 우선, design_data fallback
-from app.utils.helpers import audit, status_key, status_label, student_display_name, summary_acc, utc_to_local
+from app.utils.helpers import audit, status_key, status_label, student_display_name, summary_acc
 
 router = APIRouter(prefix="/teacher", tags=["teacher"])
 
@@ -705,7 +705,7 @@ def profile(principal: Principal = Depends(require_teacher), db: Session = Depen
     )
     code_remain = None
     if org and org.code_expires_at:
-        code_remain = max(0, (org.code_expires_at - datetime.utcnow()).days)
+        code_remain = max(0, (org.code_expires_at - datetime.now()).days)
     return {
         "name": user.name if user else "",
         "email": user.email if user else "",
@@ -716,9 +716,10 @@ def profile(principal: Principal = Depends(require_teacher), db: Session = Depen
         "org_name": org.name if org else None,
         "org_code": org.code if org else None,
         "teacher_code": membership.teacher_code if membership else None,
-        # 만료는 UTC 저장 — 노출은 KST 벽시계로 변환
+        # 만료도 created_at과 같은 로컬(KST) 규약 — 변환 없이 그대로 낸다.
+        # (여기에 +9h 보정을 되살리면 test_org_code_expiry_roundtrips_in_kst가 잡는다)
         "code_expires_at": (
-            utc_to_local(org.code_expires_at).isoformat() if org and org.code_expires_at else None
+            org.code_expires_at.isoformat() if org and org.code_expires_at else None
         ),
         "code_remain_days": code_remain,
     }

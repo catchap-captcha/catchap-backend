@@ -57,7 +57,7 @@ class _RegisterStudentsReq(_BaseModel):
     names: list[str] | None = None  # 학생 실명(슬롯 순서대로, 교사·기관 화면 전용)
     genders: list[str | None] | None = None  # 성별(슬롯 순서대로, 선생님 입력 — 아이가 안 고름)
 from app.services.stats import D  # DB(stat_blobs) 우선, design_data fallback
-from app.utils.helpers import audit, parse_grade, student_display_name, summary_acc, utc_to_local
+from app.utils.helpers import audit, parse_grade, student_display_name, summary_acc
 
 router = APIRouter(prefix="/orgs", tags=["orgs"])
 
@@ -109,12 +109,12 @@ def _org_row(db: Session, org: Organization) -> dict:
         "business_number": org.business_number,
         "admin": admin.name if admin else None,
         "tax_email": D.ORG_TAX_EMAIL,  # organizations 컬럼 없음 — stat_blobs(D)
-        # 만료는 UTC 저장 — 사용자 노출은 KST 벽시계로 변환(다른 시각들과 규약 통일)
+        # 만료도 created_at과 같은 로컬(KST) 규약 — 변환 없이 그대로 낸다.
         "code_expires_at": (
-            utc_to_local(org.code_expires_at).isoformat() if org.code_expires_at else None
+            org.code_expires_at.isoformat() if org.code_expires_at else None
         ),
         "code_remain_days": (
-            max(0, (org.code_expires_at - datetime.utcnow()).days) if org.code_expires_at else None
+            max(0, (org.code_expires_at - datetime.now()).days) if org.code_expires_at else None
         ),
     }
 
@@ -185,7 +185,7 @@ def rotate_org_code(
 
     old = org.code
     org.code = _generate_org_code(db, org.name)  # 유일 보장(기존 코드와 다름)
-    org.code_expires_at = datetime.utcnow() + timedelta(days=365)
+    org.code_expires_at = datetime.now() + timedelta(days=365)  # 로컬(KST) 규약
     audit(
         db,
         action="org.code_rotate",
@@ -200,7 +200,7 @@ def rotate_org_code(
     return {
         "ok": True,
         "code": org.code,
-        "code_expires_at": utc_to_local(org.code_expires_at).isoformat(),  # 노출은 KST
+        "code_expires_at": org.code_expires_at.isoformat(),  # 저장이 이미 KST
         "code_remain_days": 365,
     }
 

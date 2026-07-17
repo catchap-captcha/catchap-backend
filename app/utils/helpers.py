@@ -1,7 +1,7 @@
 """엔드포인트 공용 헬퍼 (감사 로그, 상태 라벨, 날짜 라벨)."""
 
 import re
-from datetime import date, datetime, timezone
+from datetime import date, datetime
 
 from sqlalchemy.orm import Session
 
@@ -9,9 +9,15 @@ from app.models import AuditLog
 
 
 # ── 앱 전역 '오늘/지금' 기준 ────────────────────────────────────────────
-# created_at 등은 로컬 naive(datetime.now)로, 만료류는 UTC naive로 저장되는 이중 규약이
-# 남아 있다. "오늘/이번 주" 같은 '날짜 경계 판정'은 반드시 이 헬퍼로 통일해 자정 경계
-# 밀림을 막는다.
+# **앱 코드가 쓰는 시각은 전부 로컬(KST) naive 하나뿐이다**(0717 통일). created_at·만료류·
+# 감사로그가 같은 프레임이라 같은 행 안에서 빼도 되고, 표시 변환도 필요 없다.
+# 단 앱 밖에 규약이 둘 더 있으니 헷갈리지 말 것:
+#   1. `app/core/security.py::_now` = aware UTC — JWT exp/iat 표준 규격이라 그대로 둔다.
+#   2. `app/db/base.py`의 `server_default=func.now()` = **DB 서버의 시계**(앱 컨테이너
+#      TZ가 아니다!). 원시 SQL INSERT가 created_at을 생략할 때만 발동한다. DB VM은
+#      2026-07-17에 Asia/Seoul로 맞췄지만 그건 인프라 설정이라 코드가 보장하지 않는다 —
+#      DB 호스트가 UTC로 돌아가면 그 경로로 들어온 행만 9시간 밀린다.
+# "오늘/이번 주" 같은 '날짜 경계 판정'은 반드시 이 헬퍼로 통일해 자정 경계 밀림을 막는다.
 # ⚠️ 배포 시 컨테이너 TZ=Asia/Seoul 로 고정해야 로컬 날짜 판정이 사용자 시간대와 일치한다
 #    (TZ 미고정 시 UTC 자정에 '오늘'이 하루 어긋날 수 있음).
 def today() -> date:
@@ -23,17 +29,6 @@ def now() -> datetime:
     """앱 전역 '지금' (로컬 시각, created_at 저장 규약과 일치)."""
     return datetime.now()
 
-
-def utc_to_local(dt: datetime | None) -> datetime | None:
-    """UTC-naive 저장값(코드/토큰 만료류)을 로컬(KST) 벽시계로 변환.
-
-    만료류는 UTC로 저장·비교되지만(자기 정합), 응답으로 내보낼 땐 created_at 등
-    다른 시각과 같은 로컬(KST) 벽시계여야 프론트 표시가 9시간 어긋나지 않는다.
-    사용자 노출 직렬화 직전에만 사용할 것 — 저장/비교에 쓰면 규약이 깨진다.
-    """
-    if dt is None:
-        return None
-    return dt.replace(tzinfo=timezone.utc).astimezone().replace(tzinfo=None)
 
 # 반 이름 맨 앞의 학년 숫자 ("1-2반", "1학년 2반", "3반" → 1/1/3)
 _GRADE_RE = re.compile(r"^\s*(\d+)")

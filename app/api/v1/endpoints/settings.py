@@ -135,7 +135,7 @@ def change_password(
 def logout_all(
     principal: Principal = Depends(get_current_principal), db: Session = Depends(get_db)
 ):
-    now = datetime.utcnow()
+    now = datetime.now()  # revoked_at — auth_service._now()·created_at과 같은 KST 규약
     subject_type = "student" if principal.kind == "student" else "user"
     revoked = 0
     rows = (
@@ -203,7 +203,7 @@ def delete_account(
 ):
     target = principal.student if principal.kind == "student" else principal.user
     target.status = "disabled"
-    now = datetime.utcnow()
+    now = datetime.now()  # revoked_at — auth_service._now()·created_at과 같은 KST 규약
     subject_type = "student" if principal.kind == "student" else "user"
     for token in (
         db.query(RefreshToken)

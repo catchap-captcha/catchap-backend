@@ -1,6 +1,6 @@
 import re
 import secrets
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 
 from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
@@ -34,7 +34,11 @@ CAPTCHA_FAIL_THRESHOLD = 5  # 이 횟수 이상 연속 실패하면 캡차 요�
 
 
 def _now() -> datetime:
-    return datetime.now(timezone.utc).replace(tzinfo=None)
+    # 로컬(KST) naive — created_at(app/db/base.py `_now`)과 같은 규약.
+    # 예전엔 UTC naive였다: 만료 저장·비교가 자기들끼리는 맞았지만 created_at은 KST라
+    # 같은 행 안에서 만료가 생성보다 9시간 이르게 보였고, email_verified_at·joined_at은
+    # ops.py가 KST로 쓰는 같은 컬럼이라 경로에 따라 9시간 다른 값이 섞였다.
+    return datetime.now()
 
 
 # --- 로그인 실패 카운터 (5회 이상 실패 → 캡차, 성공 → 리셋) ---
@@ -166,7 +170,10 @@ def issue_tokens(db: Session, subject_id: str, role: str, subject_type: str) -> 
             user_id=subject_id,
             subject_type=subject_type,
             token_hash=sha256_hash(refresh),
-            expires_at=expires_at.replace(tzinfo=None),
+            # create_refresh_token은 aware UTC를 준다 — astimezone()으로 로컬(KST)에
+            # 맞춘 뒤 naive로 떨어뜨려야 _now()·created_at과 같은 규약이 된다.
+            # (replace(tzinfo=None)만 하면 UTC 벽시계가 그대로 남아 9시간 이르게 만료된다)
+            expires_at=expires_at.astimezone().replace(tzinfo=None),
         )
     )
     db.commit()
@@ -882,7 +889,7 @@ def password_reset_confirm(db: Session, req: s.PasswordResetConfirm) -> None:
 # --- 코드 확인 ---
 def _assert_org_code_not_expired(org: Organization) -> None:
     """기관 코드가 만료됐으면 가입 차단 (연 1회 갱신 정책)."""
-    if org.code_expires_at is not None and org.code_expires_at < datetime.utcnow():
+    if org.code_expires_at is not None and org.code_expires_at < _now():
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
             detail="기관 코드가 만료되었어요. 기관 담당자에게 새 코드를 요청해 주세요.",

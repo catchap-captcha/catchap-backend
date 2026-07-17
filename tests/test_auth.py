@@ -418,7 +418,10 @@ def test_email_verification_expiry(client, db):
             email="expired@test.dev",
             purpose="signup",
             code_hash=sha256_hash("999999"),
-            expires_at=datetime.utcnow() - timedelta(minutes=1),
+            # 앱 쓰기경로(auth_service._now = KST)와 같은 규약이어야 "1분 전 만료"가
+            # 진짜 1분이다. utcnow면 KST 환경에서 9시간 1분 전이 돼, 만료 로직이
+            # 9시간까지 틀려도 이 테스트가 통과한다(판별력 상실).
+            expires_at=datetime.now() - timedelta(minutes=1),
         )
     )
     db.commit()

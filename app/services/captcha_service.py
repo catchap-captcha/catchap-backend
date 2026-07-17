@@ -82,7 +82,10 @@ def _consume(db: Session, kind: str, token_id: str, exp: float) -> bool:
         CaptchaConsumedToken(
             kind=kind,
             token_id=token_id,
-            expires_at=datetime.utcfromtimestamp(exp) if exp else None,
+            # epoch → 로컬(KST) naive. created_at과 같은 규약이라 같은 행에서 빼도 된다.
+            # (utcfromtimestamp면 만료가 생성보다 9시간 이르게 찍힌다 — 현재 이 값을
+            #  읽는 곳은 없지만, 나중에 만료 청소를 붙이면 그때 9시간 어긋난다)
+            expires_at=datetime.fromtimestamp(exp) if exp else None,
         )
     )
     try:

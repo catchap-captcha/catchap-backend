@@ -116,7 +116,9 @@ def get_email_code(db, email: str) -> str:
             email=email,
             purpose="signup",
             code_hash=sha256_hash(code),
-            expires_at=datetime.utcnow() + timedelta(minutes=5),
+            # 앱 쓰기경로(auth_service._now)와 같은 로컬(KST) 규약이어야 한다 —
+            # utcnow로 만들면 KST 환경에서 9시간 과거라 코드가 즉시 만료로 보인다.
+            expires_at=datetime.now() + timedelta(minutes=5),
         )
     )
     db.commit()

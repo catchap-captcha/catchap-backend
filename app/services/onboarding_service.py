@@ -7,7 +7,7 @@
 """
 
 import secrets
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 
 from fastapi import HTTPException, status
 from sqlalchemy import update as sa_update
@@ -61,7 +61,9 @@ _ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
 
 
 def _now() -> datetime:
-    return datetime.now(timezone.utc).replace(tzinfo=None)
+    # 로컬(KST) naive — created_at(app/db/base.py `_now`)·이 파일 line 46의
+    # datetime.now()와 같은 규약. 예전 UTC naive는 만료가 생성보다 9시간 일러 보였다.
+    return datetime.now()
 
 
 def _seg(n: int) -> str:

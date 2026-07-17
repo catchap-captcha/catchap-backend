@@ -54,7 +54,7 @@ def set_retain_consent(
         )
         .first()
     )
-    now = datetime.utcnow()
+    now = datetime.now()  # granted_at·withdrawn_at — created_at과 같은 KST 규약
     if retain and active is None:
         db.add(
             Consent(
@@ -165,7 +165,9 @@ def ops_aggregate(db: Session) -> dict:
 
     from sqlalchemy import func
 
-    now = datetime.utcnow()
+    # created_at은 로컬(KST) naive 저장 — utcnow로 창을 잡으면 하한(d7/d14)이 9시간 더
+    # 과거로 내려가 "최근 7일"에 실제로는 7일 9시간이 들어왔다(과다 집계).
+    now = datetime.now()
     d7 = now - timedelta(days=7)
     d14 = now - timedelta(days=14)
 

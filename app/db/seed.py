@@ -266,7 +266,7 @@ def _seed(db: Session) -> None:  # noqa: PLR0915
     student_hash = hash_password(STUDENT_PASSWORD)
     unusable_hash = hash_password(generate_token()[:32])
     today = date.today()
-    now = datetime.utcnow()
+    now = datetime.now()  # created_at(app/db/base.py `_now`)과 같은 로컬(KST) 규약
 
     # ---------------- 기관 + Institution 디렉토리 ----------------
     org = Organization(
