@@ -99,6 +99,32 @@ def question_pins(db: Session, lecture_id: str) -> list[int]:
     return sorted({int(pos) for (pos,) in rows})
 
 
+def passed_positions(db: Session, student_id: str, lecture_id: str) -> set[int]:
+    """이 학생이 이미 '통과한' 체크포인트 시점 집합 — LectureCheckpointEvent(passed)가 정본.
+
+    되감기(watched_max 감소)가 생기면서 'watched < pin = 미통과' 추정이 깨졌다: 되감긴
+    학생은 이미 통과한 핀 아래로 내려가 있다. 그 상태에서 watched 기준으로 재예약하면
+    통과한 핀이 다시 잡혀 소급 재출제된다(skeptic 실증 — 핀 간격이 REWIND_SEC보다 좁을
+    때 운영자 문항 수정 한 번으로 재현). 재예약·정합화의 '지나온 핀' 판정은 이 집합으로
+    한다 — 통과 이벤트는 verify 트랜잭션에서 원자적으로 적재되는 사실 기록이다."""
+    rows = (
+        db.query(LectureCheckpointEvent.position_sec)
+        .filter(
+            LectureCheckpointEvent.student_id == student_id,
+            LectureCheckpointEvent.lecture_id == lecture_id,
+            LectureCheckpointEvent.result == "passed",
+        )
+        .all()
+    )
+    return {int(p) for (p,) in rows}
+
+
+def reservable_pins(db: Session, student_id: str, lecture_id: str) -> list[int]:
+    """이 학생에게 새로 예약할 수 있는 핀 — active 핀에서 통과한 시점을 뺀 목록."""
+    done = passed_positions(db, student_id, lecture_id)
+    return [p for p in question_pins(db, lecture_id) if p not in done]
+
+
 def next_checkpoint(
     watched_max: int,
     duration_sec: int,
@@ -174,12 +200,18 @@ def claim_session(
 
 def ensure_progress(db: Session, student_id: str, lecture: Lecture) -> LectureWatchProgress:
     """학생·강의당 1행 진행 upsert — UniqueConstraint + IntegrityError 재조회(동시요청 안전)."""
+    # FOR UPDATE — 하트비트(advance)와 캡차 채점(record_checkpoint)이 같은 진행 행을
+    # 다른 트랜잭션에서 읽고-고쳐-쓰면 READ COMMITTED에서 lost update가 난다: 캡차를
+    # 푸는 동안 in-flight였던 하트비트가 되감기 '전' 스냅샷 기준의 큰 watched_max를
+    # 나중에 커밋해 되감기를 통째로 덮는다(skeptic CONFIRMED). 학생·강의당 1행이라
+    # 잠금 경합 비용은 미미하다. SQLite(테스트)에선 no-op.
     row = (
         db.query(LectureWatchProgress)
         .filter(
             LectureWatchProgress.student_id == student_id,
             LectureWatchProgress.lecture_id == lecture.id,
         )
+        .with_for_update()
         .first()
     )
     if row is not None:
@@ -235,7 +267,12 @@ def advance(
 
     anchor = progress.updated_at or progress.created_at
     elapsed = (now - anchor).total_seconds() if anchor else 0.0
-    allowed = elapsed * SPEED_FACTOR + HEARTBEAT_HEADROOM_SEC
+    # HEADROOM은 시작 직후(재생 1~2초의 반올림·전송 지연)에만 준다 — 매 비트에 무조건
+    # 더하면 elapsed≈0인 back-to-back 하트비트 N번이 N×HEADROOM을 공짜로 얻어, 되감기
+    # 30초가 스팸 6번에 실시청 0초로 무효화된다(skeptic 실증 — 봇의 되감기 우회).
+    # 시작 구간 밖에서는 SPEED_FACTOR(2.5배)의 여유가 지연·반올림을 이미 흡수한다.
+    headroom = HEARTBEAT_HEADROOM_SEC if watched < HEARTBEAT_HEADROOM_SEC else 0
+    allowed = elapsed * SPEED_FACTOR + headroom
     new_max = min(position, int(watched + allowed))
 
     # 예약이 비어 있으면 여기서 다시 잡는다 — next_checkpoint_sec=None은 '검증 끝'이 아니라
@@ -243,8 +280,10 @@ def advance(
     # 낡은 예약을 None으로 지우는데(lectures.py), 재예약 경로가 없으면 그 학생은 남은 강의
     # 내내 캡차가 한 번도 안 뜬다 = 시청 검증이 조용히 꺼진다(실제로 라이브에 나갔던 버그).
     # 영상을 끝까지 본 뒤에는 next_checkpoint가 다시 None을 돌려주므로 완주 판정은 그대로다.
+    # 통과한 핀은 제외(reservable_pins) — 되감긴 학생(watched < 통과한 핀)의 예약이
+    # 정합화로 풀린 경우, watched 기준만 보면 이미 통과한 핀을 다시 잡아 소급 재출제된다.
     if progress.next_checkpoint_sec is None and watched < duration:
-        pins = question_pins(db, progress.lecture_id)
+        pins = reservable_pins(db, progress.student_id, progress.lecture_id)
         progress.next_checkpoint_sec = next_checkpoint(watched, duration, pins)
 
     cp = progress.next_checkpoint_sec
@@ -296,6 +335,7 @@ def record_checkpoint(
             LectureWatchProgress.student_id == student_id,
             LectureWatchProgress.lecture_id == lecture_id,
         )
+        .with_for_update()  # 하트비트와의 lost update 차단 — ensure_progress 주석 참조
         .first()
     )
     if progress is None:
@@ -304,9 +344,15 @@ def record_checkpoint(
         lec = db.get(Lecture, lecture_id)
         progress.checkpoints_passed = int(progress.checkpoints_passed or 0) + 1
         progress.checkpoint_fails = 0  # 통과 — 연속 오답 카운터 리셋
-        base = max(int(progress.watched_max_sec or 0), int(position_sec))
+        # 재예약 기준은 '통과한 체크포인트 시점(cp)' — watched_max를 쓰면 클램프 유예로
+        # 부푼 값(cp+GRACE까지)이 (cp, cp+GRACE] 안의 다음 핀을 '이미 겪은 것'으로 오판해
+        # 그 핀이 영구 스킵된다(skeptic 실증 — position 크게 신고하는 봇이 인접 핀을 통째로
+        # 우회). cp 기준이면 그 핀이 정상 예약되고, watched가 이미 지나 있어도 다음
+        # 하트비트의 checkpoint_due가 즉시 게이트를 연다(건너뛰기 불가).
+        base = int(position_sec)
         if lec is not None:
-            pins = question_pins(db, lecture_id)
+            # 통과한 핀 제외 — watched<pin 판정은 되감기 이후 '통과'와 동치가 아니다
+            pins = reservable_pins(db, student_id, lecture_id)
             progress.next_checkpoint_sec = next_checkpoint(
                 base, int(lec.duration_sec or 0), pins
             )

@@ -56,7 +56,13 @@ from app.core.config import get_settings
 from app.core.permissions import Principal, require_ops, require_student
 from app.core.security import decode_token, new_uuid
 from app.db.session import get_db
-from app.models import Lecture, LectureMaterial, LectureQuestion, LectureWatchProgress
+from app.models import (
+    Lecture,
+    LectureCheckpointEvent,
+    LectureMaterial,
+    LectureQuestion,
+    LectureWatchProgress,
+)
 from app.services import auth_service, lecture_service
 from app.services.captcha_service import EDU_SUBJECTS
 from app.utils.helpers import audit
@@ -1104,11 +1110,14 @@ def _validate_question_timing(
     (100초 강의에 900 오타 하나면 충분 — 적대적 검토에서 실증). 목록에는 멀쩡한
     active 문항으로 보이므로 알아챌 방법이 없다.
 
-    ★ 1초 이상은 active일 때만 강제한다 — draft는 '시점 미배치'(position 0)로 두고
-    검수를 기다릴 수 있다(LLM 생성 문항의 기본 상태). 핀은 watched < pin 판정이라
-    0초 핀은 활성화돼도 영영 안 뜨므로, 공개 전에 반드시 걸러야 한다.
+    ★ 두 검사 모두 active일 때만 강제한다 — draft는 '시점 미배치·후보' 상태다.
+    범위 검사까지 draft에 걸면, 운영자가 영상 길이를 줄인 뒤(orphan 검사는 active만
+    센다) 밖에 남은 draft가 좌초한다: 프롬프트만 고치는 PUT도 영문 모를 400을 맞고,
+    그 draft는 저장 불가능한 상태로 갇힌다(skeptic 실증). 뜰 수 없는 시점은 공개
+    (활성화) 시점에 반드시 걸러진다 — 그게 이 함수가 지키는 유일한 불변식이다.
+    (0초 핀: watched < pin 판정이라 활성화돼도 영영 안 뜨므로 공개 전에 걸러야 한다.)
     """
-    if duration_sec and position_sec >= duration_sec:
+    if active and duration_sec and position_sec >= duration_sec:
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
             detail="출제 시점이 영상 길이를 벗어났습니다. 영상 안의 시점을 지정해 주세요.",
@@ -1170,8 +1179,23 @@ def _reconcile_progress(db: Session, lecture_id: str) -> None:
         unservable = unservable.filter(not_(cp_col.in_(pins)))
     unservable.update({"next_checkpoint_sec": None}, synchronize_session=False)
 
-    # ② 아직 안 닿은 핀을 통째로 건너뛰는 예약 — 핀에 정확히 걸린 예약은 유효하니 둔다
+    # ② 아직 안 닿은 핀을 통째로 건너뛰는 예약 — 핀에 정확히 걸린 예약은 유효하니 둔다.
+    #    '안 닿았다'는 watched만으로 판정하지 않는다: 되감긴 학생은 이미 통과한 핀
+    #    아래로 내려가 있어(watched < 통과한 핀 < cp), watched 기준만 쓰면 유효한 재도전
+    #    예약(cp)이 해제되고 재예약이 통과한 핀을 다시 잡는다 — 운영자가 아무 문항이나
+    #    수정해도 재현되는 소급 재출제(skeptic 실증). 통과 이벤트가 있는 핀은 건너뛴
+    #    것이 아니라 지나온 것이므로 해제 사유가 아니다.
     for pin in pins:
+        passed_this_pin = (
+            db.query(LectureCheckpointEvent.id)
+            .filter(
+                LectureCheckpointEvent.student_id == LectureWatchProgress.student_id,
+                LectureCheckpointEvent.lecture_id == lecture_id,
+                LectureCheckpointEvent.result == "passed",
+                LectureCheckpointEvent.position_sec == pin,
+            )
+            .exists()
+        )
         (
             db.query(LectureWatchProgress)
             .filter(
@@ -1179,6 +1203,7 @@ def _reconcile_progress(db: Session, lecture_id: str) -> None:
                 cp_col.isnot(None),
                 cp_col > pin,
                 LectureWatchProgress.watched_max_sec < pin,
+                not_(passed_this_pin),
             )
             .update({"next_checkpoint_sec": None}, synchronize_session=False)
         )

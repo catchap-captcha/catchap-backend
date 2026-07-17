@@ -2756,10 +2756,18 @@
           [].forEach.call(body.querySelectorAll('button'), function (b) { b.disabled = true; });
           eduFeedback(r.data || {}, correctText);
           if (onAnswered) { try { onAnswered(r.data || {}); } catch (e) {} } // 렌더러별 답변 후 표시(근거 공개 등)
-          // 소비자(게임 화면)가 진행 통계·완료 이동을 처리할 수 있게 알림
+          // 소비자(게임 화면)가 진행 통계·완료 이동을 처리할 수 있게 알림.
+          // lecture = 강의 게이트의 서버 정본(watched_max·next_checkpoint — verify가 되감기까지
+          // 반영해 돌려준다). 플레이어는 이 값으로 되감기를 판정해야 한다 — 로컬 오답 카운터는
+          // 새로고침·재진입 시 0으로 리셋돼 서버 checkpoint_fails와 어긋나고, 어긋난 채 서버만
+          // 되감으면 새 문항 요청이 409 무한 반복(게이트 교착)이 된다(skeptic CONFIRMED).
           box.dispatchEvent(new CustomEvent('catchap:answer', {
             bubbles: true,
-            detail: { correct: !!(r.data && r.data.success), session: sess || null },
+            detail: {
+              correct: !!(r.data && r.data.success),
+              session: sess || null,
+              lecture: (r.data && r.data.lecture) || null,
+            },
           }));
         } else if (r.ok && r.data.success) {
           solved(r.data.verdict_token);

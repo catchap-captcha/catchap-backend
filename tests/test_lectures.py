@@ -226,7 +226,13 @@ def test_heartbeat_normal_advance_and_speed_clamp(client, db, seed_org, media_di
 
 
 def test_heartbeat_clamps_at_checkpoint_until_captcha(client, db, seed_org, media_dir):
-    """체크포인트(cp)+유예(15초)를 넘어서는 진행은 캡차를 풀기 전까지 정지."""
+    """체크포인트(cp)+유예(15초)를 넘어서는 진행은 캡차를 풀기 전까지 정지.
+
+    wall-clock을 backdate해 '충분히 오래 본 것처럼' 만든다 — 예전처럼 하트비트 스팸으로
+    올리면 안 된다(스팸 전진은 이제 HEADROOM 미지급으로 막혀 있고, 그 회귀는
+    test_rewind_not_undone_by_heartbeat_spam이 고정한다)."""
+    from datetime import timedelta
+
     from app.services.lecture_service import GRACE_SEC
 
     ops_tok = _ops(client, db)
@@ -236,10 +242,12 @@ def test_heartbeat_clamps_at_checkpoint_until_captcha(client, db, seed_org, medi
     client.get(f"/api/v1/lectures/{lec['id']}", headers=auth(tok))  # cp=1 예약
     st = _session_token(client, tok, lec["id"])
 
-    last = 0
-    for _ in range(8):  # 헤드룸 5초/비트 — 클램프 없으면 40초까지 전진했을 것
-        r = _hb(client, tok, lec["id"], 500, st=st)
-        last = r.json()["watched_max_sec"]
+    # 60초 경과 위장 + position=500 위조 신고 — 클램프 없으면 150초까지 전진했을 것
+    row = _progress_row(db, lec["id"])
+    row.updated_at = row.updated_at - timedelta(seconds=60)
+    db.commit()
+    r = _hb(client, tok, lec["id"], 500, st=st)
+    last = r.json()["watched_max_sec"]
     assert last == 1 + GRACE_SEC, f"체크포인트 클램프 실패: watched={last}"
     assert r.json()["checkpoint_due"] is True
 
@@ -428,6 +436,170 @@ def test_lecture_checkpoint_fail_cap_rewinds_and_blocks_challenge(
         headers={"X-Site-Key": site_key, **auth(tok)},
     )
     assert blocked.status_code == 409, blocked.text
+
+
+def test_rewind_not_undone_by_heartbeat_spam(client, db, seed_org, media_dir):
+    """되감기 직후 back-to-back 하트비트 스팸이 실시청 없이 되감기를 무효화하면 안 된다.
+
+    HEADROOM(5초)이 비트마다 무조건 지급되면 elapsed≈0 스팸 N번이 N×5초를 공짜로 얻어
+    30초 되감기가 6번 만에 사라진다(skeptic 실증). 시작 구간(watched<HEADROOM) 밖에서는
+    지급하지 않으므로, 스팸으로는 wall-clock×SPEED_FACTOR만큼만 전진해야 한다."""
+    from datetime import timedelta
+
+    from app.services.lecture_service import (
+        MAX_CHECKPOINT_FAILS,
+        REWIND_SEC,
+    )
+
+    ops_tok = _ops(client, db)
+    lec = _upload_lecture(client, ops_tok, duration=1000).json()
+    _add_question(client, ops_tok, lec["id"], position=200, answer=2)
+    site_key = _edu_key(client, db, seed_org, ops_tok, first_party=True)
+    tok = _student_token(client, seed_org)
+    client.get(f"/api/v1/lectures/{lec['id']}", headers=auth(tok))
+    st = _session_token(client, tok, lec["id"])
+
+    # 200초 핀까지 도달 — 충분한 wall-clock이 지난 것으로 앵커를 backdate
+    row = _progress_row(db, lec["id"])
+    row.updated_at = row.updated_at - timedelta(seconds=120)
+    db.commit()
+    r = _hb(client, tok, lec["id"], 200, st=st)
+    assert r.json()["checkpoint_due"] is True, r.text
+
+    # 3연속 오답 → 되감기
+    for _ in range(MAX_CHECKPOINT_FAILS):
+        ch = _gate_challenge(client, site_key, tok, lec["id"])
+        _gate_verify(client, site_key, tok, ch["challenge_token"], ["0"])
+    db.expire_all()
+    row = _progress_row(db, lec["id"])
+    rewound_to = 200 - REWIND_SEC
+    assert int(row.watched_max_sec) == rewound_to
+
+    # 스팸 6번 — 실 wall-clock이 거의 0이므로 전진도 거의 0이어야 한다
+    for _ in range(6):
+        r = _hb(client, tok, lec["id"], 200, st=st)
+        assert r.status_code == 200, r.text
+    state = r.json()
+    assert state["checkpoint_due"] is False, "스팸만으로 게이트가 다시 열리면 되감기 무력화"
+    # SPEED_FACTOR×수백 ms 오차 여유 — HEADROOM(5초/비트)이 지급되면 rewound+30 이상이 된다
+    assert state["watched_max_sec"] <= rewound_to + 3, state
+
+    # 실제 시청(wall-clock 경과)으로는 cp에 다시 닿고, 같은 체크포인트가 재트리거된다
+    db.expire_all()
+    row = _progress_row(db, lec["id"])
+    row.updated_at = row.updated_at - timedelta(seconds=60)
+    db.commit()
+    r = _hb(client, tok, lec["id"], 200, st=st)
+    assert r.json()["checkpoint_due"] is True, "재시청 후 같은 체크포인트 재도전"
+    ch = _gate_challenge(client, site_key, tok, lec["id"])
+    res = _gate_verify(client, site_key, tok, ch["challenge_token"], ["2"])
+    assert res["success"] is True and res["lecture"]["next_checkpoint_sec"] is None
+
+
+def test_pass_inside_grace_still_reserves_adjacent_pin(client, db, seed_org, media_dir):
+    """GRACE 유예(cp+15초) 안에 다음 핀이 있어도 통과 후 반드시 예약된다.
+
+    재예약 기준이 watched_max(클램프로 cp+GRACE까지 부풂)면 (cp, cp+GRACE] 안의 핀이
+    '이미 겪은 것'으로 오판돼 영구 스킵된다(skeptic 실증 — position을 크게 신고하는
+    봇이 강사가 낸 인접 문항 하나를 통째로 우회). 기준을 cp로 바꾸면 예약이 잡히고,
+    watched가 이미 그 지점을 지났어도 다음 하트비트가 즉시 게이트를 연다."""
+    from datetime import timedelta
+
+    ops_tok = _ops(client, db)
+    lec = _upload_lecture(client, ops_tok, duration=1000).json()
+    _add_question(client, ops_tok, lec["id"], position=3, answer=2)
+    _add_question(client, ops_tok, lec["id"], position=10, answer=2, prompt="GRACE 안 인접 핀")
+    site_key = _edu_key(client, db, seed_org, ops_tok, first_party=True)
+    tok = _student_token(client, seed_org)
+    client.get(f"/api/v1/lectures/{lec['id']}", headers=auth(tok))
+    st = _session_token(client, tok, lec["id"])
+
+    # 봇 시나리오: position=50 과다 신고 — 클램프가 cp+GRACE(3+15=18)까지 허용
+    row = _progress_row(db, lec["id"])
+    row.updated_at = row.updated_at - timedelta(seconds=60)
+    db.commit()
+    r = _hb(client, tok, lec["id"], 50, st=st)
+    assert r.json()["checkpoint_due"] is True
+    db.expire_all()
+    row = _progress_row(db, lec["id"])
+    assert int(row.watched_max_sec) == 18, "클램프 상한(cp+GRACE)까지 부푼 상태가 전제"
+
+    # cp=3 통과 — 인접 핀 10이 예약에서 빠지면 안 된다
+    ch = _gate_challenge(client, site_key, tok, lec["id"])
+    res = _gate_verify(client, site_key, tok, ch["challenge_token"], ["2"])
+    assert res["success"] is True
+    assert res["lecture"]["next_checkpoint_sec"] == 10, "GRACE 안 인접 핀이 스킵됐다"
+
+    # watched(18)가 이미 10을 지나 있으므로 다음 하트비트가 즉시 게이트를 연다
+    r = _hb(client, tok, lec["id"], 18, st=st)
+    assert r.json()["checkpoint_due"] is True
+
+
+def test_reconcile_and_rereserve_respect_passed_pins(client, db, seed_org, media_dir):
+    """되감긴 학생의 재도전 예약은 문항 CRUD(정합화)를 견디고, 통과한 핀은 다시 안 잡힌다.
+
+    핀 간격 < REWIND_SEC이면 되감긴 학생은 이미 통과한 앞 핀 아래(watched < 앞 핀 < cp)에
+    있다. watched 기준 정합화는 이 유효 예약을 '앞 핀을 건너뛴다'고 오판해 해제하고,
+    재예약이 통과한 앞 핀을 다시 잡아 소급 재출제된다(skeptic 실증 — 운영자가 아무
+    문항이나 수정하면 재현). 통과 이벤트(LectureCheckpointEvent)가 정본이다."""
+    from datetime import timedelta
+
+    from app.services.lecture_service import MAX_CHECKPOINT_FAILS
+
+    ops_tok = _ops(client, db)
+    lec = _upload_lecture(client, ops_tok, duration=1000).json()
+    q100 = _add_question(client, ops_tok, lec["id"], position=100, answer=2, prompt="앞 핀")
+    q120 = _add_question(client, ops_tok, lec["id"], position=120, answer=2, prompt="뒤 핀")
+    site_key = _edu_key(client, db, seed_org, ops_tok, first_party=True)
+    tok = _student_token(client, seed_org)
+    client.get(f"/api/v1/lectures/{lec['id']}", headers=auth(tok))
+    st = _session_token(client, tok, lec["id"])
+
+    # 핀 100 도달·통과
+    row = _progress_row(db, lec["id"])
+    row.updated_at = row.updated_at - timedelta(seconds=60)
+    db.commit()
+    assert _hb(client, tok, lec["id"], 100, st=st).json()["checkpoint_due"] is True
+    ch = _gate_challenge(client, site_key, tok, lec["id"])
+    res = _gate_verify(client, site_key, tok, ch["challenge_token"], ["2"])
+    assert res["success"] is True and res["lecture"]["next_checkpoint_sec"] == 120
+
+    # 핀 120 도달 → 3연속 오답 → 되감기(watched=90 < 앞 핀 100 < cp=120)
+    db.expire_all()
+    row = _progress_row(db, lec["id"])
+    row.updated_at = row.updated_at - timedelta(seconds=60)
+    db.commit()
+    assert _hb(client, tok, lec["id"], 120, st=st).json()["checkpoint_due"] is True
+    for _ in range(MAX_CHECKPOINT_FAILS):
+        ch = _gate_challenge(client, site_key, tok, lec["id"])
+        _gate_verify(client, site_key, tok, ch["challenge_token"], ["0"])
+    db.expire_all()
+    row = _progress_row(db, lec["id"])
+    assert int(row.watched_max_sec) == 90 and int(row.next_checkpoint_sec) == 120
+
+    # 운영자가 '앞 핀' 문항의 프롬프트만 수정 — 되감긴 학생의 재도전 예약(120)이 살아야 한다
+    r = client.put(
+        f"/api/v1/ops/lectures/{lec['id']}/questions/{q100['id']}",
+        json={"prompt": "앞 핀(오타 수정)"},
+        headers=auth(ops_tok),
+    )
+    assert r.status_code == 200, r.text
+    db.expire_all()
+    row = _progress_row(db, lec["id"])
+    assert row.next_checkpoint_sec == 120, "정합화가 되감긴 학생의 유효 예약을 해제했다"
+
+    # 뒤 핀(120) 문항을 삭제하면 예약은 해제되지만, 재예약이 '통과한' 100을 다시 잡으면 안 된다
+    r = client.delete(
+        f"/api/v1/ops/lectures/{lec['id']}/questions/{q120['id']}",
+        headers=auth(ops_tok),
+    )
+    assert r.status_code == 200, r.text
+    db.expire_all()
+    row = _progress_row(db, lec["id"])
+    assert row.next_checkpoint_sec is None
+    state = _hb(client, tok, lec["id"], 95, st=st).json()
+    assert state["next_checkpoint_sec"] is None, "재예약이 이미 통과한 핀을 다시 잡았다(소급 재출제)"
+    assert state["checkpoint_due"] is False
 
 
 def test_lecture_challenge_is_multi_drag_and_never_leaks_explain(
@@ -688,6 +860,8 @@ def test_deleting_last_question_does_not_strand_student(client, db, seed_org, me
 
     예약만 남으면 학생은 cp+GRACE에서 클램프된 채 게이트는 4xx라 안 뜨고, 강의를 영영
     끝낼 수 없다. 문항이 없으면 '검증 없음'이 정직한 상태이지 '진행 불가'가 아니다."""
+    from datetime import timedelta
+
     from app.services.lecture_service import GRACE_SEC
 
     ops_tok = _ops(client, db)
@@ -704,9 +878,12 @@ def test_deleting_last_question_does_not_strand_student(client, db, seed_org, me
     )
     assert d.status_code == 200, d.text
 
-    # 헤드룸(5초/비트)만큼씩 여러 번 — 클램프가 남아 있으면 1+GRACE에서 멈춘다
-    for _ in range(8):
-        r = _hb(client, tok, lec["id"], 500, st=st)
+    # 충분한 wall-clock 경과 위장 — 클램프가 남아 있으면 1+GRACE에서 멈춘다
+    # (스팸으로 올리면 안 된다 — HEADROOM은 시작 구간에만 지급, 스팸 회귀는 별도 테스트)
+    row = _progress_row(db, lec["id"])
+    row.updated_at = row.updated_at - timedelta(seconds=60)
+    db.commit()
+    r = _hb(client, tok, lec["id"], 500, st=st)
     assert r.json()["next_checkpoint_sec"] is None, "낼 문항이 없는데 예약이 남았다"
     assert r.json()["checkpoint_due"] is False
     assert r.json()["watched_max_sec"] > 1 + GRACE_SEC, "예약이 걷혔는데도 클램프에 갇혔다"
