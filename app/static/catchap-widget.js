@@ -71,7 +71,10 @@
       + '@keyframes ccPop{0%{transform:scale(.6);opacity:.2}60%{transform:scale(1.08)}100%{transform:scale(1);opacity:1}}'
       // 로딩 스켈레톤 펄스 — reduced-motion이면 아래 미디어쿼리가 정지시킨다
       + '@keyframes ccPulse{0%,100%{opacity:.45}50%{opacity:.95}}'
-      + '@media (prefers-reduced-motion: reduce){[data-catchap-root] .cc-skel{animation:none !important}}'
+      // 담기 그릇 오답 흔들림 — "여기가 틀렸어요"를 위치로 말한다(문구는 피드백 스트립 담당)
+      + '@keyframes ccShake{0%,100%{transform:translateX(0)}20%,60%{transform:translateX(-7px)}40%,80%{transform:translateX(7px)}}'
+      + '@media (prefers-reduced-motion: reduce){[data-catchap-root] .cc-skel{animation:none !important}'
+      + '[data-catchap-root] .cc-anim{animation:none !important}}'
       // 키보드 포커스 링 — 키보드 탐색(focus-visible)에만 또렷하게, 마우스 클릭엔 안 뜬다
       + '[data-catchap-root] button:focus-visible,[data-catchap-root] [tabindex]:focus-visible,'
       + '[data-catchap-root] input:focus-visible{outline:3px solid #FF5A4D;outline-offset:2px}';
@@ -424,6 +427,7 @@
     }
 
     var lastOptions = [], lastType = '', answered = false;
+    var bowlEl = null; // multi 담기 그릇 — eduFeedback이 정오답 반응(흔들림/틴트)을 줄 대상
     var hintSlot = null; // 공통 셸이 프롬프트·맥락 아래(보기 위)에 미리 놓는 힌트 자리 —
     // 각 렌더러의 hintLine(d.hint) 호출이 여기 채워져 '문제→힌트→보기' 순서로 읽힌다.
 
@@ -501,6 +505,20 @@
       var fb = h('div');
       var okAns = res.success;
       sfx(okAns ? 'correct' : 'wrong');
+      // 담기 그릇(multi boxLabel) 반응 — 정오답을 위치로도 말한다: 오답이면 그릇이
+      // 흔들리고(reduced-motion이면 .cc-anim 미디어쿼리가 정지), 정답이면 초록 틴트.
+      if (bowlEl) {
+        if (okAns) {
+          bowlEl.style.borderColor = OK; bowlEl.style.borderStyle = 'solid';
+          bowlEl.style.background = T.color.okSoft;
+        } else {
+          bowlEl.style.borderColor = T.color.err;
+          bowlEl.className = 'cc-anim';
+          bowlEl.style.animation = 'none';
+          void bowlEl.offsetWidth; // 리플로우로 애니메이션 재시작(연속 오답에도 매번 흔들리게)
+          bowlEl.style.animation = 'ccShake .45s ease-in-out';
+        }
+      }
       if (lectureMode) {
         // 강의 시청 검증 — 간결 피드백만. 다음 문제/결과 버튼 없음(진행은 플레이어가
         // catchap:answer로 담당), 정답·해설 텍스트도 미노출(오답은 새 문항으로 재도전).
@@ -1919,7 +1937,7 @@
       // retry_count가 실제 재시도 횟수를 반영한다(통과 시 위젯 세션 종료로 자연 소멸).
       renderedAt = Date.now(); redoCount = 0; traceReset();
       if (idleGate) hideIdleGate();  // 새 문항 — 이전 게이트 정리
-      lastType = d.type; answered = false; grading = false; renderSeq += 1;
+      lastType = d.type; answered = false; grading = false; renderSeq += 1; bowlEl = null;
       timerStart();  // 활성 시간(방치 제외) 계측 — answered 리셋 뒤라야 idle 타이머가 켜진다
       lastOptions = []; // 이전 문항 보기가 새 문항 피드백(정답 텍스트 매칭)에 누출되지 않게
       onAnswered = null;
@@ -1961,7 +1979,7 @@
       // 강의 모드: 게이트 카드 폭에 맞춘 컴팩트 중앙 정렬(18px) — 스크롤 없이 다 보이게.
       css(prompt, lectureMode
         ? { fontWeight: '800', fontSize: '18px', lineHeight: '1.45', color: T.color.ink,
-            marginBottom: '14px', textAlign: 'center', maxWidth: '32ch', marginLeft: 'auto', marginRight: 'auto' }
+            marginBottom: '10px', textAlign: 'center', maxWidth: '32ch', marginLeft: 'auto', marginRight: 'auto' }
         : footerOn
         ? { fontWeight: '800', fontSize: '22px', lineHeight: '1.4', color: T.color.ink,
             marginBottom: '18px', textAlign: 'center', maxWidth: '30ch', marginLeft: 'auto', marginRight: 'auto' }
@@ -1978,9 +1996,9 @@
         pim.src = mediaUrl(d.prompt_image);
         pim.alt = '문제 이미지';
         pim.loading = 'lazy';
-        css(pim, { display: 'block', maxWidth: '100%', maxHeight: lectureMode ? '190px' : '260px',
-          margin: '0 auto 16px', borderRadius: T.radius.md, border: '1px solid ' + T.color.line,
-          objectFit: 'contain' });
+        css(pim, { display: 'block', maxWidth: '100%', maxHeight: lectureMode ? '150px' : '260px',
+          margin: lectureMode ? '0 auto 12px' : '0 auto 16px', borderRadius: T.radius.md,
+          border: '1px solid ' + T.color.line, objectFit: 'contain' });
         body.appendChild(pim);
       }
 
@@ -2058,8 +2076,8 @@
           oim.src = mediaUrl(o.image);
           oim.alt = o.text || '보기 이미지';
           oim.loading = 'lazy';
-          css(oim, { display: 'block', width: '100%', maxHeight: '120px', objectFit: 'contain',
-            borderRadius: T.radius.sm, pointerEvents: 'none' });
+          css(oim, { display: 'block', width: '100%', maxHeight: lectureMode ? '96px' : '120px',
+            objectFit: 'contain', borderRadius: T.radius.sm, pointerEvents: 'none' });
           el.appendChild(oim);
           if (o.text) {
             var ocap = h('div'); ocap.textContent = o.text;
@@ -2124,36 +2142,96 @@
         }
       } else if (d.type === 'multi') {
         // 복수선택(교육형) — 보기 토글 후 확인 제출, 서버가 집합 비교로 채점.
-        // 원본 pick(담기 상자)·touch(폰 화면) 프레이밍 복원: boxLabel이 있으면 상자로
+        // 원본 pick(담기 그릇)·touch(폰 화면) 프레이밍: boxLabel이 있으면 그릇으로
         // 끌어 담기(+탭 토글 폴백), screenTitle이 있으면 폰 화면 프레임 안에 보기 배치.
+        // 강의 게이트가 이 경로를 쓴다 — 담은 보기는 목록에서 사라지는 대신 '담았어요'
+        // 고스트 슬롯로 남아 레이아웃이 점프하지 않고, 탭 한 번으로 회수된다.
         lastOptions = d.options || [];
         var mPicked = {};
-        var mBtns = [];
+        var mBtns = [], mBadges = [];
         var mDnd = d.boxLabel ? makeDnd() : null;
-        var mBoxChips = null;
+        var mBoxChips = null, mGhost = null, mCountEl = null, mSubmit = null;
+        function mCountPicked() {
+          return Object.keys(mPicked).filter(function (k) { return mPicked[k]; }).length;
+        }
+        function mSyncSubmit() {
+          if (!mSubmit || answered || grading) return;
+          var n = mCountPicked();
+          mSubmit.disabled = n === 0;
+          mSubmit.textContent = n === 0
+            ? (mDnd ? '보기를 그릇에 담아 주세요' : '답을 골라 주세요')
+            : '확인';
+          css(mSubmit, { opacity: n === 0 ? '0.55' : '1', cursor: n === 0 ? 'not-allowed' : 'pointer' });
+        }
         function mPaintBox() {
           if (!mBoxChips) return;
           mBoxChips.innerHTML = '';
+          var n = mCountPicked();
+          if (mGhost) mGhost.style.display = n ? 'none' : '';
+          if (mCountEl) {
+            mCountEl.style.display = n ? '' : 'none';
+            mCountEl.textContent = '담은 답 ' + n;
+          }
           lastOptions.forEach(function (o) {
             if (!mPicked[o.id]) return;
-            var chip = h('div'); chip.textContent = (o.emoji ? o.emoji + ' ' : '') + o.text;
-            css(chip, { fontSize: T.font.sm, fontWeight: '700', padding: '7px 11px', margin: '3px',
-              minHeight: '34px', display: 'flex', alignItems: 'center',
-              background: T.color.card, border: '1.5px solid ' + C, borderRadius: T.radius.sm, cursor: 'pointer', color: T.color.ink });
+            // 담긴 보기 칩 — 이미지 보기는 썸네일로(텍스트가 빈 그림 전용 보기도 빈 칩이 안 된다),
+            // ✕는 '탭하면 꺼내진다'를 눈에 보이게 하는 어포던스. 버튼이라 키보드로도 회수된다.
+            var chip = h('button');
+            chip.type = 'button';
+            chip.className = 'cc-anim';
+            chip.setAttribute('aria-label', '그릇에서 꺼내기: ' + (o.text || '그림 보기'));
+            css(chip, { display: 'inline-flex', alignItems: 'center', gap: '7px', margin: '3px',
+              padding: o.image && !o.text ? '5px 9px 5px 5px' : '7px 12px',
+              minHeight: '38px', background: T.color.card, border: '1.5px solid ' + C,
+              borderRadius: T.radius.pill, cursor: 'pointer', color: T.color.ink,
+              fontWeight: '700', fontSize: T.font.sm, fontFamily: 'inherit',
+              boxShadow: '0 2px 8px -4px rgba(120,90,70,.35)',
+              animation: 'ccPop .28s ease-out' });
+            if (o.image) {
+              var ci = h('img'); ci.src = mediaUrl(o.image); ci.alt = '';
+              css(ci, { width: '28px', height: '28px', objectFit: 'cover',
+                borderRadius: '8px', pointerEvents: 'none', display: 'block' });
+              chip.appendChild(ci);
+            }
+            if (o.emoji || o.text) {
+              var ct = h('span'); ct.textContent = (o.emoji ? o.emoji + ' ' : '') + (o.text || '');
+              chip.appendChild(ct);
+            }
+            var cx = h('span'); cx.textContent = '✕'; cx.setAttribute('aria-hidden', 'true');
+            css(cx, { fontSize: '11px', fontWeight: '800', color: T.color.inkMute });
+            chip.appendChild(cx);
             chip.onclick = function () { if (answered) return; mToggle(o, false); };
             mBoxChips.appendChild(chip);
           });
+          // 이미지 문항처럼 카드가 세로로 넘칠 때 — 담는 순간 그릇·확인 버튼이 시야에
+          // 들어오게 최소 스크롤(nearest). 담긴 게 없으면 건드리지 않는다.
+          if (lectureMode && n > 0 && bowlEl && bowlEl.scrollIntoView) {
+            try { bowlEl.scrollIntoView({ block: 'nearest', behavior: 'smooth' }); } catch (e) {}
+          }
         }
         function mToggle(o, on) {
           if (answered) return;
           mPicked[o.id] = on == null ? !mPicked[o.id] : on;
-          var mb = mBtns[lastOptions.indexOf(o)];
-          if (mb) { mb.style.borderColor = mPicked[o.id] ? C : T.color.line; mb.style.background = mPicked[o.id] ? T.color.brandSoft : T.color.card;
+          var idx = lastOptions.indexOf(o);
+          var mb = mBtns[idx];
+          if (mb) {
             mb.setAttribute('aria-pressed', mPicked[o.id] ? 'true' : 'false');
-            if (mBoxChips) mb.style.display = mPicked[o.id] ? 'none' : ''; }
+            if (mBoxChips) {
+              // 그릇 모드 — 담긴 보기는 고스트 슬롯(자리 유지·점선 테두리·'담았어요' 덮개).
+              // display:none으로 빼면 그리드가 점프해 다음 드래그 목표가 움직인다.
+              mb.style.borderStyle = mPicked[o.id] ? 'dashed' : 'solid';
+              mb.style.borderColor = mPicked[o.id] ? T.color.brandLine : T.color.line;
+              mb.style.background = mPicked[o.id] ? T.color.cream : T.color.card;
+              if (mBadges[idx]) mBadges[idx].style.display = mPicked[o.id] ? 'flex' : 'none';
+            } else {
+              mb.style.borderColor = mPicked[o.id] ? C : T.color.line;
+              mb.style.background = mPicked[o.id] ? T.color.brandSoft : T.color.card;
+            }
+          }
           mPaintBox();
+          mSyncSubmit();
           if (footerOn) {
-            var mn = Object.keys(mPicked).filter(function (k) { return mPicked[k]; }).length;
+            var mn = mCountPicked();
             footerState(mn > 0, mn > 0);
           }
         }
@@ -2173,7 +2251,9 @@
           ? { display: 'grid', gap: '8px', padding: '12px' }
           : (footerOn
             ? { display: 'flex', flexWrap: 'wrap', justifyContent: 'center', gap: '12px' }
-            : { display: 'grid', gap: '8px' }));
+            // 게이트·컴팩트 — 2열 자동 그리드(카드 폭을 살리고 드래그 거리도 줄인다)
+            : { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))',
+                gap: '10px', maxWidth: '470px', margin: '0 auto', width: '100%' }));
         lastOptions.forEach(function (o) {
           var mb = h('button');
           mb.setAttribute('aria-pressed', 'false');
@@ -2186,15 +2266,27 @@
                   border: '2px solid ' + T.color.line, borderRadius: '14px', background: T.color.card,
                   cursor: 'pointer', fontSize: '16px', fontWeight: '700', color: T.color.ink,
                   fontFamily: 'inherit', transition: 'border-color .15s, background .15s' }
-              : { textAlign: 'left', padding: '13px 15px', minHeight: T.tap, border: '2px solid ' + T.color.line,
-                  borderRadius: T.radius.md, background: T.color.card, cursor: 'pointer', fontSize: T.font.md,
-                  fontWeight: '700', color: T.color.ink, fontFamily: 'inherit',
-                  transition: 'border-color .15s, background .15s' }));
+              : { textAlign: 'center', padding: '14px 12px', minHeight: T.tap, border: '2px solid ' + T.color.line,
+                  borderRadius: '14px', background: T.color.card, cursor: 'pointer', fontSize: T.font.md,
+                  fontWeight: '700', color: T.color.ink, fontFamily: 'inherit', position: 'relative',
+                  boxShadow: '0 2px 10px -8px rgba(120,90,70,.5)',
+                  transition: 'border-color .15s, background .15s, box-shadow .15s' }));
           if (mDnd) {
+            // '담았어요' 덮개 — 고스트 슬롯 상태의 라벨(보기 내용 위에 반투명으로 겹친다)
+            var mbBadge = h('span');
+            mbBadge.textContent = '그릇에 담았어요 ✓';
+            mbBadge.setAttribute('aria-hidden', 'true');
+            css(mbBadge, { position: 'absolute', inset: '0', display: 'none', alignItems: 'center',
+              justifyContent: 'center', fontSize: '12.5px', fontWeight: '800', color: C,
+              background: 'rgba(255,250,244,0.9)', borderRadius: 'inherit', pointerEvents: 'none' });
+            mb.style.position = 'relative';
+            mb.appendChild(mbBadge);
+            mBadges.push(mbBadge);
             mDnd.drag(mb, { disabled: function () { return answered; },
               onDrop: function () { mToggle(o, true); },
               onTap: function () { mToggle(o); } });
           } else {
+            mBadges.push(null);
             mb.onclick = function () { mToggle(o); };
           }
           mBtns.push(mb);
@@ -2202,35 +2294,70 @@
         });
         (mFrame || body).appendChild(mOpts);
         if (d.boxLabel) {
-          // 담기 상자 — 원본 pick: 보기 칩을 상자로 끌어다 담는다(칩 탭으로 회수)
+          // 담기 그릇 — 이 화면의 시그니처. 비면 발자국+안내 고스트가 자리를 지키고,
+          // 드래그가 다가오면 코랄 실선으로 벌어지듯 커지며(scale), 칩은 ccPop으로 안착한다.
           var mBox = h('div');
-          css(mBox, { border: '2px dashed #E0D3C4', borderRadius: '12px', padding: '8px', minHeight: '64px',
-            textAlign: 'center', maxWidth: '420px', margin: '12px auto 0', cursor: 'pointer' });
-          var mLab = h('div'); mLab.textContent = d.boxLabel;
-          css(mLab, { fontSize: '13px', fontWeight: '800', color: '#8A8070', marginBottom: '4px' });
-          mBoxChips = h('div'); css(mBoxChips, { display: 'flex', flexWrap: 'wrap', justifyContent: 'center' });
-          mBox.appendChild(mLab); mBox.appendChild(mBoxChips);
-          mDnd.addZone(mBox, '__box__', function (on) { mBox.style.borderColor = on ? C : '#E0D3C4'; mBox.style.background = on ? '#FFF6F3' : ''; });
+          css(mBox, { border: '2.5px dashed ' + T.color.lineSoft, borderRadius: '18px',
+            padding: '8px 12px 10px', minHeight: '78px', textAlign: 'center',
+            maxWidth: '470px', margin: '12px auto 0', cursor: 'pointer', position: 'relative',
+            background: T.color.cream, boxSizing: 'border-box',
+            transition: 'border-color .15s, background .15s, transform .15s' });
+          mCountEl = h('div');
+          css(mCountEl, { position: 'absolute', top: '-9px', left: '14px', display: 'none',
+            fontSize: '11px', fontWeight: '800', color: C, background: '#fff',
+            border: '1.5px solid ' + T.color.brandLine, borderRadius: T.radius.pill,
+            padding: '2px 9px', lineHeight: '1.4' });
+          mGhost = h('div');
+          mGhost.textContent = '🐾 ' + d.boxLabel;
+          css(mGhost, { fontSize: '14px', fontWeight: '700', color: T.color.inkFaint,
+            padding: '15px 6px', lineHeight: '1.5' });
+          mBoxChips = h('div');
+          css(mBoxChips, { display: 'flex', flexWrap: 'wrap', justifyContent: 'center', minHeight: '0' });
+          mBox.appendChild(mCountEl); mBox.appendChild(mBoxChips); mBox.appendChild(mGhost);
+          mDnd.addZone(mBox, '__box__', function (on) {
+            mBox.style.borderColor = on ? C : T.color.lineSoft;
+            mBox.style.borderStyle = on ? 'solid' : 'dashed';
+            mBox.style.background = on ? T.color.brandSoft : T.color.cream;
+            mBox.style.transform = on ? 'scale(1.02)' : 'scale(1)';
+          });
           body.appendChild(mBox);
-          if (d.boxHint) { var mbh = h('div'); mbh.textContent = '💡 ' + d.boxHint; css(mbh, { textAlign: 'center', fontSize: '12px', color: '#8A8070', marginTop: '6px' }); body.appendChild(mbh); }
+          bowlEl = mBox; // eduFeedback의 정오답 반응 대상(오답 흔들림·정답 틴트)
+          if (d.boxHint) {
+            var mbh = h('div'); mbh.textContent = d.boxHint;
+            css(mbh, { textAlign: 'center', fontSize: T.font.xs, color: T.color.inkMute,
+              marginTop: '8px', maxWidth: '470px', marginLeft: 'auto', marginRight: 'auto' });
+            body.appendChild(mbh);
+          }
         }
         function submitMulti() {
           var mAns = Object.keys(mPicked).filter(function (k) { return mPicked[k]; });
-          if (!mAns.length) return; // 아무것도 안 고르고 제출 방지
+          if (!mAns.length) return; // 아무것도 안 고르고 제출 방지(버튼도 비활성)
+          if (mSubmit) { // 게이트엔 상태 표시(head)가 없다 — 제출 중임을 버튼이 직접 말한다
+            mSubmit.disabled = true;
+            mSubmit.textContent = '확인 중…';
+            css(mSubmit, { opacity: '0.7', cursor: 'wait' });
+          }
           verify(token, mAns);
         }
         if (footerOn) {
           pendingRedo = function () {
             mPicked = {};
-            mBtns.forEach(function (mb) { mb.style.borderColor = T.color.line; mb.style.background = T.color.card; mb.style.display = ''; mb.setAttribute('aria-pressed', 'false'); });
+            mBtns.forEach(function (mb, i) {
+              mb.style.borderColor = T.color.line; mb.style.borderStyle = 'solid';
+              mb.style.background = T.color.card; mb.setAttribute('aria-pressed', 'false');
+              if (mBadges[i]) mBadges[i].style.display = 'none';
+            });
             mPaintBox();
             footerState(false, false);
           };
           pendingSubmit = submitMulti;
         } else {
-          var mSubmit = h('button'); mSubmit.textContent = '확인'; css(mSubmit, btnStyle(C, '#fff'));
+          mSubmit = h('button'); css(mSubmit, btnStyle(C, '#fff'));
+          css(mSubmit, { borderRadius: T.radius.pill, maxWidth: '470px', display: 'block',
+            margin: '12px auto 0', transition: 'opacity .15s' });
           mSubmit.onclick = submitMulti;
           body.appendChild(mSubmit);
+          mSyncSubmit();
         }
         if (d.hint) hintLine(d.hint);
       } else if (d.type === 'connect') {
