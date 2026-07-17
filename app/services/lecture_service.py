@@ -73,13 +73,16 @@ SESSION_TTL_SEC = 30
 
 # ---- 오답 상한(되감기) ----
 # 한 체크포인트에서 이 횟수만큼 연속 오답하면, 그 대목을 다시 보도록 watched_max를
-# REWIND_SEC만큼 되감는다. 되감기 전에는 오답 → 재발급이 무한 반복돼 보기 전수 대입이
+# 되감는다. 되감기 전에는 오답 → 재발급이 무한 반복돼 보기 전수 대입이
 # 대가 없이 가능했다. 되감으면 watched_max < cp가
 # 되어 _lecture_challenge가 409로 새 문항 발급을 거부한다 — 실제로 다시 시청해 cp까지
 # 올라와야(실시간 하트비트) 다음 문항을 받는다. 학습적으로도 옳다: 세 번 틀렸다는 건
 # 그 대목을 다시 봐야 한다는 뜻이다. (프론트 상수 MAX_CHECKPOINT_FAILS와 맞춰 둘 것)
 MAX_CHECKPOINT_FAILS = 3
-# 되감기 폭(초) — 문항이 다루는 대목(cp 직전)을 다시 듣기에 충분한 길이.
+# 되감기 폭 '폴백'(초) — 문항에 내용 시작 시점(content_start_sec)이 지정돼 있으면 그리로
+# 되감고(강사가 아는 사실 — 대목의 시작), 미지정 문항만 cp-REWIND_SEC로 되감는다.
+# 30이라는 값 자체는 근거가 없다(대목 길이는 문항마다 다르다) — 그래서 정본을 문항별
+# 필드로 옮겼고, 이 상수는 미지정 문항의 보수적 기본값으로만 남는다.
 REWIND_SEC = 30
 
 
@@ -316,10 +319,18 @@ def advance(
 
 
 def record_checkpoint(
-    db: Session, *, student_id: str, lecture_id: str, position_sec: int, passed: bool
+    db: Session,
+    *,
+    student_id: str,
+    lecture_id: str,
+    position_sec: int,
+    passed: bool,
+    rewind_to_sec: int | None = None,
 ) -> LectureWatchProgress | None:
     """체크포인트 캡차 결과 기록 — 이벤트 적재 + 통과 시 카운트 증가·다음 지점 재예약.
 
+    rewind_to_sec = 오답 상한 도달 시 되감을 지점(문항의 content_start_sec — 호출자가
+    출제된 문항에서 해석해 전달). None이면 max(0, cp - REWIND_SEC) 폴백.
     반환은 갱신된 진행 행(없으면 None). commit은 호출자 책임."""
     db.add(
         LectureCheckpointEvent(
@@ -369,7 +380,14 @@ def record_checkpoint(
         fails = int(progress.checkpoint_fails or 0) + 1
         if fails >= MAX_CHECKPOINT_FAILS:
             cp = int(position_sec)
-            progress.watched_max_sec = max(0, cp - REWIND_SEC)
+            if rewind_to_sec is not None:
+                # 문항이 지정한 내용 시작 시점 — 반드시 cp '앞'으로 클램프한다. cp 이상으로
+                # '되감으면' watched >= cp 그대로라 게이트가 즉시 재발급되고, 재시청 없는
+                # 무한 재도전(브루트포스)이 부활한다. 생성/수정 검증이 < position을 강제하지만
+                # 서비스는 호출자를 믿지 않는다(방어적 클램프 — 레거시 데이터·경로 추가 대비).
+                progress.watched_max_sec = min(max(0, int(rewind_to_sec)), max(0, cp - 1))
+            else:
+                progress.watched_max_sec = max(0, cp - REWIND_SEC)
             progress.checkpoint_fails = 0
             # 앵커 갱신 필수 — 없으면 게이트가 열려 있던 동안 늘어난 elapsed로 allowed가
             # 부풀어, 되감긴 watched_max가 다음 하트비트 한 번에 cp로 다시 튀어 오른다

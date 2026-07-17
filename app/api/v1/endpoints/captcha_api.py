@@ -388,7 +388,10 @@ def _lecture_challenge(db: Session, request: Request, api: ApiKey, lecture_id: s
     prompt_ref = payload.get("prompt_image")
     if isinstance(prompt_ref, dict) and prompt_ref.get("id"):
         public["prompt_image"] = _question_image_url(lec.id, q.id, prompt_ref)
-    meta = {"subj": lec.subject, "lec": lec.id, "cp": cp, "bank": True}
+    # qid — 오답 상한 도달 시 '이 문항'의 내용 시작 시점(content_start_sec)으로 되감기
+    # 위해 어떤 문항이 출제됐는지 서명 토큰에 봉인한다(cp 역조회는 레거시 중복 핀 때문에
+    # 모호하고, 클라이언트 신고는 신뢰하지 않는다).
+    meta = {"subj": lec.subject, "lec": lec.id, "cp": cp, "qid": q.id, "bank": True}
     # NULL이면 [answer_index] — 하위호환 규약(기존 행 무변경). select_all은 집합 정확 일치
     # 채점이라 부분 선택·초과 선택은 오답, 단일 정답이면 1개만 담아 제출하면 통과한다.
     ids = q.answer_indexes or [q.answer_index]
@@ -535,7 +538,7 @@ def _verify_lecture_checkpoint(
     next_checkpoint_sec 일치를 검증해 오래된 토큰 재사용(이미 지난 체크포인트로
     카운트 올리기)을 차단한다. 행동데이터는 source_type='lecture'로 적재.
     """
-    from app.models import LectureWatchProgress
+    from app.models import LectureQuestion, LectureWatchProgress
     from app.services import lecture_service
 
     if not api.first_party:
@@ -568,9 +571,17 @@ def _verify_lecture_checkpoint(
         behavior=behavior,
         correct=success,
     )
+    # 오답 시 되감을 지점 — 토큰에 봉인된 qid의 문항이 지정한 내용 시작 시점.
+    # 미지정(None)이면 record_checkpoint가 cp-REWIND_SEC 폴백을 쓴다. 문항이 그새
+    # 지워졌거나 구버전 토큰(qid 없음)이어도 폴백으로 안전하게 동작한다.
+    rewind_to = None
+    if not success and meta.get("qid"):
+        q = db.get(LectureQuestion, str(meta["qid"]))
+        if q is not None and q.content_start_sec is not None:
+            rewind_to = int(q.content_start_sec)
     updated = lecture_service.record_checkpoint(
         db, student_id=student.id, lecture_id=lecture_id,
-        position_sec=int(cp or 0), passed=success,
+        position_sec=int(cp or 0), passed=success, rewind_to_sec=rewind_to,
     )
     return {
         "watched_max_sec": int(updated.watched_max_sec or 0),

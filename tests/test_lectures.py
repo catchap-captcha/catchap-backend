@@ -113,7 +113,7 @@ def _hb(client, tok, lecture_id, position, *, st, **extra):
 
 def _add_question(
     client, ops_tok, lecture_id, *, position=1, answer=2, answer_indexes=None,
-    status="active", prompt="강의에서 설명한 내용은?",
+    status="active", prompt="강의에서 설명한 내용은?", content_start=None,
 ):
     """핀 문항 추가 — 기본은 1초 고정(하트비트 헤드룸 5초 안이라 한 비트로 닿는다)."""
     body = {
@@ -124,6 +124,8 @@ def _add_question(
         "explain": "강의 앞부분에서 설명했어요.",
         "status": status,
     }
+    if content_start is not None:
+        body["content_start_sec"] = content_start
     if answer_indexes is not None:
         body["answer_indexes"] = answer_indexes
     r = client.post(
@@ -494,6 +496,199 @@ def test_rewind_not_undone_by_heartbeat_spam(client, db, seed_org, media_dir):
     ch = _gate_challenge(client, site_key, tok, lec["id"])
     res = _gate_verify(client, site_key, tok, ch["challenge_token"], ["2"])
     assert res["success"] is True and res["lecture"]["next_checkpoint_sec"] is None
+
+
+def test_rewind_lands_at_question_content_start(client, db, seed_org, media_dir):
+    """문항이 내용 시작 시점을 지정하면 되감기는 폴백(cp-30)이 아니라 정확히 거기로 간다.
+
+    되감기의 목적은 '그 문항이 다루는 대목의 재시청'이고, 대목의 시작은 문항의 속성이다.
+    content_start=185(폴백이면 170)로 두 값이 갈리게 해 어느 경로를 탔는지 판별한다."""
+    from datetime import timedelta
+
+    from app.services.lecture_service import MAX_CHECKPOINT_FAILS
+
+    ops_tok = _ops(client, db)
+    lec = _upload_lecture(client, ops_tok, duration=1000).json()
+    _add_question(client, ops_tok, lec["id"], position=200, answer=2, content_start=185)
+    site_key = _edu_key(client, db, seed_org, ops_tok, first_party=True)
+    tok = _student_token(client, seed_org)
+    client.get(f"/api/v1/lectures/{lec['id']}", headers=auth(tok))
+    st = _session_token(client, tok, lec["id"])
+
+    row = _progress_row(db, lec["id"])
+    row.updated_at = row.updated_at - timedelta(seconds=120)
+    db.commit()
+    assert _hb(client, tok, lec["id"], 200, st=st).json()["checkpoint_due"] is True
+
+    for _ in range(MAX_CHECKPOINT_FAILS):
+        ch = _gate_challenge(client, site_key, tok, lec["id"])
+        res = _gate_verify(client, site_key, tok, ch["challenge_token"], ["0"])
+    assert res["lecture"]["watched_max_sec"] == 185, "지정한 내용 시작이 아니라 폴백으로 되감겼다"
+    db.expire_all()
+    row = _progress_row(db, lec["id"])
+    assert int(row.watched_max_sec) == 185
+    assert int(row.next_checkpoint_sec) == 200  # 같은 체크포인트 재도전 유지
+
+
+def test_rewind_min_boundary_cp1_cs0(client, db, seed_org, media_dir):
+    """최소 경계 — cp=1 문항의 유일한 유효 내용 시작(cs=0)이 저장되고 실제로 되감긴다.
+
+    클램프 min(max(0, cs), max(0, cp-1)) = min(0, 0) = 0 < cp=1 — 게이트가 닫히고
+    재시청이 강제됨을 경계값에서 고정한다(0 <= cs < position 검증의 하한)."""
+    from app.services.lecture_service import MAX_CHECKPOINT_FAILS
+
+    ops_tok = _ops(client, db)
+    lec = _upload_lecture(client, ops_tok).json()
+    _add_question(client, ops_tok, lec["id"], position=1, answer=2, content_start=0)
+    site_key = _edu_key(client, db, seed_org, ops_tok, first_party=True)
+    tok = _student_token(client, seed_org)
+    _reach_checkpoint(client, tok, lec["id"])
+
+    for _ in range(MAX_CHECKPOINT_FAILS):
+        ch = _gate_challenge(client, site_key, tok, lec["id"])
+        res = _gate_verify(client, site_key, tok, ch["challenge_token"], ["0"])
+    assert res["lecture"]["watched_max_sec"] == 0
+    db.expire_all()
+    row = _progress_row(db, lec["id"])
+    assert int(row.watched_max_sec) == 0 and int(row.next_checkpoint_sec) == 1
+    # 되감겼으니 새 발급은 409 — 재시청 강제(무한 재도전 부활 없음)
+    blocked = client.post(
+        f"/api/v1/captcha/v1/challenge?lecture={lec['id']}",
+        headers={"X-Site-Key": site_key, **auth(tok)},
+    )
+    assert blocked.status_code == 409, blocked.text
+
+
+def test_rewind_clamped_when_question_moved_mid_challenge(client, db, seed_org, media_dir):
+    """발급~채점 사이 문항 시점 이동 경합 — 낡은 content_start가 와도 클램프가 cp 앞을 보장.
+
+    챌린지 토큰(qid 봉인) 발급 후 강사가 그 문항을 position=500·content_start=490으로
+    옮기면, 뒤늦게 도착한 오답 verify의 rewind_to(490)는 현재 cp(200) 기준으로는 '앞으로
+    감기'다. min(rewind_to, cp-1) 클램프가 199로 눌러 watched < cp(재시청 강제)를 지킨다 —
+    이 방어선이 완화되면 되감기 없는 무한 재도전이 부활하므로 회귀로 고정한다.
+    (cp가 유효하게 남는 전제는 같은 시점의 레거시 중복 핀 — API 가드 이전 데이터를
+    직접 삽입으로 재현한다.)"""
+    from app.models import LectureQuestion
+    from app.services.lecture_service import MAX_CHECKPOINT_FAILS
+
+    ops_tok = _ops(client, db)
+    lec = _upload_lecture(client, ops_tok, duration=1000).json()
+    qa = _add_question(client, ops_tok, lec["id"], position=200, answer=2, content_start=180)
+    site_key = _edu_key(client, db, seed_org, ops_tok, first_party=True)
+    tok = _student_token(client, seed_org)
+    client.get(f"/api/v1/lectures/{lec['id']}", headers=auth(tok))
+    st = _session_token(client, tok, lec["id"])
+
+    from datetime import timedelta
+
+    row = _progress_row(db, lec["id"])
+    row.updated_at = row.updated_at - timedelta(seconds=120)
+    db.commit()
+    assert _hb(client, tok, lec["id"], 200, st=st).json()["checkpoint_due"] is True
+
+    # 상한 직전까지 오답 — qid=qa(이 시점의 유일한 문항)
+    for _ in range(MAX_CHECKPOINT_FAILS - 1):
+        ch = _gate_challenge(client, site_key, tok, lec["id"])
+        _gate_verify(client, site_key, tok, ch["challenge_token"], ["0"])
+    # 마지막 챌린지를 '이동 전에' 발급해 qid=qa를 토큰에 봉인
+    ch = _gate_challenge(client, site_key, tok, lec["id"])
+
+    # 레거시 중복 핀(가드 이전 데이터) 직접 삽입 — 이동 후에도 cp=200이 유효하게 남는다
+    db.add(
+        LectureQuestion(
+            lecture_id=lec["id"],
+            position_sec=200,
+            payload={"prompt": "레거시 중복 핀", "options": ["가", "나"], "explain": ""},
+            answer_index=0,
+            source="manual",
+            status="active",
+        )
+    )
+    db.commit()
+    # 강사가 qa를 500초(내용 시작 490)로 이동 — 예약(200)은 중복 핀 덕에 살아남는다
+    r = client.put(
+        f"/api/v1/ops/lectures/{lec['id']}/questions/{qa['id']}",
+        json={"position_sec": 500, "content_start_sec": 490},
+        headers=auth(ops_tok),
+    )
+    assert r.status_code == 200, r.text
+    db.expire_all()
+    assert int(_progress_row(db, lec["id"]).next_checkpoint_sec) == 200
+
+    # 뒤늦은 오답 verify(3회째) — rewind_to=490(낡음)이지만 클램프가 cp-1=199로 누른다
+    res = _gate_verify(client, site_key, tok, ch["challenge_token"], ["0"])
+    assert res["lecture"]["watched_max_sec"] == 199, "클램프가 완화되면 앞으로 감기가 된다"
+    db.expire_all()
+    row = _progress_row(db, lec["id"])
+    assert int(row.watched_max_sec) == 199 < 200
+    blocked = client.post(
+        f"/api/v1/captcha/v1/challenge?lecture={lec['id']}",
+        headers={"X-Site-Key": site_key, **auth(tok)},
+    )
+    assert blocked.status_code == 409, blocked.text
+
+
+def test_content_start_validation_and_clear(client, db, seed_org, media_dir):
+    """내용 시작은 출제 시점보다 앞이어야 하고(=cp 이상 되감기는 무한 재도전 부활),
+    수정에서 명시적 null이면 지정 해제(폴백 복귀), position만 옮겨 어긋나도 400."""
+    ops_tok = _ops(client, db)
+    lec = _upload_lecture(client, ops_tok, duration=1000).json()
+
+    def _try_create(cs, position=100):
+        return client.post(
+            f"/api/v1/ops/lectures/{lec['id']}/questions",
+            json={
+                "position_sec": position,
+                "content_start_sec": cs,
+                "prompt": "내용 시작 검증",
+                "options": ["가", "나"],
+                "answer_index": 0,
+                "status": "active",
+            },
+            headers=auth(ops_tok),
+        )
+
+    # 출제 시점과 같거나 뒤·음수 → 400 (같으면 되감기가 없어 재시청 없는 무한 재도전)
+    assert _try_create(100).status_code == 400
+    assert _try_create(150).status_code == 400
+    assert _try_create(-1).status_code == 400
+    r = _try_create(40)
+    assert r.status_code == 200, r.text
+    q = r.json()
+    assert q["content_start_sec"] == 40
+
+    # position만 앞으로 옮겨 기존 내용 시작(40)과 어긋나는 조합 — 최종 상태 검증에 걸린다
+    r = client.put(
+        f"/api/v1/ops/lectures/{lec['id']}/questions/{q['id']}",
+        json={"position_sec": 30},
+        headers=auth(ops_tok),
+    )
+    assert r.status_code == 400, r.text
+    # 테스트 하네스는 요청 간 세션을 공유한다 — 400으로 중단된 요청의 더티 상태(position=30)를
+    # 버려 프로덕션(요청별 세션·미커밋 폐기)과 같은 전제로 되돌린다.
+    db.rollback()
+
+    # 명시적 null = 지정 해제(폴백 복귀) — 미전송(변경 없음)과 구분된다
+    r = client.put(
+        f"/api/v1/ops/lectures/{lec['id']}/questions/{q['id']}",
+        json={"content_start_sec": None},
+        headers=auth(ops_tok),
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["content_start_sec"] is None
+    # 미전송이면 그대로 유지되는지 — 다시 지정 후 prompt만 수정
+    r = client.put(
+        f"/api/v1/ops/lectures/{lec['id']}/questions/{q['id']}",
+        json={"content_start_sec": 40},
+        headers=auth(ops_tok),
+    )
+    assert r.status_code == 200 and r.json()["content_start_sec"] == 40
+    r = client.put(
+        f"/api/v1/ops/lectures/{lec['id']}/questions/{q['id']}",
+        json={"prompt": "프롬프트만 수정"},
+        headers=auth(ops_tok),
+    )
+    assert r.status_code == 200 and r.json()["content_start_sec"] == 40
 
 
 def test_pass_inside_grace_still_reserves_adjacent_pin(client, db, seed_org, media_dir):

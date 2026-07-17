@@ -1019,6 +1019,8 @@ def _question_row(q: LectureQuestion) -> dict:
         "id": q.id,
         "lecture_id": q.lecture_id,
         "position_sec": q.position_sec,
+        # 되감기 지점(내용 시작) — null = 미지정(cp-REWIND_SEC 폴백)
+        "content_start_sec": q.content_start_sec,
         "prompt": payload.get("prompt"),
         "options": options,
         "explain": payload.get("explain"),
@@ -1051,6 +1053,10 @@ class _QuestionCreate(BaseModel):
     # 출제 시점(핀) — active면 1 이상·영상 안이어야 한다. draft는 0 허용(시점 미배치 —
     # LLM 생성 문항이 검수를 기다리는 상태. 활성화할 때 시점 지정이 강제된다).
     position_sec: int = 0
+    # 되감기 지점(내용 시작 시점) — 오답 상한 도달 시 여기로 되감는다. None = 미지정
+    # (cp-REWIND_SEC 폴백). 지정 시 0 <= 값 < position_sec 강제(cp 이상 '되감기'는
+    # 재시청 없는 무한 재도전이 된다).
+    content_start_sec: int | None = None
     # (제거됨 0717) pinned — 이제 모든 문항이 핀이다. 구버전 콘솔이 보내도 조용히 무시된다.
     # (제거됨 0717) window_sec — 구간 출제. 되감기(cp-REWIND_SEC) 기준과 내용 시점이
     # 어긋나는 버그로 고정만 남겼다(lecture_service '구간 출제: 제거됨' 주석). 역시 무시.
@@ -1126,6 +1132,19 @@ def _validate_question_timing(
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
             detail="공개(active) 문항은 출제 시점이 1초 이상이어야 합니다(0초는 아직 아무것도 보지 않은 지점이라 뜰 수 없어요). 시점을 지정한 뒤 공개해 주세요.",
+        )
+
+
+def _validate_content_start(content_start_sec: int | None, position_sec: int) -> None:
+    """되감기 지점(내용 시작)은 반드시 출제 시점보다 앞 — cp 이상 '되감기'는 watched가
+    그대로 cp 이상이라 게이트가 즉시 재발급되고, 재시청 없는 무한 재도전(보기 전수
+    대입)이 부활한다. 서비스의 방어적 클램프(cp-1)와 별개로 입력 단계에서 거절한다."""
+    if content_start_sec is None:
+        return
+    if content_start_sec < 0 or content_start_sec >= position_sec:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            detail="내용 시작(되감기) 시점은 출제 시점보다 앞이어야 합니다. 문항이 다루는 내용이 시작되는 시점을 지정해 주세요.",
         )
 
 def _reject_duplicate_pin(
@@ -1244,11 +1263,13 @@ def ops_create_question(
     _validate_question_timing(
         position, int(lec.duration_sec or 0), active=req.status == "active"
     )
+    _validate_content_start(req.content_start_sec, position)
     if req.status == "active":
         _reject_duplicate_pin(db, lec.id, position)
     q = LectureQuestion(
         lecture_id=lec.id,
         position_sec=position,
+        content_start_sec=req.content_start_sec,
         payload={
             "prompt": req.prompt.strip(),
             "options": [str(o).strip() for o in req.options],
@@ -1274,6 +1295,7 @@ def ops_create_question(
         after={
             "lecture_id": lec.id,
             "position_sec": q.position_sec,
+            "content_start_sec": q.content_start_sec,
             "status": q.status,
         },
     )
@@ -1283,6 +1305,9 @@ def ops_create_question(
 
 class _QuestionUpdate(BaseModel):
     position_sec: int | None = None
+    # None에 두 의미가 있어 model_fields_set으로 구분한다: 미전송 = 변경 없음,
+    # 명시적 null = 지정 해제(폴백 되감기로 복귀). 콘솔은 저장 시 항상 명시로 보낸다.
+    content_start_sec: int | None = None
     prompt: str | None = None
     options: list[str] | None = None
     answer_index: int | None = None
@@ -1349,6 +1374,7 @@ def ops_update_question(
 
     before = {
         "position_sec": q.position_sec,
+        "content_start_sec": q.content_start_sec,
         "status": q.status,
         "answer_index": q.answer_index,
         "answer_indexes": q.answer_indexes,
@@ -1362,14 +1388,19 @@ def ops_update_question(
     q.answer_indexes = new_answer_indexes
     if req.position_sec is not None:
         q.position_sec = max(0, req.position_sec)
+    if "content_start_sec" in req.model_fields_set:
+        q.content_start_sec = req.content_start_sec  # 명시적 null = 지정 해제(폴백 복귀)
     if req.status is not None:
         q.status = req.status
     lec = db.get(Lecture, lecture_id)
+    # 검증은 갱신 '후' 최종 상태로 — position만 옮겨 기존 content_start와 어긋나는
+    # 조합(내용 시작 >= 출제 시점)도 여기서 걸린다.
     _validate_question_timing(
         int(q.position_sec),
         int(lec.duration_sec or 0) if lec else 0,
         active=q.status == "active",
     )
+    _validate_content_start(q.content_start_sec, int(q.position_sec))
     if q.status == "active":
         _reject_duplicate_pin(db, lecture_id, int(q.position_sec), exclude_id=q.id)
     # 시점·고정 여부·활성 상태 중 무엇이 바뀌었든 예약 정합화 — 어떤 조합이 바뀌었는지
@@ -1386,6 +1417,7 @@ def ops_update_question(
         before=before,
         after={
             "position_sec": q.position_sec,
+            "content_start_sec": q.content_start_sec,
             "status": q.status,
             "answer_index": q.answer_index,
             "answer_indexes": q.answer_indexes,

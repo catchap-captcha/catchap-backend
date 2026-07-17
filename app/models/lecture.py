@@ -69,6 +69,11 @@ class LectureQuestion(Base, UUIDPk, Timestamps):
 
     lecture_id: Mapped[str] = mapped_column(CHAR(36), ForeignKey("lectures.id"), index=True)
     position_sec: Mapped[int] = mapped_column(default=0)  # 이 문항이 다루는 강의 시점
+    # 이 문항이 다루는 '내용이 시작되는' 시점(초) — 오답 상한 도달 시 여기로 되감는다
+    # (강사가 영상을 보며 지정 — "이 대목을 다시 보고 와야 답할 수 있다"의 그 대목 시작).
+    # NULL = 미지정 → max(0, cp - REWIND_SEC) 폴백. 규약: 지정 시 0 <= 값 < position_sec
+    # (생성/수정에서 검증 — cp 이상으로 '되감으면' 재시청 없이 재도전이 무한 반복된다).
+    content_start_sec: Mapped[int | None] = mapped_column(nullable=True)
     # 출제 시점 — 모든 문항이 고정 핀(전부 핀 lecture_pin_02 → 고정만 lecture_pin_03, 0717):
     # 학생이 position_sec에 닿는 순간 반드시 이 문항이 뜬다. 핀은 강사만 아는 정보를
     # 쓴다 — "이 대목 직후에 물어야 방금 본 사람만 답한다".
