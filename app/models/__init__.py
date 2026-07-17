@@ -47,6 +47,7 @@ from app.models.misc import (
     Report,
     ReportDownloadLog,
     SystemHealthLog,
+    SystemSetting,
     UserSetting,
 )
 from app.models.onboarding import ParentInviteCode, StudentJoinCode
@@ -127,6 +128,7 @@ __all__ = [
     "StudentProgress",
     "Subscription",
     "SystemHealthLog",
+    "SystemSetting",
     "User",
     "UserSetting",
     "WrongAnswer",

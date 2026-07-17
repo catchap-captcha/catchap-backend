@@ -60,6 +60,8 @@ class Settings(BaseSettings):
     # LLM 문항 자동 생성(Anthropic Messages API). 키가 비면 생성 기능은 503으로 정직하게
     # 거절한다 — stub 문제를 만들어 성공처럼 반환하지 않는다(가짜 성공 금지).
     ANTHROPIC_API_KEY: str = ""
+    # STT(OpenAI Whisper) — 강의 음성 전사. 운영 콘솔 입력(DB)이 우선이고 이건 폴백.
+    OPENAI_API_KEY: str = ""
     LLM_MODEL: str = "claude-opus-4-8"
 
     ENV: str = "dev"

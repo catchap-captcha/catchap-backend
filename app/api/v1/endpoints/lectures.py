@@ -1646,38 +1646,75 @@ def ops_generate_questions(
     principal: Principal = Depends(require_ops),
     db: Session = Depends(get_db),
 ):
-    """LLM 문항 자동 생성 — source=llm, status=draft로 저장(운영자 승인 후 active).
+    """AI 문항 자동 생성 — STT 전사(키 설정 시) → LLM 출제, source=llm·status=draft 저장.
 
-    키 미설정은 503으로 정직하게 알린다(stub 문항 생성 금지)."""
+    키는 요청 시점마다 해석한다(운영 콘솔 입력(DB) → .env 폴백) — 콘솔에서 키를 넣으면
+    재기동 없이 바로 켜진다. 정직성 규약:
+    - LLM 키 없음 → 503(설정 페이지 안내). stub 문항 생성 금지.
+    - STT 키가 '설정돼 있는데' 전사 실패 → 502로 원인 노출(메타데이터 폴백으로 조용히
+      강등하지 않는다 — 키 오류·용량 초과를 운영자가 알아야 고친다).
+    - STT 키 미설정 → 메타(제목·설명) 기반 생성 + 응답에 transcript_used=false 명시.
+    전사가 있으면 LLM이 출제 시점(position)과 되감기 지점(content_start)까지 제안하고,
+    영상 범위를 벗어나는 제안은 버려 '시점 미배치' draft로 남긴다(운영자 검수)."""
     from app.clients.ai_client import (
         AiGenerationError,
         AiNotConfiguredError,
         generate_lecture_questions,
     )
+    from app.clients.stt_client import SttError, transcribe_video
+    from app.services import settings_service
 
     lec = _get_ops_lecture(db, lecture_id)
+    llm_key = settings_service.resolve_anthropic_key(db)
+    if not llm_key:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="LLM API 키가 설정되지 않아 문제 자동 생성을 사용할 수 없습니다. 운영 콘솔 '설정'에서 키를 입력해 주세요.",
+        )
+
+    transcript: list[dict] | None = None
+    stt_key = settings_service.resolve_openai_key(db)
+    if stt_key:
+        try:
+            transcript = transcribe_video(_video_path(lec), api_key=stt_key)
+        except SttError as e:
+            raise HTTPException(
+                status.HTTP_502_BAD_GATEWAY, detail=f"강의 음성 전사(STT)에 실패했습니다: {e}"
+            )
+
     try:
         items = generate_lecture_questions(
             lecture_title=lec.title,
             description=lec.description,
             subject=lec.subject,
             n=req.n,
+            api_key=llm_key,
+            transcript=transcript,
         )
     except AiNotConfiguredError:
         raise HTTPException(
             status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="LLM API 키(ANTHROPIC_API_KEY)가 설정되지 않아 문제 자동 생성을 사용할 수 없습니다",
+            detail="LLM API 키가 설정되지 않아 문제 자동 생성을 사용할 수 없습니다. 운영 콘솔 '설정'에서 키를 입력해 주세요.",
         )
     except AiGenerationError as e:
         raise HTTPException(
             status.HTTP_502_BAD_GATEWAY, detail=f"문항 자동 생성에 실패했습니다: {e}"
         )
 
+    duration = int(lec.duration_sec or 0)
     created: list[LectureQuestion] = []
     for item in items:
+        # LLM 시점 제안 검증 — 영상 안(1 <= pos < duration)일 때만 채택, 아니면 미배치(0).
+        # content_start는 pos보다 앞일 때만(생성 검증과 동일 규칙 — cp 이상 되감기 금지).
+        pos = int(item.get("position_sec") or 0)
+        if not (1 <= pos < duration):
+            pos = 0
+        cs = item.get("content_start_sec")
+        cs = int(cs) if isinstance(cs, int) and pos >= 1 and 0 <= cs < pos else None
         q = LectureQuestion(
             lecture_id=lec.id,
-            position_sec=0,  # 시점 배치는 운영자가 검수하며 지정
+            position_sec=pos,  # 전사 기반 제안(검수 대상) 또는 0=미배치
+            content_start_sec=cs,
             payload={
                 "prompt": item["prompt"],
                 "options": item["options"],
@@ -1696,10 +1733,19 @@ def ops_generate_questions(
         actor_user_id=principal.id,
         target_type="lecture",
         target_id=lec.id,
-        after={"count": len(created), "model": get_settings().LLM_MODEL},
+        after={
+            "count": len(created),
+            "model": get_settings().LLM_MODEL,
+            "transcript_used": transcript is not None,
+        },
     )
     db.commit()
-    return {"created": len(created), "questions": [_question_row(q) for q in created]}
+    return {
+        "created": len(created),
+        # 전사 사용 여부를 정직하게 노출 — STT 미설정이면 콘솔이 '메타 기반 생성'임을 안내
+        "transcript_used": transcript is not None,
+        "questions": [_question_row(q) for q in created],
+    }
 
 
 # ---------------------------------------------------------------- 자료실(강의 자료) CRUD

@@ -2126,3 +2126,67 @@ def scratch_aggregate(
     from app.services import scratch_access
 
     return scratch_access.ops_aggregate(db)
+
+
+# ---------------------------------------------------------------- AI 설정 (운영자)
+class _AiSettingsUpdate(BaseModel):
+    # 미전송 = 변경 없음, 빈 문자열 = 삭제(미설정 복귀) — model_fields_set으로 구분한다.
+    # 원문 키는 이 요청 본문으로만 들어오고, 어떤 응답·로그에도 다시 나가지 않는다.
+    anthropic_api_key: str | None = None
+    openai_api_key: str | None = None
+
+
+def _ai_settings_payload(db: Session) -> dict:
+    from app.services import settings_service
+
+    s = get_settings()
+    return {
+        # 원문 미반환 — 설정 여부·끝 4자리·출처(console|env)만. 콘솔 입력이 env보다 우선.
+        "llm": settings_service.masked_status(db, "anthropic_api_key", s.ANTHROPIC_API_KEY),
+        "stt": settings_service.masked_status(db, "openai_api_key", s.OPENAI_API_KEY),
+        "llm_model": s.LLM_MODEL,
+    }
+
+
+@router.get("/settings/ai")
+def ops_get_ai_settings(
+    principal: Principal = Depends(require_ops), db: Session = Depends(get_db)
+):
+    """AI 기능 키 상태 — STT(OpenAI Whisper)·LLM(Anthropic). 키 원문은 절대 반환하지 않는다."""
+    return _ai_settings_payload(db)
+
+
+@router.put("/settings/ai")
+def ops_put_ai_settings(
+    req: _AiSettingsUpdate,
+    principal: Principal = Depends(require_ops),
+    db: Session = Depends(get_db),
+):
+    """AI 키 저장 — 값은 Fernet 암호화로 DB에 봉인(settings_service). 재기동 불필요:
+    문항 생성이 요청 시점마다 DB에서 키를 해석한다. 감사 로그에는 어떤 키가 바뀌었는지만
+    남기고 원문·끝 4자리도 남기지 않는다(로그 유출 대비)."""
+    from app.services import settings_service
+
+    changed: list[str] = []
+    if "anthropic_api_key" in req.model_fields_set:
+        settings_service.set_setting(
+            db, "anthropic_api_key", req.anthropic_api_key or "", updated_by=principal.id
+        )
+        changed.append("anthropic_api_key")
+    if "openai_api_key" in req.model_fields_set:
+        settings_service.set_setting(
+            db, "openai_api_key", req.openai_api_key or "", updated_by=principal.id
+        )
+        changed.append("openai_api_key")
+    if not changed:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="변경할 키가 없습니다.")
+    audit(
+        db,
+        action="system.settings.ai_keys",
+        actor_user_id=principal.id,
+        target_type="system_setting",
+        target_id=None,
+        after={"changed": changed},  # 키 이름만 — 값·끝자리 미기록
+    )
+    db.commit()
+    return _ai_settings_payload(db)

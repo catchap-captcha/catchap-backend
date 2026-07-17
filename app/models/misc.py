@@ -34,6 +34,23 @@ class UserSetting(Base, UUIDPk, Timestamps):
     settings: Mapped[dict] = mapped_column(JSON, default=dict)
 
 
+class SystemSetting(Base, UUIDPk, Timestamps):
+    """서비스 전역 설정(운영자 전용) — AI API 키 등 재기동 없이 바뀌어야 하는 값.
+
+    value는 '항상 암호화'해 저장한다(settings_service가 JWT_SECRET 파생 Fernet으로
+    봉인 — DB 덤프·백업이 새어도 원문 키가 노출되지 않는다). 평문이 필요한 값이라도
+    이 테이블에 넣는 순간 같은 규약을 따른다(호출부가 구분할 필요 없게 단일 규약).
+    읽기 API는 원문을 절대 반환하지 않는다(설정 여부 + 끝 4자리만)."""
+
+    __tablename__ = "system_settings"
+    __table_args__ = (UniqueConstraint("key", name="uq_system_setting_key"),)
+
+    key: Mapped[str] = mapped_column(String(60), index=True)
+    value: Mapped[str] = mapped_column(Text)  # Fernet 토큰(암호문)
+    # 마지막 변경자 — 감사 로그와 별개로 행 자체에도 남긴다(키 원문은 어디에도 안 남김)
+    updated_by: Mapped[str | None] = mapped_column(CHAR(36), nullable=True)
+
+
 class FamilyMessage(Base, UUIDPk, Timestamps):
     """가정안내: 교사 → 보호자 메시지"""
 

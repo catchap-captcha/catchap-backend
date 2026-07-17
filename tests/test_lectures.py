@@ -1247,7 +1247,8 @@ def test_generate_without_api_key_returns_honest_503(client, db, seed_org, media
         headers=auth(ops_tok),
     )
     assert r.status_code == 503
-    assert "ANTHROPIC_API_KEY" in r.json()["detail"]
+    # 안내가 .env 변수명이 아니라 운영자가 실제로 갈 곳(콘솔 설정)을 가리켜야 한다
+    assert "운영 콘솔" in r.json()["detail"] and "설정" in r.json()["detail"]
     assert db.query(LectureQuestion).count() == 0  # 어떤 문항도 생성되지 않는다
 
 
