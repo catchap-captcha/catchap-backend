@@ -235,6 +235,7 @@ def test_register_student_rejects_duplicate_id(client, db, seed_org):
             "email_code": code,
             "student_login_id": "stu01",  # 이미 사용 중
             "password": "Password123!",  # 이메일 가입 전환과 함께 최소 8자로 통일
+            "birth_date": "1990-03-01",  # 연령 분기 도입으로 생년월일 필수(성인)
         },
     )
     assert res.status_code == 409
@@ -251,6 +252,7 @@ def test_register_student_email_only_and_login(client, db):
             "email": "stukid@test.dev",
             "email_code": code,
             "password": "Password123!",
+            "birth_date": "1995-06-15",  # 성인 — 보호자 동의 없이 통과
         },
     )
     assert res.status_code == 200, res.text
@@ -278,6 +280,7 @@ def test_register_student_email_only_and_login(client, db):
             "email": "stukid@test.dev",
             "email_code": code2,
             "password": "Password123!",
+            "birth_date": "1995-06-15",
         },
     )
     assert dup.status_code == 409
@@ -293,6 +296,7 @@ def test_register_student_email_password_min_8(client, db):
             "email": "shortpw@test.dev",
             "email_code": code,
             "password": "1234",
+            "birth_date": "1995-06-15",
         },
     )
     assert res.status_code == 422
@@ -363,7 +367,11 @@ def test_register_parent_wrong_code(client, db):
     assert res.status_code == 400
 
 
-def test_register_teacher_claims_code(client, db, seed_org):
+def test_register_teacher_retired(client, db, seed_org):
+    """제품 전환(학교 기능 은퇴): 유효한 교사 코드가 있어도 신규 교사 가입은 410.
+
+    (종전 test_register_teacher_claims_code — 클레임 성공 경로는 접수 종료로 은퇴,
+    3단계 정리 때 코드와 함께 제거한다.)"""
     org = seed_org["org"]
     code = get_email_code(db, "newteacher@test.dev")
     res = client.post(
@@ -377,21 +385,11 @@ def test_register_teacher_claims_code(client, db, seed_org):
             "teacher_code": "T-2222",
         },
     )
-    assert res.status_code == 200
-    # 이미 클레임된 코드 재사용 불가
-    code2 = get_email_code(db, "other@test.dev")
-    res2 = client.post(
-        "/api/v1/auth/register/teacher",
-        json={
-            "name": "다른교사",
-            "email": "other@test.dev",
-            "password": "Password123!",
-            "email_code": code2,
-            "organization_id": org.id,
-            "teacher_code": "T-2222",
-        },
-    )
-    assert res2.status_code == 409
+    assert res.status_code == 410
+    # 접수 종료 후에는 어떤 계정도 만들어지지 않는다
+    from app.models import User
+
+    assert db.query(User).filter(User.email == "newteacher@test.dev").first() is None
 
 
 def test_verify_org_code(client, seed_org):

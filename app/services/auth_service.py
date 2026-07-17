@@ -16,6 +16,7 @@ from app.core.security import (
 from app.email.smtp import render_template, send_email
 from app.models import (
     ClassRoom,
+    Consent,
     EmailVerificationCode,
     Membership,
     Organization,
@@ -402,7 +403,11 @@ def send_email_code(db: Session, email: str, purpose: str, for_account: bool = F
     db.commit()
     template = "password_reset.html" if purpose == "reset" else "verify_email.html"
     subject = (
-        "[CatChap] 비밀번호 재설정 인증 코드" if purpose == "reset" else "[CatChap] 이메일 인증 코드"
+        "[CatChap] 비밀번호 재설정 인증 코드"
+        if purpose == "reset"
+        # 보호자(법정대리인) 동의 코드 — 만 14세 미만 학생 가입 게이트(연령 분기)
+        else "[CatChap] 보호자 동의 인증 코드" if purpose == "guardian"
+        else "[CatChap] 이메일 인증 코드"
     )
     html = render_template(template, code=code, name=email.split("@")[0])
     send_email(db, email, subject, html)
@@ -501,6 +506,13 @@ def _assign_pending_class(db: Session, org_id: str, membership: Membership, user
 
 
 def register_teacher(db: Session, req: s.RegisterTeacherRequest) -> User:
+    # 제품 전환(2026-07-17, 학교 기능 은퇴): 교사 신규 가입 접수 종료. 기존 교사 계정
+    # 로그인·데이터는 유지(정리는 3단계). 강의 제작자는 강사(instructor) — 운영자 초대 발급.
+    # 아래 기존 코드는 이력 보존용으로 남긴다(3단계에서 일괄 제거).
+    raise HTTPException(
+        status.HTTP_410_GONE,
+        detail="교사 신규 가입 접수가 종료되었어요. CatChap은 개인 학습자 대상 강의 서비스로 전환되었습니다.",
+    )
     email = req.email.strip().lower()
     membership = (
         db.query(Membership)
@@ -628,14 +640,47 @@ def suggest_student_ids(db: Session, requested: str, n: int = 4) -> list[str]:
     return out
 
 
+GUARDIAN_CONSENT_AGE = 14  # 만 나이 기준 — 미만이면 법정대리인 동의 필수 (개인정보보호법)
+
+
+def _age_on(today, birth) -> int:
+    """만 나이 — 생일이 안 지났으면 1 뺀다. (date 두 개를 받는다)"""
+    return today.year - birth.year - ((today.month, today.day) < (birth.month, birth.day))
+
+
 def register_student(db: Session, req: s.RegisterStudentRequest) -> StudentProfile:
     """학생 가입 — 이메일 가입 전환(2026-07-16): 학부모 가입과 동일 구성이 기본.
 
     organization_id를 주면 종전 기관 코드 검증 가입 그대로(기관 경유 가입 부활 대비 유지),
     안 주면 무소속(organization_id=None) 가입. student_login_id 미지정 시
     이메일(소문자·strip)이 로그인 아이디가 된다 — 새 email 컬럼·로그인 경로 변경 없음.
+
+    연령 분기(2026-07-17, 성인+아동 서비스 전환): 생년월일 필수 수집. 만 14세 미만은
+    보호자(법정대리인) 이메일로 받은 인증 코드 없이는 가입이 완료되지 않는다 —
+    동의 증빙은 Consent(signup_guardian) + guardian_email로 남긴다.
     """
     email = req.email.strip().lower()
+
+    # 생년월일 검증 — 미래·비현실 값 거부. today는 로컬(KST) 규약(datetime.now()).
+    today = datetime.now().date()
+    birth = req.birth_date
+    if birth > today or birth.year < 1900:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="생년월일이 올바르지 않습니다.")
+    age = _age_on(today, birth)
+
+    guardian_email: str | None = None
+    if age < GUARDIAN_CONSENT_AGE:
+        guardian_email = (req.guardian_email or "").strip().lower()
+        if not guardian_email or not (req.guardian_email_code or "").strip():
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                detail="만 14세 미만은 보호자(법정대리인) 이메일 동의가 필요해요. 보호자 이메일로 받은 인증 코드를 입력해 주세요.",
+            )
+        if guardian_email == email:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                detail="보호자 이메일은 본인 이메일과 달라야 해요.",
+            )
 
     org = None
     if req.organization_id:
@@ -657,6 +702,9 @@ def register_student(db: Session, req: s.RegisterStudentRequest) -> StudentProfi
         )
 
     _consume_verified_code(db, email, req.email_code, "signup")
+    # 보호자 코드는 학생 코드 검증 뒤, 계정 생성 전에 소비 — 실패 시 계정이 안 생긴다.
+    if age < GUARDIAN_CONSENT_AGE:
+        _consume_verified_code(db, guardian_email, req.guardian_email_code, "guardian")
 
     student = StudentProfile(
         organization_id=org.id if org else None,
@@ -664,10 +712,24 @@ def register_student(db: Session, req: s.RegisterStudentRequest) -> StudentProfi
         student_code=_generate_student_code(db),
         password_hash=hash_password(req.password),
         nickname=req.name,
+        birth_date=birth,
+        guardian_email=guardian_email,
         coins=0,
         level=1,
     )
     db.add(student)
+    if age < GUARDIAN_CONSENT_AGE:
+        db.flush()  # Consent가 student.id를 참조
+        db.add(
+            Consent(
+                student_id=student.id,
+                organization_id=org.id if org else None,
+                granted_by_user_id=None,  # 보호자 계정 없음 — 증빙은 guardian_email 코드 인증
+                consent_type="signup_guardian",
+                terms_version="v1",
+                granted_at=datetime.now(),
+            )
+        )
     db.commit()
     return student
 
@@ -697,6 +759,12 @@ def _generate_org_code(db: Session, name: str) -> str:
 
 
 def register_org(db: Session, req: s.RegisterOrgRequest) -> Organization:
+    # 제품 전환(2026-07-17, 학교 기능 은퇴): 기관(학교) 신규 등록 접수 종료. 기존 기관
+    # 계정 로그인·데이터는 유지(정리는 3단계). 아래 기존 코드는 이력 보존용으로 남긴다.
+    raise HTTPException(
+        status.HTTP_410_GONE,
+        detail="기관(학교) 신규 등록 접수가 종료되었어요. CatChap은 개인 학습자 대상 강의 서비스로 전환되었습니다.",
+    )
     email = req.contact_email.strip().lower()
     _ensure_email_unused(db, email)
     if req.business_number:

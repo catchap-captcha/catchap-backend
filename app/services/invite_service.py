@@ -45,6 +45,12 @@ def create_teacher_invite(
     class_name: str | None = None,
 ) -> str:
     """교사코드 선발급 + 초대 레코드 생성 + 초대 메일 발송. 원문 토큰을 반환(호출부가 필요 시 사용)."""
+    # 제품 전환(2026-07-17, 학교 기능 은퇴): 교사 초대 발급 종료 — 가입(register_teacher)도
+    # 함께 막혀 있어 이미 발급된 초대·코드로도 신규 가입은 불가. 기존 교사 계정은 유지.
+    raise HTTPException(
+        status.HTTP_410_GONE,
+        detail="교사 초대가 종료되었어요. CatChap은 개인 학습자 대상 강의 서비스로 전환되었습니다.",
+    )
     email = email.strip().lower()
     if role not in ("teacher", "grade_head"):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="초대할 수 없는 역할입니다.")

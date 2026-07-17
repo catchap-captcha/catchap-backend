@@ -1,3 +1,5 @@
+from datetime import date
+
 from pydantic import BaseModel, EmailStr, Field, field_validator
 
 
@@ -32,7 +34,8 @@ class RefreshRequest(BaseModel):
 
 class EmailSendRequest(BaseModel):
     email: EmailStr
-    purpose: str = Field(default="signup", pattern="^(signup|reset)$")
+    # guardian = 만 14세 미만 가입의 보호자(법정대리인) 동의 코드 — 기존 계정 이메일도 허용
+    purpose: str = Field(default="signup", pattern="^(signup|reset|guardian)$")
     # 계정용 이메일(학부모/교사/기관 가입)이면 발송 전 중복 검사 (학생 가입의 보호자 이메일은 False)
     for_account: bool = False
 
@@ -44,7 +47,7 @@ class CheckStudentIdRequest(BaseModel):
 class EmailVerifyRequest(BaseModel):
     email: EmailStr
     code: str = Field(min_length=6, max_length=6)
-    purpose: str = Field(default="signup", pattern="^(signup|reset)$")
+    purpose: str = Field(default="signup", pattern="^(signup|reset|guardian)$")
 
 
 class RegisterParentRequest(BaseModel):
@@ -78,6 +81,11 @@ class RegisterStudentRequest(BaseModel):
     student_login_id: str | None = Field(default=None, min_length=3)
     # 학부모(RegisterParentRequest)와 동일 8자 기준으로 통일 (종전 4자)
     password: str = Field(min_length=8)
+    # 연령 분기(signup_age_01): 만 14세 미만은 보호자(법정대리인) 이메일 동의 필수.
+    # 생년월일은 신규 가입 필수 — 성인/미성년 판정과 이후 데이터 처리 근거.
+    birth_date: date
+    guardian_email: EmailStr | None = None
+    guardian_email_code: str | None = None
 
 
 class RegisterOrgRequest(BaseModel):

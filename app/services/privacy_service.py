@@ -20,6 +20,8 @@ def anonymize_student(db: Session, student: StudentProfile) -> bool:
         return False  # 멱등 — 이미 파기됨
     student.real_name = None
     student.age = None
+    student.birth_date = None  # 생년월일도 식별 PII — 함께 파기 (signup_age_01)
+    student.guardian_email = None  # 보호자 연락처 파기 (동의 이력은 Consent 행으로 잔존)
     student.gender = None
     student.nickname = "탈퇴한 학생"
     student.avatar = {}

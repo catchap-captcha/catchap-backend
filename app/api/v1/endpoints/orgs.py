@@ -1585,7 +1585,14 @@ def security_stats(
 
     consented = (
         db.query(func.count(func.distinct(Consent.student_id)))
-        .filter(Consent.organization_id == org_id, Consent.withdrawn_at.is_(None))
+        .filter(
+            Consent.organization_id == org_id,
+            # 이 지표는 '학부모 연결 동의(personal_info)' 완료율 — 다른 동의 유형이 섞이면
+            # 연결 0건인데 100%가 나온다(skeptic 2026-07-17 실증: 기관 코드 경유 미성년
+            # 가입의 signup_guardian, 그리고 종전부터 scratch_retain도 새고 있었다).
+            Consent.consent_type == "personal_info",
+            Consent.withdrawn_at.is_(None),
+        )
         .scalar()
         or 0
     )

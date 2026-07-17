@@ -19,9 +19,11 @@ class Consent(Base, UUIDPk, Timestamps):
     student_id: Mapped[str] = mapped_column(
         CHAR(36), ForeignKey("student_profiles.id"), index=True
     )
-    organization_id: Mapped[str] = mapped_column(CHAR(36), index=True)
-    # 동의 주체 = 법정대리인(보호자) 사용자 id
-    granted_by_user_id: Mapped[str] = mapped_column(CHAR(36), index=True)
+    # 무소속(이메일 가입) 학생의 가입 동의는 기관이 없다 — nullable (signup_age_01)
+    organization_id: Mapped[str | None] = mapped_column(CHAR(36), index=True, nullable=True)
+    # 동의 주체 = 법정대리인(보호자) 사용자 id. 가입 시점 보호자 동의(signup_guardian)는
+    # 보호자 계정이 아직 없어 None — 증빙은 StudentProfile.guardian_email(코드 인증)로 남는다.
+    granted_by_user_id: Mapped[str | None] = mapped_column(CHAR(36), index=True, nullable=True)
     # 동의 유형 — personal_info(수집·이용) / third_party(제3자제공) / external_export 등
     consent_type: Mapped[str] = mapped_column(String(40), default="personal_info")
     terms_version: Mapped[str] = mapped_column(String(20), default="v1")

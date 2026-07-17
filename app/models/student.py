@@ -1,6 +1,6 @@
-from datetime import datetime
+from datetime import date, datetime
 
-from sqlalchemy import CHAR, JSON, Boolean, DateTime, ForeignKey, String, UniqueConstraint
+from sqlalchemy import CHAR, JSON, Boolean, Date, DateTime, ForeignKey, String, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base, Timestamps, UUIDPk
@@ -35,6 +35,12 @@ class StudentProfile(Base, UUIDPk, Timestamps):
     # 학생·학부모·랭킹 화면에는 절대 노출하지 않는다 (아이들 사이 가명 유지).
     real_name: Mapped[str | None] = mapped_column(String(100), nullable=True)
     age: Mapped[int | None] = mapped_column(nullable=True)
+    # 가입 시 수집하는 생년월일(signup_age_01) — 만 14세 미만 보호자 동의 게이트의 판정 기준.
+    # 구계정(학교 경유)은 None. age(3~13, 학교가 입력)와 별개 축 — age는 3단계 정리 대상.
+    birth_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    # 만 14세 미만 가입 시 동의한 보호자(법정대리인) 이메일 — 동의 증빙·철회 연락처.
+    # 성인 가입은 None. 탈퇴(익명화) 시 함께 파기한다.
+    guardian_email: Mapped[str | None] = mapped_column(String(255), nullable=True)
     # 성별 — 학습 분석·외부 익명 집계의 인구통계 축. male|female|other|None(미입력).
     gender: Mapped[str | None] = mapped_column(String(10), nullable=True)
     grade_band: Mapped[str] = mapped_column(String(30), default="kindergarten")
