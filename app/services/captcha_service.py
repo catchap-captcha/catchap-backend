@@ -630,6 +630,17 @@ def _wrap_bank_question(subject: str, q: dict, meta: dict) -> dict:
         if f in q:
             public[f] = q[f]
 
+    # 선택형 보기(options)는 발급마다 순서를 섞는다. 왜:
+    #  1) 정답 위치 암기 차단 — 순서가 고정이면 "매번 3번" 식으로 내용 없이 통과한다.
+    #  2) 행동 데이터 품질 — 전체학습의 목적 하나가 마우스 궤적·선택 경로 수집인데,
+    #     보기 위치가 고정이면 궤적이 늘 같은 좌표로 쏠려 봇/사람 판별 신호가 편향된다.
+    #     매번 섞으면 "어느 위치의 정답이든 자연스럽게 찾아가는가"를 관측할 수 있다.
+    # answer가 옵션 id("o3") 기반이라 순서를 바꿔도 채점은 안전하다(verify는 위치가
+    # 아니라 id로 비교). 순서 자체가 정답인 유형(order/sequence)은 options 필드를 안
+    # 쓰므로 영향이 없다. (강의 캡차는 answer_index 기반의 별도 경로라 여기 안 온다.)
+    if isinstance(public.get("options"), list) and len(public["options"]) > 1:
+        public["options"] = random.sample(public["options"], len(public["options"]))
+
     t = q["type"]
     if t == "multi":
         return _wrap("select_all", sorted(q["answer"]), public, meta)

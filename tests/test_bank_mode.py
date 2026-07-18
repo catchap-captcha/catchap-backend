@@ -317,3 +317,28 @@ def test_bank_challenge_http_and_progress(client, db, seed_org):
     row = next(s for s in subjects if s["subject"] == "국어")
     assert row["total"] == row["unsolved"] + row["wrong"] + row["correct"]
     assert row["total"] > 0
+
+
+def test_bank_options_shuffled_per_issue_and_grading_safe(client, db, seed_org):
+    """전체학습 은행 보기는 발급마다 순서가 섞이고(정답 위치 암기·행동데이터 편향 방지),
+    그래도 채점은 안전하다(answer가 옵션 id 기반이라 위치 무관)."""
+    from app.services import captcha_service as cs
+    from app.services import korean_bank
+
+    q = next(x for x in korean_bank.KOREAN_FULL if x["type"] == "single")
+
+    orders = {tuple(o["id"] for o in cs._wrap_bank_question("국어", q, {"subj": "국어", "qid": q["id"]})["options"])
+              for _ in range(10)}
+    assert len(orders) > 1, "보기 순서가 발급마다 고정 — 셔플이 작동하지 않는다"
+
+    # 채점 안전: 셔플된 발급본에서도 정답 옵션 id가 그대로 존재하고, 그 id로 통과한다
+    _first_party_key(db)
+    tok = _student_token(client)
+    ch = cs._wrap_bank_question("국어", q, {"subj": "국어", "qid": q["id"]})
+    assert q["answer"] in [o["id"] for o in ch["options"]]  # 정답 보존
+    r = client.post(
+        "/api/v1/captcha/v1/verify",
+        json={"challenge_token": ch["challenge_token"], "answer": q["answer"]},
+        headers={"X-Site-Key": "ck_edu_testfp", "Authorization": f"Bearer {tok}"},
+    )
+    assert r.status_code == 200 and r.json()["success"] is True
