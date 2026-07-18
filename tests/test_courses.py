@@ -5,7 +5,7 @@
 
 from tests.test_captcha_api import _ops, auth
 from tests.test_instructor import _create_instructor, _instructor_login
-from tests.test_lectures import _upload_lecture, media_dir  # noqa: F401 (fixture 재사용)
+from tests.test_lectures import _student_token, _upload_lecture, media_dir  # noqa: F401 (fixture 재사용)
 
 
 def _create_course(client, tok, *, title="수학 기초반", subject="수학"):
@@ -171,3 +171,39 @@ def test_lecture_reorder_scope_foreign_404(client, db, media_dir):
         ).status_code
         == 200
     )
+
+
+def test_student_sees_courses_and_lecture_course_id(client, db, seed_org, media_dir):
+    """3단계 학생 화면 — 학생이 활성 코스 목록(강사명·강의수)과 강의별 course_id를 본다.
+    빈 코스(활성 강의 0)는 학생 목록에서 빠지고, 상세 toc는 코스 스코프(미분류는 과목 스코프)."""
+    ops = _ops(client, db)
+    course = _create_course(client, ops, title="수학 코스", subject="수학")
+    empty = _create_course(client, ops, title="빈 코스", subject="수학")  # 강의 없음 → 학생 목록 제외
+    a = _upload_lecture(client, ops, title="1강", subject="수학", course_id=course["id"]).json()
+    b = _upload_lecture(client, ops, title="2강", subject="수학", course_id=course["id"]).json()
+    solo = _upload_lecture(client, ops, title="미분류강의", subject="수학").json()  # course_id 없음
+
+    stok = _student_token(client, seed_org)
+
+    # 학생 코스 목록 — 활성 강의 있는 코스만, 강사명·강의수 포함
+    cs = client.get("/api/v1/courses", headers=auth(stok)).json()
+    ids = [c["id"] for c in cs]
+    assert course["id"] in ids and empty["id"] not in ids  # 빈 코스는 학생에게 안 보임
+    mine = next(c for c in cs if c["id"] == course["id"])
+    assert mine["lecture_count"] == 2 and mine["instructor_name"]  # 강사명 해석됨
+
+    # 강의 목록 — 각 강의에 course_id(미분류는 None)
+    lects = {x["id"]: x for x in client.get("/api/v1/lectures", headers=auth(stok)).json()}
+    assert lects[a["id"]]["course_id"] == course["id"]
+    assert lects[solo["id"]]["course_id"] is None
+
+    # 코스 강의 상세 — course_id + toc는 코스 스코프(같은 코스 2강, 미분류 solo 제외)
+    detail = client.get(f"/api/v1/lectures/{a['id']}", headers=auth(stok)).json()
+    assert detail["course_id"] == course["id"]
+    assert {t["id"] for t in detail["toc"]} == {a["id"], b["id"]}
+
+    # 미분류 강의 상세 — toc는 같은 과목의 미분류만(코스 강의는 안 섞인다)
+    solo_detail = client.get(f"/api/v1/lectures/{solo['id']}", headers=auth(stok)).json()
+    assert solo_detail["course_id"] is None
+    toc_ids = {t["id"] for t in solo_detail["toc"]}
+    assert solo["id"] in toc_ids and a["id"] not in toc_ids

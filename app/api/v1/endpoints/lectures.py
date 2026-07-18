@@ -65,6 +65,7 @@ from app.models import (
     LectureMaterial,
     LectureQuestion,
     LectureWatchProgress,
+    User,
 )
 from app.services import auth_service, lecture_service
 from app.services.captcha_service import EDU_SUBJECTS
@@ -319,6 +320,9 @@ def _student_lecture_item(db: Session, lec: Lecture, progress: LectureWatchProgr
         "title": lec.title,
         "description": lec.description,
         "subject": lec.subject,
+        # 소속 코스 — 학생 화면을 과목 → 강사별 코스 → 강의로 묶는 근거(null=미분류).
+        # 운영자 _lecture_row는 이미 course_id를 주는데 학생용만 빠져 있었다(3단계에서 통일).
+        "course_id": lec.course_id,
         "order_no": int(lec.order_no or 0),
         "duration_sec": lec.duration_sec,
         "question_count": _active_question_count(db, lec.id),
@@ -372,6 +376,47 @@ def list_lectures(
     return [_student_lecture_item(db, lec, progress.get(lec.id)) for lec in rows]
 
 
+@router.get("/courses")
+def list_student_courses(
+    subject: str | None = None,
+    principal: Principal = Depends(require_student),
+    db: Session = Depends(get_db),
+):
+    """학생용 코스 목록 — 활성 코스 + 강사 실명 + 활성 강의 수. 학생 화면을 과목 → 강사별
+    코스 → 강의로 묶기 위한 상위 메타다. 운영자용 `_course_row`와 달리 (1) 강사 스코프가
+    없고(학생은 전부 본다) (2) instructor_id 대신 강사 실명을 준다. 활성 강의가 0개인
+    코스는 학생 목록에서 뺀다 — 빈 코스는 보여 줄 이유가 없다."""
+    q = db.query(Course).filter(Course.status == "active")
+    if subject:
+        q = q.filter(Course.subject == subject)
+    courses = q.order_by(Course.subject, Course.order_no, Course.created_at).all()
+    # 강사명 벌크 조회로 N+1 회피 — instructor_id는 users로의 소프트 참조(FK 없음)
+    inst_ids = {c.instructor_id for c in courses}
+    names = {u.id: u.name for u in db.query(User).filter(User.id.in_(inst_ids or [""])).all()}
+    out = []
+    for c in courses:
+        active_count = (
+            db.query(func.count(Lecture.id))
+            .filter(Lecture.course_id == c.id, Lecture.status == "active")
+            .scalar()
+            or 0
+        )
+        if not active_count:
+            continue
+        out.append(
+            {
+                "id": c.id,
+                "title": c.title,
+                "subject": c.subject,
+                "description": c.description,
+                "order_no": int(c.order_no or 0),
+                "instructor_name": names.get(c.instructor_id),
+                "lecture_count": int(active_count),
+            }
+        )
+    return out
+
+
 @router.get("/lectures/{lecture_id}")
 def lecture_detail(
     lecture_id: str,
@@ -381,13 +426,14 @@ def lecture_detail(
     lec = _get_active_lecture(db, lecture_id)
     progress = lecture_service.ensure_progress(db, principal.id, lec)
     db.commit()  # 최초 진입 시 진행 행(첫 체크포인트 예약 포함) 확정
-    # 같은 과목의 강의 목차(사이드바용) — 목록과 동일한 (order_no, created_at) 오름차순
-    toc_rows = (
-        db.query(Lecture)
-        .filter(Lecture.status == "active", Lecture.subject == lec.subject)
-        .order_by(Lecture.order_no, Lecture.created_at)
-        .all()
-    )
+    # 강의실 사이드바 목차 — 코스에 담긴 강의면 '그 코스'의 강의들(같은 커리큘럼 묶음),
+    # 미분류 강의면 예전대로 '같은 과목' 전체를 목차로 준다. 정렬은 order_no(1강·2강…).
+    toc_q = db.query(Lecture).filter(Lecture.status == "active")
+    if lec.course_id:
+        toc_q = toc_q.filter(Lecture.course_id == lec.course_id)
+    else:
+        toc_q = toc_q.filter(Lecture.subject == lec.subject, Lecture.course_id.is_(None))
+    toc_rows = toc_q.order_by(Lecture.order_no, Lecture.created_at).all()
     toc_progress = _progress_map(db, principal.id, [r.id for r in toc_rows])
     # 순수 조회 — 세션·stream_url을 주지 않는다. 상세만 열어 본 사용자가 다른 기기의
     # 시청을 차단(오탐)하지 않게, 재생 시작은 POST /session으로 명시적으로 분리했다.
@@ -396,6 +442,7 @@ def lecture_detail(
         "title": lec.title,
         "description": lec.description,
         "subject": lec.subject,
+        "course_id": lec.course_id,
         "order_no": int(lec.order_no or 0),
         "duration_sec": lec.duration_sec,
         "question_count": _active_question_count(db, lec.id),
@@ -1757,6 +1804,11 @@ def ops_place_question_to_bank(
         "type": "single",
         # topic=강의 제목 — 오답노트·챕터 제목 파생이 topic을 쓴다(출처가 화면에 보인다)
         "topic": lec.title,
+        # 출처 강의의 '전체' id — 문제은행 코스/강의별 잠금 해제의 정본 매핑이다(3단계).
+        # 슬러그는 앞 8자만 담아 손실이 있어(lec-{id[:8]}) 역추적에 못 쓴다. 서빙 시점에
+        # 이 값으로 "이 문항을 낸 강의를 학생이 완주했는가"를 판정할 수 있다. 배치 이전에
+        # 넣은 문항엔 이 필드가 없어(=강의 무관 취급) 게이팅에서 열려 있는다(호환).
+        "lecture_id": lec.id,
         "stage": 1,
         "prompt": payload.get("prompt") or "",
         "hint": "",
