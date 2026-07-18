@@ -17,6 +17,9 @@
 - **[question-formats-and-behavior-data.md](question-formats-and-behavior-data.md)** —
   전체학습 은행과 강의 캡차의 문항 형식이 왜 다른지, 왜 통일하지 않는지. 행동 데이터
   관점에서 드래그가 왜 우월한지, 보기 셔플 정책. ("강의 캡차 = 4지선다?"의 정확한 답.)
+- **[course-exam-design.md](course-exam-design.md)** — 코스 수료 시험 설계(구현 전).
+  왜 완전학습(mastery)인지, 기출의 비영리 교육용 전제(출처 표시 의무·유료화 리스크),
+  데이터 모델·API·기존 코드 재사용 지도.
 - **[onboarding-security-design.md](onboarding-security-design.md)** — 가입·코드 보안 설계.
 - **[BEHAVIOR_DATA.md](BEHAVIOR_DATA.md)** — 행동 데이터 수집·의미.
 
