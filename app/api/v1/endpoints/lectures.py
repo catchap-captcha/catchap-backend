@@ -1033,6 +1033,10 @@ def _question_row(q: LectureQuestion) -> dict:
         "source": q.source,
         "status": q.status,
         "order_no": q.order_no,
+        # 자기검증(2번째 LLM) 판정 — LLM 자동 생성 문항에만 있다(수기 문항은 None).
+        # solver_passed=True(상식으로 풀림→은행 후보)/False(강의 필요→캡차 후보)/None(미판정).
+        "solver_passed": payload.get("solver_passed"),
+        "suggested_placement": payload.get("suggested_placement"),
         # 이미지 문항 — 내부 경로·id 원문 대신 서빙 엔드포인트 URL만 노출(자료실 download_url과 동일 원칙)
         "prompt_image_url": (
             _question_image_url(q.lecture_id, q.id, pi)
@@ -1664,6 +1668,7 @@ def ops_generate_questions(
         AiGenerationError,
         AiNotConfiguredError,
         generate_lecture_questions,
+        solve_questions,
     )
     from app.clients.stt_client import SttError, transcribe_video
     from app.services import settings_service
@@ -1705,9 +1710,19 @@ def ops_generate_questions(
             status.HTTP_502_BAD_GATEWAY, detail=f"문항 자동 생성에 실패했습니다: {e}"
         )
 
+    # 자기검증(2번째 LLM) — 자막·정답 없이 문항만으로 풀어 봇 저항성을 판정한다.
+    # 상식으로 풀림(passed=True) → 전체학습 지식 은행 후보, 못 풂 → 강의 캡차 후보.
+    # '참고 신호'라 실패해도 생성은 살린다(조용히 삼키지 않고 응답에 verify_error 명시).
+    solver: list[bool] | None = None
+    verify_error: str | None = None
+    try:
+        solver = solve_questions(items, api_key=llm_key)
+    except (AiNotConfiguredError, AiGenerationError) as e:
+        verify_error = str(e)
+
     duration = int(lec.duration_sec or 0)
     created: list[LectureQuestion] = []
-    for item in items:
+    for idx, item in enumerate(items):
         # LLM 시점 제안 검증 — 영상 안(1 <= pos < duration)일 때만 채택, 아니면 미배치(0).
         # content_start는 pos보다 앞일 때만(생성 검증과 동일 규칙 — cp 이상 되감기 금지).
         pos = int(item.get("position_sec") or 0)
@@ -1715,6 +1730,9 @@ def ops_generate_questions(
             pos = 0
         cs = item.get("content_start_sec")
         cs = int(cs) if isinstance(cs, int) and pos >= 1 and 0 <= cs < pos else None
+        # 자기검증 결과 → 배치 제안(강사가 최종 결정). None=미판정.
+        passed = solver[idx] if solver is not None and idx < len(solver) else None
+        placement = None if passed is None else ("bank" if passed else "captcha")
         q = LectureQuestion(
             lecture_id=lec.id,
             position_sec=pos,  # 전사 기반 제안(검수 대상) 또는 0=미배치
@@ -1723,6 +1741,9 @@ def ops_generate_questions(
                 "prompt": item["prompt"],
                 "options": item["options"],
                 "explain": item.get("explain", ""),
+                # 자기검증(봇 저항) 판정 — 강사 검수 화면이 읽어 '은행/캡차' 배치를 돕는다
+                "solver_passed": passed,
+                "suggested_placement": placement,
             },
             answer_index=item["answer_index"],
             source="llm",
@@ -1741,13 +1762,20 @@ def ops_generate_questions(
             "count": len(created),
             "model": get_settings().LLM_MODEL,
             "transcript_used": transcript is not None,
+            "self_verified": solver is not None,
         },
     )
     db.commit()
+    solved_ct = sum(1 for p in (solver or []) if p)
     return {
         "created": len(created),
         # 전사 사용 여부를 정직하게 노출 — STT 미설정이면 콘솔이 '메타 기반 생성'임을 안내
         "transcript_used": transcript is not None,
+        # 자기검증 요약 — 봇이 푼 수(=은행 후보)/못 푼 수(=캡차 후보). 미판정이면 verify_error.
+        "self_verified": solver is not None,
+        "bank_candidates": solved_ct if solver is not None else None,
+        "captcha_candidates": (len(created) - solved_ct) if solver is not None else None,
+        "verify_error": verify_error,
         "questions": [_question_row(q) for q in created],
     }
 

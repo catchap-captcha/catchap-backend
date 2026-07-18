@@ -129,6 +129,8 @@ def test_generate_uses_console_key_and_reports_transcript_flag(
     import app.clients.ai_client as ai_client
 
     monkeypatch.setattr(ai_client, "generate_lecture_questions", fake_generate)
+    # 자기검증(2번째 LLM)도 가로채 실제 네트워크 호출을 막는다(판정 자체는 다른 테스트에서)
+    monkeypatch.setattr(ai_client, "solve_questions", lambda items, **k: [True] * len(items))
 
     files = {"file": ("v.mp4", b"0" * 1024, "video/mp4")}
     up = client.post(
@@ -153,6 +155,105 @@ def test_generate_uses_console_key_and_reports_transcript_flag(
     assert body["questions"][0]["position_sec"] == 0  # 시점 미배치 draft
     assert body["questions"][0]["status"] == "draft"
     assert db.query(LectureQuestion).count() == 1
+
+
+def test_self_verification_tags_bank_vs_captcha(client, db, monkeypatch, tmp_path):
+    """자기검증(2번째 LLM): 상식으로 풀린 문항=은행 후보(bank), 못 푼 문항=캡차 후보(captcha).
+
+    생성 LLM과 별개로 solve LLM을 가로채, 판정이 문항 메타(solver_passed·
+    suggested_placement)와 응답 요약(bank/captcha_candidates)에 반영되는지 고정한다."""
+    from app.core.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "ANTHROPIC_API_KEY", "")
+    monkeypatch.setattr(get_settings(), "OPENAI_API_KEY", "")
+    monkeypatch.setattr(get_settings(), "LECTURE_MEDIA_DIR", str(tmp_path))
+    ops_tok = _ops(client, db)
+    client.put(
+        "/api/v1/ops/settings/ai",
+        json={"anthropic_api_key": "sk-console-key-7777"},
+        headers=auth(ops_tok),
+    )
+
+    import app.clients.ai_client as ai_client
+
+    monkeypatch.setattr(
+        ai_client,
+        "generate_lecture_questions",
+        lambda **k: [
+            {"prompt": "상식 문제", "options": ["가", "나"], "answer_index": 0, "explain": ""},
+            {"prompt": "강의 필요 문제", "options": ["다", "라"], "answer_index": 1, "explain": ""},
+        ],
+    )
+    # 1번은 봇이 맞힘(→은행), 2번은 봇이 못 맞힘(→캡차)
+    monkeypatch.setattr(ai_client, "solve_questions", lambda items, **k: [True, False])
+
+    up = client.post(
+        "/api/v1/ops/lectures",
+        data={"title": "자기검증 강의", "subject": "국어", "duration_sec": "300"},
+        files={"file": ("v.mp4", b"0" * 1024, "video/mp4")},
+        headers=auth(ops_tok),
+    )
+    lec_id = up.json()["id"]
+    r = client.post(
+        f"/api/v1/ops/lectures/{lec_id}/questions/generate",
+        json={"n": 2},
+        headers=auth(ops_tok),
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["self_verified"] is True
+    assert body["bank_candidates"] == 1 and body["captcha_candidates"] == 1
+    assert body["verify_error"] is None
+    qs = body["questions"]
+    assert qs[0]["solver_passed"] is True and qs[0]["suggested_placement"] == "bank"
+    assert qs[1]["solver_passed"] is False and qs[1]["suggested_placement"] == "captcha"
+
+
+def test_self_verification_failure_is_honest_not_swallowed(client, db, monkeypatch, tmp_path):
+    """자기검증 LLM이 실패해도 생성은 살리되, 조용히 삼키지 않고 verify_error로 노출한다."""
+    from app.core.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "ANTHROPIC_API_KEY", "")
+    monkeypatch.setattr(get_settings(), "OPENAI_API_KEY", "")
+    monkeypatch.setattr(get_settings(), "LECTURE_MEDIA_DIR", str(tmp_path))
+    ops_tok = _ops(client, db)
+    client.put(
+        "/api/v1/ops/settings/ai",
+        json={"anthropic_api_key": "sk-console-key-7777"},
+        headers=auth(ops_tok),
+    )
+
+    import app.clients.ai_client as ai_client
+    from app.clients.ai_client import AiGenerationError
+
+    monkeypatch.setattr(
+        ai_client,
+        "generate_lecture_questions",
+        lambda **k: [{"prompt": "문제", "options": ["가", "나"], "answer_index": 0, "explain": ""}],
+    )
+
+    def boom(items, **k):
+        raise AiGenerationError("solver 응답 파싱 실패")
+
+    monkeypatch.setattr(ai_client, "solve_questions", boom)
+
+    up = client.post(
+        "/api/v1/ops/lectures",
+        data={"title": "검증실패 강의", "subject": "국어", "duration_sec": "300"},
+        files={"file": ("v.mp4", b"0" * 1024, "video/mp4")},
+        headers=auth(ops_tok),
+    )
+    r = client.post(
+        f"/api/v1/ops/lectures/{up.json()['id']}/questions/generate",
+        json={"n": 1},
+        headers=auth(ops_tok),
+    )
+    assert r.status_code == 200, r.text  # 생성은 살아있다
+    body = r.json()
+    assert body["created"] == 1
+    assert body["self_verified"] is False
+    assert "solver" in (body["verify_error"] or "")  # 조용히 삼키지 않음
+    assert body["questions"][0]["solver_passed"] is None  # 미판정
 
 
 def test_generate_stt_failure_is_honest_502(client, db, monkeypatch, tmp_path):
@@ -206,3 +307,22 @@ def test_ai_client_parses_position_suggestions():
     # content_start >= position → 시점만 버림(문항은 유지, cs 미포함)
     assert out[1]["position_sec"] == 30 and "content_start_sec" not in out[1]
     assert "position_sec" not in out[2]
+
+
+def test_solve_questions_parsing_and_conservative_default(monkeypatch):
+    """solve_questions 파싱 — q 번호로 매칭, 답 누락 문항은 False(보수적=캡차 후보)."""
+    import app.clients.ai_client as ai
+    from app.core.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "ANTHROPIC_API_KEY", "sk-x")
+    qs = [
+        {"prompt": "q1", "options": ["가", "나"], "answer_index": 0},  # LLM 0 → 맞힘 → True
+        {"prompt": "q2", "options": ["다", "라"], "answer_index": 1},  # LLM 0 → 틀림 → False
+        {"prompt": "q3", "options": ["마", "바"], "answer_index": 0},  # 응답 누락 → False(보수적)
+    ]
+    monkeypatch.setattr(
+        ai, "_post_messages",
+        lambda key, prompt, **kw: '[{"q":1,"answer_index":0},{"q":2,"answer_index":0}]',
+    )
+    assert ai.solve_questions(qs, api_key="sk-x") == [True, False, False]
+    assert ai.solve_questions([]) == []  # 빈 입력은 호출 없이 []

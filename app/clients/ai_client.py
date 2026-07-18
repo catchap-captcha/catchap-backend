@@ -71,6 +71,95 @@ def _prompt(
     )
 
 
+def _post_messages(key: str, prompt: str, *, max_tokens: int) -> str:
+    """Anthropic Messages API 1회 호출 → 응답 텍스트. 실패는 AiGenerationError로 전파.
+
+    생성(generate)과 자기검증(solve)이 공유하는 단일 호출 경로."""
+    settings = get_settings()
+    try:
+        resp = httpx.post(
+            _API_URL,
+            headers={
+                "x-api-key": key,
+                "anthropic-version": _API_VERSION,
+                "content-type": "application/json",
+            },
+            json={
+                "model": settings.LLM_MODEL,
+                "max_tokens": max_tokens,
+                "messages": [{"role": "user", "content": prompt}],
+            },
+            timeout=_TIMEOUT_SEC,
+        )
+    except httpx.HTTPError as e:
+        raise AiGenerationError(f"LLM API 호출 실패(네트워크): {e}") from e
+    if resp.status_code != 200:
+        raise AiGenerationError(f"LLM API 오류(HTTP {resp.status_code}): {resp.text[:300]}")
+    body = resp.json()
+    if body.get("stop_reason") == "refusal":
+        raise AiGenerationError("LLM이 요청을 거절했습니다(stop_reason=refusal).")
+    text = "".join(
+        block.get("text", "")
+        for block in body.get("content", [])
+        if isinstance(block, dict) and block.get("type") == "text"
+    )
+    if not text.strip():
+        raise AiGenerationError("LLM 응답에 텍스트 블록이 없습니다.")
+    return text
+
+
+def _solve_prompt(questions: list[dict]) -> str:
+    """자기검증(solver)용 프롬프트 — 정답·해설·자막을 숨기고 문항+보기만 준다.
+
+    '강의를 보지 않은' 상태를 재현해, 상식만으로 풀리는지(=봇도 풀 수 있는지) 측정한다."""
+    blocks = []
+    for i, q in enumerate(questions):
+        opts = "\n".join(f"  {j}) {o}" for j, o in enumerate(q["options"]))
+        blocks.append(f"문제{i + 1}: {q['prompt']}\n{opts}")
+    return (
+        "당신은 아래 문제들의 배경이 되는 강의를 '전혀 보지 않았습니다'.\n"
+        "오직 문제와 보기 텍스트만 보고, 일반 상식으로 각 문제의 정답 보기 번호를 고르세요.\n"
+        "모르면 가장 그럴듯한 것을 고르되, 반드시 하나를 고르세요.\n\n"
+        + "\n\n".join(blocks)
+        + '\n\n각 문제의 답을 이 JSON 배열로만 출력하세요(코드펜스·설명 없이):\n'
+        '[{"q": 1, "answer_index": 0}]'
+    )
+
+
+def solve_questions(questions: list[dict], *, api_key: str | None = None) -> list[bool]:
+    """자기검증(2번째 LLM) — 자막·정답 없이 문항만으로 답을 고르게 한다.
+
+    반환: questions 순서대로 '맥락 없이 맞혔는지'(bool) 리스트.
+    - True  = 강의를 안 봐도 상식으로 풀림 → 봇 저항 없음 → 전체학습 지식 은행 후보.
+    - False = 강의를 봐야 풀림 → 봇은 못 풂 → 강의 시청 검증(캡차) 후보.
+    (한계: 4지선다는 우연히 맞을 수 있다 — 판정은 강사 검수의 '참고 신호'다.)
+    파싱 실패로 특정 문항의 답을 못 얻으면 그 문항은 False(보수적 — 캡차 후보로 남긴다).
+    키 없으면 AiNotConfiguredError."""
+    if not questions:
+        return []
+    settings = get_settings()
+    key = (api_key if api_key is not None else settings.ANTHROPIC_API_KEY or "").strip()
+    if not key:
+        raise AiNotConfiguredError("LLM API 키(Anthropic)가 설정되지 않았습니다.")
+
+    text = _post_messages(key, _solve_prompt(questions), max_tokens=1024)
+    raw = text.strip()
+    m = re.search(r"```(?:json)?\s*(\[.*?\])\s*```", raw, re.DOTALL)
+    if m:
+        raw = m.group(1)
+    try:
+        picks = json.loads(raw)
+    except ValueError as e:
+        raise AiGenerationError(f"자기검증 응답이 JSON 배열이 아닙니다: {e}") from e
+    # {q(1-based): answer_index} 로 정규화 — 순서가 뒤섞이거나 누락돼도 q로 매칭
+    by_q: dict[int, int] = {}
+    if isinstance(picks, list):
+        for p in picks:
+            if isinstance(p, dict) and isinstance(p.get("q"), int) and isinstance(p.get("answer_index"), int):
+                by_q[p["q"]] = p["answer_index"]
+    return [by_q.get(i + 1, -1) == q.get("answer_index") for i, q in enumerate(questions)]
+
+
 def _parse_questions(text: str, n: int) -> list[dict]:
     """모델 응답 텍스트 → 문항 리스트. 형식이 어긋나면 AiGenerationError(폴백 생성 금지)."""
     raw = text.strip()
@@ -146,39 +235,7 @@ def generate_lecture_questions(
         raise AiNotConfiguredError("LLM API 키(Anthropic)가 설정되지 않았습니다.")
 
     n = max(1, min(int(n), 20))
-    try:
-        resp = httpx.post(
-            _API_URL,
-            headers={
-                "x-api-key": key,
-                "anthropic-version": _API_VERSION,
-                "content-type": "application/json",
-            },
-            json={
-                "model": settings.LLM_MODEL,
-                "max_tokens": 8192,
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": _prompt(lecture_title, description, subject, n, transcript),
-                    }
-                ],
-            },
-            timeout=_TIMEOUT_SEC,
-        )
-    except httpx.HTTPError as e:
-        raise AiGenerationError(f"LLM API 호출 실패(네트워크): {e}") from e
-    if resp.status_code != 200:
-        raise AiGenerationError(f"LLM API 오류(HTTP {resp.status_code}): {resp.text[:300]}")
-
-    body = resp.json()
-    if body.get("stop_reason") == "refusal":
-        raise AiGenerationError("LLM이 요청을 거절했습니다(stop_reason=refusal).")
-    text = "".join(
-        block.get("text", "")
-        for block in body.get("content", [])
-        if isinstance(block, dict) and block.get("type") == "text"
+    text = _post_messages(
+        key, _prompt(lecture_title, description, subject, n, transcript), max_tokens=8192
     )
-    if not text.strip():
-        raise AiGenerationError("LLM 응답에 텍스트 블록이 없습니다.")
     return _parse_questions(text, n)
