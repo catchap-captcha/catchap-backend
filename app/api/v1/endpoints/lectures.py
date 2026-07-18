@@ -862,6 +862,43 @@ def ops_list_lectures(
     return [_lecture_row(db, lec) for lec in rows]
 
 
+class _LectureReorder(BaseModel):
+    # 한 그룹(한 코스, 또는 한 과목의 미분류)의 강의 전체를 새 순서대로. 콘솔이 그룹 단위로 보낸다.
+    lecture_ids: list[str] = Field(min_length=1, max_length=500)
+
+
+@router.put("/ops/lectures/reorder")
+def ops_reorder_lectures(
+    req: _LectureReorder,
+    principal: Principal = Depends(require_lecture_manager),
+    db: Session = Depends(get_db),
+):
+    """드래그로 바꾼 강의 순서를 저장 — 넘어온 차례대로 order_no=1,2,3…을 부여한다.
+
+    왜 '한 그룹 전체'를 받나: order_no는 (과목, order_no, created_at) 목차 정렬의 키다.
+    한 코스의 강의들만 통째로 재부여하면 그 코스 안 순서만 바뀌고, 코스로 묶어 보는
+    화면(운영 콘솔·학생 목차)에서는 코스끼리 order_no가 겹쳐도 그룹으로 분리돼 문제없다.
+    부분만 보내면 그 강의들만 1..n으로 눌려 같은 그룹의 나머지와 뒤섞이므로, 콘솔은 항상
+    그룹 전체를 보낸다(호출자 책임). 소유는 각 강의를 _get_ops_lecture로 확인 —
+    강사가 남의 강의를 섞어 보내면 404(존재 미노출)."""
+    seen: set[str] = set()
+    lectures: list[Lecture] = []
+    for lid in req.lecture_ids:
+        if lid in seen:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="중복된 강의가 있습니다.")
+        seen.add(lid)
+        lectures.append(_get_ops_lecture(db, lid, principal))  # 없거나 남의 것이면 404
+    for idx, lec in enumerate(lectures):
+        lec.order_no = idx + 1  # 1-based — 신규 업로드(max+1)와 같은 관례
+    audit(
+        db, action="lecture.reorder", actor_user_id=principal.id,
+        target_type="lecture", target_id=lectures[0].id,
+        after={"count": len(lectures), "order": req.lecture_ids},
+    )
+    db.commit()
+    return {"ok": True, "count": len(lectures)}
+
+
 def _copy_upload_to_tmp(upload: UploadFile, tmp_path: Path, limit: int) -> int:
     """업로드를 임시파일로 청크 복사 — 누적 바이트가 limit를 넘으면 임시파일 삭제 + 413.
 

@@ -97,3 +97,77 @@ def test_update_lecture_course_reassign(client, db, media_dir):
     client.put(f"/api/v1/ops/lectures/{lec['id']}", json={"course_id": c1["id"]}, headers=auth(ops))
     r = client.put(f"/api/v1/ops/lectures/{lec['id']}", json={"title": "제목만"}, headers=auth(ops))
     assert r.json()["course_id"] == c1["id"]  # 코스 유지
+
+
+def test_lecture_reorder_within_course(client, db, media_dir):
+    """드래그 재배열 — 넘어온 차례대로 order_no=1,2,3, 목록 순서도 그대로 바뀐다."""
+    from app.models import Lecture
+
+    ops = _ops(client, db)
+    course = _create_course(client, ops, title="영어 코스", subject="영어")
+    a = _upload_lecture(client, ops, title="A강", subject="영어", course_id=course["id"]).json()
+    b = _upload_lecture(client, ops, title="B강", subject="영어", course_id=course["id"]).json()
+    c = _upload_lecture(client, ops, title="C강", subject="영어", course_id=course["id"]).json()
+
+    # 업로드 순서 A,B,C(order_no 1,2,3)를 역순 C,B,A로 재배열
+    r = client.put(
+        "/api/v1/ops/lectures/reorder",
+        json={"lecture_ids": [c["id"], b["id"], a["id"]]},
+        headers=auth(ops),
+    )
+    assert r.status_code == 200 and r.json()["count"] == 3
+    assert db.get(Lecture, c["id"]).order_no == 1
+    assert db.get(Lecture, b["id"]).order_no == 2
+    assert db.get(Lecture, a["id"]).order_no == 3
+
+    # 목록 순서(과목·order_no·created_at)도 C,B,A
+    listed = [
+        x["title"]
+        for x in client.get("/api/v1/ops/lectures", headers=auth(ops)).json()
+        if x["course_id"] == course["id"]
+    ]
+    assert listed == ["C강", "B강", "A강"]
+
+    # 중복 강의가 섞이면 400(부분 재부여로 뒤섞이는 것 방지)
+    assert (
+        client.put(
+            "/api/v1/ops/lectures/reorder",
+            json={"lecture_ids": [a["id"], a["id"]]},
+            headers=auth(ops),
+        ).status_code
+        == 400
+    )
+
+
+def test_lecture_reorder_scope_foreign_404(client, db, media_dir):
+    """강사는 남의 강의를 섞어 재배열할 수 없다(404, 존재 미노출). 자기 것만은 OK."""
+    ops = _ops(client, db)
+    created = _create_instructor(client, ops, email="reord-inst@catchap.dev")
+    itok = _instructor_login(client, "reord-inst@catchap.dev", created["temp_password"]).json()["access_token"]
+    ops_lec = _upload_lecture(client, ops, title="운영자강의", subject="수학").json()
+    my_lec = _upload_lecture(client, itok, title="강사강의", subject="수학").json()
+
+    # 자기 것 + 남의 것을 섞어 보내면 404 — 그리고 order_no는 전혀 바뀌지 않는다(원자적)
+    from app.models import Lecture
+
+    before = db.get(Lecture, my_lec["id"]).order_no
+    assert (
+        client.put(
+            "/api/v1/ops/lectures/reorder",
+            json={"lecture_ids": [my_lec["id"], ops_lec["id"]]},
+            headers=auth(itok),
+        ).status_code
+        == 404
+    )
+    db.expire_all()
+    assert db.get(Lecture, my_lec["id"]).order_no == before  # 부분 변경 없음
+
+    # 강사 자기 강의만은 재배열 성공
+    assert (
+        client.put(
+            "/api/v1/ops/lectures/reorder",
+            json={"lecture_ids": [my_lec["id"]]},
+            headers=auth(itok),
+        ).status_code
+        == 200
+    )
