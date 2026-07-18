@@ -85,3 +85,45 @@ def anonymize_stale_students(db: Session, inactive_days: int = 365) -> int:
     if n:
         db.commit()
     return n
+
+
+def find_minor_students(db: Session) -> list[StudentProfile]:
+    """만 14세 미만으로 '확인되는' 미파기 학생 목록 — 아동 테스트데이터 파기 대상.
+
+    판정은 보수적으로 '알려진 미성년'만: 생년월일(만 나이<14) 또는 학교 입력 age(<14 —
+    범위가 3~13이라 존재 자체가 미성년 확정). 연령 정보가 없는 계정은 건드리지 않는다
+    (성인일 수 있음 — 별도 보고만). 이미 익명화된 계정(real_name=None+disabled)은
+    anonymize_student가 멱등 스킵한다."""
+    today = date.today()
+    rows = db.query(StudentProfile).filter(
+        (StudentProfile.birth_date.isnot(None)) | (StudentProfile.age.isnot(None))
+    ).all()
+    out = []
+    for s in rows:
+        if s.birth_date is not None:
+            age = (
+                today.year
+                - s.birth_date.year
+                - ((today.month, today.day) < (s.birth_date.month, s.birth_date.day))
+            )
+            if age < 14:
+                out.append(s)
+        elif s.age is not None and s.age < 14:
+            out.append(s)
+    return out
+
+
+def purge_minor_students(db: Session) -> int:
+    """만 14세 미만(확인된) 학생 전원 익명화 — 실서비스 전 아동 테스트데이터 파기.
+
+    (사용자 결정 0716·실행 승인 0718.) 행동데이터는 절대 삭제하지 않는다 —
+    anonymize_student는 학습기록·behavior_summaries를 건드리지 않고(soft ref 유지),
+    기존 축적분은 성인(팀원) 생성이라 actor_band='adult'로 태깅된 채 계속 사용한다.
+    필기 원본만 보존 동의 없는 것에 한해 파기된다(기존 정책 그대로)."""
+    n = 0
+    for s in find_minor_students(db):
+        if anonymize_student(db, s):
+            n += 1
+    if n:
+        db.commit()
+    return n
