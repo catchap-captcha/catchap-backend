@@ -130,7 +130,12 @@ def test_generate_uses_console_key_and_reports_transcript_flag(
 
     monkeypatch.setattr(ai_client, "generate_lecture_questions", fake_generate)
     # 자기검증(2번째 LLM)도 가로채 실제 네트워크 호출을 막는다(판정 자체는 다른 테스트에서)
-    monkeypatch.setattr(ai_client, "solve_questions", lambda items, **k: [True] * len(items))
+    monkeypatch.setattr(
+        ai_client, "verify_questions",
+        lambda items, **k: [
+            {"blind_passed": True, "transcript_passed": None, "verdict": "bank"}
+        ] * len(items),
+    )
 
     files = {"file": ("v.mp4", b"0" * 1024, "video/mp4")}
     up = client.post(
@@ -184,8 +189,14 @@ def test_self_verification_tags_bank_vs_captcha(client, db, monkeypatch, tmp_pat
             {"prompt": "강의 필요 문제", "options": ["다", "라"], "answer_index": 1, "explain": ""},
         ],
     )
-    # 1번은 봇이 맞힘(→은행), 2번은 봇이 못 맞힘(→캡차)
-    monkeypatch.setattr(ai_client, "solve_questions", lambda items, **k: [True, False])
+    # 1번=블라인드로 풀림(상식→bank), 2번=블라인드 못 풀고 자막으론 풀림(→captcha)
+    monkeypatch.setattr(
+        ai_client, "verify_questions",
+        lambda items, **k: [
+            {"blind_passed": True, "transcript_passed": None, "verdict": "bank"},
+            {"blind_passed": False, "transcript_passed": None, "verdict": "captcha"},
+        ],
+    )
 
     up = client.post(
         "/api/v1/ops/lectures",
@@ -235,7 +246,7 @@ def test_self_verification_failure_is_honest_not_swallowed(client, db, monkeypat
     def boom(items, **k):
         raise AiGenerationError("solver 응답 파싱 실패")
 
-    monkeypatch.setattr(ai_client, "solve_questions", boom)
+    monkeypatch.setattr(ai_client, "verify_questions", boom)
 
     up = client.post(
         "/api/v1/ops/lectures",
@@ -326,3 +337,56 @@ def test_solve_questions_parsing_and_conservative_default(monkeypatch):
     )
     assert ai.solve_questions(qs, api_key="sk-x") == [True, False, False]
     assert ai.solve_questions([]) == []  # 빈 입력은 호출 없이 []
+
+
+def test_verify_questions_majority_and_three_way_verdict(monkeypatch):
+    """verify_questions — 셔플 3회 다수결 + 자막 solve로 3분류(bank/captcha/discard).
+
+    q1: 블라인드 2/3 → bank(상식). q2: 블라인드 0/3·자막 ✓ → captcha(강의 의존·정상).
+    q3: 블라인드 0/3·자막 ✗ → discard(불량 의심). 셔플 변형본이 와도 판정이 원 문항
+    순서로 돌아오는지(answer_index 재배치 포함)를 함께 고정한다."""
+    import app.clients.ai_client as ai
+
+    qs = [
+        {"prompt": "상식", "options": ["a", "b", "c", "d"], "answer_index": 0},
+        {"prompt": "강의필요", "options": ["a", "b", "c", "d"], "answer_index": 1},
+        {"prompt": "불량", "options": ["a", "b", "c", "d"], "answer_index": 2},
+    ]
+    calls = {"blind": 0}
+
+    def fake_solve(questions, *, api_key=None, context=None, transcript=None):
+        # 공개 맥락이 항상 전달되는지(공격자 조건 일치) 고정
+        assert context and context.get("title") == "T"
+        if transcript is not None:
+            return [False, True, False]  # 자막 주면: q2만 풀림
+        calls["blind"] += 1
+        # 블라인드: q1만 2번째 시도까지 풀림(2/3 다수결 통과), q2·q3은 전부 실패
+        return [calls["blind"] <= 2, False, False]
+
+    monkeypatch.setattr(ai, "solve_questions", fake_solve)
+    out = ai.verify_questions(
+        qs, api_key="sk-x", context={"title": "T"}, transcript=[{"start": 0, "end": 1, "text": "x"}]
+    )
+    assert calls["blind"] == 3  # 셔플 3회
+    assert [v["verdict"] for v in out] == ["bank", "captcha", "discard"]
+    assert out[0]["blind_passed"] is True and out[1]["transcript_passed"] is True
+    assert out[2]["transcript_passed"] is False
+
+    # 자막이 없으면 불량 판별 불가 — 못 푼 문항은 captcha(종전 동작 유지)
+    calls["blind"] = 0
+    out2 = ai.verify_questions(qs, api_key="sk-x", context={"title": "T"}, transcript=None)
+    assert [v["verdict"] for v in out2] == ["bank", "captcha", "captcha"]
+    assert all(v["transcript_passed"] is None for v in out2)
+
+
+def test_shuffled_variants_remap_answer(monkeypatch):
+    """_shuffled_variants — 보기 순서가 바뀌어도 answer_index가 정답을 계속 가리킨다."""
+    import random
+
+    import app.clients.ai_client as ai
+
+    q = {"prompt": "p", "options": ["정답", "b", "c", "d"], "answer_index": 0}
+    for seed in range(6):
+        v = ai._shuffled_variants([q], random.Random(seed))[0]
+        assert v["options"][v["answer_index"]] == "정답"
+        assert sorted(v["options"]) == sorted(q["options"])

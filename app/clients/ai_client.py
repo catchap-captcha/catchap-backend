@@ -108,33 +108,64 @@ def _post_messages(key: str, prompt: str, *, max_tokens: int) -> str:
     return text
 
 
-def _solve_prompt(questions: list[dict]) -> str:
-    """자기검증(solver)용 프롬프트 — 정답·해설·자막을 숨기고 문항+보기만 준다.
+def _solve_prompt(
+    questions: list[dict],
+    *,
+    context: dict | None = None,
+    transcript: list[dict] | None = None,
+) -> str:
+    """자기검증(solver)용 프롬프트 — 정답·해설은 항상 숨긴다.
 
-    '강의를 보지 않은' 상태를 재현해, 상식만으로 풀리는지(=봇도 풀 수 있는지) 측정한다."""
+    - context(제목·과목·설명): 실제 공격자가 강의 화면에서 '보는' 공개 정보 — 블라인드
+      판정에도 항상 준다(안 주면 검증자가 공격자보다 불리해 판정이 후해진다).
+    - transcript 없음 = 블라인드(상식으로 풀리는지 = 봇도 풀 수 있는지).
+    - transcript 있음 = 자막 기준으로 풀리는지(못 풀면 문항 자체가 불량이라는 신호)."""
     blocks = []
     for i, q in enumerate(questions):
         opts = "\n".join(f"  {j}) {o}" for j, o in enumerate(q["options"]))
         blocks.append(f"문제{i + 1}: {q['prompt']}\n{opts}")
+    ctx = ""
+    if context:
+        ctx = (
+            f"과목: {context.get('subject') or '(미상)'}\n"
+            f"강의 제목: {context.get('title') or '(미상)'}\n"
+            f"강의 설명: {context.get('description') or '(없음)'}\n\n"
+        )
+    if transcript is None:
+        head = (
+            "당신은 아래 강의를 '전혀 보지 않았습니다'. 강의 페이지에서 보이는 공개 정보"
+            "(과목·제목·설명)와 문제·보기 텍스트만으로, 일반 상식과 추론을 총동원해 "
+            "각 문제의 정답 보기 번호를 고르세요.\n"
+            "모르면 가장 그럴듯한 것을 고르되, 반드시 하나를 고르세요.\n\n"
+        )
+    else:
+        lines = "\n".join(f"[{seg['start']:.0f}s~{seg['end']:.0f}s] {seg['text']}" for seg in transcript)
+        head = (
+            "아래는 어느 강의의 음성 전사(자막)입니다. 자막에 나온 내용을 근거로 "
+            "각 문제의 정답 보기 번호를 고르세요. 자막에 근거가 없으면 가장 그럴듯한 것을 "
+            "고르되, 반드시 하나를 고르세요.\n\n---\n" + lines + "\n---\n\n"
+        )
     return (
-        "당신은 아래 문제들의 배경이 되는 강의를 '전혀 보지 않았습니다'.\n"
-        "오직 문제와 보기 텍스트만 보고, 일반 상식으로 각 문제의 정답 보기 번호를 고르세요.\n"
-        "모르면 가장 그럴듯한 것을 고르되, 반드시 하나를 고르세요.\n\n"
+        head
+        + ctx
         + "\n\n".join(blocks)
         + '\n\n각 문제의 답을 이 JSON 배열로만 출력하세요(코드펜스·설명 없이):\n'
         '[{"q": 1, "answer_index": 0}]'
     )
 
 
-def solve_questions(questions: list[dict], *, api_key: str | None = None) -> list[bool]:
-    """자기검증(2번째 LLM) — 자막·정답 없이 문항만으로 답을 고르게 한다.
+def solve_questions(
+    questions: list[dict],
+    *,
+    api_key: str | None = None,
+    context: dict | None = None,
+    transcript: list[dict] | None = None,
+) -> list[bool]:
+    """solver 1회 호출 — questions 순서대로 '맞혔는지'(bool) 리스트.
 
-    반환: questions 순서대로 '맥락 없이 맞혔는지'(bool) 리스트.
-    - True  = 강의를 안 봐도 상식으로 풀림 → 봇 저항 없음 → 전체학습 지식 은행 후보.
-    - False = 강의를 봐야 풀림 → 봇은 못 풂 → 강의 시청 검증(캡차) 후보.
-    (한계: 4지선다는 우연히 맞을 수 있다 — 판정은 강사 검수의 '참고 신호'다.)
-    파싱 실패로 특정 문항의 답을 못 얻으면 그 문항은 False(보수적 — 캡차 후보로 남긴다).
-    키 없으면 AiNotConfiguredError."""
+    transcript=None이면 블라인드(공개 맥락만), 있으면 자막 기준 풀이.
+    파싱 실패로 특정 문항의 답을 못 얻으면 그 문항은 False(미정답 처리).
+    키 없으면 AiNotConfiguredError. (다수결·판정 조합은 verify_questions가 담당.)"""
     if not questions:
         return []
     settings = get_settings()
@@ -142,7 +173,9 @@ def solve_questions(questions: list[dict], *, api_key: str | None = None) -> lis
     if not key:
         raise AiNotConfiguredError("LLM API 키(Anthropic)가 설정되지 않았습니다.")
 
-    text = _post_messages(key, _solve_prompt(questions), max_tokens=1024)
+    text = _post_messages(
+        key, _solve_prompt(questions, context=context, transcript=transcript), max_tokens=1024
+    )
     raw = text.strip()
     m = re.search(r"```(?:json)?\s*(\[.*?\])\s*```", raw, re.DOTALL)
     if m:
@@ -158,6 +191,85 @@ def solve_questions(questions: list[dict], *, api_key: str | None = None) -> lis
             if isinstance(p, dict) and isinstance(p.get("q"), int) and isinstance(p.get("answer_index"), int):
                 by_q[p["q"]] = p["answer_index"]
     return [by_q.get(i + 1, -1) == q.get("answer_index") for i, q in enumerate(questions)]
+
+
+def _shuffled_variants(questions: list[dict], rng) -> list[dict]:
+    """보기 순서를 셔플한 사본 — answer_index도 함께 재배치.
+
+    LLM 생성 문항의 위치 편향(정답을 특정 위치·긴 보기에 두는 습관)을 검증자가
+    '습관으로' 맞히는 것을 막는다. 원본은 변형하지 않는다."""
+    out = []
+    for q in questions:
+        idxs = list(range(len(q["options"])))
+        rng.shuffle(idxs)
+        out.append(
+            {
+                "prompt": q["prompt"],
+                "options": [q["options"][i] for i in idxs],
+                "answer_index": idxs.index(q["answer_index"]),
+            }
+        )
+    return out
+
+
+def verify_questions(
+    questions: list[dict],
+    *,
+    api_key: str | None = None,
+    context: dict | None = None,
+    transcript: list[dict] | None = None,
+    trials: int = 3,
+) -> list[dict]:
+    """자기검증 오케스트레이터 — 문항별 {blind_passed, transcript_passed, verdict}.
+
+    1) 블라인드 solve를 '보기 셔플'로 trials회(기본 3) 돌려 다수결 — 우연 정답(4지선다
+       25%)과 위치 편향을 줄인다. 공개 맥락(제목·과목·설명)은 항상 제공(공격자 조건 일치).
+    2) 자막이 있으면 자막-포함 solve 1회 — '자막을 줘도 못 푸는' 문항은 불량(환각·모호)
+       신호다.
+    verdict:
+      - 'bank'    = 블라인드로 풀림 → 상식 문제 → 시청 검증(캡차) 부적합, 지식 은행 후보.
+      - 'captcha' = 블라인드로 못 풀고 자막으론 풀림 → 강의 의존적·정상 문항(이상적).
+      - 'discard' = 블라인드로도 자막으로도 못 풀림 → 불량 의심(폐기 권고).
+      - 자막이 없으면 불량 판별 불가 → 못 푼 문항은 'captcha'(종전과 동일, 한계 명시).
+    판정은 강사 검수의 참고 신호다(자동 배치 아님)."""
+    if not questions:
+        return []
+    import random
+
+    trials = max(1, min(int(trials), 5))
+    blind_hits = [0] * len(questions)
+    for t in range(trials):
+        rng = random.Random(t * 7919 + len(questions))  # 재현 가능(시드=회차)·회차마다 다른 셔플
+        variants = _shuffled_variants(questions, rng)
+        result = solve_questions(variants, api_key=api_key, context=context)
+        for i, ok in enumerate(result):
+            if ok:
+                blind_hits[i] += 1
+    majority = trials // 2 + 1
+    blind_passed = [h >= majority for h in blind_hits]
+
+    transcript_passed: list[bool] | None = None
+    if transcript:
+        transcript_passed = solve_questions(
+            questions, api_key=api_key, context=context, transcript=transcript
+        )
+
+    out = []
+    for i in range(len(questions)):
+        if blind_passed[i]:
+            verdict = "bank"
+        elif transcript_passed is not None and not transcript_passed[i]:
+            verdict = "discard"
+        else:
+            verdict = "captcha"
+        out.append(
+            {
+                "blind_passed": blind_passed[i],
+                "transcript_passed": None if transcript_passed is None else transcript_passed[i],
+                "verdict": verdict,
+            }
+        )
+    return out
 
 
 def _parse_questions(text: str, n: int) -> list[dict]:
