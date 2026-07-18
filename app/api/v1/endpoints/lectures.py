@@ -1559,18 +1559,33 @@ def ops_place_question_to_bank(
     )
     # 원 문항에 배치 이력 표식 — 중복 배치 방지 + 콘솔 '은행 배치됨' 배지의 근거
     q.payload = {**payload, "bank_placed": {"bank_id": slug, "at": datetime.now().isoformat(timespec="seconds")}}
+    # ★은행으로 옮긴 문항은 강의 캡차 출제에서 뺀다(active→draft 강등). 은행 배치는
+    # 자기검증 verdict='bank'(봇도 상식으로 풀림) 문항의 경로라, 활성 캡차로 남겨두면
+    # 봇이 그냥 통과하는 약한 시청 검증이 된다(skeptic 0718). 캡차 출제는 active만
+    # 대상이므로(_lecture_challenge) draft로 내리면 캡차 풀에서 빠지되, 문항 목록엔
+    # 남아 '은행 배치됨' 배지를 유지한다. 완전 삭제가 아닌 이유: 은행에 payload를
+    # 복사했어도 원 문항은 '이 강의에서 이 개념을 냈다'는 이력이라 보존한다.
+    demoted = q.status == "active"
+    if demoted:
+        q.status = "draft"
+    db.flush()
     audit(
         db,
         action="lecture.question.to_bank",
         actor_user_id=principal.id,
         target_type="lecture_question",
         target_id=q.id,
-        after={"bank_id": slug, "subject": lec.subject, "order_no": max_order + 1},
+        after={"bank_id": slug, "subject": lec.subject, "order_no": max_order + 1,
+               "demoted_from_active": demoted},
     )
+    # 활성 문항 하나가 줄었으면(강등) 그 시점 예약을 정합 — 마지막 활성 핀을 은행으로
+    # 보내면 학생이 게이트에 닿아도 낼 문제가 없어 갇히므로(문항 삭제와 동일 처치).
+    if demoted:
+        _reconcile_progress(db, lecture_id)
     db.commit()
     # 런타임 은행 갱신 — 재기동 없이 오늘의퀴즈·은행 풀에 즉시 반영(요청 세션 주입)
     runtime_visible = subject_banks.refresh_from_db(db)
-    return {"ok": True, "bank_id": slug, "runtime_visible": runtime_visible}
+    return {"ok": True, "bank_id": slug, "runtime_visible": runtime_visible, "demoted_from_active": demoted}
 
 
 # ---------------------------------------------------------------- 문항 이미지 첨부

@@ -34,7 +34,12 @@ def main() -> int:
         if cmd == "minors":
             # 아동 테스트데이터 파기 (사용자 승인 0718). 기본은 드라이런 —
             # --execute 없이는 아무것도 바꾸지 않고 대상만 보여준다.
-            from app.models import BehaviorSummary, StudentProfile
+            from app.models import (
+                BehaviorSummary,
+                BehaviorTrace,
+                LearningAttempt,
+                StudentProfile,
+            )
 
             targets = privacy_service.find_minor_students(db)
             pending = [s for s in targets if s.real_name is not None or s.status != "disabled"]
@@ -50,14 +55,29 @@ def main() -> int:
             if "--execute" not in args:
                 print("(드라이런 — 실행하려면 --execute)")
                 return 0
-            before_behavior = db.query(BehaviorSummary).count()
+            # 불변식: 파기는 학습·행동 데이터를 삭제하지 않는다(성인 생성분 보존 —
+            # 사용자 지시 0718). 행동요약뿐 아니라 궤적·학습시도까지 셋을 검사한다
+            # (skeptic 0718: 한 테이블만 세면 다른 테이블 삭제를 못 잡는다).
+            def _counts():
+                return {
+                    "behavior_summaries": db.query(BehaviorSummary).count(),
+                    "behavior_traces": db.query(BehaviorTrace).count(),
+                    "learning_attempts": db.query(LearningAttempt).count(),
+                }
+
+            before = _counts()
             n = privacy_service.purge_minor_students(db)
-            after_behavior = db.query(BehaviorSummary).count()
+            after = _counts()
             print(f"익명화 실행: {n}건")
-            # 불변식: 행동데이터는 삭제되지 않는다(성인 생성분 보존 — 사용자 지시 0718)
-            print(f"행동데이터 행수 {before_behavior} → {after_behavior} (불변이어야 함)")
-            if before_behavior != after_behavior:
-                print("!! 행동데이터 행수가 변했다 — 즉시 조사 필요")
+            print(f"데이터 불변식 (삭제 0이어야 함):")
+            leaked = False
+            for k in before:
+                mark = "OK" if before[k] == after[k] else "!! 변함"
+                if before[k] != after[k]:
+                    leaked = True
+                print(f"  {k}: {before[k]} → {after[k]}  [{mark}]")
+            if leaked:
+                print("!! 학습/행동 데이터가 삭제됐다 — 즉시 조사 필요(파기는 PII 익명화만이어야 함)")
                 return 1
             return 0
         if cmd == "student" and len(args) > 1:

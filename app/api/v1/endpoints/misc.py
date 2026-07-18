@@ -1,14 +1,15 @@
-"""기타 API — 문의(무인증), AI 챗 stub, CAPTCHA 챌린지 stub."""
+"""기타 API — 문의 접수(무인증) + CAPTCHA 챌린지 stub.
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+(학생/학부모 AI 챗은 학생 게임화·학부모 은퇴 0718로 제거됨 — 그와 함께 딸려온
+require_parent·check_parent_child·chat 스키마 import도 정리했다. git 이력 참고.)"""
+
+from fastapi import APIRouter, Depends, Request
 from sqlalchemy.orm import Session
 
-from app.core.permissions import Principal, check_parent_child, require_parent, require_student
 from app.db.session import get_db
-from app.models import Inquiry, StudentProfile
-from app.schemas.misc import InquiryCreate, ParentChatRequest, StudentChatRequest
+from app.models import Inquiry
+from app.schemas.misc import InquiryCreate
 from app.services import auth_service
-from app.services.stats import D  # DB(stat_blobs) 우선, design_data fallback
 
 router = APIRouter(tags=["misc"])
 

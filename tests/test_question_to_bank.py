@@ -96,10 +96,42 @@ def test_to_bank_converts_and_hot_reloads(client, db, media_dir):
         qs = client.get(f"/api/v1/ops/lectures/{lec['id']}/questions", headers=auth(tok)).json()
         mine = next(x for x in qs if x["id"] == q["id"])
         assert mine["bank_placed"]["bank_id"] == body["bank_id"]
+        # draft로 배치했으니 강등 없음
+        assert body["demoted_from_active"] is False and mine["status"] == "draft"
         r2 = client.post(
             f"/api/v1/ops/lectures/{lec['id']}/questions/{q['id']}/to-bank", headers=auth(tok)
         )
         assert r2.status_code == 409
+
+
+def test_to_bank_demotes_active_out_of_captcha_pool(client, db, media_dir):
+    """★활성(캡차 출제 중) 문항을 은행에 보내면 draft로 강등돼 캡차 풀에서 빠진다.
+
+    verdict='bank'(봇도 상식으로 풀림) 문항이 활성 캡차로 남으면 약한 검증이 되는
+    구멍(skeptic 0718)을 막는다. 캡차 출제는 active만 대상이므로 draft 강등으로 충분."""
+    with _bank_state_guard():
+        tok = _ops(client, db)
+        lec = _upload_lecture(client, tok, title="암석", subject="과학", duration=600).json()
+        db.add(Question(id="sci-seed-3", subject="과학", type="single", order_no=1,
+                        playable=True, payload={"id": "sci-seed-3", "type": "single",
+                                                "topic": "seed", "stage": 1, "prompt": "p",
+                                                "hint": "", "options": [{"id": "o1", "text": "x"}],
+                                                "answer": "o1", "explain": "", "playable": True}))
+        db.commit()
+        # 활성(공개) 문항 — 시점 지정 후 active
+        q = _make_question(client, tok, lec["id"], position_sec=30, status="active")
+        assert q["status"] == "active"
+
+        r = client.post(
+            f"/api/v1/ops/lectures/{lec['id']}/questions/{q['id']}/to-bank", headers=auth(tok)
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["demoted_from_active"] is True
+
+        qs = client.get(f"/api/v1/ops/lectures/{lec['id']}/questions", headers=auth(tok)).json()
+        mine = next(x for x in qs if x["id"] == q["id"])
+        assert mine["status"] == "draft"  # 캡차 풀에서 빠짐 — 목록엔 남아 배지 유지
+        assert mine["bank_placed"] is not None
 
 
 def test_to_bank_rejects_unconvertible(client, db, media_dir):
