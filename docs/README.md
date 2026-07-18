@@ -20,6 +20,9 @@
 - **[course-exam-design.md](course-exam-design.md)** — 코스 수료 시험 설계(구현 전).
   왜 완전학습(mastery)인지, 기출의 비영리 교육용 전제(출처 표시 의무·유료화 리스크),
   데이터 모델·API·기존 코드 재사용 지도.
+- **[question-bank-scale-design.md](question-bank-scale-design.md)** — 문제은행 규모
+  확장 설계(구현 전). 만 개 규모에서 무한 스트림이 왜 무너지는지, 학생×문항 상태
+  기계 + 간격 반복(SRS)·"오늘의 큐"·세트 단위·20주 챕터의 한계와 코스 기반 재편.
 - **[onboarding-security-design.md](onboarding-security-design.md)** — 가입·코드 보안 설계.
 - **[BEHAVIOR_DATA.md](BEHAVIOR_DATA.md)** — 행동 데이터 수집·의미.
 
