@@ -16,6 +16,33 @@ from sqlalchemy.orm import Mapped, mapped_column
 from app.db.base import Base, Timestamps, UUIDPk
 
 
+class Course(Base, UUIDPk, Timestamps):
+    """강사 코스 — 한 강사가 한 과목으로 묶는 강의 묶음(예: '수학 기초반').
+
+    설계(사용자 결정 2026-07-18): **코스 = 과목 하나 고정.** 생성 시 subject를 정하고,
+    그 코스에 담기는 모든 강의는 이 과목이어야 한다(강의 업로드/수정에서 검증).
+    한 강사가 코스를 여러 개 만들 수 있다(예: '수학 기초반'·'수학 심화반').
+    학생 화면 구조는 과목 → 강사별 코스 → 코스 안의 강의 순서(order_no)다.
+
+    소유권: instructor_id == 그 강사. 운영자는 전체를 감독한다(강사 강의 스코프와 동일
+    규약 — _get_ops_course가 강사에겐 남의 코스를 404로 흘리지 않는다). 인강 표준
+    (인프런·클래스101 등)의 코스=한 강사·한 주제 모델과 같은 계열."""
+
+    __tablename__ = "courses"
+    __table_args__ = (Index("ix_course_subject_status", "subject", "status"),)
+
+    # 소프트 참조(FK 제약 없이 인덱스만) — behavior_summaries.student_id와 같은 규약.
+    # 이 코드베이스는 relationship을 안 쓰고 명시적 db.get/query로 조회하며, DB FK는
+    # collation 일치를 강제해(라이브/로컬 collation 불일치 시 생성 실패) 이식성만 해친다.
+    instructor_id: Mapped[str] = mapped_column(CHAR(36), index=True)
+    subject: Mapped[str] = mapped_column(String(20))  # 과목 고정 — 이 코스의 모든 강의가 이 과목
+    title: Mapped[str] = mapped_column(String(200))
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # 과목 안에서의 코스 정렬(학생 화면: 같은 과목의 코스들 순서). 미지정 시 max+1로 맨 뒤.
+    order_no: Mapped[int] = mapped_column(default=0)
+    status: Mapped[str] = mapped_column(String(20), default="active")  # active|hidden|deleted
+
+
 class Lecture(Base, UUIDPk, Timestamps):
     """강의 영상 메타 — 파일 경로는 저장하지 않고 LECTURE_MEDIA_DIR/{id}{video_ext}로 유도(경로조작 원천 차단)"""
 
@@ -28,6 +55,10 @@ class Lecture(Base, UUIDPk, Timestamps):
     title: Mapped[str] = mapped_column(String(200))
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     subject: Mapped[str] = mapped_column(String(20))  # 국어|영어|수학|과학|사회|생활
+    # 소속 코스 — 강사 코스 모델(course_tbl_01) 도입 전 강의는 NULL(미분류). 코스의
+    # subject와 이 강의의 subject는 반드시 일치한다(업로드/수정에서 검증 — 코스=과목 고정).
+    # 소프트 참조(FK 제약 없이 인덱스만) — Course.instructor_id와 같은 이유(collation 회피).
+    course_id: Mapped[str | None] = mapped_column(CHAR(36), nullable=True, index=True)
     video_ext: Mapped[str] = mapped_column(String(10))  # .mp4|.webm
     video_bytes: Mapped[int] = mapped_column(BigInteger, default=0)
     duration_sec: Mapped[int] = mapped_column(default=0)

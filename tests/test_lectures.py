@@ -71,7 +71,7 @@ def _edu_key(client, db, seed_org, ops_tok, *, first_party=True, subject="국어
 def _upload_lecture(
     client, ops_tok, *, title="분수의 덧셈", subject="국어", duration=600,
     size=2 * 1024 * 1024, filename="v.mp4",
-    content_type="video/mp4", order_no=None,
+    content_type="video/mp4", order_no=None, course_id=None,
 ):
     data = {
         "title": title,
@@ -81,6 +81,8 @@ def _upload_lecture(
     }
     if order_no is not None:
         data["order_no"] = str(order_no)
+    if course_id is not None:
+        data["course_id"] = course_id
     return client.post(
         "/api/v1/ops/lectures",
         data=data,

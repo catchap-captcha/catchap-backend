@@ -50,7 +50,7 @@ from fastapi import (
 )
 from fastapi.responses import FileResponse
 from jwt import PyJWTError
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import func, not_
 from sqlalchemy.orm import Session
 
@@ -59,6 +59,7 @@ from app.core.permissions import Principal, require_lecture_manager, require_stu
 from app.core.security import decode_token, new_uuid
 from app.db.session import get_db
 from app.models import (
+    Course,
     Lecture,
     LectureCheckpointEvent,
     LectureMaterial,
@@ -686,6 +687,7 @@ def _lecture_row(db: Session, lec: Lecture) -> dict:
         "title": lec.title,
         "description": lec.description,
         "subject": lec.subject,
+        "course_id": lec.course_id,  # 소속 코스(없으면 None=미분류)
         "video_ext": lec.video_ext,
         "video_bytes": lec.video_bytes,
         "duration_sec": lec.duration_sec,
@@ -696,6 +698,155 @@ def _lecture_row(db: Session, lec: Lecture) -> dict:
         "active_question_count": _active_question_count(db, lec.id),
         "created_at": lec.created_at.isoformat() if lec.created_at else None,
     }
+
+
+# ================================================================ 강사 코스 CRUD
+# 코스 = 한 강사가 한 과목으로 묶는 강의 묶음(예: '수학 기초반'). 코스=과목 고정
+# (사용자 결정 0718). 강사는 자기 코스만, 운영자는 전체를 감독한다(강의 스코프와 동일
+# 규약 — 남의 코스는 404로 존재 미노출). 학생 화면: 과목 → 강사별 코스 → 강의(order_no).
+class _CourseCreate(BaseModel):
+    title: str = Field(min_length=1, max_length=200)
+    subject: str  # 이 코스의 고정 과목 — 담기는 모든 강의가 이 과목이어야 한다
+    description: str | None = Field(default=None, max_length=2000)
+
+
+class _CourseUpdate(BaseModel):
+    # 미전송(None)은 변경 안 함. subject는 못 바꾼다 — 코스=과목 고정이라 소속 강의와
+    # 어긋나기 때문(바꾸려면 새 코스를 만든다).
+    title: str | None = Field(default=None, min_length=1, max_length=200)
+    description: str | None = Field(default=None, max_length=2000)
+    order_no: int | None = None
+    status: str | None = None  # active|hidden
+
+
+def _get_ops_course(db: Session, course_id: str, principal: Principal) -> Course:
+    """코스 로더 — 운영자는 전체, 강사는 자기 코스(instructor_id)만. 남의 코스는 403이
+    아니라 404(강의 스코프 _get_ops_lecture와 동일 — 존재 여부를 흘리지 않는다)."""
+    c = db.get(Course, course_id)
+    if c is None or c.status == "deleted":
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="코스를 찾을 수 없습니다.")
+    if principal.role == "instructor" and c.instructor_id != principal.id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="코스를 찾을 수 없습니다.")
+    return c
+
+
+def _course_row(db: Session, c: Course) -> dict:
+    lecture_count = (
+        db.query(func.count(Lecture.id))
+        .filter(Lecture.course_id == c.id, Lecture.status != "deleted")
+        .scalar()
+        or 0
+    )
+    return {
+        "id": c.id,
+        "title": c.title,
+        "subject": c.subject,
+        "description": c.description,
+        "order_no": int(c.order_no or 0),
+        "status": c.status,
+        "instructor_id": c.instructor_id,
+        "lecture_count": int(lecture_count),
+        "created_at": c.created_at.isoformat() if c.created_at else None,
+    }
+
+
+@router.get("/ops/courses")
+def ops_list_courses(
+    principal: Principal = Depends(require_lecture_manager), db: Session = Depends(get_db)
+):
+    q = db.query(Course).filter(Course.status != "deleted")
+    if principal.role == "instructor":
+        q = q.filter(Course.instructor_id == principal.id)
+    rows = q.order_by(Course.subject, Course.order_no, Course.created_at).all()
+    return [_course_row(db, c) for c in rows]
+
+
+@router.post("/ops/courses")
+def ops_create_course(
+    req: _CourseCreate,
+    principal: Principal = Depends(require_lecture_manager),
+    db: Session = Depends(get_db),
+):
+    """코스 생성 — 소유자는 생성한 본인(강사 또는 운영자). subject는 여기서 고정된다."""
+    if req.subject not in EDU_SUBJECTS:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="지원하지 않는 과목입니다.")
+    # 과목 내 맨 뒤 배정(학생 화면의 코스 나열 순서). 내 코스 기준 max+1.
+    max_no = (
+        db.query(func.max(Course.order_no))
+        .filter(Course.subject == req.subject, Course.status != "deleted")
+        .scalar()
+        or 0
+    )
+    c = Course(
+        instructor_id=principal.id,
+        subject=req.subject,
+        title=req.title.strip(),
+        description=req.description,
+        order_no=int(max_no) + 1,
+        status="active",
+    )
+    db.add(c)
+    db.flush()
+    audit(
+        db, action="course.create", actor_user_id=principal.id,
+        target_type="course", target_id=c.id,
+        after={"title": c.title, "subject": c.subject},
+    )
+    db.commit()
+    return _course_row(db, c)
+
+
+@router.put("/ops/courses/{course_id}")
+def ops_update_course(
+    course_id: str,
+    req: _CourseUpdate,
+    principal: Principal = Depends(require_lecture_manager),
+    db: Session = Depends(get_db),
+):
+    c = _get_ops_course(db, course_id, principal)
+    if req.status is not None and req.status not in ("active", "hidden"):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="status는 active|hidden만 가능합니다.")
+    before = {"title": c.title, "order_no": c.order_no, "status": c.status}
+    if req.title is not None:
+        c.title = req.title.strip()
+    if req.description is not None:
+        c.description = req.description
+    if req.order_no is not None:
+        c.order_no = int(req.order_no)
+    if req.status is not None:
+        c.status = req.status
+    audit(
+        db, action="course.update", actor_user_id=principal.id,
+        target_type="course", target_id=c.id,
+        before=before, after={"title": c.title, "order_no": c.order_no, "status": c.status},
+    )
+    db.commit()
+    return _course_row(db, c)
+
+
+@router.delete("/ops/courses/{course_id}")
+def ops_delete_course(
+    course_id: str,
+    principal: Principal = Depends(require_lecture_manager),
+    db: Session = Depends(get_db),
+):
+    """코스 소프트 삭제 — 소속 강의는 미분류(course_id=NULL)로 풀어 준다(강의 자체는
+    보존). 강의를 함께 지우지 않는 이유: 강의는 시청 이력·문항이 딸린 큰 자산이라
+    코스 삭제가 실수여도 콘텐츠가 사라지면 안 된다."""
+    c = _get_ops_course(db, course_id, principal)
+    freed = (
+        db.query(Lecture)
+        .filter(Lecture.course_id == c.id, Lecture.status != "deleted")
+        .update({Lecture.course_id: None}, synchronize_session=False)
+    )
+    c.status = "deleted"
+    audit(
+        db, action="course.delete", actor_user_id=principal.id,
+        target_type="course", target_id=c.id,
+        after={"lectures_unassigned": int(freed)},
+    )
+    db.commit()
+    return {"ok": True, "lectures_unassigned": int(freed)}
 
 
 @router.get("/ops/lectures")
@@ -744,6 +895,7 @@ def ops_create_lecture(
     duration_sec: int = Form(...),
     description: str | None = Form(default=None),
     order_no: int | None = Form(default=None),  # 미지정 → 과목 맨 뒤(max+1)
+    course_id: str | None = Form(default=None),  # 소속 코스(선택) — 미지정이면 미분류
     file: UploadFile = File(...),
     principal: Principal = Depends(require_lecture_manager),
     db: Session = Depends(get_db),
@@ -756,6 +908,15 @@ def ops_create_lecture(
     )
     if subject not in EDU_SUBJECTS:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="지원하지 않는 과목입니다.")
+    # 코스 지정 시 — 소유(강사는 자기 코스만: _get_ops_course가 404) + 과목 일치 강제
+    # (코스=과목 고정: 수학 코스엔 수학 강의만).
+    if course_id:
+        course = _get_ops_course(db, course_id, principal)
+        if course.subject != subject:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                detail=f"이 코스는 '{course.subject}' 과목이라 '{subject}' 강의를 담을 수 없어요.",
+            )
     if duration_sec <= 0:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="영상 길이(duration_sec)가 필요합니다.")
     ext = os.path.splitext(file.filename or "")[1].lower()
@@ -781,6 +942,7 @@ def ops_create_lecture(
         title=title.strip()[:200],
         description=description,
         subject=subject,
+        course_id=course_id or None,
         video_ext=ext,
         video_bytes=0,
         duration_sec=duration_sec,
@@ -839,6 +1001,8 @@ class _LectureUpdate(BaseModel):
     # 간격 개념이 사라졌다. 구버전 콘솔이 보내도 pydantic이 조용히 무시한다.
     order_no: int | None = None  # 과목 내 목차 순서 재배열
     status: str | None = None  # active|hidden
+    # 소속 코스 변경. model_fields_set으로 '미전송'과 '명시적 null(미분류로 빼기)'을 구분.
+    course_id: str | None = None
 
 
 @router.put("/ops/lectures/{lecture_id}")
@@ -854,6 +1018,20 @@ def ops_update_lecture(
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="지원하지 않는 과목입니다.")
     if req.status is not None and req.status not in ("active", "hidden"):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="status는 active|hidden만 가능합니다.")
+    # 코스 변경 — 명시적으로 전송된 경우만(미전송이면 유지). null이면 미분류로 뺀다.
+    # 코스를 지정하면 소유 확인 + 과목 일치 강제(변경될 subject 기준). 코스=과목 고정.
+    if "course_id" in req.model_fields_set:
+        if req.course_id:
+            course = _get_ops_course(db, req.course_id, principal)
+            eff_subject = req.subject if req.subject is not None else lec.subject
+            if course.subject != eff_subject:
+                raise HTTPException(
+                    status.HTTP_400_BAD_REQUEST,
+                    detail=f"이 코스는 '{course.subject}' 과목이라 '{eff_subject}' 강의를 담을 수 없어요.",
+                )
+            lec.course_id = req.course_id
+        else:
+            lec.course_id = None
 
     before = {
         "title": lec.title, "subject": lec.subject, "status": lec.status,

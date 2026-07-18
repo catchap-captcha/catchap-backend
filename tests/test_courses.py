@@ -1,0 +1,99 @@
+"""강사 코스(1단계) — CRUD·과목 고정·강사 소유 스코프·강의 연결·기존 강의 호환.
+
+설계: docs/product-direction.md(코스=과목 고정), 강사 스코프는 test_instructor와 동일 규약.
+"""
+
+from tests.test_captcha_api import _ops, auth
+from tests.test_instructor import _create_instructor, _instructor_login
+from tests.test_lectures import _upload_lecture, media_dir  # noqa: F401 (fixture 재사용)
+
+
+def _create_course(client, tok, *, title="수학 기초반", subject="수학"):
+    r = client.post("/api/v1/ops/courses", json={"title": title, "subject": subject}, headers=auth(tok))
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def test_course_crud_and_subject_fixed(client, db, media_dir):
+    ops = _ops(client, db)
+    c = _create_course(client, ops, title="수학 기초반", subject="수학")
+    assert c["subject"] == "수학" and c["lecture_count"] == 0
+
+    # 지원하지 않는 과목 400
+    assert client.post("/api/v1/ops/courses", json={"title": "x", "subject": "체육"}, headers=auth(ops)).status_code == 400
+
+    # 수정 — 제목/순서/상태. subject는 스키마에 없어 바뀌지 않는다(코스=과목 고정)
+    r = client.put(f"/api/v1/ops/courses/{c['id']}", json={"title": "수학 심화반", "order_no": 5}, headers=auth(ops))
+    assert r.status_code == 200 and r.json()["title"] == "수학 심화반" and r.json()["subject"] == "수학"
+
+    # 소프트 삭제 — 목록에서 사라짐
+    assert client.delete(f"/api/v1/ops/courses/{c['id']}", headers=auth(ops)).status_code == 200
+    assert all(x["id"] != c["id"] for x in client.get("/api/v1/ops/courses", headers=auth(ops)).json())
+
+
+def test_course_scope_instructor_owns_only(client, db, media_dir):
+    """강사는 자기 코스만 — 목록 필터 + 남의 코스는 수정/삭제/강의연결 전부 404."""
+    ops = _ops(client, db)
+    created = _create_instructor(client, ops, email="c-inst@catchap.dev")
+    itok = _instructor_login(client, "c-inst@catchap.dev", created["temp_password"]).json()["access_token"]
+
+    ops_course = _create_course(client, ops, title="운영자 코스", subject="과학")
+    my_course = _create_course(client, itok, title="강사 코스", subject="영어")
+
+    # 목록: 강사=자기 것만, 운영자=전체
+    assert [x["id"] for x in client.get("/api/v1/ops/courses", headers=auth(itok)).json()] == [my_course["id"]]
+    assert {x["id"] for x in client.get("/api/v1/ops/courses", headers=auth(ops)).json()} >= {
+        ops_course["id"], my_course["id"]
+    }
+
+    # 남의 코스 수정·삭제 404
+    oid = ops_course["id"]
+    assert client.put(f"/api/v1/ops/courses/{oid}", json={"title": "탈취"}, headers=auth(itok)).status_code == 404
+    assert client.delete(f"/api/v1/ops/courses/{oid}", headers=auth(itok)).status_code == 404
+
+
+def test_lecture_course_link_and_subject_match(client, db, media_dir):
+    """강의를 코스에 담을 때 소유·과목 일치 강제. 코스 삭제 시 강의는 미분류로 보존."""
+    ops = _ops(client, db)
+    course = _create_course(client, ops, title="과학 코스", subject="과학")
+
+    # 과목 불일치 — 국어 강의를 과학 코스에 담으려 하면 400
+    bad = _upload_lecture(client, ops, title="국어강의", subject="국어", course_id=course["id"])
+    assert bad.status_code == 400 and "과목" in bad.json()["detail"]
+
+    # 과목 일치 — 성공, course_id 귀속
+    ok = _upload_lecture(client, ops, title="과학강의", subject="과학", course_id=course["id"])
+    assert ok.status_code == 200, ok.text
+    assert ok.json()["course_id"] == course["id"]
+
+    # 코스에 강의 수 반영
+    courses = client.get("/api/v1/ops/courses", headers=auth(ops)).json()
+    assert next(x for x in courses if x["id"] == course["id"])["lecture_count"] == 1
+
+    # 코스 삭제 → 강의는 미분류(course_id=None)로 살아남는다
+    d = client.delete(f"/api/v1/ops/courses/{course['id']}", headers=auth(ops))
+    assert d.status_code == 200 and d.json()["lectures_unassigned"] == 1
+    from app.models import Lecture
+
+    assert db.get(Lecture, ok.json()["id"]).course_id is None
+    assert db.get(Lecture, ok.json()["id"]).status != "deleted"  # 강의 자체는 보존
+
+
+def test_update_lecture_course_reassign(client, db, media_dir):
+    """강의 수정으로 코스 이동/해제 — 명시 전송만 반영, 과목 일치 강제."""
+    ops = _ops(client, db)
+    c1 = _create_course(client, ops, title="수학A", subject="수학")
+    c2 = _create_course(client, ops, title="영어A", subject="영어")
+    lec = _upload_lecture(client, ops, title="수학강의", subject="수학", course_id=c1["id"]).json()
+
+    # 과목 다른 코스로 이동 400
+    assert client.put(f"/api/v1/ops/lectures/{lec['id']}", json={"course_id": c2["id"]}, headers=auth(ops)).status_code == 400
+
+    # null 전송 = 미분류로 빼기
+    r = client.put(f"/api/v1/ops/lectures/{lec['id']}", json={"course_id": None}, headers=auth(ops))
+    assert r.status_code == 200 and r.json()["course_id"] is None
+
+    # 미전송 = 유지(다른 필드만 수정)
+    client.put(f"/api/v1/ops/lectures/{lec['id']}", json={"course_id": c1["id"]}, headers=auth(ops))
+    r = client.put(f"/api/v1/ops/lectures/{lec['id']}", json={"title": "제목만"}, headers=auth(ops))
+    assert r.json()["course_id"] == c1["id"]  # 코스 유지

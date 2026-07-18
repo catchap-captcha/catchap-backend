@@ -27,6 +27,7 @@ from app.models.learning import (
     WrongAnswer,
 )
 from app.models.lecture import (
+    Course,
     Lecture,
     LectureCheckpointEvent,
     LectureMaterial,
@@ -96,6 +97,7 @@ __all__ = [
     "Invoice",
     "LearningAttempt",
     "LearningSummary",
+    "Course",
     "Lecture",
     "LectureCheckpointEvent",
     "LectureMaterial",
