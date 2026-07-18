@@ -1041,6 +1041,8 @@ def _question_row(q: LectureQuestion) -> dict:
         "transcript_solver_passed": payload.get("transcript_solver_passed"),
         "suggested_placement": payload.get("suggested_placement"),
         "solver_meta": payload.get("solver_meta"),
+        # 은행 배치 이력 — {bank_id, at} 또는 None. 콘솔 '은행 배치됨' 배지·중복 방지 근거.
+        "bank_placed": payload.get("bank_placed"),
         # 이미지 문항 — 내부 경로·id 원문 대신 서빙 엔드포인트 URL만 노출(자료실 download_url과 동일 원칙)
         "prompt_image_url": (
             _question_image_url(q.lecture_id, q.id, pi)
@@ -1469,6 +1471,106 @@ def ops_delete_question(
     for p in image_paths:
         p.unlink(missing_ok=True)  # commit 성공 후 — 이미 없어도 무해(멱등)
     return {"ok": True}
+
+
+@router.post("/ops/lectures/{lecture_id}/questions/{question_id}/to-bank")
+def ops_place_question_to_bank(
+    lecture_id: str,
+    question_id: str,
+    principal: Principal = Depends(require_lecture_manager),
+    db: Session = Depends(get_db),
+):
+    """강의 문항 → 전체학습 문제은행 배치 — 자기검증 '은행 적합' 판정의 실행 단계.
+
+    왜 이 기능인가: 자기검증(2번째 LLM)이 '상식으로 풀리는' 문항을 걸러내면 그건
+    시청 검증(캡차)엔 부적합하지만 버릴 필요는 없다 — 전체학습 지식 문제로 재활용한다.
+    (설계 전체 그림: docs/lecture-question-pipeline.md)
+
+    형식 변환이 이 엔드포인트의 존재 이유다. 강의 문항과 은행 문항은 스키마가 다르다:
+      강의: options=["가","나"] · answer_index=0        (인덱스 기반)
+      은행: options=[{id:"o1",text:"가"}] · answer="o1" (옵션 id 기반, type="single")
+    변환을 잘못하면 학생 게임 화면에서 문항이 깨지므로 여기 한 곳에서만 변환한다.
+
+    정직성 규약:
+    - DB 은행이 비어 있으면(파일 폴백 가동 중) 409 — 이 상태에서 1행을 넣으면 다음
+      재기동 때 로더가 'DB에 문항 있음'으로 판단해 그 1행이 은행 전체가 돼 버린다
+      (파일 은행 1,000+문항 증발). 은행 시드(로더) 선행이 필수라는 사실을 숨기지 않는다.
+    - 배치 직후 런타임 은행을 갱신(subject_banks.refresh_from_db)해 재기동 없이 반영
+      한다 — 갱신 실패면 응답에 runtime_visible=false로 정직하게 노출.
+    한계(문서에도 기록): 다답형·이미지 문항은 은행 single 형식이 못 담아 400.
+    배치된 문항은 은행 리스트 말미(order_no=말미)라 기존 주간 챕터를 흔들지 않는다 —
+    챕터 구조 재편은 별도 단계(전체학습 재편)."""
+    from app.models import Question
+    from app.services import subject_banks
+
+    q = _get_ops_question(db, lecture_id, question_id, principal)
+    lec = db.get(Lecture, lecture_id)
+    payload = q.payload or {}
+
+    if (payload.get("bank_placed") or {}).get("bank_id"):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, detail="이미 은행에 배치된 문항입니다."
+        )
+    answers = q.answer_indexes or [q.answer_index]
+    if len(answers) != 1:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            detail="다답형 문항은 은행(단일 정답형)으로 보낼 수 없어요. 단일 정답으로 수정 후 시도해 주세요.",
+        )
+    if payload.get("prompt_image") or payload.get("option_images"):
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            detail="이미지가 붙은 문항은 은행 형식이 지원하지 않아 보낼 수 없어요.",
+        )
+    options = payload.get("options") or []
+    if not (2 <= len(options) <= 6) or not all(isinstance(o, str) and o.strip() for o in options):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="보기 형식이 올바르지 않습니다.")
+    if db.query(Question).count() == 0:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail="문제은행이 아직 DB에 적재되지 않았어요(파일 폴백 상태). 은행 로더로 기존 문항을 먼저 적재해야 배치할 수 있어요.",
+        )
+
+    ans_i = int(answers[0])
+    slug = f"lec-{lec.id[:8]}-{q.id[:8]}"  # 출처 추적 가능한 유일 슬러그(PK 유니크가 최종 방어)
+    max_order = (
+        db.query(func.max(Question.order_no)).filter(Question.subject == lec.subject).scalar()
+        or 0
+    )
+    bank_payload = {
+        "id": slug,
+        "type": "single",
+        # topic=강의 제목 — 오답노트·챕터 제목 파생이 topic을 쓴다(출처가 화면에 보인다)
+        "topic": lec.title,
+        "stage": 1,
+        "prompt": payload.get("prompt") or "",
+        "hint": "",
+        # 위젯은 emoji 없으면 text로 렌더한다(catchap-widget.js: o.emoji || o.text)
+        "options": [{"id": f"o{i + 1}", "text": t.strip()} for i, t in enumerate(options)],
+        "answer": f"o{ans_i + 1}",
+        "explain": payload.get("explain") or "",
+        "playable": True,
+    }
+    db.add(
+        Question(
+            id=slug, subject=lec.subject, type="single",
+            order_no=max_order + 1, playable=True, payload=bank_payload,
+        )
+    )
+    # 원 문항에 배치 이력 표식 — 중복 배치 방지 + 콘솔 '은행 배치됨' 배지의 근거
+    q.payload = {**payload, "bank_placed": {"bank_id": slug, "at": datetime.now().isoformat(timespec="seconds")}}
+    audit(
+        db,
+        action="lecture.question.to_bank",
+        actor_user_id=principal.id,
+        target_type="lecture_question",
+        target_id=q.id,
+        after={"bank_id": slug, "subject": lec.subject, "order_no": max_order + 1},
+    )
+    db.commit()
+    # 런타임 은행 갱신 — 재기동 없이 오늘의퀴즈·은행 풀에 즉시 반영(요청 세션 주입)
+    runtime_visible = subject_banks.refresh_from_db(db)
+    return {"ok": True, "bank_id": slug, "runtime_visible": runtime_visible}
 
 
 # ---------------------------------------------------------------- 문항 이미지 첨부

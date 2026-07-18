@@ -34,20 +34,27 @@ _FILE_BANKS: dict[str, list[dict]] = {
 }
 
 
-def _load_from_db() -> dict[str, list[dict]] | None:
+def _load_from_db(db=None) -> dict[str, list[dict]] | None:
     """DB(questions)에서 과목별 문항을 order_no 순으로 로드 — 없거나 실패면 None(→ 파일 폴백).
 
     order_by(order_no)로 은행 리스트 순서를 복원한다(챕터 슬라이싱이 이 순서에 의존).
-    앱 시작 1회 로드(파일 은행과 동일 성능) — 문제 갱신은 로더 재실행 + 서버 재기동."""
+    앱 시작 1회 로드(파일 은행과 동일 성능). 갱신은 refresh_from_db()(아래) — 강의 유래
+    문항 배치가 재기동 없이 반영되게 한다.
+    db 인자: 호출자의 세션을 쓸 수 있게(테스트는 SQLite 오버라이드 세션을 주입 —
+    SessionLocal 직결이면 테스트가 개발 MySQL을 건드린다). None이면 SessionLocal."""
     try:
-        from app.db.session import SessionLocal
         from app.models import Question
 
-        db = SessionLocal()
-        try:
+        if db is not None:
             rows = db.query(Question).order_by(Question.subject, Question.order_no).all()
-        finally:
-            db.close()
+        else:
+            from app.db.session import SessionLocal
+
+            _db = SessionLocal()
+            try:
+                rows = _db.query(Question).order_by(Question.subject, Question.order_no).all()
+            finally:
+                _db.close()
         if not rows:
             return None
         banks: dict[str, list[dict]] = {}
@@ -130,6 +137,35 @@ _BY_ID: dict[str, dict[str, dict]] = {
 _PLAYABLE: dict[str, list[dict]] = {
     subject: [q for q in bank if q["playable"]] for subject, bank in BANKS.items()
 }
+
+
+def refresh_from_db(db=None) -> bool:
+    """DB 은행을 다시 읽어 런타임 레지스트리(BANKS/_BY_ID/_PLAYABLE)를 제자리 갱신.
+
+    왜 필요한가: 이 레지스트리들은 임포트 시 1회 구축이라, 강의 유래 문항을 questions
+    테이블에 넣어도 재기동 전까지 학생 화면에 안 보인다 — 그러면 '은행으로 보내기'
+    버튼이 성공한 척만 하는 셈이다(가짜 성공 금지 원칙 위반). 배치 직후 이 함수를
+    불러 즉시 반영한다.
+
+    왜 '제자리(clear+update)'인가: 다른 모듈들이 임포트 시점에 이 dict '객체'의 참조를
+    이미 들고 있다 — 새 dict로 재할당하면 그들은 옛 객체를 계속 본다. 같은 객체를
+    비우고 다시 채워야 모든 참조자에게 전파된다.
+
+    반환 False = DB가 비었거나 실패(파일 폴백 상태) — 이때 갱신하면 파일 은행 전체가
+    사라지므로 아무것도 바꾸지 않는다. 호출자는 False를 정직하게 알릴 것."""
+    fresh = _load_from_db(db)
+    if not fresh:
+        return False
+    for s in tuple(_UNIT_PREFIX):
+        if s in fresh:
+            fresh[s] = _weekly_reorder(s, fresh[s])
+    BANKS.clear()
+    BANKS.update(fresh)
+    _BY_ID.clear()
+    _BY_ID.update({subject: {q["id"]: q for q in bank} for subject, bank in BANKS.items()})
+    _PLAYABLE.clear()
+    _PLAYABLE.update({subject: [q for q in bank if q["playable"]] for subject, bank in BANKS.items()})
+    return True
 
 
 def get_question(subject: str, qid: str) -> dict | None:
