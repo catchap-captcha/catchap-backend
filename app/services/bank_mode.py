@@ -24,15 +24,19 @@
 import random
 from datetime import datetime, timedelta
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from app.models import LectureWatchProgress, StudentProfile, StudentQuestionState
+from app.models import LearningAttempt, LectureWatchProgress, StudentProfile, StudentQuestionState
 from app.services import subject_banks
 
 # ---------------------------------------------------------------- SRS 상수 (설계 §9 기본값)
 # 마스터 기준: 연속 2회 정답. 사다리: streak 1→+1일, 2→+3일, 3→+7일, 4→+14일, 5+→+30일.
 MASTER_STREAK = 2
 SRS_LADDER_DAYS = [1, 3, 7, 14, 30]
+# 오늘의 Q 일일 목표(1세트) — 퀴즈 통합 결정(0719): 매일 습관의 기준선. 목표 달성일이
+# 연속되면 '연속 학습일'이 쌓인다. 풀이 커져도 목표는 이 값 하나(천장이 아니라 바닥).
+Q_DAILY_GOAL = 10
 
 
 def _now() -> datetime:
@@ -227,6 +231,43 @@ def queue_status(db: Session, student: StudentProfile, subject: str) -> dict:
         "new": len(new),
         "resting": len(resting),
         "next_review_at": next_at.isoformat() if next_at else None,
+    }
+
+
+def q_daily_stats(db: Session, student_id: str) -> dict:
+    """오늘의 Q 일일 목표·연속 학습일 — Q축(문제은행·챕터) 응답만 센다.
+
+    Q축 판별 = LearningAttempt.chapter_no IS NOT NULL(자유 은행은 0 마커, 주차는 N —
+    오늘의퀴즈는 NULL이라 제외). graded(서버 채점)만 — 자기신고로 목표·연속일을 못 채운다.
+    연속 학습일 = 목표(Q_DAILY_GOAL) 달성일이 끊기지 않은 날 수. 오늘 아직 미달성이면
+    어제까지의 연속을 보여준다(오늘 달성하면 +1 — 표준 스트릭 표기)."""
+    today = _now().date()
+    since = today - timedelta(days=60)  # 스트릭 상한 60일 — 화면 표기용으로 충분
+    rows = (
+        db.query(func.date(LearningAttempt.created_at), func.count(LearningAttempt.id))
+        .filter(
+            LearningAttempt.student_id == student_id,
+            LearningAttempt.graded.is_(True),
+            LearningAttempt.content_id.isnot(None),
+            LearningAttempt.chapter_no.isnot(None),
+            LearningAttempt.created_at >= datetime.combine(since, datetime.min.time()),
+        )
+        .group_by(func.date(LearningAttempt.created_at))
+        .all()
+    )
+    by_day = {d if isinstance(d, type(today)) else datetime.strptime(str(d), "%Y-%m-%d").date(): int(n) for d, n in rows}
+    done_today = by_day.get(today, 0)
+    goal_met = done_today >= Q_DAILY_GOAL
+    day = today if goal_met else today - timedelta(days=1)
+    streak = 0
+    while by_day.get(day, 0) >= Q_DAILY_GOAL and day > since:
+        streak += 1
+        day -= timedelta(days=1)
+    return {
+        "goal": Q_DAILY_GOAL,
+        "done_today": done_today,
+        "goal_met": goal_met,
+        "streak_days": streak,
     }
 
 

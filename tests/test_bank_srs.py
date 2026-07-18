@@ -96,16 +96,58 @@ def test_challenge_today_done_http_and_early_review(client, db, seed_org):
     assert row["total"] == row["unsolved"] + row["wrong"] + row["correct"]
 
 
-def _raw_attempt(db, student, subject, qid, result, at):
-    """SRS 훅 없이 원장(LearningAttempt)만 기록 — 백필 입력 재현용(created_at 지정)."""
+def _raw_attempt(db, student, subject, qid, result, at, chapter_no=1):
+    """SRS 훅 없이 원장(LearningAttempt)만 기록 — 백필·일일 목표 입력 재현용(created_at 지정)."""
     db.add(
         LearningAttempt(
             organization_id=student.organization_id, student_id=student.id,
-            subject=subject, chapter_no=1, content_id=qid, result=result,
+            subject=subject, chapter_no=chapter_no, content_id=qid, result=result,
             score=20 if result == "correct" else 0, created_at=at,
         )
     )
     db.commit()
+
+
+def test_q_today_goal_and_streak(client, db, seed_org):
+    """오늘의 Q 현황 — Q축(chapter_no NOT NULL)만 세고, 목표 달성일 연속이 streak."""
+    from tests.test_bank_mode import _mk_attempt  # noqa: F401 (경로용 아님 — 토큰 헬퍼만 사용)
+
+    student = seed_org["student"]
+    ids = [q["id"] for q in subject_banks.playable_pool("수학")]
+    now = datetime.now()
+    today9 = now.replace(hour=9, minute=0, second=0, microsecond=0)
+
+    # 어제: 목표(10문제) 달성 — Q축(chapter_no=0 자유 은행 마커)
+    for i in range(10):
+        _raw_attempt(db, student, "수학", ids[i % len(ids)], "correct", today9 - timedelta(days=1), chapter_no=0)
+    # 오늘: 3문제(Q축) + 오늘의퀴즈 2문제(chapter_no NULL — 목표에 안 섞여야 함)
+    for i in range(3):
+        _raw_attempt(db, student, "수학", ids[i % len(ids)], "correct", today9, chapter_no=0)
+    for _ in range(2):
+        db.add(LearningAttempt(
+            organization_id=student.organization_id, student_id=student.id,
+            subject="수학", chapter_no=None, content_id=ids[0], result="correct",
+            score=20, created_at=today9,
+        ))
+    db.commit()
+
+    tok = _student_token(client)
+    r = client.get("/api/v1/students/me/q-today", headers={"Authorization": f"Bearer {tok}"})
+    assert r.status_code == 200, r.text
+    d = r.json()
+    assert d["goal"] == 10
+    assert d["done_today"] == 3  # 퀴즈 2문제는 제외
+    assert d["goal_met"] is False
+    assert d["streak_days"] == 1  # 어제 달성 — 오늘 미달성이면 어제까지의 연속을 보여준다
+    assert d["total"]["new"] > 0 and "subjects" in d
+    row = next(s for s in d["subjects"] if s["subject"] == "수학")
+    assert set(row) >= {"due", "wrong", "new", "resting", "next_review_at"}
+
+    # 오늘 7문제를 더 채우면 목표 달성 + streak 2(어제+오늘)
+    for i in range(7):
+        _raw_attempt(db, student, "수학", ids[i % len(ids)], "correct", today9, chapter_no=0)
+    d2 = client.get("/api/v1/students/me/q-today", headers={"Authorization": f"Bearer {tok}"}).json()
+    assert d2["done_today"] == 10 and d2["goal_met"] is True and d2["streak_days"] == 2
 
 
 def test_backfill_rebuilds_states_idempotently(db, seed_org):

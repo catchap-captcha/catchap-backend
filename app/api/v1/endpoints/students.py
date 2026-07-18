@@ -413,6 +413,37 @@ def bank_progress(
     return {"subjects": out}
 
 
+@router.get("/students/me/q-today")
+def q_today(
+    principal: Principal = Depends(require_student), db: Session = Depends(get_db)
+):
+    """오늘의 Q 현황 — 홈·문제은행의 'Q 카드' 원천(퀴즈 통합 1단계, 설계
+    question-bank-scale-design.md 결정 ①②③).
+
+    전 과목 통합 관점: 일일 목표(1세트=10문제) 진행·연속 학습일 + 과목별 큐(만기/틀린/새).
+    프론트는 이걸로 '오늘의 Q 시작' 진입 과목(만기 많은 곳 우선)을 고른다 — 발급 자체는
+    기존 과목 단위 챌린지를 그대로 쓴다(위젯·행동데이터 경로 불변)."""
+    from app.services import bank_mode, subject_banks
+
+    me = _me(principal)
+    stats = bank_mode.q_daily_stats(db, me.id)
+    subjects = []
+    total_due = total_wrong = total_new = 0
+    for subject in D.SUBJECT_ORDER:
+        if subject not in subject_banks.LIVE_SUBJECTS:
+            continue
+        st = bank_mode.queue_status(db, me, subject)
+        subjects.append({"subject": subject, **st, "meta": D.SUBJECT_META.get(subject, {})})
+        total_due += st["due"]
+        total_wrong += st["wrong"]
+        total_new += st["new"]
+    return {
+        **stats,
+        "total": {"due": total_due, "wrong": total_wrong, "new": total_new},
+        "subjects": subjects,
+    }
+
+
 @router.get("/students/me/daily-quiz")
 def daily_quiz(
     principal: Principal = Depends(require_student), db: Session = Depends(get_db)
