@@ -163,3 +163,59 @@ def test_to_bank_rejects_unconvertible(client, db, media_dir):
             f"/api/v1/ops/lectures/{lec['id']}/questions/{imgq['id']}/to-bank", headers=auth(tok)
         )
         assert r.status_code == 400 and "이미지" in r.json()["detail"]
+
+
+def test_bank_lecture_question_gated_by_completion(client, db, seed_org, media_dir):
+    """★문제은행 강의 잠금(3단계) — 강의에서 배치한 은행 문항은 그 강의를 완주해야 출제된다.
+    강의 무관(기존) 문항은 항상 열림. 비로그인(외부 임베드)은 강의 문항 제외. 진도(split_pool)
+    도 잠긴 문항을 뺀다. 배치 payload의 전체 lecture_id가 잠금 판정의 정본."""
+    from app.models import LectureWatchProgress
+    from app.services import bank_mode
+
+    with _bank_state_guard():
+        tok = _ops(client, db)
+        lec = _upload_lecture(client, tok, title="별의 일생", subject="과학").json()
+        # 은행 시드(강의 무관) — 파일 폴백 409 회피 + '항상 열림' 대조군
+        db.add(Question(id="sci-seed-g", subject="과학", type="single", order_no=1,
+                        playable=True, payload={"id": "sci-seed-g", "type": "single",
+                                                "topic": "seed", "stage": 1, "prompt": "p",
+                                                "hint": "", "options": [{"id": "o1", "text": "x"}],
+                                                "answer": "o1", "explain": "", "playable": True}))
+        db.commit()
+        q = _make_question(client, tok, lec["id"])
+        r = client.post(
+            f"/api/v1/ops/lectures/{lec['id']}/questions/{q['id']}/to-bank", headers=auth(tok)
+        )
+        assert r.status_code == 200, r.text
+        bank_id = r.json()["bank_id"]
+
+        # 배치된 은행 문항엔 출처 lecture_id(전체)가 있다 — 잠금 판정 정본
+        placed = subject_banks.get_question("과학", bank_id)
+        assert placed["lecture_id"] == lec["id"]
+
+        student = seed_org["student"]
+
+        # 완주 전: 강의 문항 잠김 — 그것만 후보로 줘도 None, 은행 전체 출제에도 안 나온다
+        assert bank_mode.pick_from(db, student, "과학", [bank_id]) is None
+        for _ in range(20):
+            assert bank_mode.pick_question(db, student, "과학")["id"] != bank_id
+        # 강의 무관 시드는 항상 열림(대조군)
+        assert bank_mode.pick_from(db, student, "과학", ["sci-seed-g"])["id"] == "sci-seed-g"
+        # 진도에서도 잠긴 문항은 빠진다
+        u, w, c = bank_mode.split_pool(db, student, "과학")
+        assert bank_id not in u + w + c
+
+        # 완주 기록 → 열린다
+        db.add(LectureWatchProgress(
+            student_id=student.id, lecture_id=lec["id"], watched_max_sec=600,
+            next_checkpoint_sec=None, checkpoints_passed=1, status="done",
+        ))
+        db.commit()
+        assert bank_mode.pick_from(db, student, "과학", [bank_id])["id"] == bank_id
+        u2, _, _ = bank_mode.split_pool(db, student, "과학")
+        assert bank_id in u2  # 이제 '안 푼 문항'으로 보인다
+
+        # 비로그인(student=None) — 완주 정보 없음 → 강의 문항 제외
+        assert bank_mode.pick_from(db, None, "과학", [bank_id]) is None
+        assert bank_mode.is_unlocked(placed, None) is False
+        assert bank_mode.is_unlocked({"id": "x"}, None) is True  # 강의 무관은 항상 열림

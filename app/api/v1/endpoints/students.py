@@ -843,14 +843,16 @@ def game_session(
     day: int | None = Query(default=None, ge=1),
     count: int = Query(default=5, ge=1, le=25),
     principal: Principal = Depends(require_student),
+    db: Session = Depends(get_db),
 ):
     """실제 플레이 가능한 문항 세트 발급 (정답 미포함 — 채점은 서버).
 
     day 지정 시(생활 전용 — 일차 커리큘럼): 그 일차의 playable 문항 (미래 일차는 잠금 → available=false).
     day 미지정: 과목 뱅크 전체에서 무작위. 수학·과학·사회는 뱅크가 작아 커리큘럼 없이 무작위만 지원.
+    (레거시 — 현재 프론트 미사용. 그래도 강의 완주 잠금은 걸어 강의 문항이 새지 않게 한다.)
     """
-    _me(principal)
-    from app.services import subject_banks
+    me = _me(principal)
+    from app.services import bank_mode, subject_banks
 
     if subject not in subject_banks.LIVE_SUBJECTS:
         return {"available": False, "subject": subject, "questions": []}
@@ -872,7 +874,8 @@ def game_session(
         }
     import random as _random
 
-    pool = subject_banks.playable_pool(subject)
+    # 강의 완주 잠금 적용 — 미완주 강의 유래 문항은 풀에서 빠진다
+    pool = bank_mode.unlocked_pool(db, me, subject)
     picked = _random.sample(pool, min(count, len(pool)))
     return {"available": True, "subject": subject, "questions": [subject_banks.public_question(q) for q in picked]}
 
@@ -1001,6 +1004,12 @@ def chapter_session(
     done = max(0, min(_ch.STAGES, cp.stages_done if cp else 0))
     use_stage = stage if stage is not None else min(_ch.STAGES, done + 1)
     qs = _ch.stage_questions(subject, chapter, use_stage)
+    # 강의 완주 잠금 — 이 단계에 섞인 미완주 강의 유래 문항은 뺀다(공개형엔 lecture_id가 없어
+    # 원본 dict로 판정). 챕터는 기존 은행이 대부분이라 이 필터가 실제로 도는 일은 드물다.
+    from app.services import bank_mode
+
+    completed = bank_mode.completed_lecture_ids(db, me.id)
+    qs = [q for q in qs if bank_mode.is_unlocked(subject_banks.get_question(subject, q["id"]), completed)]
     return {
         "available": len(qs) > 0,
         "subject": subject,
