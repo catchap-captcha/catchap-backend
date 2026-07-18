@@ -75,9 +75,9 @@ CatChap도 강사가 여럿이 되면 한 과목에 여러 강사의 강의가 �
   + 활성 강의 수)를 추가했다. 강의실 사이드바 목차(toc)는 코스 스코프(코스에 담긴 강의는
   그 코스의 강의들). 학생 대면 "전체학습"은 "문제은행"으로 개명(URL·주석·내부 키는 유지).
 - 단계: ①코스 모델·CRUD(완료) → ②강의 드래그 정렬(완료) → ③학생 화면 재구성·"문제은행"
-  이름(완료) + **코스/강의별 잠금 해제(진행 중, 아래)**.
+  이름·코스/강의별 잠금 해제(**전부 완료**).
 
-### 문제은행 코스/강의별 잠금 해제 (③ 남은 부분)
+### 문제은행 코스/강의별 잠금 해제 (③, 완료)
 
 의도: **강의를 완주하면 그 강의에서 뽑아 문제은행에 넣은 문항이 열린다**(시청 검증 철학 —
 실제로 봐야 그 강의의 연습 문제를 푼다). 완주 판정은 `LectureWatchProgress.status=="done"`.
@@ -86,16 +86,17 @@ CatChap도 강사가 여럿이 되면 한 과목에 여러 강사의 강의가 �
   저장한다. 슬러그 `lec-{lecture_id[:8]}-...`는 앞 8자만 담아 역추적에 못 쓰므로, 서빙
   시점에 "이 문항을 낸 강의를 학생이 완주했는가"를 판정할 정본 키를 payload에 심었다.
   `lecture_id`가 없는 문항(강의 무관·기존 은행 1,000+문항)은 게이팅에서 열려 있다(호환).
-- **남은 것(게이팅)**: 서빙 시점에 `payload.lecture_id`가 있고 학생이 그 강의를 완주하지
-  않았으면 그 문항을 후보에서 뺀다. 급소는 서빙 경로가 **여럿**이라는 것 —
-  캡차 챌린지(`captcha_api.py:challenge`), `students.py:game-session`/`chapter-session`,
-  채점(`game-answer`). 일부만 막으면 새는 게이트가 되므로, 완주 강의 집합 헬퍼 +
-  후보 필터를 공통 지점에 두고 각 서빙 경로에 붙여야 한다(비로그인 임베드는 완주 정보가
-  없어 강의 유래 문항 제외). 빈 풀 폴백(게이팅으로 후보가 0이 되면)까지 다뤄야 안전하다.
+- **게이팅(완료)**: `bank_mode`에 `completed_lecture_ids`·`is_unlocked`·`unlocked_pool`을 두고,
+  단문항 출제(`_pick` → 캡차 challenge)와 진도(`split_pool`)에 잠금을 선적용한다 — 미완주
+  강의 문항은 후보에서 빠지고, 다 잠기면 `None`(호출자가 이미 처리). 비로그인(완주 정보
+  없음)은 강의 유래 문항 전부 잠금. **라이브 문제은행 서빙은 위젯→캡차 `challenge`→
+  `bank_mode`가 유일 경로**다(`game-session`/`chapter-session`은 프론트 미사용 레거시 —
+  그래도 두 곳에도 잠금을 걸어 누수 차단). `public_question`이 `lecture_id`를 떼므로 게이팅은
+  원본 dict(`get_question`)로 판정한다.
 
 모델·API 지도: `app/models/lecture.py`(Course), lectures.py(`/ops/courses`,
 `/ops/lectures/reorder`, 학생 `/courses`, 은행 배치 payload `lecture_id`),
-서빙 `captcha_api.py`·`students.py`·`app/services/bank_mode.py`·`subject_banks.py`.
+서빙·잠금 `captcha_api.py`·`app/services/bank_mode.py`(is_unlocked/unlocked_pool)·`subject_banks.py`.
 
 ## 4. 지금 살아있는 역할 (역할 지형)
 
