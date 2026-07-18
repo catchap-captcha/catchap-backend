@@ -26,7 +26,9 @@ class StudentProgress(Base, UUIDPk, Timestamps):
         UniqueConstraint("student_id", "subject", name="uq_student_progress_subject"),
     )
 
-    organization_id: Mapped[str] = mapped_column(CHAR(36), index=True)
+    # 무소속(이메일 가입) 학생 허용 — 기관 은퇴(제품 전환) 후 org는 선택이다.
+    # NOT NULL이던 시절엔 무소속 학생의 채점 저장이 1048로 통째로 409났다(0719 라이브 실증).
+    organization_id: Mapped[str | None] = mapped_column(CHAR(36), index=True, nullable=True)
     student_id: Mapped[str] = mapped_column(
         CHAR(36), ForeignKey("student_profiles.id"), index=True
     )
@@ -66,7 +68,8 @@ class LearningAttempt(Base, UUIDPk, Timestamps):
         Index("ix_la_org_created", "organization_id", "created_at"),
     )
 
-    organization_id: Mapped[str] = mapped_column(CHAR(36), index=True)
+    # 무소속(이메일 가입) 학생 허용 — orgless_learn_01 (위 StudentProgress 주석 참조)
+    organization_id: Mapped[str | None] = mapped_column(CHAR(36), index=True, nullable=True)
     student_id: Mapped[str] = mapped_column(
         CHAR(36), ForeignKey("student_profiles.id"), index=True
     )
@@ -86,6 +89,42 @@ class LearningAttempt(Base, UUIDPk, Timestamps):
     graded: Mapped[bool] = mapped_column(default=True, index=True)
 
 
+class StudentQuestionState(Base, UUIDPk, Timestamps):
+    """학생×문항 SRS(간격 반복) 상태 — 문제은행 '오늘의 큐'의 정본.
+
+    설계: docs/question-bank-scale-design.md. 은행이 만 개로 커져도 학생이 오늘 마주하는
+    문항을 작게 유지하기 위한 상태 기계다(공부 키워드: spaced repetition, mastery).
+
+    - **행이 없으면 '안 푼(new)'** — 행은 실제 응답한 문항에만 생겨 희소하게 유지된다
+      (풀이 만 개여도 500문제 푼 학생은 500행). 출제 조회가 풀 크기가 아니라 학생 이력
+      크기에 비례하게 만드는 핵심.
+    - LearningAttempt가 원장(원본 기록)이고 이 테이블은 서빙용 파생 상태다 — 유실돼도
+      백필(manage_bank_srs.py)로 재구축 가능. 갱신은 서버 채점(graded) 응답만 반영.
+    - 참조는 소프트(FK 없음) — 라이브 덤프로 재생성한 DB의 collation 불일치로 FK 생성이
+      실패하는 문제의 선례(Course.instructor_id)를 따른다.
+    """
+
+    __tablename__ = "student_question_states"
+    __table_args__ = (
+        UniqueConstraint("student_id", "question_id", name="uq_sqs_student_question"),
+        # 출제 큐 조회 축 — (학생, 과목)으로 그 학생의 상태 전부를 한 번에 가져온다
+        Index("ix_sqs_student_subject", "student_id", "subject"),
+    )
+
+    student_id: Mapped[str] = mapped_column(CHAR(36), index=True)
+    # 은행 문항 슬러그 — LearningAttempt.content_id와 같은 폭(80자, 'lec-…' 슬러그 대응)
+    question_id: Mapped[str] = mapped_column(String(80))
+    subject: Mapped[str] = mapped_column(String(20))
+    # learning(학습 중) | mastered(연속 2회 정답 — 오답노트 '2회 정답 승격'과 같은 리듬)
+    state: Mapped[str] = mapped_column(String(10), default="learning")
+    correct_streak: Mapped[int] = mapped_column(default=0)
+    wrong_count: Mapped[int] = mapped_column(default=0)
+    last_result: Mapped[str] = mapped_column(String(10))  # correct | incorrect
+    # 다음 복습 만기(SRS 사다리 1·3·7·14·30일). 오답이면 NULL(즉시 재출제 후보라 만기 무의미)
+    next_review_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
 class WrongAnswer(Base, UUIDPk, Timestamps):
     """오답노트 항목"""
 
@@ -94,7 +133,8 @@ class WrongAnswer(Base, UUIDPk, Timestamps):
     student_id: Mapped[str] = mapped_column(
         CHAR(36), ForeignKey("student_profiles.id"), index=True
     )
-    organization_id: Mapped[str] = mapped_column(CHAR(36), index=True)
+    # 무소속(이메일 가입) 학생 허용 — orgless_learn_01 (StudentProgress 주석 참조)
+    organization_id: Mapped[str | None] = mapped_column(CHAR(36), index=True, nullable=True)
     subject: Mapped[str] = mapped_column(String(20), index=True)
     category: Mapped[str] = mapped_column(String(30))
     question: Mapped[str] = mapped_column(Text)

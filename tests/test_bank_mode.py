@@ -41,10 +41,18 @@ def _mk_attempt(db, student, subject, qid, result):
             score=20 if result == "correct" else 0,
         )
     )
+    # 런타임 채점 싱크(_apply_attempt)와 동일하게 SRS 상태도 갱신 — 서빙 분류의 정본이
+    # LearningAttempt 스캔에서 student_question_states로 바뀌었다(설계 question-bank-scale-design.md).
+    bank_mode.record_answer(db, student.id, subject, qid, result == "correct")
     db.commit()
 
 
-def test_bank_priority_unsolved_then_wrong_then_correct(db, seed_org):
+def test_bank_priority_srs_queue(db, seed_org, monkeypatch):
+    """SRS 큐(만기→틀린→새): 휴면 제외·소진 시 '오늘 완료'·복습 미리 하기·만기 재등장.
+
+    구 '안 푼>틀린>맞춘 무한 순환'을 대체하는 스펙(설계: question-bank-scale-design.md)."""
+    from datetime import timedelta
+
     student = seed_org["student"]
     subject = "수학"
     ids = [q["id"] for q in subject_banks.playable_pool(subject)]
@@ -54,29 +62,38 @@ def test_bank_priority_unsolved_then_wrong_then_correct(db, seed_org):
     unsolved, wrong, correct = bank_mode.split_pool(db, student, subject)
     assert len(unsolved) == len(ids) and not wrong and not correct
 
-    # 한 문항을 틀리고, 다른 문항을 맞히면 → 분류 반영
+    # 한 문항을 틀리고 다른 문항을 맞히면 → 분류 반영 + '틀린 것'이 새 문항보다 우선
     _mk_attempt(db, student, subject, ids[0], "incorrect")
     _mk_attempt(db, student, subject, ids[1], "correct")
     unsolved, wrong, correct = bank_mode.split_pool(db, student, subject)
     assert ids[0] in wrong and ids[1] in correct
     assert ids[0] not in unsolved and ids[1] not in unsolved
+    for _ in range(5):
+        assert bank_mode.pick_question(db, student, subject)["id"] == ids[0], "틀린 문항 우선"
 
-    # 안 푼 문항이 남아 있으면 출제는 반드시 안 푼 것에서
+    # 틀린 걸 다시 맞히면 휴면(만기 전) — 이제 새 문항에서만 나온다(맞춘 것 재순환 없음)
+    _mk_attempt(db, student, subject, ids[0], "correct")
+    fresh = set(ids[2:])
     for _ in range(10):
-        q = bank_mode.pick_question(db, student, subject)
-        assert q["id"] in unsolved
+        assert bank_mode.pick_question(db, student, subject)["id"] in fresh
 
-    # 전부 풀되 ids[0]만 오답이면 → 틀린 문제 우선
+    # 전부 한 번씩 맞히면 → '오늘 완료'(None) + 다음 복습일 안내. 무한 재순환 폐지.
     for qid in ids[2:]:
         _mk_attempt(db, student, subject, qid, "correct")
-    for _ in range(5):
-        q = bank_mode.pick_question(db, student, subject)
-        assert q["id"] == ids[0], "틀린 문제가 우선 출제돼야 한다"
-
-    # 틀린 것도 다시 맞히면 → 맞춘 문제 순환(전체에서)
-    _mk_attempt(db, student, subject, ids[0], "correct")
     unsolved, wrong, correct = bank_mode.split_pool(db, student, subject)
     assert not unsolved and not wrong and len(correct) == len(ids)
+    assert bank_mode.pick_question(db, student, subject) is None
+    st = bank_mode.queue_status(db, student, subject)
+    assert st["resting"] == len(ids) and st["next_review_at"]
+
+    # '복습 미리 하기'(early)는 휴면에서 낸다 — 완료가 강제 종료는 아니다
+    assert bank_mode.pick_question(db, student, subject, early=True)["id"] in correct
+    # 챕터 등 명시 선택(pick_from)은 휴면 폴백 — 완료한 주차 복습이 막히지 않는다
+    assert bank_mode.pick_from(db, student, subject, ids[:3])["id"] in ids[:3]
+
+    # 만기(사다리 1일)가 지나면 복습으로 다시 나온다
+    real_now = bank_mode._now
+    monkeypatch.setattr(bank_mode, "_now", lambda: real_now() + timedelta(days=2))
     assert bank_mode.pick_question(db, student, subject)["id"] in correct
 
 

@@ -248,7 +248,8 @@ def _credit_student(
         # 주차 플레이는 실제 챕터 번호, 자유 은행은 0 마커 — 둘 다 오늘의퀴즈
         # 진행바(chapter_no IS NULL 집계)에 안 섞인다
         chapter_no=meta.get("chapter") if is_chapter else (0 if is_bank else None),
-        # 문항 id — 문제은행 모드의 '안 푼/틀린/맞춘' 분류 원천(bank_mode._last_results).
+        # 문항 id — 원장 기록용. SRS 상태 갱신(bank_mode.record_answer)은 _apply_attempt
+        # (단일 채점 싱크)가 이 content_id로 수행한다(설계: question-bank-scale-design.md).
         # 컬럼(80자) 초과분은 잘라 저장 — 초과로 verify 전체가 500나는 것보다 낫다.
         content_id=str(qid)[:80] if qid else None,
         result="correct" if correct else "incorrect",
@@ -408,7 +409,8 @@ def challenge(
     replay: bool = False,  # edu: 복습 세션 — verify 적립 시 코인·퀴즈 상태 미반영
     chapter: int | None = None,  # 전체학습 주간 챕터 — 그 챕터 문항만 + 오늘의퀴즈 미오염
     stage: int | None = None,  # 챕터 단계(1~5) — 단계 문항 슬라이스
-    bank: bool = False,  # 전체학습 문제은행 모드 — 안 푼>틀린>맞춘 우선 출제, 코인·퀴즈 미반영
+    bank: bool = False,  # 전체학습 문제은행 모드 — SRS 큐(만기>틀린>새) 출제, 코인·퀴즈 미반영
+    early: bool = False,  # 문제은행 '복습 미리 하기' — 오늘 큐 소진 후 휴면 문항을 미리 복습
     lecture: str | None = None,  # 강의 시청 검증 — 체크포인트 확인 문제(1st-party edu 전용)
     db: Session = Depends(get_db),
 ):
@@ -436,10 +438,11 @@ def challenge(
     if chapter is not None:
         learning = True  # 전체학습 주간 챕터도 학습 세션(조작형 대신 실문항)
     if bank and api.product == "edu" and eff_subject in cs.EDU_SUBJECTS:
-        # 전체학습 문제은행 모드 — 학생 이력 기반 우선순위 출제(안 푼>틀린>맞춘), 단계 없이 무한.
-        # 인증 학생이 없으면(외부 임베드) 은행 전체 랜덤으로 동작한다.
-        # chapter가 함께 오면(전체학습 = 주차 목차 유지) 그 주차 문항 풀 안에서만 우선순위 출제한다
-        # (사용자 결정 0714: 주차는 목차로 유지, 그 안은 안푼>틀린>푼 무한순환 — 5단계 게이팅 제거).
+        # 전체학습 문제은행 모드 — SRS 큐 출제(만기 복습>틀린>새, 설계:
+        # question-bank-scale-design.md). 큐가 비면 '오늘 완료'를 정직하게 알린다(무한
+        # 재순환 폐지). 인증 학생이 없으면(외부 임베드) 잠금 적용된 풀에서 랜덤.
+        # chapter가 함께 오면(주차 목차 유지) 그 주차 풀 안에서 SRS 우선순위 + 휴면 폴백
+        # (명시적 챕터 선택 = 의도적 복습이라 '오늘 완료'로 막지 않는다).
         from app.services import bank_mode
 
         student = _optional_student(db, request)
@@ -452,9 +455,22 @@ def challenge(
             q = bank_mode.pick_from(db, student, eff_subject, ids)
             bank_meta = {"subj": eff_subject, "bank": True, "chapter": eff_chapter}
         else:
-            q = bank_mode.pick_question(db, student, eff_subject)
+            q = bank_mode.pick_question(db, student, eff_subject, early=early)
             bank_meta = {"subj": eff_subject, "bank": True}
         if q is None:
+            # '오늘 완료'(큐 소진·휴면만 남음)와 '문항 없음'(풀 비었거나 전부 잠김)을 구분해
+            # 알린다 — 완료를 에러처럼 보이게 하면 학생이 고장으로 오해한다(정직한 상태 표기).
+            if student is not None and chapter is None:
+                st = bank_mode.queue_status(db, student, eff_subject)
+                if st["resting"] > 0 and not (st["due"] or st["wrong"] or st["new"]):
+                    raise HTTPException(
+                        status.HTTP_404_NOT_FOUND,
+                        detail={
+                            "all_done": True,
+                            "next_review_at": st["next_review_at"],
+                            "message": "오늘 몫을 다 끝냈어요! 복습할 때가 되면 문제가 다시 열려요.",
+                        },
+                    )
             raise HTTPException(status.HTTP_404_NOT_FOUND, detail="플레이할 문항이 없어요.")
         # meta.bank → verify가 코인·오늘의퀴즈를 건드리지 않고 기록·오답노트만 남긴다.
         # chapter도 실으면 그 주차로 오답노트·통계가 기록된다(무보상은 유지).

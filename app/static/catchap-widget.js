@@ -159,7 +159,8 @@
     var chapter = box.getAttribute('data-chapter') || '';      // 전체학습 주간 챕터
     var stage = box.getAttribute('data-stage') || '';          // 챕터 단계(1~5)
     var replay = box.getAttribute('data-replay') === '1';      // 복습(코인·퀴즈 상태 미반영)
-    var bankMode = box.getAttribute('data-bank') === '1';      // 전체학습 문제은행(안 푼>틀린>맞춘, 무보상)
+    var bankMode = box.getAttribute('data-bank') === '1';      // 전체학습 문제은행(SRS 큐: 만기>틀린>새, 무보상)
+    var earlyMode = box.getAttribute('data-early') === '1';    // 은행 '복습 미리 하기' — 오늘 큐 소진 후 휴면 복습
     var lecture = box.getAttribute('data-lecture') || '';      // 강의 시청 검증 — 체크포인트 확인 문제
     var sessionTotal = parseInt(box.getAttribute('data-total') || '0', 10) || 0; // 세션 문항 수
     // 효과음: 기본 켜짐(외부 임베드). 인앱은 게임 화면이 학생 설정에 따라 직접 재생하므로
@@ -2916,12 +2917,33 @@
       if (stage) qs.push('stage=' + encodeURIComponent(stage));
       if (replay) qs.push('replay=true');
       if (bankMode) qs.push('bank=true');
+      if (bankMode && earlyMode) qs.push('early=true');
       if (lecture) qs.push('lecture=' + encodeURIComponent(lecture));
       var path = '/captcha/v1/challenge' + (qs.length ? '?' + qs.join('&') : '');
       getAuth().then(function (a) {
         return api(base, path, key, null, a);
       }).then(function (r) {
-        if (!r.ok) { fail(r.data && r.data.detail ? r.data.detail : '요청 실패'); return; }
+        if (!r.ok) {
+          var d = r.data && r.data.detail;
+          // 문제은행 '오늘 완료' — 에러가 아니라 상태다. 위젯 안에 완료 안내를 그리고
+          // 소비자(게임 화면)에게 이벤트로 알려 완료 화면·'복습 미리 하기'를 띄우게 한다.
+          if (d && typeof d === 'object' && d.all_done) {
+            status.textContent = '오늘 완료';
+            status.style.color = '#17B08C';
+            body.innerHTML = '';
+            var doneMsg = document.createElement('div');
+            css(doneMsg, { padding: '28px 10px', textAlign: 'center', fontWeight: '700', color: '#6E6558', fontSize: '14px' });
+            doneMsg.textContent = d.message || '오늘 몫을 다 끝냈어요!';
+            body.appendChild(doneMsg);
+            box.dispatchEvent(new CustomEvent('catchap:bankdone', {
+              bubbles: true,
+              detail: { next_review_at: d.next_review_at || null, message: d.message || '' },
+            }));
+            return;
+          }
+          fail(typeof d === 'string' && d ? d : '요청 실패');
+          return;
+        }
         product = r.data.product;
         status.textContent = product === 'edu' ? ('교육 · ' + (r.data.subject || '')) : '캡차';
         render(r.data);

@@ -24,6 +24,7 @@ from app.models.learning import (
     LearningSummary,
     Recommendation,
     StudentProgress,
+    StudentQuestionState,
     WrongAnswer,
 )
 from app.models.lecture import (
@@ -128,6 +129,7 @@ __all__ = [
     "StudentItem",
     "StudentProfile",
     "StudentProgress",
+    "StudentQuestionState",
     "Subscription",
     "SystemHealthLog",
     "SystemSetting",

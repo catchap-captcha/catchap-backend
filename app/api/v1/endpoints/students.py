@@ -575,6 +575,14 @@ def _apply_attempt(
     )
     db.add(attempt)
 
+    # 문제은행 SRS 상태 갱신(설계: question-bank-scale-design.md) — 서버 채점(graded)된
+    # 은행 문항(content_id 있음) 응답만. 자기신고(graded=False)는 정답률과 같은 이유로 제외.
+    # 여기(단일 채점 싱크)에 두면 위젯 verify·game-answer 등 모든 채점 경로가 자동 포함된다.
+    if graded and req.content_id:
+        from app.services import bank_mode
+
+        bank_mode.record_answer(db, me.id, req.subject, req.content_id, req.result == "correct")
+
     # 행동 데이터(포인터 궤적 포함) — 아동용 캡차 판정 모델의 학습 재료.
     # require_student 경로라 student_id는 인증된 본인 것만 기록된다.
     if req.behavior:
