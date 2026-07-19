@@ -119,16 +119,27 @@ def _completion(db: Session, student_id: str, course_id: str) -> CourseCompletio
 
 
 def _grant_completion_if_mastered(
-    db: Session, student_id: str, course_id: str, active_ids: set[str]
+    db: Session, student_id: str, course_id: str, active_ids: set[str],
+    *, perfect_sitting: bool = False,
 ) -> CourseCompletion | None:
     """전 활성 문항 정복이면 수료 부여(멱등). 수료 시점 스냅샷을 남긴다.
 
-    perfect = 이 코스 시험에서 오답 기록이 0(모든 문항 첫 시도 정답 — 설계 §3의
-    상위 보상). 문항이 0개면 수료 대상이 아니다(시험 없는 코스)."""
+    **perfect(완벽 통과) = 현재 활성 전 문항을 '한 회차에 모두 맞힌 적'이 있는가**
+    (0719 정책 재설계 — 재도전 경로+공정성). perfect_sitting=이번 제출이 그 완벽 회차였나.
+    - 첫 회차에 전 문항을 다 담아 아싸면 → 수료와 동시에 perfect=True.
+    - 여러 회차로 조금씩 정복해 수료하면 perfect=False(한 회차 무결점이 아님).
+    - 수료 후 '완벽 도전'(전 문항 한 판)을 아싸면 기존 수료를 perfect로 **승급**한다
+      — 한 번 틀렸다고 영구 박탈되던 옛 규칙의 가혹함을 없앤다.
+    이 정의는 오답 이력을 보지 않으므로, 강사가 나중에 삭제한 문항의 오답이 완벽 통과를
+    막던 불공정(skeptic 지적)도 자연히 사라진다. 문항이 0개면 수료 대상 아님(시험 없는 코스)."""
     if not active_ids:
         return None
     existing = _completion(db, student_id, course_id)
     if existing:
+        # 이미 수료 — 완벽 도전으로 전 문항을 한 회차에 정복하면 perfect로 승급(멱등)
+        if perfect_sitting and not existing.perfect:
+            existing.perfect = True
+            db.flush()
         return existing
     mastered = _mastered_ids(db, student_id, course_id)
     if not active_ids <= mastered:
@@ -148,7 +159,7 @@ def _grant_completion_if_mastered(
         passed_at=datetime.now(),
         question_count=len(active_ids),
         sittings_count=sittings,
-        perfect=not _wrong_ever_ids(db, student_id, course_id),
+        perfect=perfect_sitting,
     )
     try:
         # 수료 삽입만 SAVEPOINT로 격리 — 동시 최종 제출(두 탭) 경합 시 UNIQUE(student,course)
@@ -347,6 +358,9 @@ def _exam_state(db: Session, student_id: str, course_id: str) -> dict:
     lectures_done = len(lec_ids & done)
     completion = _completion(db, student_id, course_id)
     mastered = _mastered_ids(db, student_id, course_id) & active_ids
+    available = bool(active_ids) and bool(lec_ids) and lec_ids <= done
+    passed = completion is not None
+    perfect = bool(completion.perfect) if completion else False
     return {
         "has_exam": bool(active_ids),
         "question_count": len(active_ids),
@@ -354,10 +368,12 @@ def _exam_state(db: Session, student_id: str, course_id: str) -> dict:
         "lectures_total": len(lec_ids),
         "lectures_done": lectures_done,
         # 응시 자격 = 코스의 모든 활성 강의 완주(문제은행 잠금과 같은 정본)
-        "available": bool(active_ids) and bool(lec_ids) and lec_ids <= done,
-        "passed": completion is not None,
-        "perfect": bool(completion.perfect) if completion else False,
+        "available": available,
+        "passed": passed,
+        "perfect": perfect,
         "passed_at": completion.passed_at.isoformat() if completion else None,
+        # 완벽 도전 가능 = 수료했지만 아직 완벽 통과 아님(재도전 경로 — 전 문항 한 판 아싸기)
+        "can_perfect_challenge": passed and not perfect and available,
     }
 
 
@@ -375,16 +391,30 @@ def exam_state(
     return {"course_id": course_id, "title": c.title, **_exam_state(db, principal.id, course_id)}
 
 
+def _shuffled_sitting(student_id: str, course_id: str, picked: list) -> CourseExamSitting:
+    """회차 생성 헬퍼 — 문항별 보기 셔플 순열을 서버에 보관(표시 위치 → 원본 인덱스)."""
+    return CourseExamSitting(
+        student_id=student_id,
+        course_id=course_id,
+        questions=[
+            {"question_id": q.id, "order": random.sample(range(len(q.options)), len(q.options))}
+            for q in picked
+        ],
+    )
+
+
 @router.post("/courses/{course_id}/exam/session")
 def exam_session(
     course_id: str,
+    perfect: bool = False,  # 완벽 도전 — 전 문항을 한 판에(수료 후 재도전 경로)
     principal: Principal = Depends(require_student),
     db: Session = Depends(get_db),
 ):
     """회차 발급 — 정답·해설 미포함, 보기는 문항별 셔플(순열은 서버 보관).
 
-    출제 대상: 정복 못 한 문항(안 푼 → 틀린 순). 미제출 회차가 있으면 그대로
-    재사용(새로고침으로 문항 조합을 다시 굴리는 파밍 차단)."""
+    일반 모드: 정복 못 한 문항(안 푼 → 틀린 순)을 최대 10문항. 미제출 회차 재사용(파밍 차단).
+    완벽 도전(perfect=True): 현재 활성 **전 문항을 한 회차에**(10 상한 없음). 수료 후에도
+    가능 — 한 회차에 다 맞히면 완벽 통과로 승급(0719 정책 재설계·재도전 경로)."""
     from app.models import Course
 
     c = db.get(Course, course_id)
@@ -393,16 +423,21 @@ def exam_session(
     st = _exam_state(db, principal.id, course_id)
     if not st["has_exam"]:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="이 코스에는 수료 시험이 없습니다.")
-    if st["passed"]:
+    # 완벽 도전은 '수료 후 재도전' 전용 — 미수료 학생은 일반 시험을 본다(perfect 파라미터
+    # 무시). 이렇게 나누면 회차 종류가 학생 상태로 유일하게 갈려(미수료=일반·수료=완벽 도전)
+    # 커버리지로 모드를 헷갈릴 여지가 없다(작은 코스의 일반 회차도 전 문항 커버라 애매해짐 방지).
+    if st["passed"] and (not perfect or st["perfect"]):
         return {"passed": True, "perfect": st["perfect"], "passed_at": st["passed_at"]}
     if not st["available"]:
         raise HTTPException(
             status.HTTP_403_FORBIDDEN,
             detail=f"수료 시험은 강의를 전부 완주하면 열려요. ({st['lectures_done']}/{st['lectures_total']} 완주)",
         )
+    challenge = st["passed"]  # 이 지점에 온 수료 학생 = 완벽 도전(위 게이트가 그 외를 걸러냄)
 
     active = _active_questions(db, course_id)
     by_id = {q.id: q for q in active}
+    active_ids = set(by_id)
 
     # 미제출 회차 재사용 — 단, 문항이 삭제·비활성됐으면 그 회차를 닫고 새로 낸다
     open_sitting = (
@@ -414,41 +449,41 @@ def exam_session(
         )
         .first()
     )
-    if open_sitting and _sitting_valid(open_sitting, by_id):
+    if challenge:
+        # 완벽 도전 회차는 전 문항 커버여야 재사용(강사가 문항을 더했으면 새로 낸다)
+        open_full = bool(open_sitting) and {i["question_id"] for i in open_sitting.questions} == active_ids
+        reusable = bool(open_sitting) and _sitting_valid(open_sitting, by_id) and open_full
+    else:
+        reusable = bool(open_sitting) and _sitting_valid(open_sitting, by_id)
+    if reusable:
         sitting = open_sitting
     else:
         if open_sitting:
-            # 재사용 불가 회차 폐기 — 문항이 사라졌거나(삭제·비활성), 발급 후 강사가 보기 수를
-            # 바꿔 저장된 순열(order)이 현재 옵션과 어긋난 경우. 그대로 두면 채점 시 order 매핑이
-            # IndexError/ValueError로 터져(그 학생 시험 영구 봉쇄) — skeptic CONFIRMED 수정.
+            # 재사용 불가 회차 폐기 — 문항 소실/보기 수 변경으로 순열이 어긋났거나(skeptic
+            # CONFIRMED: 그대로 두면 채점 시 IndexError/ValueError로 시험 영구 봉쇄) 또는
+            # 완벽 도전인데 커버리지가 어긋난 경우.
             db.delete(open_sitting)
-        mastered = _mastered_ids(db, principal.id, course_id)
-        wrong = _wrong_ever_ids(db, principal.id, course_id)
-        unmastered = [q for q in active if q.id not in mastered]
-        if not unmastered:
-            # 전부 정복인데 수료가 없는 상태(예: 틀렸던 문항을 강사가 삭제) — 정합 회복
-            comp = _grant_completion_if_mastered(db, principal.id, course_id, {q.id for q in active})
-            db.commit()
-            st2 = _exam_state(db, principal.id, course_id)
-            return {"passed": comp is not None, "perfect": st2["perfect"], "passed_at": st2["passed_at"]}
-        # 안 푼 것(오답 이력도 없는 것) 먼저, 그다음 틀린 것 — 각 그룹 안에서 섞는다
-        fresh = [q for q in unmastered if q.id not in wrong]
-        retry = [q for q in unmastered if q.id in wrong]
-        random.shuffle(fresh)
-        random.shuffle(retry)
-        picked = (fresh + retry)[:EXAM_SITTING_SIZE]
-        sitting = CourseExamSitting(
-            student_id=principal.id,
-            course_id=course_id,
-            questions=[
-                {
-                    "question_id": q.id,
-                    # 순열: 표시 위치 → 원본 인덱스. random.sample = 비복원 셔플
-                    "order": random.sample(range(len(q.options)), len(q.options)),
-                }
-                for q in picked
-            ],
-        )
+        if challenge:
+            # 완벽 도전 — 전 문항(정복 여부 무관·10 상한 없음)을 한 회차에
+            picked = list(active)
+            random.shuffle(picked)
+        else:
+            mastered = _mastered_ids(db, principal.id, course_id)
+            wrong = _wrong_ever_ids(db, principal.id, course_id)
+            unmastered = [q for q in active if q.id not in mastered]
+            if not unmastered:
+                # 전부 정복인데 수료가 없는 상태(예: 틀렸던 문항을 강사가 삭제) — 정합 회복
+                comp = _grant_completion_if_mastered(db, principal.id, course_id, active_ids)
+                db.commit()
+                st2 = _exam_state(db, principal.id, course_id)
+                return {"passed": comp is not None, "perfect": st2["perfect"], "passed_at": st2["passed_at"]}
+            # 안 푼 것(오답 이력도 없는 것) 먼저, 그다음 틀린 것 — 각 그룹 안에서 섞는다
+            fresh = [q for q in unmastered if q.id not in wrong]
+            retry = [q for q in unmastered if q.id in wrong]
+            random.shuffle(fresh)
+            random.shuffle(retry)
+            picked = (fresh + retry)[:EXAM_SITTING_SIZE]
+        sitting = _shuffled_sitting(principal.id, course_id, picked)
         db.add(sitting)
         db.commit()
 
@@ -470,6 +505,8 @@ def exam_session(
         "passed": False,
         "sitting_id": sitting.id,
         "questions": questions,
+        # 완벽 도전 회차인가 — 화면이 '완벽 도전(전 문항 한 판)'으로 안내한다
+        "perfect_challenge": challenge,
         "progress": {"mastered": st["mastered_count"], "total": st["question_count"]},
     }
 
@@ -507,6 +544,7 @@ def exam_submit(
     results = []
     correct_n = 0
     stale = 0  # 발급 후 강사가 편집·삭제해 채점 불가한 문항 수(학생에게 정직히 안내)
+    graded_ids: set[str] = set()  # 이번 회차에서 실제 채점된 문항(완벽 회차 판정용)
     for item in sitting.questions:
         q = db.get(CourseExamQuestion, item["question_id"])
         order: list[int] = item.get("order", [])
@@ -516,6 +554,7 @@ def exam_submit(
         if q is None or len(order) != len(q.options):
             stale += 1
             continue
+        graded_ids.add(q.id)
         # 표시 인덱스(0..len-1) 기준 선택만 인정 — 음수·범위 밖은 버린다(order[-1] 같은
         # 파이썬 음수 인덱싱으로 표시-순서 계약을 우회하는 것 차단, skeptic 경미 지적).
         picks = [p for p in picks_by_q.get(q.id, []) if isinstance(p, int) and 0 <= p < len(order)]
@@ -555,7 +594,14 @@ def exam_submit(
     db.flush()
 
     active_ids = {q.id for q in _active_questions(db, course_id)}
-    completion = _grant_completion_if_mastered(db, principal.id, course_id, active_ids)
+    # 완벽 회차 = 이 한 회차가 현재 활성 전 문항을 담아 하나도 안 틀리고 다 맞힘(stale 없음).
+    perfect_sitting = (
+        stale == 0 and len(results) > 0
+        and correct_n == len(results) and graded_ids == active_ids
+    )
+    completion = _grant_completion_if_mastered(
+        db, principal.id, course_id, active_ids, perfect_sitting=perfect_sitting
+    )
     mastered = _mastered_ids(db, principal.id, course_id) & active_ids
     db.commit()
     return {

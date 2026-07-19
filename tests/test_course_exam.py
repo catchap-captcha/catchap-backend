@@ -46,21 +46,26 @@ def _complete_lecture(db, student_id, lecture_id):
     db.commit()
 
 
-def _submit_all_correct(client, stok, course_id, db):
-    """현재 회차를 발급받아 전 문항 정답으로 제출 — 결과 dict 반환."""
-    sess = client.post(f"/api/v1/courses/{course_id}/exam/session", headers=auth(stok)).json()
-    if sess.get("passed"):
-        return sess
+def _answer_all_correct(db, sess):
+    """세션 문항 → 표시 순서 기준 정답 picks 목록(전부 정답)."""
     answers = []
     for item in sess["questions"]:
         q = db.get(CourseExamQuestion, item["question_id"])
-        # 표시 순서(item['options']) 안에서 원본 정답 텍스트의 위치를 찾아 picks로
         correct_texts = {q.options[i] for i in q.answer_indexes}
         picks = [i for i, opt in enumerate(item["options"]) if opt in correct_texts]
         answers.append({"question_id": q.id, "picks": picks})
+    return answers
+
+
+def _submit_all_correct(client, stok, course_id, db, *, perfect=False):
+    """현재 회차(perfect=True면 완벽 도전)를 발급받아 전 문항 정답으로 제출 — 결과 dict 반환."""
+    url = f"/api/v1/courses/{course_id}/exam/session" + ("?perfect=true" if perfect else "")
+    sess = client.post(url, headers=auth(stok)).json()
+    if sess.get("passed") and not sess.get("questions"):
+        return sess
     return client.post(
         f"/api/v1/courses/{course_id}/exam/submit",
-        json={"sitting_id": sess["sitting_id"], "answers": answers},
+        json={"sitting_id": sess["sitting_id"], "answers": _answer_all_correct(db, sess)},
         headers=auth(stok),
     ).json()
 
@@ -203,8 +208,9 @@ def test_mastery_retry_only_wrong_until_pass(client, db, seed_org):
     assert after["passed"] is True
 
 
-def test_perfect_when_all_first_try(client, db, seed_org):
-    """완벽 통과 — 오답 기록 없이 전 문항 첫 시도 정답."""
+def test_perfect_when_all_correct_one_sitting(client, db, seed_org):
+    """완벽 통과 = 현재 활성 전 문항을 한 회차에 모두 맞힘(0719 재정의). 작은 코스는
+    첫 회차가 곧 전 문항이라 첫 판 무결점이 그대로 완벽 통과."""
     tok = _ops(client, db)
     course = _mk_course(client, tok, db)
     lec = _assign_lecture(client, tok, course["id"])
@@ -215,11 +221,71 @@ def test_perfect_when_all_first_try(client, db, seed_org):
     stok = _student_token(client, seed_org)
     res = _submit_all_correct(client, stok, course["id"], db)
     assert res["passed"] is True and res["perfect"] is True
-    # 오답 응답 기록이 0
-    assert db.query(CourseExamAttempt).filter(
-        CourseExamAttempt.student_id == seed_org["student"].id,
-        CourseExamAttempt.result == "incorrect",
-    ).count() == 0
+
+
+def test_perfect_challenge_upgrade_after_pass(client, db, seed_org):
+    """★0719 정책 재설계 — 한 번 틀려 완벽을 놓치고 수료해도, '완벽 도전'(전 문항 한 판)을
+    아싸면 완벽 통과로 승급한다(옛 규칙의 '한 번 틀리면 영구 박탈' 폐지 = 재도전 경로).
+    perfect 판정은 오답 이력을 보지 않으므로 공정성 문제(삭제 문항 오답)도 함께 사라진다."""
+    tok = _ops(client, db)
+    course = _mk_course(client, tok, db)
+    lec = _assign_lecture(client, tok, course["id"])
+    _complete_lecture(db, seed_org["student"].id, lec["id"])
+    for i in range(3):
+        _add_exam_q(client, tok, course["id"], prompt=f"q{i}", options=["a", "b", "c"], answer_indexes=[i % 3])
+    stok = _student_token(client, seed_org)
+
+    # 1회차: 한 문항 일부러 오답(→ 첫 판 무결점 실패)
+    sess = client.post(f"/api/v1/courses/{course['id']}/exam/session", headers=auth(stok)).json()
+    answers = []
+    for idx, item in enumerate(sess["questions"]):
+        q = db.get(CourseExamQuestion, item["question_id"])
+        ct = {q.options[a] for a in q.answer_indexes}
+        picks = [i for i, o in enumerate(item["options"]) if o in ct]
+        if idx == 0:
+            picks = [i for i, o in enumerate(item["options"]) if o not in ct][:1]
+        answers.append({"question_id": q.id, "picks": picks})
+    r = client.post(f"/api/v1/courses/{course['id']}/exam/submit",
+                    json={"sitting_id": sess["sitting_id"], "answers": answers}, headers=auth(stok)).json()
+    assert r["passed"] is False and r["perfect"] is False
+
+    # 2회차: 틀린 것만 맞혀 수료(완벽 아님 — 한 회차 무결점이 아님)
+    res = _submit_all_correct(client, stok, course["id"], db)
+    assert res["passed"] is True and res["perfect"] is False
+
+    # 상태: 완벽 도전 가능(수료했지만 미완벽)
+    st = client.get(f"/api/v1/courses/{course['id']}/exam", headers=auth(stok)).json()
+    assert st["passed"] and not st["perfect"] and st["can_perfect_challenge"] is True
+
+    # 완벽 도전 발급 → 전 문항(3)을 한 회차에
+    ch = client.post(f"/api/v1/courses/{course['id']}/exam/session?perfect=true", headers=auth(stok)).json()
+    assert ch["perfect_challenge"] is True and len(ch["questions"]) == 3
+    up = client.post(f"/api/v1/courses/{course['id']}/exam/submit",
+                     json={"sitting_id": ch["sitting_id"], "answers": _answer_all_correct(db, ch)},
+                     headers=auth(stok)).json()
+    assert up["passed"] is True and up["perfect"] is True
+
+    # 승급 확정 — 이제 완벽 도전 불가(더 올릴 게 없음)
+    st2 = client.get(f"/api/v1/courses/{course['id']}/exam", headers=auth(stok)).json()
+    assert st2["perfect"] is True and st2["can_perfect_challenge"] is False
+
+
+def test_perfect_challenge_only_after_pass(client, db, seed_org):
+    """완벽 도전은 수료 후 전용 — 미수료 학생이 perfect=true를 보내도 일반 회차로 처리하고,
+    can_perfect_challenge는 수료 전까지 False(두 모드가 학생 상태로 유일하게 갈린다)."""
+    tok = _ops(client, db)
+    course = _mk_course(client, tok, db)
+    lec = _assign_lecture(client, tok, course["id"])
+    _complete_lecture(db, seed_org["student"].id, lec["id"])
+    for i in range(2):
+        _add_exam_q(client, tok, course["id"], prompt=f"q{i}", options=["a", "b"], answer_indexes=[i % 2])
+    stok = _student_token(client, seed_org)
+
+    st = client.get(f"/api/v1/courses/{course['id']}/exam", headers=auth(stok)).json()
+    assert st["can_perfect_challenge"] is False  # 아직 미수료
+    # 미수료 + perfect=true → 일반 회차(완벽 도전 아님)
+    sess = client.post(f"/api/v1/courses/{course['id']}/exam/session?perfect=true", headers=auth(stok)).json()
+    assert sess["perfect_challenge"] is False
 
 
 def test_no_answer_is_wrong(client, db, seed_org):
