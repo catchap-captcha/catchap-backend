@@ -424,8 +424,10 @@ def list_student_courses(
     ):
         exam_mastered.setdefault(cid, set()).add(qid)
     passed_courses = {
-        r[0]: r[1]
-        for r in db.query(CourseCompletion.course_id, CourseCompletion.perfect)
+        r[0]: {"perfect": bool(r[1]), "passed_at": r[2]}
+        for r in db.query(
+            CourseCompletion.course_id, CourseCompletion.perfect, CourseCompletion.passed_at
+        )
         .filter(CourseCompletion.student_id == principal.id,
                 CourseCompletion.course_id.in_(course_ids or [""]))
         .all()
@@ -471,7 +473,13 @@ def list_student_courses(
                     "lectures_done": len(set(lec_ids) & completed),
                     "lectures_total": len(lec_ids),
                     "passed": c.id in passed_courses,
-                    "perfect": bool(passed_courses.get(c.id, False)),
+                    "perfect": passed_courses.get(c.id, {}).get("perfect", False),
+                    # 수료일 — '나의 기록' 수료 현황의 '수료 완료' 칸 표기(미수료면 None)
+                    "passed_at": (
+                        passed_courses[c.id]["passed_at"].isoformat()
+                        if c.id in passed_courses and passed_courses[c.id]["passed_at"]
+                        else None
+                    ),
                 },
             }
         )

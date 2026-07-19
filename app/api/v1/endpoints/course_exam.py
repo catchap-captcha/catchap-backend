@@ -377,47 +377,9 @@ def _exam_state(db: Session, student_id: str, course_id: str) -> dict:
     }
 
 
-@router.get("/courses/completions")
-def my_course_completions(
-    principal: Principal = Depends(require_student),
-    db: Session = Depends(get_db),
-):
-    """이 학생이 수료한 코스 목록 — '나의 기록' 성취(수료·완벽 통과) 섹션의 원천.
-
-    (경로 주의: `/courses/{course_id}/exam`와 겹치지 않는 고정 경로다 — bare `/courses/{id}`
-    라우트가 없어 'completions'가 course_id로 잡히지 않는다.) 삭제된 코스는 뺀다 —
-    수료 자체는 보존이지만 화면엔 존재하는 코스만 보여준다(수료 기록은 passed_at 고정)."""
-    from app.models import Course
-
-    rows = (
-        db.query(CourseCompletion)
-        .filter(CourseCompletion.student_id == principal.id)
-        .order_by(CourseCompletion.passed_at.desc())
-        .all()
-    )
-    course_ids = [r.course_id for r in rows]
-    courses = {
-        c.id: c
-        for c in db.query(Course)
-        .filter(Course.id.in_(course_ids or [""]), Course.status != "deleted")
-        .all()
-    }
-    out = []
-    for r in rows:
-        c = courses.get(r.course_id)
-        if c is None:
-            continue  # 삭제된 코스 — 목록에서 제외
-        out.append(
-            {
-                "course_id": r.course_id,
-                "title": c.title,
-                "subject": c.subject,
-                "perfect": bool(r.perfect),
-                "question_count": r.question_count,
-                "passed_at": r.passed_at.isoformat() if r.passed_at else None,
-            }
-        )
-    return out
+# (제거됨 0719) GET /courses/completions — '나의 기록' 수료 현황이 수료한 것만이 아니라
+# 진행 중·잠김 코스까지 함께 보여주도록 바뀌면서(사용자 결정), 원천을 GET /courses의
+# exam{} 요약(passed_at 추가)으로 통일했다. 별도 완료 목록 엔드포인트는 소비처가 없어 삭제.
 
 
 @router.get("/courses/{course_id}/exam")
