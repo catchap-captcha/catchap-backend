@@ -14,7 +14,6 @@ from app.models import (
     ClassRoom,
     ConceptRead,
     Content,
-    DailyQuizStatus,
     LearningAttempt,
     Recommendation,
     ShopItem,
@@ -40,115 +39,49 @@ router = APIRouter(tags=["students"])
 def _me(principal: Principal) -> StudentProfile:
     assert principal.student is not None
     return principal.student
-def _today_quiz_rows(db: Session, student_id: str) -> list[DailyQuizStatus]:
-    """오늘의퀴즈 행 조회 — 오늘 날짜 행이 없으면 프리셋(과목/주제/보상)으로 생성."""
-    today = date.today()
-    rows = (
-        db.query(DailyQuizStatus)
-        .filter(DailyQuizStatus.student_id == student_id, DailyQuizStatus.quiz_date == today)
-        .all()
-    )
-    # 프리셋 6과목 중 오늘 행이 없는 과목을 보충 생성.
-    # (기존엔 '행이 하나도 없을 때만' 6과목 생성 → 한 과목만 풀어 그 행이 생기면 나머지 5과목이
-    #  사라져 오늘의퀴즈에 한 과목만 보이던 버그 해소)
-    have = {r.subject for r in rows}
-    new_rows = []
-    for preset in D.DAILY_QUIZ:
-        if preset["subject"] not in have:
-            r = DailyQuizStatus(
-                student_id=student_id,
-                quiz_date=today,
-                subject=preset["subject"],
-                topic=preset["topic"],
-                status="todo",
-                reward_coins=preset["reward"],
-            )
-            new_rows.append(r)
-            rows.append(r)
-    if new_rows:
-        db.add_all(new_rows)
-        db.commit()
-    order = {s: i for i, s in enumerate(D.SUBJECT_ORDER)}
-    rows.sort(key=lambda r: order.get(r.subject, len(order)))
-    return rows
-# 과목당 오늘의퀴즈 문항 수(= 인앱 EDU 세션 EDU_SESSION_TOTAL). '오늘 이 과목 풀었나' 판정 기준.
-DAILY_QUIZ_TOTAL = 5
-def _played_today(db: Session, student_id: str) -> dict[str, int]:
-    """오늘 과목별 오늘의퀴즈 시도 수(chapter_no NULL = 습관 축만).
-    화면상 '오늘의 퀴즈 현황'의 단일 기준(사용자 결정 2026-07-13): 한 과목의 오늘 시도가
-    DAILY_QUIZ_TOTAL 이상이면 '오늘 완료'로 본다(마지막이 오답이어도 — 홈 진행바·과목카드·
-    다음 과목·이어하기가 모두 이 기준을 공유해 서로 어긋나지 않게). 코인·랭킹·6과목 스티커의
-    'done 승격'은 별개로 daily_quiz_status(정답 완주)만 인정한다(위조 방지 유지)."""
+# (은퇴 0719, Q 통합 3단계-c) 오늘의퀴즈 헬퍼 일체 삭제 — _today_quiz_rows(매일
+# DailyQuizStatus 6행을 계속 생성하던 마지막 쓰기 경로)·_played_today·_quiz_done_set·
+# 랭킹 산식 상수. '매일'은 오늘의 Q(bank_mode.q_daily_stats)가 단일 정본이다.
+# daily_quiz_status 기존 행은 보존(기록), 신규 생성만 중단.
+def _q_played_today(db: Session, student_id: str) -> dict[str, int]:
+    """오늘 과목별 Q(문제은행) 서버 채점 응답 수 — 홈 과목 카드의 진행 수치.
+    Q축 판별은 q_daily_stats와 동일(chapter_no IS NOT NULL·graded만)."""
     start = datetime.combine(date.today(), time.min)
     return dict(
         db.query(LearningAttempt.subject, func.count(LearningAttempt.id))
         .filter(
             LearningAttempt.student_id == student_id,
             LearningAttempt.created_at >= start,
-            LearningAttempt.chapter_no.is_(None),
-            LearningAttempt.graded.is_(True),  # 서버 채점만 — 자기신고가 표시상 '완료'도 못 만들게
+            LearningAttempt.chapter_no.isnot(None),
+            LearningAttempt.graded.is_(True),
         )
         .group_by(LearningAttempt.subject)
         .all()
     )
-def _played_set(played: dict[str, int]) -> set[str]:
-    """오늘 (5문항) 푼 과목 집합 — '완료(현황)' 판정 공용."""
-    return {s for s, n in played.items() if int(n) >= DAILY_QUIZ_TOTAL}
-def _quiz_done_set(db: Session, student_id: str, played: dict[str, int] | None = None) -> set[str]:
-    """화면 표시용 '오늘 완료' 과목 집합.
-    현황 기준(시도 5문항) ∪ 정답완주(daily_quiz_status.status=='done'). 실제 흐름에선
-    status=='done'이 시도≥5를 함의하므로 보통 시도 집합과 같지만, 정답완주 과목을 절대
-    누락하지 않도록 합집합으로 둔다. 코인·랭킹 지급 판정과는 무관(그건 status 단독)."""
-    if played is None:
-        played = _played_today(db, student_id)
-    done = _played_set(played)
-    rows = (
-        db.query(DailyQuizStatus.subject)
-        .filter(
-            DailyQuizStatus.student_id == student_id,
-            DailyQuizStatus.quiz_date == date.today(),
-            DailyQuizStatus.status == "done",
-        )
-        .all()
-    )
-    return done | {r.subject for r in rows}
-# 랭킹 점수 산식(사용자 결정 2026-07-08): 정답률·풀이속도 + 6과목 완주 보너스 + 연속 완주 보너스.
-# 학년별로만 합산 · 학기 누적(리셋 없음). 완료(daily_quiz_status done) 과목·일에 대해서만 점수 부여.
-# - 정답률: 과목·일 정답률 0~100% → 0~10점
-# - 풀이속도: 그 과목·일 '정답' 문항의 평균 풀이시간 — 빠를수록 0~5점(오답 빠른 찍기엔 점수 없음)
-# - 6과목 완주: 하루 6과목 전부 완료 시 +30
-# - 연속 완주: 6과목 완주가 전날에도 이어지면 그 날마다 +10 (꾸준함 보상)
-RANK_ACC_MAX = 10  # 과목·일 정답률 만점(100%)
-RANK_SPEED_MAX = 5  # 과목·일 속도 만점(빠른 정답)
-RANK_SPEED_FAST_MS = 4000  # 평균 4초 이하 정답 → 속도 만점
-RANK_SPEED_SLOW_MS = 20000  # 평균 20초 이상 → 속도 0점
-RANK_FULLDAY_BONUS = 30  # 하루 6과목 완주 보너스
-RANK_STREAK_STEP = 10  # 6과목 완주 연속 하루당 추가
 # ---------------------------------------------------------------- 학습 홈
 @router.get("/students/me/dashboard")
 def dashboard(
     principal: Principal = Depends(require_student), db: Session = Depends(get_db)
 ):
     me = _me(principal)
-    quiz = _today_quiz_rows(db, me.id)
-    today_total = len(quiz)
-    # 과목 카드·진행바: '오늘의 퀴즈 현황' 단일 기준 = 오늘 시도 수(_played_today).
-    # 5문항 다 풀면 완료로 본다(마지막 오답이어도) — 홈·오늘의퀴즈 페이지·결과화면 다음 과목이
-    # 같은 기준을 써 서로 어긋나지 않게. 전체학습 주간 챕터(chapter_no 있음)는 제외해 습관 축과 분리.
-    # 완료 = 시도≥5 ∪ 정답완주(status=='done'). status_done은 방금 조회한 quiz 행 재사용.
-    played = _played_today(db, me.id)
-    status_done = {q.subject for q in quiz if q.status == "done"}
-    done_display = _played_set(played) | status_done
-    today_done = sum(1 for card in D.HOME_SUBJECT_CARDS if card["subject"] in done_display)
+    # 오늘의 Q 기준(Q 통합 3단계-c): 퀴즈 행 생성·'과목당 완료' 판정은 은퇴.
+    # '오늘'은 일일 목표(Q_DAILY_GOAL) 진행이고, 과목 카드는 오늘 Q 풀이 수만 보여준다
+    # (목표가 전과목 통합이라 과목 단위 done 개념이 없다 — state는 todo/progress뿐).
+    from app.services import bank_mode
+
+    q_stats = bank_mode.q_daily_stats(db, me.id)
+    played = _q_played_today(db, me.id)
     subjects = []
     for card in D.HOME_SUBJECT_CARDS:
         sub = card["subject"]
-        total = card["total"]
         n = int(played.get(sub, 0))
-        done = total if sub in done_display else min(total, n)
-        state = "done" if sub in done_display else ("progress" if n > 0 else "todo")
         subjects.append(
-            {**card, "done": done, "state": state, "meta": D.SUBJECT_META[sub]}
+            {
+                **card,
+                "done": min(int(card["total"]), n),
+                "state": "progress" if n > 0 else "todo",
+                "meta": D.SUBJECT_META[sub],
+            }
         )
     growth = aggregate.student_growth(db, me)  # 시도 없으면 None → 성장 그래프 데모
     # 배지·학년랭킹·AI코멘트 필드는 게임화 은퇴(0718)로 응답에서 제거 — 프론트도 안 읽는다.
@@ -157,7 +90,7 @@ def dashboard(
         "level": me.level,
         "coins": me.coins,
         "student_code": me.student_code,
-        "today": {"done": today_done, "total": today_total},
+        "today": {"done": q_stats["done_today"], "total": q_stats["goal"]},
         "subjects": subjects,
         # 성장 그래프: learning_attempts 실집계 (시도 없으면 D 데모값)
         "growth": fb(growth, D.HOME_GROWTH),
@@ -391,100 +324,9 @@ def q_today(
         "total": {"due": total_due, "wrong": total_wrong, "new": total_new},
         "subjects": subjects,
     }
-@router.get("/students/me/daily-quiz")
-def daily_quiz(
-    principal: Principal = Depends(require_student), db: Session = Depends(get_db)
-):
-    me = _me(principal)
-    rows = _today_quiz_rows(db, me.id)
-    # 과목별 오늘 시도 수(5단계 진행 바용) — 하루 5문제(5단계) 기준
-    _today_start = datetime.combine(date.today(), time.min)
-    # 전체학습 주간 챕터 플레이(chapter_no 있음)는 오늘의퀴즈 진행바에서 제외(학습·습관 분리).
-    _att_today = dict(
-        db.query(LearningAttempt.subject, func.count(LearningAttempt.id))
-        .filter(
-            LearningAttempt.student_id == me.id,
-            LearningAttempt.created_at >= _today_start,
-            LearningAttempt.chapter_no.is_(None),
-        )
-        .group_by(LearningAttempt.subject)
-        .all()
-    )
-    STAGES = 5
-    def _card_status(r) -> str:
-        # '오늘의 퀴즈 현황' 단일 기준(홈·결과화면과 동일): 오늘 5문항 다 풀면 완료로 표시
-        # (마지막 오답이어도). 코인·랭킹의 정답완주 done은 별개(daily_quiz_status.status).
-        if int(_att_today.get(r.subject, 0)) >= STAGES:
-            return "done"
-        return r.status
-    quizzes = [
-        {
-            "id": r.id,
-            "subject": r.subject,
-            "topic": r.topic,
-            "status": _card_status(r),
-            "reward": r.reward_coins,
-            "meta": D.SUBJECT_META.get(r.subject, {}),
-            # 5단계 진행 바: 완료면 5/5, 아니면 오늘 시도 수(최대 5)
-            "stages": STAGES,
-            "stage_done": min(STAGES, int(_att_today.get(r.subject, 0))),
-        }
-        for r in rows
-    ]
-    done = sum(1 for q in quizzes if q["status"] == "done")
-    # '이번 주 연속 도전' — learning_attempts 실집계 (이번 주 시도 없으면 D 유지)
-    today = date.today()
-    ws = today - timedelta(days=today.weekday())
-    week_rows = (
-        db.query(LearningAttempt)
-        .filter(
-            LearningAttempt.student_id == me.id,
-            LearningAttempt.created_at >= datetime.combine(ws, time.min),
-        )
-        .all()
-    )
-    # 연속 일수는 학생 홈/기록과 같은 정의(60일 이력에서 오늘·어제부터 과거로 역산)를 쓴다 —
-    # 주간 스트립 안에서만 역산하면 주 경계에서 연속이 끊겨(금~월 연속 4일이 1일)
-    # 화면 간 수치가 갈렸다
-    hist_rows = (
-        db.query(LearningAttempt)
-        .filter(
-            LearningAttempt.student_id == me.id,
-            LearningAttempt.created_at >= datetime.combine(today - timedelta(days=60), time.min),
-        )
-        .all()
-    )
-    hist_days = {r.created_at.date() for r in hist_rows if r.created_at}
-    if week_rows or hist_days:
-        # 실데이터가 있으면 주간 스트립도 실데이터로 — 디자인 폴백(월~목 done)을 섞으면
-        # "이번 주 4일 했는데 연속 0일" 같은 표시 모순이 생긴다
-        days_done = {r.created_at.date().weekday() for r in week_rows if r.created_at}
-        week = []
-        for i, label in enumerate(["월", "화", "수", "목", "금", "토", "일"]):
-            day: dict = {"label": label, "done": i in days_done}
-            if i == today.weekday():
-                day["today"] = True
-            week.append(day)
-        streak = aggregate._streak_days(hist_days)
-    else:
-        week = D.DAILY_QUIZ_WEEK
-        streak = sum(1 for day in week if day.get("done"))
-    return {
-        "quizzes": quizzes,
-        "done": done,
-        "total": len(quizzes),
-        "remain": len(quizzes) - done,
-        "week": week,
-        "streak_days": streak,
-        "coins": me.coins,  # NAV 냥코인 칩
-    }
-# ---------------------------------------------------------------- 지갑/상점
-# ---------------------------------------------------------------- 학년 랭킹
-# 상위 3위 보너스 코인 (하루 1회, 랭킹 확인 시 지급 — 순위 유지 동기)
-RANK_TOP3_COINS = {1: 30, 2: 20, 3: 10}
-# ---------------------------------------------------------------- 상장 · 개근 뱃지
-ATTENDANCE_BADGE_NAME = "개근왕"
-ATTENDANCE_STREAK_DAYS = 30  # 30일 연속 학습 = 개근상
+# (은퇴 0719, Q 통합 3단계-c) GET /students/me/daily-quiz 삭제 — 오늘의퀴즈 서빙 종료.
+# 현황·연속일은 GET /students/me/q-today(오늘의 Q)가 담당한다. 랭킹 보너스(RANK_TOP3)·
+# 개근 뱃지 상수도 게임화 은퇴로 함께 제거(지급 경로가 이미 없음).
 # ---------------------------------------------------------------- 학습 시도 저장
 @router.post("/learning/attempts")
 def save_attempt(
@@ -970,9 +812,8 @@ def game_answer(
         "hint": q.get("explain") or q["hint"],
         "coins_earned": saved.get("coins_earned", 0),
         "stages_done": stages_done,
-        # 6과목 완주 스티커 — 이 문항 적립으로 지급된 순간을 프론트가 놓치지 않게(위젯 경로와 동일)
-        "sticker_awarded": saved.get("sticker_awarded", False),
-        "sticker_coins": saved.get("sticker_coins", 0),
+        # (은퇴 0719, Q 통합 3단계-c) 스티커 키 삭제 — 지급 루프가 2단계에서 끊겼고,
+        # 소비하던 게임 화면 연출도 함께 제거됨(0/False 고정 계약의 완전 은퇴).
     }
 # ---------------------------------------------------------------- 학습결과 / 게임화면
 @router.get("/students/me/result")
@@ -986,22 +827,8 @@ def result(
     # 오늘 해당 과목 시도 실집계(정답/오답/점수/시간/연속) — 없으면 D 프리셋
     res_agg = aggregate.student_result_today(db, me, key)
     s = {**D.RESULT_SUBJECTS[key], **(res_agg or {})}
-    # 오늘의 학습 지도·다음 과목: '오늘의 퀴즈 현황' 단일 기준 = 오늘 5문항 푼 과목 ∪ 정답완주.
-    # (홈·오늘의퀴즈 페이지와 같은 기준 — 예전엔 여기만 status=="done"이라, 5문 다 풀고 마지막이
-    #  오답인 과목을 '다음 과목'으로 다시 내밀어 방금 푼 과목으로 역주행하던 버그가 있었다.)
-    done_set = _quiz_done_set(db, me.id) | {key}
-    # 오늘의 스티커(6과목 완주) — daily_rewards 장부 기준. 자정이 지나면 자동으로 미획득.
-    from app.models import DailyReward
-    sticker_today = (
-        db.query(DailyReward)
-        .filter(
-            DailyReward.student_id == me.id,
-            DailyReward.kind == "all_subjects_sticker",
-            DailyReward.reward_date == date.today(),
-        )
-        .first()
-        is not None
-    )
+    # (은퇴 0719, Q 통합 3단계-c) '오늘의 학습 지도'(6과목 완료 지도·다음 과목·스티커) 필드
+    # 삭제 — 과목당 완료 개념이 퀴즈와 함께 은퇴됐다(오늘의 Q는 전과목 통합 일일 목표).
     return {
         "subject": key,
         "nickname": me.nickname,
@@ -1010,10 +837,6 @@ def result(
         # 세션 문항 수(마지막 세션 실집계). 시도 없으면 프리셋과 맞춰 5.
         "total": s.get("total", 5),
         "levels": D.RESULT_LEVELS,
-        "today_done": sorted(done_set, key=D.SUBJECT_ORDER.index),
-        "subject_order": D.SUBJECT_ORDER,
-        "all_done_today": done_set >= set(D.SUBJECT_ORDER),
-        "sticker_today": sticker_today,
         # 오늘 이 과목 시도가 없어 점수·정답 수치가 디자인(데모)값이면 demo=True
         "demo": not res_agg,
     }

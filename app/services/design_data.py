@@ -165,7 +165,8 @@ SEARCH_ITEMS = [
     {"title": "그림 찾기 퀴즈", "tag": "놀이", "desc": "조건에 맞는 그림을 골라요", "icon": "ph-fill ph-image", "subject": "과학", "href": "/student/game?subject=과학", "kw": "그림 찾기 퀴즈 이미지 사진"},
     {"title": "안전 지킴이", "tag": "놀이", "desc": "안전한 행동과 위험한 것 구분", "icon": "ph-fill ph-shield-check", "subject": "생활", "href": "/student/game?subject=생활", "kw": "안전 지킴이 위험 생활안전"},
     {"title": "냥이 미로 탐험", "tag": "놀이", "desc": "고양이를 생선가게까지 데려가기", "icon": "ph-fill ph-path", "subject": "생활", "href": "/student/game?subject=생활", "kw": "미로 탐험 냥이 길찾기 경로"},
-    {"title": "오늘의 퀴즈", "tag": "바로가기", "desc": "오늘 할당된 퀴즈 풀기", "icon": "ph-fill ph-lightning", "subject": None, "href": "/student/daily-quiz", "kw": "오늘 퀴즈 할당 데일리"},
+    # (Q 통합 0719) 오늘의퀴즈 은퇴 — 검색 바로가기는 '오늘의 Q'(문제은행)로 교체
+    {"title": "오늘의 Q", "tag": "바로가기", "desc": "복습·틀린·새 문제를 매일 목표만큼", "icon": "ph-fill ph-lightning", "subject": None, "href": "/student/all-learning", "kw": "오늘 큐 퀴즈 데일리 문제은행 복습"},
     {"title": "배지", "tag": "바로가기", "desc": "모은 배지와 보상 확인", "icon": "ph-fill ph-medal", "subject": None, "href": "/student/badges", "kw": "배지 보상 상장 트로피"},
 ]
 

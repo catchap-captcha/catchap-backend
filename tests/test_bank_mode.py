@@ -119,7 +119,8 @@ def test_bank_attempt_no_coin_no_quiz(client, db, seed_org):
     assert r.status_code == 200 and r.json()["success"] is True
     sess = r.json()["session"]
     assert sess["coins_earned"] == 0, "은행 모드는 무보상"
-    assert sess["quiz_bonus"] == 0
+    # (Q 통합 3단계-c) 퀴즈 축 응답 키 자체가 은퇴 — 과거 done 행이 새어 나오지 않는다
+    assert "quiz_bonus" not in sess and "quiz_done" not in sess and "sticker_awarded" not in sess
 
     db.refresh(student)
     assert student.coins == 100  # seed 그대로

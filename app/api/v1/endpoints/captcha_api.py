@@ -21,7 +21,7 @@ from sqlalchemy.orm import Session
 
 from app.core.security import decode_token, sha256_hash
 from app.db.session import get_db
-from app.models import ApiKey, DailyQuizStatus, LearningAttempt, StudentProfile
+from app.models import ApiKey, LearningAttempt, StudentProfile
 from app.services import auth_service
 from app.services import captcha_service as cs
 
@@ -253,29 +253,15 @@ def _credit_student(
     # 위젯 verify는 서버가 챌린지 정답을 검증한 경로 → graded=True(점수 부수효과 대상).
     saved = _apply_attempt(attempt_req, student, db, graded=True)
 
-    quiz_done = (
-        db.query(DailyQuizStatus)
-        .filter(
-            DailyQuizStatus.student_id == student.id,
-            DailyQuizStatus.quiz_date == date.today(),
-            DailyQuizStatus.subject == subject,
-            DailyQuizStatus.status == "done",
-        )
-        .first()
-        is not None
-    )
+    # (은퇴 0719, Q 통합 3단계-c) quiz_done(DailyQuizStatus 조회)·quiz_bonus·스티커 키 삭제 —
+    # 과거 done 행이 True로 새어 나와 은퇴한 퀴즈 UI를 되살리는 것을 막는다(위젯은 이 키들을
+    # 읽지 않고, 게임 화면의 소비부도 함께 제거됨). coins_earned는 0 고정 계약 유지.
     return {
         "answered": answered,
         "total": EDU_SESSION_TOTAL,
-        "quiz_done": quiz_done,
         "replay": replay,
         "coins_earned": saved.get("coins_earned", 0),
         "coins": saved.get("coins"),
-        # 6과목 완주 스티커 — 이 문항 적립으로 오늘 전 과목 done이 된 순간 함께 지급됨
-        "sticker_awarded": saved.get("sticker_awarded", False),
-        "sticker_coins": saved.get("sticker_coins", 0),
-        # 오늘의퀴즈 완료 보상(광고된 reward_coins) — 완료 승격 문항에서만 >0
-        "quiz_bonus": saved.get("quiz_bonus", 0),
     }
 
 

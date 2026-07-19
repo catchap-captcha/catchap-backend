@@ -608,9 +608,10 @@ def chapter_stats(db: Session, me: StudentProfile) -> list[dict]:
     """전체학습(숙련 축) 과목 × 챕터별 정답률 — 학생/학부모 대시보드 공용.
 
     두 축 분리(사용자 결정 2026-07-13): 챕터 축은 전체학습 주차 챕터(chapter_no ≥ 1)만.
-    은행모드(chapter_no=0)·오늘의 퀴즈(NULL)는 종합 정답률에서 제외한다. 오늘의 퀴즈
-    정답률은 daily_quiz_accuracy로 '분리 노출'(합치지 않음). 정답률은 표본 ≥ MIN_ACC_SAMPLE
-    일 때만 값, 아니면 null(미학습/표본부족). 잠금·챕터 수·제목은 chapters 서비스가 원천.
+    은행모드(chapter_no=0)는 종합 정답률에서 제외한다. (은퇴 0719, Q 통합 3단계-c:
+    오늘의 퀴즈 분리 노출 필드 daily_quiz_accuracy 삭제 — 퀴즈 축 자체가 은퇴.)
+    정답률은 표본 ≥ MIN_ACC_SAMPLE일 때만 값, 아니면 null(미학습/표본부족).
+    잠금·챕터 수·제목은 chapters 서비스가 원천.
     """
     from app.services import chapters as ch
 
@@ -629,18 +630,6 @@ def chapter_stats(db: Session, me: StudentProfile) -> list[dict]:
     acc_map: dict[tuple[str, int], tuple[int, int]] = {
         (s, int(c)): (int(t), int(cor)) for s, c, t, cor in ch_rows
     }
-    # 오늘의 퀴즈(습관) 과목별 정답률 (chapter_no IS NULL) — 분리 노출용
-    dq_rows = (
-        db.query(
-            LearningAttempt.subject,
-            func.count(LearningAttempt.id),
-            func.coalesce(func.sum(case((LearningAttempt.result == "correct", 1), else_=0)), 0),
-        )
-        .filter(LearningAttempt.student_id == me.id, LearningAttempt.chapter_no.is_(None))
-        .group_by(LearningAttempt.subject)
-        .all()
-    )
-    dq_map: dict[str, tuple[int, int]] = {s: (int(t), int(cor)) for s, t, cor in dq_rows}
     # 챕터 단계 진행(5단계 바)
     prog_map: dict[tuple[str, int], int] = {
         (s, int(c)): int(sd)
@@ -684,13 +673,11 @@ def chapter_stats(db: Session, me: StudentProfile) -> list[dict]:
                 "unlocked": no <= unlocked,
                 "unreviewed_wrong": unrev,  # 이 챕터 미복습 오답 수(복습하면 줄어듦)
             })
-        dq_total, dq_correct = dq_map.get(subject, (0, 0))
         out.append({
             "subject": subject,
             "unlocked_chapters": unlocked,
             "max_chapters": mx,
             "overall_accuracy": _acc_pct(tot_all, cor_all),
-            "daily_quiz_accuracy": _acc_pct(dq_total, dq_correct),
             "unreviewed_wrong": unreviewed_all,
             "chapters": chapters,
         })
@@ -698,49 +685,56 @@ def chapter_stats(db: Session, me: StudentProfile) -> list[dict]:
 
 
 def habit_series(db: Session, me: StudentProfile, weeks: int = 4) -> dict:
-    """오늘의 퀴즈(습관 축) 일별 완료·정답률 시계열 + 연속일 — 나의 기록/홈 습관 추세용.
+    """오늘의 Q 일별 풀이·정답률 시계열 + 연속 학습일 — 나의 기록 습관 추세용.
 
-    습관 축(chapter_no IS NULL)만. done=그날 5문항 이상 푼 과목 수(현황 기준과 동일),
-    accuracy=그날 오늘의 퀴즈 정답률(표본<MIN이면 null로 두지 않고 실제 비율 — 일별은 표본이
-    작아도 추세가 의미 있어 그대로 보여준다).
+    (Q 통합 3단계-c) 퀴즈 축(chapter_no IS NULL)에서 Q축(chapter_no IS NOT NULL·graded)으로
+    재정의 — 퀴즈 승격이 멈춘 뒤 이 그래프가 얼어붙은 옛 데이터를 보여주던 것을 바로잡는다.
+    goal_met=그날 일일 목표(Q_DAILY_GOAL) 달성 여부(옛 done 과목 수를 대체),
+    accuracy=그날 Q 정답률(일별은 표본이 작아도 추세가 의미 있어 그대로 보여준다),
+    streak=q_daily_stats와 같은 정의(목표 달성일 연속 — 오늘 미달성이면 어제까지).
     """
+    from app.services.bank_mode import Q_DAILY_GOAL
+
     today = date.today()
     n = max(1, weeks) * 7
     start = today - timedelta(days=n - 1)
     rows = (
-        db.query(LearningAttempt.subject, LearningAttempt.result, LearningAttempt.created_at)
+        db.query(LearningAttempt.result, LearningAttempt.created_at)
         .filter(
             LearningAttempt.student_id == me.id,
-            LearningAttempt.chapter_no.is_(None),
+            LearningAttempt.chapter_no.isnot(None),
+            LearningAttempt.graded.is_(True),
+            LearningAttempt.content_id.isnot(None),
             LearningAttempt.created_at >= _dt(start),
         )
         .all()
     )
     day_tot: dict[date, int] = {}
     day_cor: dict[date, int] = {}
-    day_subj: dict[date, dict[str, int]] = {}
-    for subj, result, created in rows:
+    for result, created in rows:
         if not created:
             continue
         d = created.date()
         day_tot[d] = day_tot.get(d, 0) + 1
         if result == "correct":
             day_cor[d] = day_cor.get(d, 0) + 1
-        sd = day_subj.setdefault(d, {})
-        sd[subj] = sd.get(subj, 0) + 1
     days = []
     for i in range(n):
         d = start + timedelta(days=i)
         t = day_tot.get(d, 0)
-        done_subjects = sum(1 for c in day_subj.get(d, {}).values() if c >= 5)
         days.append({
             "date": d.isoformat(),
             "attempts": t,
-            "done": done_subjects,
+            "goal_met": t >= Q_DAILY_GOAL,
             "accuracy": round(day_cor.get(d, 0) / t * 100) if t else None,
         })
-    active_days = {d for d, t in day_tot.items() if t > 0}
-    return {"days": days, "streak": _streak_days(active_days, today)}
+    # 연속 학습일 = 목표 달성일 연속(오늘 아직 미달성이면 어제부터 역산 — q_daily_stats와 동일)
+    day = today if day_tot.get(today, 0) >= Q_DAILY_GOAL else today - timedelta(days=1)
+    streak = 0
+    while day_tot.get(day, 0) >= Q_DAILY_GOAL and day >= start:
+        streak += 1
+        day -= timedelta(days=1)
+    return {"days": days, "streak": streak}
 
 
 # ---------------------------------------------------------------- 교사: 대시보드
