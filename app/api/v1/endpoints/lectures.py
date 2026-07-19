@@ -423,6 +423,18 @@ def list_student_courses(
         .all()
     ):
         exam_mastered.setdefault(cid, set()).add(qid)
+    # 코스별 마지막 시험 활동 시각 — '나의 기록' 수료 현황의 '진행 중' 칸을 최신순(행동 우선)으로
+    # 정렬하는 근거. 시험을 한 번도 안 본 코스는 없음(FE에서 nulls-last).
+    exam_last_activity = {
+        r[0]: r[1]
+        for r in db.query(
+            CourseExamAttempt.course_id, func.max(CourseExamAttempt.created_at)
+        )
+        .filter(CourseExamAttempt.student_id == principal.id,
+                CourseExamAttempt.course_id.in_(course_ids or [""]))
+        .group_by(CourseExamAttempt.course_id)
+        .all()
+    }
     passed_courses = {
         r[0]: {"perfect": bool(r[1]), "passed_at": r[2]}
         for r in db.query(
@@ -478,6 +490,12 @@ def list_student_courses(
                     "passed_at": (
                         passed_courses[c.id]["passed_at"].isoformat()
                         if c.id in passed_courses and passed_courses[c.id]["passed_at"]
+                        else None
+                    ),
+                    # 마지막 시험 활동 시각 — '진행 중' 칸 최신순 정렬 근거(안 본 코스는 None)
+                    "last_activity_at": (
+                        exam_last_activity[c.id].isoformat()
+                        if exam_last_activity.get(c.id)
                         else None
                     ),
                 },

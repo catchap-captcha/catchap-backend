@@ -425,12 +425,13 @@ def test_courses_exam_summary_passed_at(client, db, seed_org):
     ex = next(c for c in rows if c["id"] == course["id"])["exam"]
     assert ex["has_exam"] and ex["available"] and ex["passed"] is False and ex["passed_at"] is None
 
-    # 완벽 통과 수료 → passed/perfect/passed_at 채워짐
+    # 완벽 통과 수료 → passed/perfect/passed_at 채워짐 + 시험 활동이 있으니 last_activity_at도
     res = _submit_all_correct(client, stok, course["id"], db)
     assert res["passed"] and res["perfect"]
     rows2 = client.get("/api/v1/courses", headers=auth(stok)).json()
     ex2 = next(c for c in rows2 if c["id"] == course["id"])["exam"]
     assert ex2["passed"] is True and ex2["perfect"] is True and ex2["passed_at"]
+    assert ex2["last_activity_at"]  # 진행 중 칸 최신순 정렬 근거(제출로 시험 활동 생김)
 
 
 def test_metrics_isolation_no_learning_attempt(client, db, seed_org):

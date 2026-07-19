@@ -17,9 +17,13 @@
 - **[question-formats-and-behavior-data.md](question-formats-and-behavior-data.md)** —
   전체학습 은행과 강의 캡차의 문항 형식이 왜 다른지, 왜 통일하지 않는지. 행동 데이터
   관점에서 드래그가 왜 우월한지, 보기 셔플 정책. ("강의 캡차 = 4지선다?"의 정확한 답.)
-- **[course-exam-design.md](course-exam-design.md)** — 코스 수료 시험 설계(구현 전).
+- **[course-exam-design.md](course-exam-design.md)** — 코스 수료 시험(1단계 구현 완료).
   왜 완전학습(mastery)인지, 기출의 비영리 교육용 전제(출처 표시 의무·유료화 리스크),
+  완벽 통과 정책 재설계(오답 1건 영구 박탈 폐지 → '한 회차에 다 맞힘' + 재도전 경로),
   데이터 모델·API·기존 코드 재사용 지도.
+- **[my-records-recentering.md](my-records-recentering.md)** — '나의 기록'을 게임 시절
+  통계 대시보드 → 학습 루프 성취 리포트로 재중심화. 코스 수료 현황(수료/진행/잠김),
+  **왜 '행동 우선(action-first)' 정렬**인지(실무 표준), 게임 라벨 정리, 스케일(더 보기).
 - **[question-bank-scale-design.md](question-bank-scale-design.md)** — 문제은행 규모
   확장 설계(구현 전). 만 개 규모에서 무한 스트림이 왜 무너지는지, 학생×문항 상태
   기계 + 간격 반복(SRS)·"오늘의 큐"·세트 단위·20주 챕터의 한계와 코스 기반 재편.
