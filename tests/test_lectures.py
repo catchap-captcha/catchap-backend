@@ -841,6 +841,44 @@ def test_lecture_challenge_is_multi_drag_and_never_leaks_explain(
     assert "answer" not in vr2 and "explain" not in vr2
 
 
+def test_lecture_challenge_serves_cropped_prompt_image(client, db, seed_org, media_dir):
+    """강사가 붙인(강의 화면에서 크롭한) 이미지가 학생 체크포인트 챌린지에 실려 나오고,
+    무인증으로 실제 서빙된다. 이미지 URL·챌린지에 정답/해설은 새지 않는다(파밍 차단)."""
+    import base64
+
+    ops_tok = _ops(client, db)
+    lec = _upload_lecture(client, ops_tok).json()
+    q = _add_question(client, ops_tok, lec["id"], answer=2)  # 시점 핀 문항(position_sec=1)
+    # 크롭 결과를 대신하는 1x1 PNG를 prompt 슬롯에 첨부(브라우저 크롭 → 이 엔드포인트로 업로드)
+    png = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+    )
+    r = client.post(
+        f"/api/v1/ops/lectures/{lec['id']}/questions/{q['id']}/images",
+        data={"slot": "prompt"},
+        files={"file": ("crop.png", png, "image/png")},
+        headers=auth(ops_tok),
+    )
+    assert r.status_code == 200, r.text
+
+    # 학생이 체크포인트에 닿았을 때 나오는 챌린지에 prompt_image URL이 실려야 한다
+    site_key = _edu_key(client, db, seed_org, ops_tok, first_party=True)
+    tok = _student_token(client, seed_org)
+    _reach_checkpoint(client, tok, lec["id"])
+    ch = client.post(
+        f"/api/v1/captcha/v1/challenge?lecture={lec['id']}",
+        headers={"X-Site-Key": site_key, **auth(tok)},
+    ).json()
+    assert "prompt_image" in ch, "크롭 이미지가 학생 챌린지에 실리지 않았다"
+
+    # 그 URL이 무인증으로 실제 이미지 바이트를 서빙하는지(PNG 시그니처 확인)
+    ir = client.get(ch["prompt_image"])
+    assert ir.status_code == 200, ir.text
+    assert ir.content[:8] == b"\x89PNG\r\n\x1a\n"
+    # 이미지 문항이어도 정답·해설은 챌린지에 새지 않는다
+    assert "explain" not in ch and "강의 앞부분" not in str(ch)
+
+
 def test_lecture_token_verify_requires_first_party_edu_key(
     client, db, seed_org, media_dir
 ):
