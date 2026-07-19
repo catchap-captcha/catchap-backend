@@ -537,6 +537,44 @@ def test_generate_exam_questions_llm(client, db, seed_org, monkeypatch):
     assert qs[0]["answer_indexes"] == [2]
 
 
+def test_generate_exam_uses_lecture_transcript(client, db, seed_org, monkeypatch):
+    """강의 자막이 있으면 코스 시험 생성기에 그 텍스트가 전달되고 used_transcripts에 반영된다."""
+    from app.core.config import get_settings
+    from app.models import LectureTranscript
+
+    monkeypatch.setattr(get_settings(), "ANTHROPIC_API_KEY", "sk-x")
+    tok = _ops(client, db)
+    course = _mk_course(client, tok, db)
+    lec = _assign_lecture(client, tok, course["id"], title="1강")
+    db.add(LectureTranscript(
+        lecture_id=lec["id"],
+        segments=[{"start": 0.0, "end": 3.0, "text": "분수는 전체를 나눈 조각이다"}],
+        source="paste", segment_count=1,
+    ))
+    db.commit()
+
+    import app.clients.ai_client as ai
+
+    seen = {}
+
+    def fake_gen(**k):
+        seen.update(k)
+        return [{"prompt": "q", "options": ["가", "나", "다", "라"], "answer_index": 0, "explain": ""}]
+
+    monkeypatch.setattr(ai, "generate_course_exam_questions", fake_gen)
+    r = client.post(
+        f"/api/v1/ops/courses/{course['id']}/exam-questions/generate", json={"n": 1}, headers=auth(tok)
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["used_transcripts"] == 1
+    # 생성기에 전달된 lectures에 자막 텍스트가 실려 있는지
+    assert any("분수는 전체를 나눈" in (l.get("transcript") or "") for l in seen["lectures"])
+    # 자막이 있으면 프롬프트가 '자막 근거' 모드로 바뀌는지(직접 확인)
+    from app.clients.ai_client import _course_exam_prompt
+    p = _course_exam_prompt("코스", "수학", seen["lectures"], 1)
+    assert "실제 내용(자막)" in p and "분수는 전체를 나눈" in p
+
+
 def test_generate_exam_questions_no_key_503(client, db, seed_org, monkeypatch):
     """키가 하나도 없으면 정직한 503(stub 문항 생성 금지)."""
     from app.core.config import get_settings

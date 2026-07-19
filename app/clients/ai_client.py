@@ -492,19 +492,41 @@ def generate_lecture_questions(
 
 
 def _course_exam_prompt(course_title: str, subject: str, lectures: list[dict], n: int) -> str:
-    lines = "\n".join(
-        f"- {l.get('title', '')}" + (f": {l['description']}" if l.get("description") else "")
-        for l in lectures
-    ) or "- (강의 정보 없음)"
+    # 강의 전사(자막)가 있으면 그 '실제 내용'을 근거로 출제(제목·설명만 쓸 때보다 깊은 문항).
+    # 없으면 제목·설명만으로 폴백. lectures 각 항목의 transcript 유무로 갈린다.
+    has_tr = any((l.get("transcript") or "").strip() for l in lectures)
+    if has_tr:
+        blocks = []
+        for l in lectures:
+            head = f"■ 강의: {l.get('title', '')}"
+            if l.get("description"):
+                head += f" — {l['description']}"
+            body = (l.get("transcript") or "").strip() or "(자막 없음 — 제목·설명만 참고)"
+            blocks.append(head + "\n" + body)
+        source = "아래는 이 코스 각 강의의 실제 내용(자막)입니다.\n\n" + "\n\n".join(blocks)
+        basis = (
+            "위 강의 자막에 실제로 나온 내용을 근거로, 코스를 수료한 학생이 그 내용을 이해했는지"
+            " 확인하는"
+        )
+        extra = "- 자막에 없는 내용을 지어내지 마세요(자막 근거 문항).\n"
+    else:
+        lines = "\n".join(
+            f"- {l.get('title', '')}" + (f": {l['description']}" if l.get("description") else "")
+            for l in lectures
+        ) or "- (강의 정보 없음)"
+        source = f"이 코스는 다음 강의들로 구성됩니다:\n{lines}"
+        basis = "이 강의들에서 다룬 내용을 종합적으로 이해했는지 확인하는"
+        extra = ""
     return (
         "당신은 온라인 강의 코스의 '수료 시험' 출제자입니다.\n"
-        f"과목: {subject}\n코스 제목: {course_title}\n"
-        f"이 코스는 다음 강의들로 구성됩니다:\n{lines}\n\n"
-        f"이 강의들에서 다룬 내용을 '종합적으로 이해했는지' 확인하는 4지선다 수료 시험 문제 {n}개를 만드세요.\n"
+        f"과목: {subject}\n코스 제목: {course_title}\n\n"
+        f"{source}\n\n"
+        f"{basis} 4지선다 수료 시험 문제 {n}개를 만드세요.\n"
         "규칙:\n"
         "- 코스 전체 범위를 골고루 다루되, 특정 강의 하나에만 치우치지 마세요.\n"
         "- 각 문제는 보기 4개, 정답은 하나.\n"
         "- 단순 암기보다 개념 이해·적용을 확인하는 문제를 우선하세요.\n"
+        f"{extra}"
         "- explain에 정답 해설 1~2문장.\n\n"
         "다음 JSON 배열만 출력하세요(코드펜스·설명 없이):\n"
         '[{"prompt": "질문", "options": ["보기1", "보기2", "보기3", "보기4"], '
@@ -523,7 +545,10 @@ def generate_course_exam_questions(
     models: list[dict] | None = None,
     on_usage=None,
 ) -> list[dict]:
-    """코스 강의 구성(제목·설명)에서 수료 시험 문항 n개 생성 — 멀티프로바이더 _post_messages 재사용.
+    """코스 강의 구성(제목·설명·자막)에서 수료 시험 문항 n개 생성 — 멀티프로바이더 _post_messages 재사용.
+
+    lectures 각 항목에 transcript(자막 텍스트)가 있으면 그 실제 내용을 근거로 출제한다
+    (제목·설명만 쓸 때보다 깊은 문항). 없으면 제목·설명만으로 폴백(_course_exam_prompt).
 
     반환 [{prompt, options, answer_index, explain}]. **자기검증(봇저항)은 하지 않는다** —
     수료 시험은 시청 검증 캡차가 아니라 '지식·이해'를 확인하는 시험이라, 상식으로 풀리는

@@ -32,6 +32,7 @@ from app.models import (
     CourseExamSitting,
     Lecture,
     LectureQuestion,
+    LectureTranscript,
 )
 from app.services import bank_mode
 from app.utils.helpers import audit
@@ -42,6 +43,10 @@ router = APIRouter(tags=["course-exam"])
 # 다시'의 리듬을 만들기 위해(문제은행 세트 10문항과 같은 보폭).
 EXAM_SITTING_SIZE = 10
 ORIGINS = {"manual", "past_exam", "lecture", "llm"}
+# LLM 시험 생성 시 강의 전사(자막)를 프롬프트에 넣는 예산 — 실제 내용 근거로 더 깊은 문항을
+# 만들되, 코스에 강의가 많으면 전체 자막이 토큰을 폭발시키므로 총·강의별 상한으로 자른다.
+_COURSE_EXAM_TR_TOTAL_CAP = 30000  # 총 문자 예산(대략 수천 토큰 규모)
+_COURSE_EXAM_TR_PER_LECTURE = 5000  # 강의 하나당 상한(한 강의가 예산을 독식하지 않게)
 
 
 # ---------------------------------------------------------------- 공통 로더·파생
@@ -468,18 +473,35 @@ def ops_generate_exam_questions(
             status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="LLM API 키가 설정되지 않아 문항 자동 생성을 쓸 수 없습니다. 운영 콘솔 '설정'에서 키를 입력해 주세요.",
         )
+    # 강의 목록 + 각 강의의 전사(자막)를 근거로 넣는다 — 제목·설명만 쓰던 것보다 실제 내용에
+    # 기반한 깊은 문항이 나온다. 자막이 있는 강의는 그 텍스트를, 없으면 제목·설명만 쓴다.
+    # 총·강의별 문자 상한으로 토큰 폭발을 막는다(강의가 많은 코스 방어).
     lec_ids = _course_lecture_ids(db, course_id)
-    lectures = (
-        [
-            {"title": r[0], "description": r[1]}
-            for r in db.query(Lecture.title, Lecture.description)
-            .filter(Lecture.id.in_(lec_ids))
-            .order_by(Lecture.order_no)
-            .all()
-        ]
+    lecture_rows = (
+        db.query(Lecture.id, Lecture.title, Lecture.description)
+        .filter(Lecture.id.in_(lec_ids))
+        .order_by(Lecture.order_no)
+        .all()
         if lec_ids
         else []
     )
+    tr_map: dict[str, list] = {}
+    if lec_ids:
+        for t in (
+            db.query(LectureTranscript).filter(LectureTranscript.lecture_id.in_(lec_ids)).all()
+        ):
+            tr_map[t.lecture_id] = t.segments or []
+    lectures = []
+    budget = _COURSE_EXAM_TR_TOTAL_CAP
+    used_transcripts = 0
+    for lid, title, desc in lecture_rows:
+        text = " ".join(str(s.get("text") or "") for s in tr_map.get(lid, [])).strip()
+        take = ""
+        if text and budget > 0:
+            take = text[: min(len(text), _COURSE_EXAM_TR_PER_LECTURE, budget)]
+            budget -= len(take)
+            used_transcripts += 1
+        lectures.append({"title": title, "description": desc, "transcript": take})
 
     def _to_models(cands):
         return [
@@ -536,9 +558,15 @@ def ops_generate_exam_questions(
     db.flush()
     audit(db, action="course.exam_question.generate", actor_user_id=principal.id,
           target_type="course", target_id=course_id,
-          after={"created": len(created), "n": req.n})
+          after={"created": len(created), "n": req.n, "transcripts": used_transcripts})
     db.commit()
-    return {"created": len(created), "questions": [_question_row(q) for q in created]}
+    return {
+        "created": len(created),
+        # 자막을 근거로 쓴 강의 수 — 0이면 제목·설명만으로 생성(콘솔이 안내)
+        "used_transcripts": used_transcripts,
+        "lecture_count": len(lecture_rows),
+        "questions": [_question_row(q) for q in created],
+    }
 
 
 # ---------------------------------------------------------------- 학생: 상태·발급·채점

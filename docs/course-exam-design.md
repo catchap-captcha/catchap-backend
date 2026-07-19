@@ -213,13 +213,17 @@
   점 — to-bank는 옵션 id 기반이라 변환 필요). **멱등**: 원 강의 문항 payload에
   `exam_imported` 마커(to-bank의 bank_placed와 동형)를 남겨 재실행 시 건너뛴다. 이미지
   문항·형식 불량은 조용히 건너뛰되 개수를 정직하게 반환({imported, skipped}).
-- **LLM 생성** `POST /ops/courses/{cid}/exam-questions/generate` — 코스 강의 구성(제목·설명)을
-  근거로 **멀티프로바이더 LLM**(#26 — 운영자가 고른 생성 슬롯 모델·Anthropic/OpenAI)이
-  수료 시험 문항 초안(origin=llm)을 만든다. `ai_client.generate_course_exam_questions`가
-  `_post_messages`+`_parse_questions`를 재사용한다. **자기검증(봇저항)은 안 한다** —
-  수료 시험은 시청 검증 캡차가 아니라 지식·이해 확인이라 상식으로 풀리는 문항도 정당
-  (강의 캡차의 bank/captcha/discard 3분류와 목적이 다르다). 키 없으면 503, 생성 실패 502.
-- FE: 강사 시험 문항 모달에 '강의 문항 가져오기'·'AI로 생성' 버튼(둘 다 결과는 초안 안내).
+- **LLM 생성** `POST /ops/courses/{cid}/exam-questions/generate` — 코스 강의 구성을 근거로
+  **멀티프로바이더 LLM**(#26 — 운영자가 고른 생성 슬롯 모델·Anthropic/OpenAI)이 수료 시험
+  문항 초안(origin=llm)을 만든다. **근거 우선순위(2026-07-20 확장): 강의 자막(전사) > 제목·설명.**
+  코스 소속 강의에 저장된 전사(lecture_transcripts)가 있으면 그 실제 내용을 프롬프트에 넣어
+  깊은 문항을 만들고, 없으면 제목·설명만으로 폴백한다. 강의가 많은 코스의 토큰 폭발을 막으려
+  총(_COURSE_EXAM_TR_TOTAL_CAP=30k자)·강의별(5k자) 상한으로 자른다. 응답 `used_transcripts`로
+  자막을 쓴 강의 수를 정직하게 노출(콘솔 배너). `ai_client.generate_course_exam_questions`가
+  `_post_messages`+`_parse_questions`를 재사용. **자기검증(봇저항)은 안 한다** — 수료 시험은
+  시청 검증 캡차가 아니라 지식·이해 확인이라 상식으로 풀리는 문항도 정당. 키 없으면 503, 502.
+- FE: 강사 시험 문항 모달에 '강의 문항 가져오기'·'AI로 생성' 버튼(둘 다 결과는 초안 안내),
+  생성 배너에 자막 사용 여부 표기. 강의 관리 화면에 첫 방문 강사용 '이용 안내' 모달(5단계).
 
 **2단계 — 잔여(미착수)**: 수료증 PDF, 행동 데이터 연동, 대시보드 지표(강사: 시험 통과율·
 오래 걸린 문항 / 운영자: 수료율), 이미지 문항.
