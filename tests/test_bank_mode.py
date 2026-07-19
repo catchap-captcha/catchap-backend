@@ -249,8 +249,10 @@ def test_verify_long_qid_and_answerless_wrong(client, db, seed_org):
 
 
 def test_dont_know_marks_wrong_with_explain(client, db, seed_org):
-    """'잘 모르겠어요'(answer=null) — 찍기 강요 없이 오답 처리 + 해설 응답 + 오답노트 명시."""
-    from app.models import WrongAnswer
+    """'잘 모르겠어요'(answer=null) — 찍기 강요 없이 오답 처리 + 해설 응답 + SRS wrong 상자 기록.
+
+    결정 ④(Q 통합): 옛 오답노트(WrongAnswer) 쓰기는 은퇴 — 오답의 정본은 StudentQuestionState."""
+    from app.models import StudentQuestionState, WrongAnswer
     from app.services import captcha_service as cs
     from app.services import subject_banks
 
@@ -277,12 +279,23 @@ def test_dont_know_marks_wrong_with_explain(client, db, seed_org):
     body = r.json()
     assert body["success"] is False, "무응답은 오답으로 채점돼야 한다(운 좋은 정답 없음)"
     assert body.get("explain"), "공부용 해설이 내려와야 한다"
-    note = (
+    # 옛 오답노트에는 신규 기록이 생기지 않는다(쓰기 은퇴 — 데이터 보존, 쓰기만 중단)
+    assert (
         db.query(WrongAnswer)
         .filter(WrongAnswer.student_id == student.id, WrongAnswer.question == q["prompt"])
         .first()
+        is None
     )
-    assert note is not None and note.my_answer == "잘 모르겠어요"
+    # 대신 SRS 상태에 오답으로 남아 '틀린 문제' 뷰·최우선 재출제의 근거가 된다
+    st = (
+        db.query(StudentQuestionState)
+        .filter(
+            StudentQuestionState.student_id == student.id,
+            StudentQuestionState.question_id == q["id"],
+        )
+        .first()
+    )
+    assert st is not None and st.last_result == "incorrect" and st.wrong_count >= 1
 
 
 def test_chapter_clamp_on_subject_without_that_week(client, db, seed_org):

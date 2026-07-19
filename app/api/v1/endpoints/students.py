@@ -22,6 +22,7 @@ from app.models import (
     StudentItem,
     StudentProfile,
     StudentProgress,
+    StudentQuestionState,
     WrongAnswer,
 )
 from app.schemas.student import (
@@ -258,47 +259,54 @@ def records(
         # 시도 기록이 없어 전부 디자인(데모)값이면 demo=True
         "demo": not agg,
     }
-# ---------------------------------------------------------------- 오답노트
+# ---------------------------------------------------------------- 틀린 문제(구 오답노트)
 @router.get("/students/me/wrong-notes")
 def wrong_notes(
     principal: Principal = Depends(require_student), db: Session = Depends(get_db)
 ):
+    """'틀린 문제' 뷰(Q 통합 3단계, 결정 ④ — question-bank-scale-design.md).
+
+    별도 오답노트 테이블 대신 **SRS 상태의 wrong 상자**(마지막 응답이 오답인 문항)를
+    은행 문항과 조인해 그린다. 정본이 하나(SRS)라 이중 장부 불일치가 원천 소멸하고,
+    다시 맞히면(휴면/마스터 전환) 목록에서 자동으로 빠진다 — '2회 정답 복습완료 승격'
+    개념이 사라진 이유. 옛 WrongAnswer 데이터는 보존되지만 화면 정본은 SRS다.
+    '다시 풀기'는 오늘의 Q로 보내면 된다 — 틀린 문항이 어차피 최우선 출제다."""
+    from app.services import subject_banks
+
     me = _me(principal)
     rows = (
-        db.query(WrongAnswer)
-        .filter(WrongAnswer.student_id == me.id)
-        .order_by(WrongAnswer.wrong_date.desc(), WrongAnswer.created_at.desc())
+        db.query(StudentQuestionState)
+        .filter(
+            StudentQuestionState.student_id == me.id,
+            StudentQuestionState.last_result == "incorrect",
+        )
+        .order_by(StudentQuestionState.last_attempt_at.desc())
         .all()
     )
     items = []
     by_cat: dict[str, int] = {}
-    for w in rows:
-        tag = D.WRONG_TAGS.get(w.category, {})
-        by_cat[w.category] = by_cat.get(w.category, 0) + 1
+    for r in rows:
+        q = subject_banks.get_question(r.subject, r.question_id)
+        if q is None:
+            continue  # 은퇴·제거된 문항 — 현재 풀이 정본이므로 화면에서 제외
+        cat = subject_banks.WRONG_CATEGORY.get(r.subject, "safe")
+        by_cat[cat] = by_cat.get(cat, 0) + 1
         items.append(
             {
-                "id": w.id,
-                "cat": w.category,
-                "subject": w.subject,
-                "question": w.question,
-                "wrong": w.my_answer,
-                "answer": w.correct_answer,
-                "tip": w.tip,
-                "date": date_label(w.wrong_date),
-                "reviewed": w.reviewed,
-                "chapter_no": w.chapter_no,  # 전체학습 챕터 오답이면 그 챕터, 오늘의 퀴즈면 null
-                "tag": tag,
+                "id": r.question_id,
+                "cat": cat,
+                "subject": r.subject,
+                "question": q.get("prompt") or "",
+                "answer": _correct_answer_text(q)[:200],
+                "tip": q.get("explain") or q.get("hint"),
+                "date": date_label(r.last_attempt_at.date()) if r.last_attempt_at else "",
+                "wrong_count": int(r.wrong_count or 0),
+                "tag": D.WRONG_TAGS.get(cat, {}),
             }
         )
-    reviewed_n = sum(1 for w in rows if w.reviewed)
     return {
         "items": items,
-        "summary": {
-            "total": len(items),
-            "pending": len(items) - reviewed_n,
-            "reviewed": reviewed_n,  # 복습 완료 수 (wrong_answers.reviewed 실데이터)
-            "by_category": by_cat,
-        },
+        "summary": {"total": len(items), "by_category": by_cat},
         "tags": D.WRONG_TAGS,
     }
 # ---------------------------------------------------------------- 연습장 필기 재생 (본인)
@@ -895,105 +903,10 @@ def _correct_answer_text(q: dict) -> str:
             return ", ".join(vals)
     # 그 외(route/trace/swipe/sort/connect/memory/puzzle…) → 개념 설명으로 복습 포인트 제공
     return q.get("explain") or q.get("hint") or "그림과 활동을 다시 살펴봐요"
-def _student_answer_text(q: dict, student_answer) -> str:
-    """학생이 낸 답을 텍스트로 — 조작형은 정확 재현이 어려워 빈 문자열(문제+정답+개념만 남김)."""
-    t = q.get("type")
-    if student_answer is None:
-        return ""
-    if t in ("dictation", "type_in", "input"):
-        return str(student_answer)[:200]
-    if isinstance(student_answer, str):
-        return _opt_texts(q, [student_answer])  # 옵션 없으면 "" (조작형)
-    if isinstance(student_answer, list):
-        return _opt_texts(q, [str(x) for x in student_answer])
-    return ""  # dict(연결/분류 제출) 등 — 재현 생략
-def _mark_reviewed(db: Session, me: StudentProfile, q: dict) -> None:
-    """정답으로 '2회' 다시 맞힌 문항의 미복습 오답노트를 복습완료(reviewed=True)로 승격.
-    사용자 결정(2026-07-14): 한 번 운 좋게 맞힌 걸로 지우지 않고 2회 정답부터 승격(간격
-    반복 학습). 현재 정답 시도는 아직 LearningAttempt에 저장되기 전이므로, 이 문항의 '이전'
-    graded 정답이 1회 이상이면(=지금이 2번째) 승격한다. 오답노트는 프롬프트로 매칭한다."""
-    prompt = q.get("prompt")
-    qid = q.get("id")
-    if not prompt:
-        return
-    prior_correct = 0
-    if qid:
-        prior_correct = (
-            db.query(func.count(LearningAttempt.id))
-            .filter(
-                LearningAttempt.student_id == me.id,
-                LearningAttempt.content_id == str(qid)[:80],
-                LearningAttempt.result == "correct",
-                LearningAttempt.graded.is_(True),
-            )
-            .scalar()
-            or 0
-        )
-    if prior_correct < 1:
-        return  # 첫 정답 — 아직 승격하지 않는다(2회 필요)
-    db.query(WrongAnswer).filter(
-        WrongAnswer.student_id == me.id,
-        WrongAnswer.question == prompt,
-        WrongAnswer.reviewed.is_(False),
-    ).update({WrongAnswer.reviewed: True}, synchronize_session=False)
-def _record_wrong(
-    db: Session, me: StudentProfile, subject: str, q: dict, student_answer,
-    chapter_no: int | None = None,
-) -> None:
-    """게임 오답을 오답노트(WrongAnswer)·취약추천(Recommendation)에 실기록.
-    전 문제 유형 지원 — 정답은 _correct_answer_text(유형별 렌더), 학생 답은
-    _student_answer_text. 같은 문항이 '미복습' 상태로 있으면 중복 저장하지 않는다.
-    복습(replay) 오답은 호출부에서 제외한다. chapter_no는 전체학습 주차 챕터 오답이면 그
-    챕터(≥1), 오늘의 퀴즈 오답이면 None — '약한 챕터 미복습 오답' 진단에 쓴다.
-    """
-    from app.services import subject_banks
-    dup = (
-        db.query(WrongAnswer)
-        .filter(
-            WrongAnswer.student_id == me.id,
-            WrongAnswer.question == q["prompt"],
-            WrongAnswer.reviewed.is_(False),
-        )
-        .first()
-    )
-    if dup is None:
-        db.add(
-            WrongAnswer(
-                student_id=me.id,
-                organization_id=me.organization_id,
-                subject=subject,
-                category=subject_banks.WRONG_CATEGORY.get(subject, "safe"),  # D.WRONG_TAGS 키
-                question=q["prompt"],
-                # '잘 모르겠어요'(무응답)는 빈칸 대신 명시 — 오답노트에서 구분되게
-                my_answer=("잘 모르겠어요" if student_answer is None else _student_answer_text(q, student_answer))[:200],
-                correct_answer=_correct_answer_text(q)[:200],
-                tip=q.get("explain") or q.get("hint"),
-                wrong_date=date.today(),
-                chapter_no=chapter_no if (isinstance(chapter_no, int) and chapter_no >= 1) else None,
-            )
-        )
-    # 취약 주제 추천 — 같은 과목·챕터(stage)에 active 추천이 없으면 생성
-    stage = int(q.get("stage") or 1)
-    rec_dup = (
-        db.query(Recommendation)
-        .filter(
-            Recommendation.student_id == me.id,
-            Recommendation.subject == subject,
-            Recommendation.chapter_no == stage,
-            Recommendation.status == "active",
-        )
-        .first()
-    )
-    if rec_dup is None:
-        db.add(
-            Recommendation(
-                student_id=me.id,
-                subject=subject,
-                chapter_no=stage,
-                priority="보통",
-                reason=f"{q.get('topic') or subject} 문제에서 틀린 적이 있어요. 다시 한 번 풀어볼까요?",
-            )
-        )
+# (은퇴 0719 — Q 통합 3단계 결정 ④) _student_answer_text·_mark_reviewed·_record_wrong 제거.
+# 오답 기록·복습완료 승격·취약추천 생성은 SRS(student_question_states)가 대체한다:
+# 틀린 문항은 wrong 상자에 남아 최우선 재출제되고, '틀린 문제' 화면(wrong-notes)이
+# 그 상자를 그린다. 옛 WrongAnswer·Recommendation 데이터는 보존(쓰기만 중단).
 @router.post("/students/me/game-answer")
 def game_answer(
     req: _GameAnswerReq,
@@ -1024,16 +937,10 @@ def game_answer(
         answer_ids = [str(q["answer"])]
         picked_ids = [str(req.option_id)] if req.option_id else []
         correct = picked_ids == answer_ids
-    # 오답이면 오답노트·취약추천에 실기록 / 정답이면 그 문항 미복습 오답노트를 복습완료로 승격.
-    # (복습은 제외 — 반복 파밍/중복 누적 방지)
-    if not req.replay:
-        if not correct:
-            student_ans = req.option_ids if q["type"] == "multi" else req.option_id
-            _record_wrong(db, me, req.subject, q, student_ans, chapter_no=req.chapter_no)
-        else:
-            _mark_reviewed(db, me, q)
-    # 서버 판정 결과를 학습기록으로 저장 (기존 save_attempt와 동일 부수효과: 코인 상한·진도·퀴즈 상태)
-    # 챕터 플레이(chapter_no 지정)는 daily=False — 코인·정답률(숙련도)은 반영하되 오늘의퀴즈(습관) 미갱신.
+    # 오답노트 별도 기록 은퇴(Q 통합 3단계, 결정 ④) — 오답은 _apply_attempt의 SRS 갱신
+    # (record_answer)이 wrong 상자에 남기고, '틀린 문제' 화면이 그 상자를 그린다.
+    # 서버 판정 결과를 학습기록으로 저장 (진도·정답률·SRS 상태 갱신)
+    # 챕터 플레이(chapter_no 지정)는 daily=False — 정답률(숙련도)은 반영하되 오늘의퀴즈(습관) 미갱신.
     is_chapter = req.chapter_no is not None
     attempt_req = AttemptCreate(
         subject=req.subject,

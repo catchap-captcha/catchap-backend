@@ -219,8 +219,11 @@ def test_habit_stats_streak(client, db, seed_org):
     assert last["attempts"] >= 5 and last["done"] >= 1 and last["accuracy"] == 100
 
 
-def test_wrong_note_chapter_link_and_review(client, db, seed_org):
-    """오답노트: 챕터 오답은 chapter_no 기록, 같은 문항 정답 시 복습완료(reviewed) 승격."""
+def test_wrong_view_srs_from_game_answer(client, db, seed_org):
+    """'틀린 문제' 뷰(결정 ④) — game-answer 오답이 SRS wrong 상자로 화면에 노출되고,
+    한 번 다시 맞히면 뷰에서 즉시 이탈한다. 옛 '2회 정답 복습완료 승격'은 은퇴 —
+    같은 리듬(연속 2회)은 SRS 마스터 축이 담당하고, 뷰는 last_result만 본다."""
+    from app.models import StudentQuestionState, WrongAnswer
     from app.services import subject_banks
 
     token = _student_token(client, seed_org)
@@ -228,33 +231,40 @@ def test_wrong_note_chapter_link_and_review(client, db, seed_org):
     correct = str(q["answer"])
     wrong = next(str(o["id"]) for o in q["options"] if str(o["id"]) != correct)
 
-    # 2챕터 오답 → 오답노트에 chapter_no=2, 미복습
+    # 오답 → 신규 WrongAnswer 없음(쓰기 은퇴), SRS 뷰에 과목·카테고리·틀린 횟수로 노출
     r = client.post("/api/v1/students/me/game-answer",
                     json={"subject": "수학", "question_id": q["id"], "option_id": wrong, "chapter_no": 2},
                     headers=auth(token))
     assert r.status_code == 200 and r.json()["correct"] is False
+    assert (
+        db.query(WrongAnswer)
+        .filter(WrongAnswer.student_id == seed_org["student"].id)
+        .count()
+        == 0
+    )
     notes = client.get("/api/v1/students/me/wrong-notes", headers=auth(token)).json()
-    note = next(n for n in notes["items"] if n["question"] == q["prompt"])
-    assert note["chapter_no"] == 2 and note["reviewed"] is False
-    assert notes["summary"]["reviewed"] == 0
+    note = next(n for n in notes["items"] if n["id"] == q["id"])
+    assert note["subject"] == "수학" and note["cat"] == "num" and note["wrong_count"] >= 1
+    assert notes["summary"]["total"] >= 1
 
-    # 같은 문항 1회 정답 → 아직 미복습(사용자 결정: 2회 정답부터 승격, 운으로 한 번 맞힌 것 제외)
+    # 정답 1회 → last_result가 correct로 바뀌어 뷰에서 자동 이탈("다시 맞히면 사라져요")
     r2 = client.post("/api/v1/students/me/game-answer",
                      json={"subject": "수학", "question_id": q["id"], "option_id": correct, "chapter_no": 2},
                      headers=auth(token))
     assert r2.status_code == 200 and r2.json()["correct"] is True
     notes2 = client.get("/api/v1/students/me/wrong-notes", headers=auth(token)).json()
-    note2 = next(n for n in notes2["items"] if n["question"] == q["prompt"])
-    assert note2["reviewed"] is False and notes2["summary"]["reviewed"] == 0
+    assert all(n["id"] != q["id"] for n in notes2["items"])
 
-    # 2회째 정답 → 복습완료 승격
-    r3 = client.post("/api/v1/students/me/game-answer",
-                     json={"subject": "수학", "question_id": q["id"], "option_id": correct, "chapter_no": 2},
-                     headers=auth(token))
-    assert r3.status_code == 200 and r3.json()["correct"] is True
-    notes3 = client.get("/api/v1/students/me/wrong-notes", headers=auth(token)).json()
-    note3 = next(n for n in notes3["items"] if n["question"] == q["prompt"])
-    assert note3["reviewed"] is True and notes3["summary"]["reviewed"] >= 1
+    # 마스터 축은 뷰와 별개 — 연속 1회라 아직 learning(연속 2회부터 mastered)
+    st = (
+        db.query(StudentQuestionState)
+        .filter(
+            StudentQuestionState.student_id == seed_org["student"].id,
+            StudentQuestionState.question_id == q["id"],
+        )
+        .first()
+    )
+    assert st is not None and st.state == "learning" and st.correct_streak == 1
 
 
 
@@ -353,7 +363,8 @@ def test_game_session_server_graded(client, db, seed_org):
 
 
 def test_game_session_new_subjects(client, db, seed_org):
-    """수학·과학·사회·영어 실문항 (capcha_service my/sw/ms 이식): 발급 sanitize + 서버 채점 + 오답노트 과목 매핑."""
+    """수학·과학·사회·영어 실문항 (capcha_service my/sw/ms 이식): 발급 sanitize + 서버 채점
+    + '틀린 문제' 뷰(SRS) 과목·카테고리 매핑(결정 ④: WrongAnswer 쓰기 은퇴)."""
     from app.models import LearningAttempt, WrongAnswer
 
     token = _student_token(client, seed_org)
@@ -383,8 +394,10 @@ def test_game_session_new_subjects(client, db, seed_org):
         headers=auth(token),
     )
     assert r.status_code == 200 and r.json()["correct"] is False
-    wa = db.query(WrongAnswer).filter(WrongAnswer.student_id == seed_org["student"].id).all()
-    assert any(w.subject == "수학" and w.category == "num" for w in wa)
+    # 결정 ④: WrongAnswer 신규 기록 없음 — 과목·카테고리 매핑은 '틀린 문제' 뷰(SRS 파생)가 담당
+    assert db.query(WrongAnswer).filter(WrongAnswer.student_id == seed_org["student"].id).count() == 0
+    notes = client.get("/api/v1/students/me/wrong-notes", headers=auth(token)).json()
+    assert any(n["subject"] == "수학" and n["cat"] == "num" for n in notes["items"])
 
     # 사회 정답 제출 → correct + learning_attempts에 과목 그대로 기록 (single 문항 선택)
     from app.services.social_bank import SOCIAL_FULL
@@ -415,8 +428,9 @@ def test_game_session_new_subjects(client, db, seed_org):
     )
     assert re1.status_code == 200 and re1.json()["correct"] is False
     assert re1.json()["answer_text"] == next(o["text"] for o in eq["options"] if o["id"] == eq["answer"])
-    wa2 = db.query(WrongAnswer).filter(WrongAnswer.student_id == seed_org["student"].id).all()
-    assert any(w.subject == "영어" and w.category == "eng" for w in wa2)
+    assert db.query(WrongAnswer).filter(WrongAnswer.student_id == seed_org["student"].id).count() == 0
+    notes2 = client.get("/api/v1/students/me/wrong-notes", headers=auth(token)).json()
+    assert any(n["subject"] == "영어" and n["cat"] == "eng" for n in notes2["items"])
     re2 = client.post(
         "/api/v1/students/me/game-answer",
         json={"question_id": eq["id"], "subject": "영어", "option_id": eq["answer"]},
@@ -429,7 +443,7 @@ def test_game_session_new_subjects(client, db, seed_org):
 
 
 def test_game_session_korean(client, db, seed_org):
-    """국어 실문항 (capcha_service jy 이식): 발급 sanitize + 서버 채점 + 오답노트 word + 의견 multi."""
+    """국어 실문항 (capcha_service jy 이식): 발급 sanitize + 서버 채점 + '틀린 문제' 뷰 word + 의견 multi."""
     from app.models import LearningAttempt, WrongAnswer
 
     token = _student_token(client, seed_org)
@@ -452,8 +466,9 @@ def test_game_session_korean(client, db, seed_org):
         headers=auth(token),
     )
     assert r1.status_code == 200 and r1.json()["correct"] is False
-    wa = db.query(WrongAnswer).filter(WrongAnswer.student_id == seed_org["student"].id).all()
-    assert any(w.subject == "국어" and w.category == "word" for w in wa)
+    assert db.query(WrongAnswer).filter(WrongAnswer.student_id == seed_org["student"].id).count() == 0
+    notes = client.get("/api/v1/students/me/wrong-notes", headers=auth(token)).json()
+    assert any(n["subject"] == "국어" and n["cat"] == "word" for n in notes["items"])
     r2 = client.post(
         "/api/v1/students/me/game-answer",
         json={"question_id": kq["id"], "subject": "국어", "option_id": kq["answer"]},

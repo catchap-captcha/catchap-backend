@@ -48,9 +48,11 @@ def test_correct_answer_text_covers_all_types():
     assert _correct_answer_text(q_bare)
 
 
-def test_wrong_note_recorded_for_manipulation_type_via_verify(client, db, seed_org):
-    """조작형(따라그리기 등)이라도 뱅크 문항 오답이면 오답노트에 기록되고 정답(개념)이 채워진다."""
+def test_wrong_view_from_srs_via_verify(client, db, seed_org):
+    """'틀린 문제' 뷰(Q 통합 3단계, 결정 ④) — 오답이 SRS wrong 상자에 남아 화면에 노출되고,
+    다시 맞히면 자동 이탈한다. 별도 WrongAnswer 기록은 더 이상 생기지 않는다."""
     from app.models import WrongAnswer
+    from app.services import bank_mode
     from app.services import captcha_service as cs
     from app.services import subject_banks
     from tests.test_bank_mode import _first_party_key, _student_token
@@ -58,8 +60,9 @@ def test_wrong_note_recorded_for_manipulation_type_via_verify(client, db, seed_o
     _first_party_key(db)
     tok = _student_token(client)
     student = seed_org["student"]
+    headers = {"X-Site-Key": "ck_edu_testfp", "Authorization": f"Bearer {tok}"}
 
-    # trace(따라그리기) 문항 — 정답 텍스트가 없는 대표 유형
+    # trace(따라그리기) 문항 — 정답 텍스트가 없어 개념(explain) 폴백을 검증하는 대표 유형
     trace_q = next(
         (q for s in sorted(subject_banks.LIVE_SUBJECTS)
          for q in subject_banks.playable_pool(s) if q["type"] == "trace"),
@@ -75,16 +78,34 @@ def test_wrong_note_recorded_for_manipulation_type_via_verify(client, db, seed_o
     r = client.post(
         "/api/v1/captcha/v1/verify",
         json={"challenge_token": ch["challenge_token"], "answer": [[0.1, 0.1], [0.2, 0.2]]},
-        headers={"X-Site-Key": "ck_edu_testfp", "Authorization": f"Bearer {tok}"},
+        headers=headers,
     )
     assert r.status_code == 200, r.text
     if r.json()["success"]:
-        return  # 우연히 통과하면(가능성 낮음) 오답노트 대상 아님 — 스킵
+        return  # 우연히 통과하면(가능성 낮음) 오답 시나리오가 아님 — 스킵
 
-    w = (
+    # 옛 오답노트에는 더 이상 쌓이지 않는다(쓰기 중단 — 데이터는 보존이지만 신규 없음)
+    assert (
         db.query(WrongAnswer)
         .filter(WrongAnswer.student_id == student.id, WrongAnswer.question == trace_q["prompt"])
         .first()
+        is None
     )
-    assert w is not None, "조작형 오답도 오답노트에 남아야 한다"
-    assert w.correct_answer, "정답(개념 설명)이 채워져야 한다"
+
+    # '틀린 문제' 화면(SRS 뷰)에 문항+정답(개념 폴백)이 노출된다
+    res = client.get(
+        "/api/v1/students/me/wrong-notes", headers={"Authorization": f"Bearer {tok}"}
+    ).json()
+    mine = next((i for i in res["items"] if i["id"] == trace_q["id"]), None)
+    assert mine is not None, "오답이 틀린 문제 목록에 보여야 한다"
+    assert mine["answer"], "정답(개념 설명 폴백)이 채워져야 한다"
+    assert mine["wrong_count"] >= 1
+    assert res["summary"]["total"] >= 1
+
+    # 다시 맞히면(SRS 갱신) 목록에서 자동으로 사라진다 — '복습완료 승격'의 대체
+    bank_mode.record_answer(db, student.id, subj, trace_q["id"], True)
+    db.commit()
+    res2 = client.get(
+        "/api/v1/students/me/wrong-notes", headers={"Authorization": f"Bearer {tok}"}
+    ).json()
+    assert all(i["id"] != trace_q["id"] for i in res2["items"])
