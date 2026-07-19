@@ -354,7 +354,7 @@ def test_verify_questions_majority_and_three_way_verdict(monkeypatch):
     ]
     calls = {"blind": 0}
 
-    def fake_solve(questions, *, api_key=None, context=None, transcript=None):
+    def fake_solve(questions, *, api_key=None, context=None, transcript=None, models=None, on_usage=None):
         # 공개 맥락이 항상 전달되는지(공격자 조건 일치) 고정
         assert context and context.get("title") == "T"
         if transcript is not None:

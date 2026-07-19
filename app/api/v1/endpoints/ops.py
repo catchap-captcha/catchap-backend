@@ -23,6 +23,7 @@ from app.core.security import hash_password, verify_password
 from app.db.session import get_db
 from app.email.smtp import send_email
 from app.models import (
+    AiModelConfig,
     ApiKey,
     ApiUsageLog,
     AuditLog,
@@ -45,6 +46,7 @@ from app.models import (
     Subscription,
     User,
 )
+from app.services import ai_models_service
 from app.services import captcha_service as _cs
 
 router = APIRouter(prefix="/ops", tags=["ops"])
@@ -2193,6 +2195,208 @@ def ops_put_ai_settings(
     )
     db.commit()
     return _ai_settings_payload(db)
+
+
+# ---------------------------------------------------------------- AI 모델 선택(런타임) #26
+# 실제 LLM 호출(문항 생성·자기검증)이 쓰는 모델을 운영자가 고른다. 표시용 카탈로그
+# (/ops/ai-models = ModelVersion, 기관 콘솔 노출)와 '다른' 것 — 경로도 /ai-runtime 로 분리.
+# 2슬롯(생성/검증)·On/Off·삭제·자동 스왑·토큰/추정비용. 슬롯 포인터·자동스왑은
+# system_settings에, 모델 목록·누적 토큰은 ai_model_configs 테이블에 둔다(ai_models_service).
+def _ai_model_row(m: AiModelConfig) -> dict:
+    return {
+        "id": m.id,
+        "provider": m.provider,
+        "model_id": m.model_id,
+        "name": m.name,
+        "enabled": bool(m.enabled),
+        "cost_in_usd": float(m.cost_in_usd or 0),
+        "cost_out_usd": float(m.cost_out_usd or 0),
+        "tokens_in": int(m.tokens_in or 0),
+        "tokens_out": int(m.tokens_out or 0),
+        "est_cost_usd": ai_models_service.estimate_cost_usd(m),
+    }
+
+
+def _ai_runtime_payload(db: Session) -> dict:
+    rows = db.query(AiModelConfig).order_by(AiModelConfig.created_at).all()
+    return {
+        "models": [_ai_model_row(m) for m in rows],
+        "slots": {
+            "generate": ai_models_service.get_slot(db, "generate"),
+            "verify": ai_models_service.get_slot(db, "verify"),
+        },
+        "auto_swap": ai_models_service.auto_swap_enabled(db),
+        # 슬롯 미설정 시 폴백 모델 — 이게 안전망이라 슬롯이 비어도 파이프라인은 돈다
+        "fallback_model": get_settings().LLM_MODEL,
+    }
+
+
+@router.get("/ai-runtime")
+def ops_ai_runtime(principal: Principal = Depends(require_ops), db: Session = Depends(get_db)):
+    """운영자 AI 모델 선택 상태 — 등록 모델·슬롯 배정·자동 스왑·모델별 토큰/추정비용."""
+    return _ai_runtime_payload(db)
+
+
+class _AiModelCreateReq(BaseModel):
+    provider: str = Field(min_length=1, max_length=60)
+    model_id: str = Field(min_length=1, max_length=120)
+    name: str = Field(min_length=1, max_length=100)
+    enabled: bool = True
+    cost_in_usd: float = Field(default=0.0, ge=0)
+    cost_out_usd: float = Field(default=0.0, ge=0)
+
+
+@router.post("/ai-runtime/models")
+def ops_ai_model_create(
+    req: _AiModelCreateReq,
+    principal: Principal = Depends(require_ops),
+    db: Session = Depends(get_db),
+):
+    """모델 등록 — 이 목록에서 생성/검증 슬롯에 배정할 수 있다(등록만으로는 미사용)."""
+    m = AiModelConfig(
+        provider=req.provider.strip(),
+        model_id=req.model_id.strip(),
+        name=req.name.strip(),
+        enabled=req.enabled,
+        cost_in_usd=req.cost_in_usd,
+        cost_out_usd=req.cost_out_usd,
+    )
+    db.add(m)
+    db.flush()
+    audit(
+        db,
+        action="ops.ai_runtime.model_create",
+        actor_user_id=principal.id,
+        target_type="ai_model_config",
+        target_id=m.id,
+        after={"provider": m.provider, "model_id": m.model_id, "name": m.name},
+    )
+    db.commit()
+    return {"ok": True, **_ai_model_row(m)}
+
+
+class _AiModelUpdateReq(BaseModel):
+    provider: str | None = Field(default=None, min_length=1, max_length=60)
+    model_id: str | None = Field(default=None, min_length=1, max_length=120)
+    name: str | None = Field(default=None, min_length=1, max_length=100)
+    enabled: bool | None = None
+    cost_in_usd: float | None = Field(default=None, ge=0)
+    cost_out_usd: float | None = Field(default=None, ge=0)
+
+
+@router.patch("/ai-runtime/models/{model_id}")
+def ops_ai_model_update(
+    model_id: str,
+    req: _AiModelUpdateReq,
+    principal: Principal = Depends(require_ops),
+    db: Session = Depends(get_db),
+):
+    """모델 정보 수정 + On/Off. 지정한 필드만 바꾼다(model_fields_set)."""
+    m = db.get(AiModelConfig, model_id)
+    if m is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="모델을 찾을 수 없습니다.")
+    before = {"model_id": m.model_id, "name": m.name, "enabled": bool(m.enabled)}
+    fields = req.model_fields_set
+    if "provider" in fields and req.provider is not None:
+        m.provider = req.provider.strip()
+    if "model_id" in fields and req.model_id is not None:
+        m.model_id = req.model_id.strip()
+    if "name" in fields and req.name is not None:
+        m.name = req.name.strip()
+    if "enabled" in fields and req.enabled is not None:
+        m.enabled = req.enabled
+    if "cost_in_usd" in fields and req.cost_in_usd is not None:
+        m.cost_in_usd = req.cost_in_usd
+    if "cost_out_usd" in fields and req.cost_out_usd is not None:
+        m.cost_out_usd = req.cost_out_usd
+    audit(
+        db,
+        action="ops.ai_runtime.model_update",
+        actor_user_id=principal.id,
+        target_type="ai_model_config",
+        target_id=m.id,
+        before=before,
+        after={"model_id": m.model_id, "name": m.name, "enabled": bool(m.enabled)},
+    )
+    db.commit()
+    return {"ok": True, **_ai_model_row(m)}
+
+
+@router.delete("/ai-runtime/models/{model_id}")
+def ops_ai_model_delete(
+    model_id: str,
+    principal: Principal = Depends(require_ops),
+    db: Session = Depends(get_db),
+):
+    """모델 삭제 — 슬롯에 배정돼 있었다면 그 슬롯도 함께 비운다(끊긴 포인터 방지)."""
+    m = db.get(AiModelConfig, model_id)
+    if m is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="모델을 찾을 수 없습니다.")
+    # 이 모델을 가리키던 슬롯을 미배정으로 되돌린다(삭제 후 죽은 포인터가 남지 않게)
+    for role in ai_models_service.SLOTS:
+        if ai_models_service.get_slot(db, role) == m.id:
+            ai_models_service.set_slot(db, role, None, updated_by=principal.id)
+    audit(
+        db,
+        action="ops.ai_runtime.model_delete",
+        actor_user_id=principal.id,
+        target_type="ai_model_config",
+        target_id=m.id,
+        before={"provider": m.provider, "model_id": m.model_id, "name": m.name},
+    )
+    db.delete(m)
+    db.commit()
+    return {"ok": True}
+
+
+class _AiRuntimeConfigReq(BaseModel):
+    # 슬롯 배정 — 모델 config id(빈 문자열/None=미배정). auto_swap과 함께 지정한 것만 바꾼다.
+    generate_model_id: str | None = None
+    verify_model_id: str | None = None
+    auto_swap: bool | None = None
+
+
+@router.put("/ai-runtime/config")
+def ops_ai_runtime_config(
+    req: _AiRuntimeConfigReq,
+    principal: Principal = Depends(require_ops),
+    db: Session = Depends(get_db),
+):
+    """생성/검증 슬롯 배정 + 자동 스왑 토글. 배정 모델은 실재·미삭제여야 한다(404).
+
+    같은 모델을 두 슬롯에 함께 지정할 수 있다(포인터를 settings에 둔 이유). 빈 값=미배정."""
+    fields = req.model_fields_set
+    changed: list[str] = []
+
+    def _assign(role: str, mid: str | None):
+        mid = (mid or "").strip()
+        if mid:
+            if db.get(AiModelConfig, mid) is None:
+                raise HTTPException(
+                    status.HTTP_404_NOT_FOUND, detail=f"배정할 모델을 찾을 수 없습니다({role})."
+                )
+        ai_models_service.set_slot(db, role, mid or None, updated_by=principal.id)
+        changed.append(f"slot:{role}")
+
+    if "generate_model_id" in fields:
+        _assign("generate", req.generate_model_id)
+    if "verify_model_id" in fields:
+        _assign("verify", req.verify_model_id)
+    if "auto_swap" in fields and req.auto_swap is not None:
+        ai_models_service.set_auto_swap(db, req.auto_swap, updated_by=principal.id)
+        changed.append("auto_swap")
+    if not changed:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="변경할 항목이 없습니다.")
+    audit(
+        db,
+        action="ops.ai_runtime.config",
+        actor_user_id=principal.id,
+        target_type="system_setting",
+        target_id=None,
+        after={"changed": changed},
+    )
+    db.commit()
+    return _ai_runtime_payload(db)
 
 
 # ---------------------------------------------------------------- 강사 계정 관리 (초대·승인제)

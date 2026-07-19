@@ -14,6 +14,10 @@
 - **[lecture-question-pipeline.md](lecture-question-pipeline.md)** — 강의 확인 문항
   자동 생성 + 자기검증(2-LLM adversarial filtering). 왜 LLM을 2개 쓰는지,
   셔플 다수결·공개맥락·3분류를 왜 넣었는지, 한계와 다음 방향.
+- **[ai-model-selection.md](ai-model-selection.md)** — 운영자 AI 모델 선택(#26).
+  생성·검증 **2슬롯**에 어떤 모델을 쓸지 고르는 런타임 설정. 왜 표시용 카탈로그와
+  분리했는지, 왜 슬롯 포인터를 settings에 뒀는지(같은 모델 두 슬롯), **자동 스왑**의
+  판단 규칙(가용성 실패=스왑, 거절=스왑 안 함), 토큰 누적을 원자적으로 하는 이유.
 - **[question-formats-and-behavior-data.md](question-formats-and-behavior-data.md)** —
   전체학습 은행과 강의 캡차의 문항 형식이 왜 다른지, 왜 통일하지 않는지. 행동 데이터
   관점에서 드래그가 왜 우월한지, 보기 셔플 정책. ("강의 캡차 = 4지선다?"의 정확한 답.)

@@ -71,41 +71,81 @@ def _prompt(
     )
 
 
-def _post_messages(key: str, prompt: str, *, max_tokens: int) -> str:
-    """Anthropic Messages API 1회 호출 → 응답 텍스트. 실패는 AiGenerationError로 전파.
+def _post_messages(
+    key: str,
+    prompt: str,
+    *,
+    max_tokens: int,
+    models: list[dict] | None = None,
+    on_usage=None,
+) -> str:
+    """Anthropic Messages API 호출 → 응답 텍스트. 실패는 AiGenerationError로 전파.
 
-    생성(generate)과 자기검증(solve)이 공유하는 단일 호출 경로."""
+    생성(generate)과 자기검증(solve)이 공유하는 단일 호출 경로.
+
+    models = 운영자가 고른 후보 모델 목록 [{"config_id", "model_id"}] (우선순위 순).
+    None/빈 목록이면 .env LLM_MODEL 단일 시도(하위호환). **자동 스왑**: 앞 후보가
+    네트워크 오류·비200(429 rate limit·529 overloaded·400 등)이면 다음 후보로 넘어간다
+    (호출 실패 시 대체). 단, 200을 받았는데 거절/빈 응답이면 스왑하지 않는다 — 그건
+    모델 가용성이 아니라 요청 내용 문제라 다른 모델도 같을 가능성이 크다(토큰 낭비 방지).
+
+    on_usage(config_id, tokens_in, tokens_out): 200을 받을 때마다 호출(토큰 누적 기록용).
+    거절/빈 응답이어도 토큰은 소비됐으므로 먼저 기록하고 예외를 던진다(정직한 회계)."""
     settings = get_settings()
-    try:
-        resp = httpx.post(
-            _API_URL,
-            headers={
-                "x-api-key": key,
-                "anthropic-version": _API_VERSION,
-                "content-type": "application/json",
-            },
-            json={
-                "model": settings.LLM_MODEL,
-                "max_tokens": max_tokens,
-                "messages": [{"role": "user", "content": prompt}],
-            },
-            timeout=_TIMEOUT_SEC,
+    attempts = models or [{"config_id": None, "model_id": settings.LLM_MODEL}]
+    last_err: Exception | None = None
+    for cand in attempts:
+        model_id = (cand.get("model_id") or settings.LLM_MODEL).strip()
+        try:
+            resp = httpx.post(
+                _API_URL,
+                headers={
+                    "x-api-key": key,
+                    "anthropic-version": _API_VERSION,
+                    "content-type": "application/json",
+                },
+                json={
+                    "model": model_id,
+                    "max_tokens": max_tokens,
+                    "messages": [{"role": "user", "content": prompt}],
+                },
+                timeout=_TIMEOUT_SEC,
+            )
+        except httpx.HTTPError as e:
+            last_err = AiGenerationError(f"LLM API 호출 실패(네트워크): {e}")
+            continue  # 자동 스왑 — 다음 후보
+        if resp.status_code != 200:
+            last_err = AiGenerationError(f"LLM API 오류(HTTP {resp.status_code}): {resp.text[:300]}")
+            continue  # 자동 스왑 — 다음 후보
+        try:
+            body = resp.json()
+        except ValueError as e:
+            # 200인데 본문이 JSON이 아님(프록시·CDN이 200으로 HTML 에러 페이지를 반환하는 등).
+            # 원시 ValueError를 누수시키면 (1) AiGenerationError로 안 감싸져 엔드포인트가 500을
+            # 뱉고 (2) 자동 스왑이 무력화된다 — 비200과 동일하게 다음 후보로 넘긴다.
+            last_err = AiGenerationError(f"LLM 응답이 JSON이 아닙니다(HTTP 200): {e}")
+            continue  # 자동 스왑 — 다음 후보
+        body = body if isinstance(body, dict) else {}
+        # 토큰 사용량 기록(성공 호출) — 거절/빈 응답이어도 입력 토큰은 소비됐다
+        usage = body.get("usage") or {}
+        if on_usage is not None:
+            on_usage(
+                cand.get("config_id"),
+                int(usage.get("input_tokens") or 0),
+                int(usage.get("output_tokens") or 0),
+            )
+        if body.get("stop_reason") == "refusal":
+            raise AiGenerationError("LLM이 요청을 거절했습니다(stop_reason=refusal).")
+        text = "".join(
+            block.get("text", "")
+            for block in body.get("content", [])
+            if isinstance(block, dict) and block.get("type") == "text"
         )
-    except httpx.HTTPError as e:
-        raise AiGenerationError(f"LLM API 호출 실패(네트워크): {e}") from e
-    if resp.status_code != 200:
-        raise AiGenerationError(f"LLM API 오류(HTTP {resp.status_code}): {resp.text[:300]}")
-    body = resp.json()
-    if body.get("stop_reason") == "refusal":
-        raise AiGenerationError("LLM이 요청을 거절했습니다(stop_reason=refusal).")
-    text = "".join(
-        block.get("text", "")
-        for block in body.get("content", [])
-        if isinstance(block, dict) and block.get("type") == "text"
-    )
-    if not text.strip():
-        raise AiGenerationError("LLM 응답에 텍스트 블록이 없습니다.")
-    return text
+        if not text.strip():
+            raise AiGenerationError("LLM 응답에 텍스트 블록이 없습니다.")
+        return text
+    # 모든 후보 실패 — 마지막 오류를 정직하게 전파
+    raise last_err or AiGenerationError("LLM 호출 가능한 모델이 없습니다.")
 
 
 def _solve_prompt(
@@ -160,12 +200,15 @@ def solve_questions(
     api_key: str | None = None,
     context: dict | None = None,
     transcript: list[dict] | None = None,
+    models: list[dict] | None = None,
+    on_usage=None,
 ) -> list[bool]:
     """solver 1회 호출 — questions 순서대로 '맞혔는지'(bool) 리스트.
 
     transcript=None이면 블라인드(공개 맥락만), 있으면 자막 기준 풀이.
     파싱 실패로 특정 문항의 답을 못 얻으면 그 문항은 False(미정답 처리).
-    키 없으면 AiNotConfiguredError. (다수결·판정 조합은 verify_questions가 담당.)"""
+    키 없으면 AiNotConfiguredError. (다수결·판정 조합은 verify_questions가 담당.)
+    models/on_usage는 _post_messages로 그대로 넘긴다(검증 슬롯 모델·자동 스왑·토큰 기록)."""
     if not questions:
         return []
     settings = get_settings()
@@ -174,7 +217,11 @@ def solve_questions(
         raise AiNotConfiguredError("LLM API 키(Anthropic)가 설정되지 않았습니다.")
 
     text = _post_messages(
-        key, _solve_prompt(questions, context=context, transcript=transcript), max_tokens=1024
+        key,
+        _solve_prompt(questions, context=context, transcript=transcript),
+        max_tokens=1024,
+        models=models,
+        on_usage=on_usage,
     )
     raw = text.strip()
     m = re.search(r"```(?:json)?\s*(\[.*?\])\s*```", raw, re.DOTALL)
@@ -219,6 +266,8 @@ def verify_questions(
     context: dict | None = None,
     transcript: list[dict] | None = None,
     trials: int = 3,
+    models: list[dict] | None = None,
+    on_usage=None,
 ) -> list[dict]:
     """자기검증 오케스트레이터 — 문항별 {blind_passed, transcript_passed, verdict}.
 
@@ -241,7 +290,9 @@ def verify_questions(
     for t in range(trials):
         rng = random.Random(t * 7919 + len(questions))  # 재현 가능(시드=회차)·회차마다 다른 셔플
         variants = _shuffled_variants(questions, rng)
-        result = solve_questions(variants, api_key=api_key, context=context)
+        result = solve_questions(
+            variants, api_key=api_key, context=context, models=models, on_usage=on_usage
+        )
         for i, ok in enumerate(result):
             if ok:
                 blind_hits[i] += 1
@@ -251,7 +302,12 @@ def verify_questions(
     transcript_passed: list[bool] | None = None
     if transcript:
         transcript_passed = solve_questions(
-            questions, api_key=api_key, context=context, transcript=transcript
+            questions,
+            api_key=api_key,
+            context=context,
+            transcript=transcript,
+            models=models,
+            on_usage=on_usage,
         )
 
     out = []
@@ -332,6 +388,8 @@ def generate_lecture_questions(
     n: int = 5,
     api_key: str | None = None,
     transcript: list[dict] | None = None,
+    models: list[dict] | None = None,
+    on_usage=None,
 ) -> list[dict]:
     """강의 메타(+전사)에서 확인 문항 n개 생성.
 
@@ -348,6 +406,10 @@ def generate_lecture_questions(
 
     n = max(1, min(int(n), 20))
     text = _post_messages(
-        key, _prompt(lecture_title, description, subject, n, transcript), max_tokens=8192
+        key,
+        _prompt(lecture_title, description, subject, n, transcript),
+        max_tokens=8192,
+        models=models,
+        on_usage=on_usage,
     )
     return _parse_questions(text, n)

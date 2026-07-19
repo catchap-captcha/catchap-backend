@@ -2146,7 +2146,7 @@ def ops_generate_questions(
         verify_questions,
     )
     from app.clients.stt_client import SttError, transcribe_video
-    from app.services import settings_service
+    from app.services import ai_models_service, settings_service
 
     lec = _get_ops_lecture(db, lecture_id, principal)
     llm_key = settings_service.resolve_anthropic_key(db)
@@ -2155,6 +2155,19 @@ def ops_generate_questions(
             status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="LLM API 키가 설정되지 않아 문제 자동 생성을 사용할 수 없습니다. 운영 콘솔 '설정'에서 키를 입력해 주세요.",
         )
+
+    # 운영자가 고른 생성/검증 슬롯 모델 해석(#26) — 후보 목록 + 토큰 사용량 기록 콜백.
+    # 슬롯 미설정이면 후보 0 → ai_client가 .env LLM_MODEL로 폴백(하위호환).
+    def _to_models(cands):
+        return [{"config_id": m.id, "model_id": m.model_id} for m in cands] or None
+
+    gen_models = _to_models(ai_models_service.resolve_candidates(db, "generate"))
+    verify_cands = ai_models_service.resolve_candidates(db, "verify")
+    verify_models = _to_models(verify_cands)
+
+    def _on_usage(config_id, tokens_in, tokens_out):
+        if config_id:
+            ai_models_service.record_usage(db, config_id, tokens_in, tokens_out)
 
     transcript: list[dict] | None = None
     stt_key = settings_service.resolve_openai_key(db)
@@ -2174,6 +2187,8 @@ def ops_generate_questions(
             n=req.n,
             api_key=llm_key,
             transcript=transcript,
+            models=gen_models,
+            on_usage=_on_usage,
         )
     except AiNotConfiguredError:
         raise HTTPException(
@@ -2197,11 +2212,15 @@ def ops_generate_questions(
             api_key=llm_key,
             context={"title": lec.title, "subject": lec.subject, "description": lec.description},
             transcript=transcript,
+            models=verify_models,
+            on_usage=_on_usage,
         )
     except (AiNotConfiguredError, AiGenerationError) as e:
         verify_error = str(e)
 
     verified_at = datetime.now().isoformat(timespec="seconds")
+    # 감사 메타에 남길 검증 모델명 — 검증 슬롯 첫 후보(운영자 의도) 또는 .env 폴백
+    verify_model_label = verify_cands[0].model_id if verify_cands else get_settings().LLM_MODEL
     duration = int(lec.duration_sec or 0)
     created: list[LectureQuestion] = []
     for idx, item in enumerate(items):
@@ -2227,9 +2246,10 @@ def ops_generate_questions(
                 "solver_passed": None if v is None else v["blind_passed"],
                 "transcript_solver_passed": None if v is None else v["transcript_passed"],
                 "suggested_placement": None if v is None else v["verdict"],
-                # 판정 감사용 메타 — 어느 모델이 언제 몇 회 다수결로 판정했나
+                # 판정 감사용 메타 — 어느 모델이 언제 몇 회 다수결로 판정했나.
+                # 검증 슬롯 모델(운영자 선택)이 있으면 그걸, 없으면 .env 폴백 모델을 기록.
                 "solver_meta": (
-                    {"model": get_settings().LLM_MODEL, "verified_at": verified_at, "trials": 3}
+                    {"model": verify_model_label, "verified_at": verified_at, "trials": 3}
                     if v is not None
                     else None
                 ),

@@ -27,6 +27,7 @@ from app.models.learning import (
     StudentQuestionState,
     WrongAnswer,
 )
+from app.models.ai_model_config import AiModelConfig
 from app.models.course_exam import (
     CourseCompletion,
     CourseExamAttempt,
@@ -73,6 +74,7 @@ from app.models.student import ClassAssignment, ParentStudentLink, StudentProfil
 from app.models.user import User
 
 __all__ = [
+    "AiModelConfig",
     "AiPrediction",
     "ApiKey",
     "ApiUsageLog",
