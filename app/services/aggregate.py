@@ -440,7 +440,9 @@ def student_records(db: Session, me: StudentProfile) -> dict | None:
         meta = D.SUBJECT_META[sub]
         mastery.append(
             {
-                "name": D.GAME_SUBJECTS.get(sub, {}).get("gameTitle", sub),
+                # 과목명 그대로 — 게임 제목(gameTitle: '한글 낱말 찾기' 등)은 게임화 은퇴로 폐기,
+                # '나의 기록'은 학습 리포트라 과목명이 맞다(0719 재중심화).
+                "name": sub,
                 "icon": meta["icon"],
                 "color": meta["color"],
                 "bg": meta["soft"],
@@ -480,7 +482,8 @@ def student_records(db: Session, me: StudentProfile) -> dict | None:
         acc = _acc(group) or 0
         activities.append(
             {
-                "title": D.GAME_SUBJECTS.get(sub, {}).get("gameTitle", f"{sub} 학습"),
+                # 게임 제목 폐기(0719 재중심화) — 과목 학습으로 표기
+                "title": f"{sub} 학습",
                 "sub": f"{sub} · {len(group)}문제",
                 "icon": meta["icon"],
                 "color": meta["color"],

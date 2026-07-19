@@ -409,6 +409,40 @@ def test_negative_and_out_of_range_picks_rejected(client, db, seed_org):
     assert res.json()["correct"] == 0 and res.json()["results"][0]["picked"] == []
 
 
+def test_course_completions_list(client, db, seed_org):
+    """'나의 기록' 성취 섹션 원천 — GET /courses/completions. 수료하면 목록에 뜨고(완벽 통과
+    플래그 포함), 코스가 삭제되면 목록에서 빠진다(수료 자체는 보존이나 화면엔 존재 코스만).
+    경로가 /courses/{course_id}/exam와 겹치지 않는지도 함께 확인(빈 목록 200)."""
+    from app.models import Course
+
+    tok = _ops(client, db)
+    stok = _student_token(client, seed_org)
+
+    # 수료 전 — 빈 목록(경로 정상 동작 = completions가 course_id로 안 잡힘)
+    r0 = client.get("/api/v1/courses/completions", headers=auth(stok))
+    assert r0.status_code == 200 and r0.json() == []
+
+    # 코스 완주 + 시험 전 문항 정답 → 완벽 통과 수료
+    course = _mk_course(client, tok, db, subject="수학", title="수학 개념완성")
+    lec = _assign_lecture(client, tok, course["id"])
+    _complete_lecture(db, seed_org["student"].id, lec["id"])
+    for i in range(2):
+        _add_exam_q(client, tok, course["id"], prompt=f"q{i}", options=["a", "b"], answer_indexes=[i % 2])
+    res = _submit_all_correct(client, stok, course["id"], db)
+    assert res["passed"] and res["perfect"]
+
+    rows = client.get("/api/v1/courses/completions", headers=auth(stok)).json()
+    mine = next(c for c in rows if c["course_id"] == course["id"])
+    assert mine["title"] == "수학 개념완성" and mine["subject"] == "수학"
+    assert mine["perfect"] is True and mine["question_count"] == 2 and mine["passed_at"]
+
+    # 코스 삭제 → 목록에서 제외(수료 기록은 DB에 남지만 존재하는 코스만 노출)
+    db.get(Course, course["id"]).status = "deleted"
+    db.commit()
+    rows2 = client.get("/api/v1/courses/completions", headers=auth(stok)).json()
+    assert all(c["course_id"] != course["id"] for c in rows2)
+
+
 def test_metrics_isolation_no_learning_attempt(client, db, seed_org):
     """지표 격리(설계 §7) — 시험 응답은 LearningAttempt에 안 쌓인다(정답률 오염 방지)."""
     from app.models import LearningAttempt
