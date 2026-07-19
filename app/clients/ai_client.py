@@ -1,8 +1,11 @@
-"""Anthropic Messages API 클라이언트 — 강의 확인 문항 자동 생성(LLM).
+"""LLM 클라이언트(Anthropic·OpenAI) — 강의 확인 문항 자동 생성/자기검증.
 
-가짜 성공 금지: ANTHROPIC_API_KEY가 비어 있으면 호출 전에 AiNotConfiguredError를 던진다
-(stub 문항을 만들어 성공처럼 반환하지 않는다). 응답 파싱 실패도 정직한 예외로 전파한다.
-기존 의존성 httpx로 직접 호출한다(신규 SDK 불필요).
+운영자가 슬롯에 고른 모델의 provider에 따라 실제 API를 가른다(#26 다음 단계): Anthropic
+Messages API(기본·폴백) 또는 OpenAI Chat Completions(GPT 계열). provider 판별은 _is_openai.
+
+가짜 성공 금지: 키가 하나도 없으면 호출 전에 AiNotConfiguredError를 던진다(stub 문항을 만들어
+성공처럼 반환하지 않는다). 응답 파싱 실패도 정직한 예외로 전파한다. 기존 의존성 httpx로
+직접 호출한다(신규 SDK 불필요).
 """
 
 import json
@@ -13,6 +16,7 @@ import httpx
 from app.core.config import get_settings
 
 _API_URL = "https://api.anthropic.com/v1/messages"
+_OPENAI_URL = "https://api.openai.com/v1/chat/completions"
 _API_VERSION = "2023-06-01"
 _TIMEOUT_SEC = 120.0
 
@@ -71,6 +75,75 @@ def _prompt(
     )
 
 
+def _is_openai(provider: str | None) -> bool:
+    """provider 라벨이 OpenAI 계열인가 — 실제 호출 API를 가른다(그 외는 Anthropic)."""
+    return "openai" in (provider or "").strip().lower()
+
+
+def _anthropic_request(key: str, model_id: str, prompt: str, max_tokens: int):
+    return httpx.post(
+        _API_URL,
+        headers={
+            "x-api-key": key,
+            "anthropic-version": _API_VERSION,
+            "content-type": "application/json",
+        },
+        json={
+            "model": model_id,
+            "max_tokens": max_tokens,
+            "messages": [{"role": "user", "content": prompt}],
+        },
+        timeout=_TIMEOUT_SEC,
+    )
+
+
+def _openai_request(key: str, model_id: str, prompt: str, max_tokens: int):
+    # OpenAI Chat Completions. 신형 모델(gpt-5·o계열)은 max_tokens를 거부하고
+    # max_completion_tokens를 요구하므로 후자를 쓴다(구형도 대개 수용). 호환 안 되면
+    # 제공사 오류가 정직하게 드러나고 자동 스왑이 다음 후보로 넘긴다.
+    return httpx.post(
+        _OPENAI_URL,
+        headers={"Authorization": f"Bearer {key}", "content-type": "application/json"},
+        json={
+            "model": model_id,
+            "max_completion_tokens": max_tokens,
+            "messages": [{"role": "user", "content": prompt}],
+        },
+        timeout=_TIMEOUT_SEC,
+    )
+
+
+def _anthropic_extract(body: dict) -> tuple[str, int, int, bool]:
+    """Anthropic 응답 → (text, tokens_in, tokens_out, refused)."""
+    usage = body.get("usage") or {}
+    text = "".join(
+        block.get("text", "")
+        for block in body.get("content", [])
+        if isinstance(block, dict) and block.get("type") == "text"
+    )
+    return (
+        text,
+        int(usage.get("input_tokens") or 0),
+        int(usage.get("output_tokens") or 0),
+        body.get("stop_reason") == "refusal",
+    )
+
+
+def _openai_extract(body: dict) -> tuple[str, int, int, bool]:
+    """OpenAI Chat Completions 응답 → (text, tokens_in, tokens_out, refused)."""
+    usage = body.get("usage") or {}
+    choices = body.get("choices") or []
+    first = choices[0] if choices and isinstance(choices[0], dict) else {}
+    msg = first.get("message") or {}
+    refused = bool(msg.get("refusal")) or first.get("finish_reason") == "content_filter"
+    return (
+        str(msg.get("content") or ""),
+        int(usage.get("prompt_tokens") or 0),
+        int(usage.get("completion_tokens") or 0),
+        refused,
+    )
+
+
 def _post_messages(
     key: str,
     prompt: str,
@@ -78,38 +151,39 @@ def _post_messages(
     max_tokens: int,
     models: list[dict] | None = None,
     on_usage=None,
+    openai_key: str | None = None,
 ) -> str:
-    """Anthropic Messages API 호출 → 응답 텍스트. 실패는 AiGenerationError로 전파.
+    """LLM 호출 → 응답 텍스트. provider별로 API를 가른다. 실패는 AiGenerationError로 전파.
 
     생성(generate)과 자기검증(solve)이 공유하는 단일 호출 경로.
 
-    models = 운영자가 고른 후보 모델 목록 [{"config_id", "model_id"}] (우선순위 순).
-    None/빈 목록이면 .env LLM_MODEL 단일 시도(하위호환). **자동 스왑**: 앞 후보가
-    네트워크 오류·비200(429 rate limit·529 overloaded·400 등)이면 다음 후보로 넘어간다
-    (호출 실패 시 대체). 단, 200을 받았는데 거절/빈 응답이면 스왑하지 않는다 — 그건
-    모델 가용성이 아니라 요청 내용 문제라 다른 모델도 같을 가능성이 크다(토큰 낭비 방지).
+    models = 운영자가 고른 후보 목록 [{"config_id", "model_id", "provider"}] (우선순위 순).
+    provider=OpenAI면 OpenAI Chat Completions(openai_key), 그 외는 Anthropic Messages(key).
+    None/빈 목록이면 .env LLM_MODEL(Anthropic) 단일 시도(하위호환).
 
-    on_usage(config_id, tokens_in, tokens_out): 200을 받을 때마다 호출(토큰 누적 기록용).
-    거절/빈 응답이어도 토큰은 소비됐으므로 먼저 기록하고 예외를 던진다(정직한 회계)."""
+    **자동 스왑**: 앞 후보가 네트워크 오류·비200(429·529·400 등)·비JSON 200·해당 provider 키
+    미설정이면 다음 후보로 넘어간다(가용성 문제). 단, 200을 받았는데 거절/빈 응답이면
+    스왑하지 않는다 — 모델 가용성이 아니라 요청 내용 문제라 다른 모델도 같을 가능성이 크다.
+
+    on_usage(config_id, tokens_in, tokens_out): 200을 받을 때마다 호출(토큰 누적 기록용)."""
     settings = get_settings()
-    attempts = models or [{"config_id": None, "model_id": settings.LLM_MODEL}]
+    attempts = models or [
+        {"config_id": None, "model_id": settings.LLM_MODEL, "provider": "anthropic"}
+    ]
     last_err: Exception | None = None
     for cand in attempts:
+        is_oa = _is_openai(cand.get("provider"))
         model_id = (cand.get("model_id") or settings.LLM_MODEL).strip()
+        prov_key = ((openai_key if is_oa else key) or "").strip()
+        if not prov_key:
+            # 이 후보 provider의 키가 없음 — 못 쓰는 모델이니 다음 후보로(스왑)
+            last_err = AiGenerationError(
+                f"{'OpenAI' if is_oa else 'Anthropic'} API 키가 없어 모델을 쓸 수 없습니다({model_id})."
+            )
+            continue
         try:
-            resp = httpx.post(
-                _API_URL,
-                headers={
-                    "x-api-key": key,
-                    "anthropic-version": _API_VERSION,
-                    "content-type": "application/json",
-                },
-                json={
-                    "model": model_id,
-                    "max_tokens": max_tokens,
-                    "messages": [{"role": "user", "content": prompt}],
-                },
-                timeout=_TIMEOUT_SEC,
+            resp = (_openai_request if is_oa else _anthropic_request)(
+                prov_key, model_id, prompt, max_tokens
             )
         except httpx.HTTPError as e:
             last_err = AiGenerationError(f"LLM API 호출 실패(네트워크): {e}")
@@ -120,29 +194,21 @@ def _post_messages(
         try:
             body = resp.json()
         except ValueError as e:
-            # 200인데 본문이 JSON이 아님(프록시·CDN이 200으로 HTML 에러 페이지를 반환하는 등).
-            # 원시 ValueError를 누수시키면 (1) AiGenerationError로 안 감싸져 엔드포인트가 500을
-            # 뱉고 (2) 자동 스왑이 무력화된다 — 비200과 동일하게 다음 후보로 넘긴다.
+            # 200인데 본문이 JSON이 아님(프록시·CDN이 200으로 HTML 반환 등) — 원시 ValueError를
+            # 누수하면 500 + 자동 스왑 무력화. 비200과 동일하게 다음 후보로 넘긴다.
             last_err = AiGenerationError(f"LLM 응답이 JSON이 아닙니다(HTTP 200): {e}")
             continue  # 자동 스왑 — 다음 후보
-        body = body if isinstance(body, dict) else {}
+        if not isinstance(body, dict):
+            last_err = AiGenerationError("LLM 응답이 JSON 객체가 아닙니다(HTTP 200).")
+            continue
+        text, tin, tout, refused = (_openai_extract if is_oa else _anthropic_extract)(body)
         # 토큰 사용량 기록(성공 호출) — 거절/빈 응답이어도 입력 토큰은 소비됐다
-        usage = body.get("usage") or {}
         if on_usage is not None:
-            on_usage(
-                cand.get("config_id"),
-                int(usage.get("input_tokens") or 0),
-                int(usage.get("output_tokens") or 0),
-            )
-        if body.get("stop_reason") == "refusal":
-            raise AiGenerationError("LLM이 요청을 거절했습니다(stop_reason=refusal).")
-        text = "".join(
-            block.get("text", "")
-            for block in body.get("content", [])
-            if isinstance(block, dict) and block.get("type") == "text"
-        )
+            on_usage(cand.get("config_id"), tin, tout)
+        if refused:
+            raise AiGenerationError("LLM이 요청을 거절했습니다.")
         if not text.strip():
-            raise AiGenerationError("LLM 응답에 텍스트 블록이 없습니다.")
+            raise AiGenerationError("LLM 응답에 텍스트가 없습니다.")
         return text
     # 모든 후보 실패 — 마지막 오류를 정직하게 전파
     raise last_err or AiGenerationError("LLM 호출 가능한 모델이 없습니다.")
@@ -202,19 +268,22 @@ def solve_questions(
     transcript: list[dict] | None = None,
     models: list[dict] | None = None,
     on_usage=None,
+    openai_key: str | None = None,
 ) -> list[bool]:
     """solver 1회 호출 — questions 순서대로 '맞혔는지'(bool) 리스트.
 
     transcript=None이면 블라인드(공개 맥락만), 있으면 자막 기준 풀이.
     파싱 실패로 특정 문항의 답을 못 얻으면 그 문항은 False(미정답 처리).
-    키 없으면 AiNotConfiguredError. (다수결·판정 조합은 verify_questions가 담당.)
-    models/on_usage는 _post_messages로 그대로 넘긴다(검증 슬롯 모델·자동 스왑·토큰 기록)."""
+    키가 하나도(Anthropic·OpenAI) 없으면 AiNotConfiguredError. (다수결·판정 조합은
+    verify_questions가 담당.) models/on_usage/openai_key는 _post_messages로 그대로 넘긴다
+    (검증 슬롯 모델·provider별 호출·자동 스왑·토큰 기록)."""
     if not questions:
         return []
     settings = get_settings()
     key = (api_key if api_key is not None else settings.ANTHROPIC_API_KEY or "").strip()
-    if not key:
-        raise AiNotConfiguredError("LLM API 키(Anthropic)가 설정되지 않았습니다.")
+    oa = (openai_key or "").strip()
+    if not key and not oa:
+        raise AiNotConfiguredError("LLM API 키가 설정되지 않았습니다.")
 
     text = _post_messages(
         key,
@@ -222,6 +291,7 @@ def solve_questions(
         max_tokens=1024,
         models=models,
         on_usage=on_usage,
+        openai_key=oa,
     )
     raw = text.strip()
     m = re.search(r"```(?:json)?\s*(\[.*?\])\s*```", raw, re.DOTALL)
@@ -268,6 +338,7 @@ def verify_questions(
     trials: int = 3,
     models: list[dict] | None = None,
     on_usage=None,
+    openai_key: str | None = None,
 ) -> list[dict]:
     """자기검증 오케스트레이터 — 문항별 {blind_passed, transcript_passed, verdict}.
 
@@ -291,7 +362,8 @@ def verify_questions(
         rng = random.Random(t * 7919 + len(questions))  # 재현 가능(시드=회차)·회차마다 다른 셔플
         variants = _shuffled_variants(questions, rng)
         result = solve_questions(
-            variants, api_key=api_key, context=context, models=models, on_usage=on_usage
+            variants, api_key=api_key, context=context, models=models,
+            on_usage=on_usage, openai_key=openai_key,
         )
         for i, ok in enumerate(result):
             if ok:
@@ -308,6 +380,7 @@ def verify_questions(
             transcript=transcript,
             models=models,
             on_usage=on_usage,
+            openai_key=openai_key,
         )
 
     out = []
@@ -390,6 +463,7 @@ def generate_lecture_questions(
     transcript: list[dict] | None = None,
     models: list[dict] | None = None,
     on_usage=None,
+    openai_key: str | None = None,
 ) -> list[dict]:
     """강의 메타(+전사)에서 확인 문항 n개 생성.
 
@@ -401,8 +475,9 @@ def generate_lecture_questions(
     stub 문항을 지어내 반환하지 않는다."""
     settings = get_settings()
     key = (api_key if api_key is not None else settings.ANTHROPIC_API_KEY or "").strip()
-    if not key:
-        raise AiNotConfiguredError("LLM API 키(Anthropic)가 설정되지 않았습니다.")
+    oa = (openai_key or "").strip()
+    if not key and not oa:
+        raise AiNotConfiguredError("LLM API 키가 설정되지 않았습니다.")
 
     n = max(1, min(int(n), 20))
     text = _post_messages(
@@ -411,5 +486,6 @@ def generate_lecture_questions(
         max_tokens=8192,
         models=models,
         on_usage=on_usage,
+        openai_key=oa,
     )
     return _parse_questions(text, n)

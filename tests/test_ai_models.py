@@ -213,6 +213,106 @@ def test_post_messages_non_json_200_all_fail_is_wrapped(monkeypatch):
         ai._post_messages("k", "p", max_tokens=10, models=[{"config_id": "c", "model_id": "m"}])
 
 
+# -------------------------------------------------- 멀티 프로바이더(OpenAI/GPT) 라우팅
+def test_post_messages_routes_openai(monkeypatch):
+    """provider=OpenAI 후보는 OpenAI Chat Completions(Bearer 인증)로 호출하고 응답을 파싱한다."""
+    import app.clients.ai_client as ai
+
+    seen = {}
+
+    def fake_post(url, *, headers, json, timeout):
+        seen["url"] = url
+        seen["auth"] = headers.get("Authorization")
+        seen["model"] = json["model"]
+        seen["mct"] = "max_completion_tokens" in json
+        return _FakeResp(
+            200,
+            body={
+                "choices": [{"message": {"content": "OAI-OUT"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 40, "completion_tokens": 8},
+            },
+        )
+
+    monkeypatch.setattr(ai.httpx, "post", fake_post)
+    usage = []
+    text = ai._post_messages(
+        "anthropic-key", "p", max_tokens=100,
+        models=[{"config_id": "c1", "model_id": "gpt-5", "provider": "OpenAI"}],
+        on_usage=lambda cid, i, o: usage.append((cid, i, o)),
+        openai_key="sk-openai",
+    )
+    assert text == "OAI-OUT"
+    assert seen["url"].endswith("/chat/completions")
+    assert seen["auth"] == "Bearer sk-openai"  # Anthropic 키가 아니라 OpenAI 키를 씀
+    assert seen["model"] == "gpt-5" and seen["mct"] is True  # 신형 토큰 파라미터
+    assert usage == [("c1", 40, 8)]  # OpenAI usage(prompt/completion_tokens) 파싱
+
+
+def test_post_messages_cross_provider_swap(monkeypatch):
+    """Anthropic 후보가 529면 OpenAI 후보로 자동 스왑(provider를 넘나든다)."""
+    import app.clients.ai_client as ai
+
+    seen = []
+
+    def fake_post(url, *, headers, json, timeout):
+        seen.append(json["model"])
+        if "anthropic" in url:
+            return _FakeResp(529, text="overloaded")
+        return _FakeResp(200, body={
+            "choices": [{"message": {"content": "OK"}}],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 1},
+        })
+
+    monkeypatch.setattr(ai.httpx, "post", fake_post)
+    usage = []
+    text = ai._post_messages(
+        "ak", "p", max_tokens=10,
+        models=[
+            {"config_id": "a", "model_id": "claude-opus-4-8", "provider": "Anthropic"},
+            {"config_id": "b", "model_id": "gpt-5", "provider": "OpenAI"},
+        ],
+        on_usage=lambda cid, i, o: usage.append((cid, i, o)),
+        openai_key="sk-oa",
+    )
+    assert text == "OK"
+    assert seen == ["claude-opus-4-8", "gpt-5"]
+    assert usage == [("b", 3, 1)]  # 성공한 OpenAI 후보만 기록
+
+
+def test_post_messages_openai_missing_key_skips_then_falls_back(monkeypatch):
+    """OpenAI 후보인데 openai_key가 없으면 호출조차 안 하고 스킵 → 다음 Anthropic 후보로."""
+    import app.clients.ai_client as ai
+
+    seen = []
+
+    def fake_post(url, *, headers, json, timeout):
+        seen.append(json["model"])
+        return _FakeResp(200, body={
+            "content": [{"type": "text", "text": "ANT"}],
+            "usage": {"input_tokens": 2, "output_tokens": 1},
+        })
+
+    monkeypatch.setattr(ai.httpx, "post", fake_post)
+    text = ai._post_messages(
+        "ak", "p", max_tokens=10,
+        models=[
+            {"config_id": "g", "model_id": "gpt-5", "provider": "OpenAI"},
+            {"config_id": "a", "model_id": "claude-opus-4-8", "provider": "Anthropic"},
+        ],
+        openai_key="",  # OpenAI 키 미설정
+    )
+    assert text == "ANT"
+    assert seen == ["claude-opus-4-8"]  # gpt는 키가 없어 호출 시도조차 안 함
+
+    # OpenAI 후보만 있고 키 없으면 원시 예외가 아니라 AiGenerationError
+    with pytest.raises(ai.AiGenerationError):
+        ai._post_messages(
+            "ak", "p", max_tokens=10,
+            models=[{"config_id": "g", "model_id": "gpt-5", "provider": "OpenAI"}],
+            openai_key="",
+        )
+
+
 # ------------------------------------------------------------------- 엔드포인트 CRUD
 def test_ai_runtime_crud_and_slot_delete(client, db):
     """등록→슬롯 배정→삭제 시 슬롯 자동 해제, 비운영자 거부."""

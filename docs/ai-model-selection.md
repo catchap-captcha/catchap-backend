@@ -8,7 +8,8 @@
 
 운영 콘솔 **설정** 페이지의 "AI 모델 선택" 섹션. 운영자가:
 
-- 모델을 등록한다(회사·표시 이름·모델 ID·입출력 단가).
+- 모델을 등록한다(회사·표시 이름·모델 ID·입출력 단가). **회사 = Anthropic(Claude) 또는
+  OpenAI(GPT)** — 회사가 실제 호출 API를 정한다(멀티 프로바이더).
 - **2슬롯**에 배정한다 — `generate`(문항 생성) / `verify`(자기검증).
 - **On/Off**로 사용 여부를 토글하고, **삭제**할 수 있다.
 - **자동 스왑**을 켜면 슬롯 모델이 꺼졌거나 호출에 실패할 때 다른 켜진 모델로 대체한다.
@@ -38,6 +39,16 @@
 `ai_slot_verify`(모델 id를 가리키는 포인터) + `ai_auto_swap`로 settings에 뒀다. 같은
 모델을 두 슬롯에 함께 배정할 수 있다. (settings 저장은 기존 Fernet 창구를 재사용 — 비밀은
 아니지만 배선을 늘리지 않으려는 선택. 값은 모델 id/불리언이라 암호화돼도 무해하다.)
+
+### 왜 회사(provider)가 실제 호출 API를 가르나 (멀티 프로바이더)
+`ai_client._is_openai(provider)`가 회사 라벨을 보고 호출 API를 정한다 — "OpenAI" 포함이면
+**OpenAI Chat Completions**(`Authorization: Bearer`, `max_completion_tokens`, 응답
+`choices[].message.content`), 그 외는 **Anthropic Messages**(`x-api-key`, `max_tokens`, 응답
+`content[].text`). provider·model_id·key가 provider마다 다르므로, 후보 목록의 각 항목이
+`provider`를 싣고 엔드포인트가 두 키(Anthropic·OpenAI)를 모두 넘긴다 — `_post_messages`가
+후보별로 provider에 맞는 키·API를 고른다. **왜 GPT도?** 생성=Claude·검증=GPT처럼 **서로 다른
+회사가 교차 검증**하면 자기검증(self-verification)이 더 독립적이다(한 회사 모델이 자기 습관에
+안 물든 판정). OpenAI 키는 STT(Whisper)와 **같은 키를 공용**한다(같은 OpenAI 계정 전제).
 
 ### 왜 자동 스왑을 넣었나 / 어떻게 판단하나
 운영자가 지정한 슬롯 모델이 점검·중단·rate limit(429)·overloaded(529)로 죽으면 문항 생성
@@ -85,10 +96,13 @@ solve 호출이 3~4회**라 한 요청 안에서도 같은 모델에 여러 번 
 
 ## 한계와 다음 방향
 
-- **Anthropic 전용(1단계).** 실제 호출은 Anthropic Messages API만 지원한다. `provider`는
-  표시용 라벨이고, 슬롯엔 Anthropic 계열 model_id를 넣는 전제다. OpenAI 등 타사 LLM을
-  생성/검증 백엔드로 붙이려면 별도 호출 경로(어댑터)가 필요하다 — **다음 단계**. (STT는
-  이미 OpenAI Whisper를 별도로 쓰지만, 그건 전사이지 문항 생성 LLM이 아니다.)
+- **지원 provider = Anthropic + OpenAI**(2026-07-19 GPT 추가). Google Gemini 등 다른 회사는
+  `_post_messages`에 provider 분기 + 요청/응답 어댑터(`_openai_request`·`_openai_extract`와
+  동형)를 하나 더 추가하면 붙는다 — 남은 다음 단계. OpenAI는 신형 모델용
+  `max_completion_tokens`를 쓰며, 이를 거부하는 특수 모델은 제공사 오류로 드러나고 자동 스왑이
+  다음 후보로 넘긴다.
+- **OpenAI 키는 STT(Whisper)와 공용.** GPT LLM 호출과 음성 전사가 같은 `openai_api_key`를
+  쓴다(같은 OpenAI 계정 전제). 두 용도를 다른 계정으로 나누려면 키 분리가 필요하다(미지원).
 - **추정 비용은 참고용.** 단가는 운영자가 넣는 공시가이고, 토큰은 응답 `usage` 합산이다 —
   실청구액이 아니다. 다음 방향: 슬롯별 월 예산·경보, 실제 청구 API 연동.
 - **거절/실패 시 토큰 회계.** 생성이 예외로 끝나면 엔드포인트가 commit을 안 해 그 요청의

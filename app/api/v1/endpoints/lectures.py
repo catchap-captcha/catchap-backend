@@ -2149,17 +2149,24 @@ def ops_generate_questions(
     from app.services import ai_models_service, settings_service
 
     lec = _get_ops_lecture(db, lecture_id, principal)
+    # LLM 키 — Anthropic(기본·폴백)과 OpenAI(GPT 슬롯·STT 공용) 둘 다 해석한다.
+    # 하나라도 있으면 진행: provider별로 후보에 맞는 키를 골라 쓰고, 없는 provider의
+    # 후보는 자동 스왑으로 건너뛴다(#26 다음 단계 — GPT 모델도 실제 호출).
     llm_key = settings_service.resolve_anthropic_key(db)
-    if not llm_key:
+    openai_key = settings_service.resolve_openai_key(db)
+    if not llm_key and not openai_key:
         raise HTTPException(
             status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="LLM API 키가 설정되지 않아 문제 자동 생성을 사용할 수 없습니다. 운영 콘솔 '설정'에서 키를 입력해 주세요.",
         )
 
     # 운영자가 고른 생성/검증 슬롯 모델 해석(#26) — 후보 목록 + 토큰 사용량 기록 콜백.
-    # 슬롯 미설정이면 후보 0 → ai_client가 .env LLM_MODEL로 폴백(하위호환).
+    # provider를 함께 실어 ai_client가 Anthropic/OpenAI 중 맞는 API로 호출한다.
+    # 슬롯 미설정이면 후보 0 → ai_client가 .env LLM_MODEL(Anthropic)로 폴백(하위호환).
     def _to_models(cands):
-        return [{"config_id": m.id, "model_id": m.model_id} for m in cands] or None
+        return [
+            {"config_id": m.id, "model_id": m.model_id, "provider": m.provider} for m in cands
+        ] or None
 
     gen_models = _to_models(ai_models_service.resolve_candidates(db, "generate"))
     verify_cands = ai_models_service.resolve_candidates(db, "verify")
@@ -2170,10 +2177,9 @@ def ops_generate_questions(
             ai_models_service.record_usage(db, config_id, tokens_in, tokens_out)
 
     transcript: list[dict] | None = None
-    stt_key = settings_service.resolve_openai_key(db)
-    if stt_key:
+    if openai_key:  # STT(Whisper)도 같은 OpenAI 키를 쓴다
         try:
-            transcript = transcribe_video(_video_path(lec), api_key=stt_key)
+            transcript = transcribe_video(_video_path(lec), api_key=openai_key)
         except SttError as e:
             raise HTTPException(
                 status.HTTP_502_BAD_GATEWAY, detail=f"강의 음성 전사(STT)에 실패했습니다: {e}"
@@ -2189,6 +2195,7 @@ def ops_generate_questions(
             transcript=transcript,
             models=gen_models,
             on_usage=_on_usage,
+            openai_key=openai_key,
         )
     except AiNotConfiguredError:
         raise HTTPException(
@@ -2214,6 +2221,7 @@ def ops_generate_questions(
             transcript=transcript,
             models=verify_models,
             on_usage=_on_usage,
+            openai_key=openai_key,
         )
     except (AiNotConfiguredError, AiGenerationError) as e:
         verify_error = str(e)
