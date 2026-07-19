@@ -219,3 +219,80 @@ def test_bank_lecture_question_gated_by_completion(client, db, seed_org, media_d
         assert bank_mode.pick_from(db, None, "과학", [bank_id]) is None
         assert bank_mode.is_unlocked(placed, None) is False
         assert bank_mode.is_unlocked({"id": "x"}, None) is True  # 강의 무관은 항상 열림
+
+
+def test_course_q_scoped_and_gated(client, db, seed_org, media_dir):
+    """★코스 Q(Q 통합 3단계-b, 결정 ③) — challenge?bank&course=는 그 코스 강의 유래
+    문항만 낸다. 완주 전엔 잠금 안내 404, 완주 후 출제(공용 문항은 코스 소속이 없어
+    자연히 제외). 학생 코스 목록엔 문항 수 배지(총·열림)가 실린다."""
+    from app.models import LectureWatchProgress
+    from tests.test_bank_mode import _first_party_key, _student_token
+
+    with _bank_state_guard():
+        tok = _ops(client, db)
+        lec = _upload_lecture(client, tok, title="화산 활동", subject="과학", duration=600).json()
+        # 코스 생성 + 강의 소속 — ops API 경유(코스=과목 고정 계약 그대로 태운다)
+        crs = client.post(
+            "/api/v1/ops/courses",
+            json={"title": "과학 기초반", "subject": "과학"},
+            headers=auth(tok),
+        ).json()
+        r = client.put(
+            f"/api/v1/ops/lectures/{lec['id']}",
+            json={"course_id": crs["id"]},
+            headers=auth(tok),
+        )
+        assert r.status_code == 200, r.text
+        # 은행 시드(강의 무관 — 코스 Q에 나오면 안 되는 대조군) + 강의 문항 배치
+        db.add(Question(id="sci-seed-cq", subject="과학", type="single", order_no=1,
+                        playable=True, payload={"id": "sci-seed-cq", "type": "single",
+                                                "topic": "seed", "stage": 1, "prompt": "공용 문제",
+                                                "hint": "", "options": [{"id": "o1", "text": "x"}],
+                                                "answer": "o1", "explain": "", "playable": True}))
+        db.commit()
+        q = _make_question(client, tok, lec["id"])
+        rb = client.post(
+            f"/api/v1/ops/lectures/{lec['id']}/questions/{q['id']}/to-bank", headers=auth(tok)
+        )
+        assert rb.status_code == 200, rb.text
+
+        _first_party_key(db)
+        stok = _student_token(client)
+        headers = {"X-Site-Key": "ck_edu_testfp", "Authorization": f"Bearer {stok}"}
+
+        # 완주 전 — 후보는 있으나 전부 잠김 → '완주하면 열려요' 안내(오류 아닌 순서 안내)
+        r = client.post(
+            f"/api/v1/captcha/v1/challenge?bank=true&course={crs['id']}", headers=headers
+        )
+        assert r.status_code == 404 and "완주" in str(r.json()["detail"])
+
+        # 없는 코스 → 404 (외부 키에는 코스 계약 자체가 없다 — first_party 전용)
+        r = client.post(
+            "/api/v1/captcha/v1/challenge?bank=true&course=nope", headers=headers
+        )
+        assert r.status_code == 404
+
+        # 학생 코스 목록 배지 — 총 1문항, 열림 0
+        rows = client.get(
+            "/api/v1/courses", headers={"Authorization": f"Bearer {stok}"}
+        ).json()
+        mine = next(x for x in rows if x["id"] == crs["id"])
+        assert mine["bank_question_count"] == 1 and mine["unlocked_question_count"] == 0
+
+        # 완주 → 코스 Q가 그 강의 유래 문항(코스 유일 후보)을 낸다. 공용 시드는 안 나온다.
+        db.add(LectureWatchProgress(
+            student_id=seed_org["student"].id, lecture_id=lec["id"], watched_max_sec=600,
+            next_checkpoint_sec=None, checkpoints_passed=1, status="done",
+        ))
+        db.commit()
+        for _ in range(5):  # 후보가 1개뿐이라 매번 같은 문항 — 공용 미혼입을 반복 확인
+            r = client.post(
+                f"/api/v1/captcha/v1/challenge?bank=true&course={crs['id']}", headers=headers
+            )
+            assert r.status_code == 200, r.text
+            assert r.json()["prompt"] == "강의에서 배운 별의 색은?"
+        rows2 = client.get(
+            "/api/v1/courses", headers={"Authorization": f"Bearer {stok}"}
+        ).json()
+        mine2 = next(x for x in rows2 if x["id"] == crs["id"])
+        assert mine2["unlocked_question_count"] == 1

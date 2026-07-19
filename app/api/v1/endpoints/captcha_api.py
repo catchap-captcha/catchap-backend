@@ -399,6 +399,7 @@ def challenge(
     stage: int | None = None,  # 챕터 단계(1~5) — 단계 문항 슬라이스
     bank: bool = False,  # 전체학습 문제은행 모드 — SRS 큐(만기>틀린>새) 출제, 코인·퀴즈 미반영
     early: bool = False,  # 문제은행 '복습 미리 하기' — 오늘 큐 소진 후 휴면 문항을 미리 복습
+    course: str | None = None,  # 코스 Q — bank와 함께: 그 코스 강의 유래 문항만(1st-party 전용)
     lecture: str | None = None,  # 강의 시청 검증 — 체크포인트 확인 문제(1st-party edu 전용)
     db: Session = Depends(get_db),
 ):
@@ -434,6 +435,34 @@ def challenge(
         from app.services import bank_mode
 
         student = _optional_student(db, request)
+        if course is not None:
+            # 코스 Q(Q 통합 3단계-b, 결정 ③) — 그 코스의 강의 유래 문항만 SRS 우선순위로.
+            # 휴면 폴백 포함(pick_from) — 코스를 콕 집은 연습은 챕터와 같은 '의도적 복습'
+            # 취급이라 '오늘 완료'로 막지 않는다(수료 시험 훈련장 역할). 1st-party 전용:
+            # 코스 id는 인앱 화면 계약이라 외부 판매 키에는 열지 않는다.
+            from app.models import Course
+
+            crs = db.get(Course, course) if api.first_party else None
+            if crs is None or crs.status != "active":
+                raise HTTPException(status.HTTP_404_NOT_FOUND, detail="코스를 찾을 수 없습니다.")
+            eff_subject = crs.subject  # 코스=과목 고정 — 화면이 준 subject보다 코스가 정본
+            ids = bank_mode.course_question_ids(db, eff_subject, crs.id)
+            if not ids:
+                raise HTTPException(
+                    status.HTTP_404_NOT_FOUND,
+                    detail="이 코스의 연습 문제가 아직 없어요. 강의 문항이 은행에 배치되면 열려요.",
+                )
+            q = bank_mode.pick_from(db, student, eff_subject, ids)
+            if q is None:
+                # 후보는 있는데 전부 잠김 — 강의 완주 잠금(배움→연습 순서)을 정직하게 안내
+                raise HTTPException(
+                    status.HTTP_404_NOT_FOUND,
+                    detail="이 코스의 문제는 강의를 완주하면 열려요.",
+                )
+            ch = cs._wrap_bank_question(
+                eff_subject, q, {"subj": eff_subject, "bank": True, "course": crs.id}
+            )
+            return _emit_challenge(db, api, eff_subject, ch)
         if chapter is not None:
             from app.services import chapters as _ch
 

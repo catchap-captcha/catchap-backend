@@ -161,6 +161,7 @@
     var replay = box.getAttribute('data-replay') === '1';      // 복습(코인·퀴즈 상태 미반영)
     var bankMode = box.getAttribute('data-bank') === '1';      // 전체학습 문제은행(SRS 큐: 만기>틀린>새, 무보상)
     var earlyMode = box.getAttribute('data-early') === '1';    // 은행 '복습 미리 하기' — 오늘 큐 소진 후 휴면 복습
+    var courseId = box.getAttribute('data-course') || '';      // 코스 Q — 그 코스 강의 유래 문항만(bank와 함께)
     var lecture = box.getAttribute('data-lecture') || '';      // 강의 시청 검증 — 체크포인트 확인 문제
     var sessionTotal = parseInt(box.getAttribute('data-total') || '0', 10) || 0; // 세션 문항 수
     // 효과음: 기본 켜짐(외부 임베드). 인앱은 게임 화면이 학생 설정에 따라 직접 재생하므로
@@ -2918,6 +2919,7 @@
       if (replay) qs.push('replay=true');
       if (bankMode) qs.push('bank=true');
       if (bankMode && earlyMode) qs.push('early=true');
+      if (bankMode && courseId) qs.push('course=' + encodeURIComponent(courseId));
       if (lecture) qs.push('lecture=' + encodeURIComponent(lecture));
       var path = '/captcha/v1/challenge' + (qs.length ? '?' + qs.join('&') : '');
       getAuth().then(function (a) {

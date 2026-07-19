@@ -386,6 +386,8 @@ def list_student_courses(
     코스 → 강의로 묶기 위한 상위 메타다. 운영자용 `_course_row`와 달리 (1) 강사 스코프가
     없고(학생은 전부 본다) (2) instructor_id 대신 강사 실명을 준다. 활성 강의가 0개인
     코스는 학생 목록에서 뺀다 — 빈 코스는 보여 줄 이유가 없다."""
+    from app.services import bank_mode
+
     q = db.query(Course).filter(Course.status == "active")
     if subject:
         q = q.filter(Course.subject == subject)
@@ -393,16 +395,22 @@ def list_student_courses(
     # 강사명 벌크 조회로 N+1 회피 — instructor_id는 users로의 소프트 참조(FK 없음)
     inst_ids = {c.instructor_id for c in courses}
     names = {u.id: u.name for u in db.query(User).filter(User.id.in_(inst_ids or [""])).all()}
+    # 코스 Q 배지(3단계-b) 원천 — 이 학생의 완주 강의 + 과목별 강의 유래 문항 수(과목당 1회 집계)
+    completed = bank_mode.completed_lecture_ids(db, principal.id)
+    qcounts_by_subject: dict[str, dict[str, int]] = {}
     out = []
     for c in courses:
-        active_count = (
-            db.query(func.count(Lecture.id))
+        lec_ids = [
+            r[0]
+            for r in db.query(Lecture.id)
             .filter(Lecture.course_id == c.id, Lecture.status == "active")
-            .scalar()
-            or 0
-        )
-        if not active_count:
+            .all()
+        ]
+        if not lec_ids:
             continue
+        if c.subject not in qcounts_by_subject:
+            qcounts_by_subject[c.subject] = bank_mode.lecture_question_counts(c.subject)
+        counts = qcounts_by_subject[c.subject]
         out.append(
             {
                 "id": c.id,
@@ -411,7 +419,14 @@ def list_student_courses(
                 "description": c.description,
                 "order_no": int(c.order_no or 0),
                 "instructor_name": names.get(c.instructor_id),
-                "lecture_count": int(active_count),
+                "lecture_count": len(lec_ids),
+                # 코스 Q — 이 코스 강의에서 은행으로 배치된 문항 수. 화면 규칙:
+                # unlocked>0 → '이 코스 문제 풀기(N)' 버튼 / total>0 & unlocked=0 →
+                # "완주하면 열려요" 잠금 안내 / total=0 → 아무것도 안 보임(아직 없음).
+                "bank_question_count": sum(counts.get(i, 0) for i in lec_ids),
+                "unlocked_question_count": sum(
+                    counts.get(i, 0) for i in lec_ids if i in completed
+                ),
             }
         )
     return out

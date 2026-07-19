@@ -89,6 +89,47 @@ def unlocked_pool(db: Session, student: StudentProfile | None, subject: str) -> 
     return [q for q in subject_banks.playable_pool(subject) if is_unlocked(q, completed)]
 
 
+# ---------------------------------------------------------------- 코스 Q (Q 통합 3단계-b)
+# 결정 ③(0719): Q는 오늘의 Q(전과목 통합·매일 습관)와 코스 Q(그 코스 범위만 — 수료 시험
+# 훈련장) 2층이다. 코스 Q의 후보 = 그 코스의 활성 강의에서 유래한 은행 문항(payload.
+# lecture_id가 코스 강의를 가리키는 것)뿐. 공용 문항은 코스 소속이 없으므로 자연히 빠진다.
+def lecture_question_counts(subject: str) -> dict[str, int]:
+    """과목 은행의 강의 유래 문항 수를 강의별로 집계(lecture_id → 문항 수).
+
+    학생 코스 목록의 '문제 N개' 배지와 코스 Q 후보 산출이 함께 쓰는 원천. 풀 1회 스캔
+    O(과목 풀 크기) — 현 규모(과목당 수백)에선 요청당 과목별 1회로 충분히 가볍고,
+    만 개 규모가 되면 subject_banks에 lecture_id 역인덱스를 두면 된다(_BY_ID와 동형)."""
+    counts: dict[str, int] = {}
+    for q in subject_banks.playable_pool(subject):
+        lec = q.get("lecture_id")
+        if lec:
+            counts[lec] = counts.get(lec, 0) + 1
+    return counts
+
+
+def course_question_ids(db: Session, subject: str, course_id: str) -> list[str]:
+    """코스 Q 후보 문항 id — 그 코스의 활성 강의에서 유래한 은행 문항 전부(잠금 적용 전).
+
+    잠금(강의 완주)은 여기서 하지 않는다 — 출제(pick_from)가 _unlocked_ids로 일괄
+    적용한다. 빈 리스트 = 이 코스엔 은행 배치된 문항이 아직 없다는 뜻(호출자가
+    '아직 없어요'와 '완주하면 열려요'를 구분해 정직하게 안내하는 근거)."""
+    from app.models import Lecture
+
+    lec_ids = {
+        r[0]
+        for r in db.query(Lecture.id)
+        .filter(Lecture.course_id == course_id, Lecture.status == "active")
+        .all()
+    }
+    if not lec_ids:
+        return []
+    return [
+        q["id"]
+        for q in subject_banks.playable_pool(subject)
+        if q.get("lecture_id") in lec_ids
+    ]
+
+
 # ---------------------------------------------------------------- SRS 상태 갱신(채점 시)
 def record_answer(
     db: Session, student_id: str, subject: str, question_id: str, correct: bool
