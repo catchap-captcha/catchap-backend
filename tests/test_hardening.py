@@ -66,7 +66,8 @@ def test_incorrect_completed_does_not_mark_done(client, db, seed_org):
     )
     assert quiz is None or quiz.status != "done"
 
-    # 한 문항 더 정답(graded≥5 + 정답) → 정상 done
+    # Q 통합 2단계(0719): 승격 자체가 은퇴 — graded≥5 + 정답이어도 done이 되지 않는다.
+    # (위조 차단 가드는 '승격이 아예 없음'으로 대체·강화된 셈. 기록·정답률은 정상 저장.)
     _game_answer(client, token, "국어", correct=True, last=True, q=q)
     db.expire_all()
     quiz2 = (
@@ -78,7 +79,7 @@ def test_incorrect_completed_does_not_mark_done(client, db, seed_org):
         )
         .first()
     )
-    assert quiz2.status == "done"
+    assert quiz2 is None or quiz2.status != "done"
 
 
 # ---------------------------------------------------------------- A9

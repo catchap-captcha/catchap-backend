@@ -287,8 +287,8 @@ def test_replay_attempt_no_status_no_coins(client, db, seed_org):
     )
     assert quiz is None or quiz.status != "done"  # 복습으로 오늘 완료 처리되지 않음
 
-    # 정식 완료(서버 채점)는 여전히 동작 — 게임 채점 5문항 정답 → done + 코인 지급.
-    # (무채점 /learning/attempts로는 이제 done·코인이 안 되므로 game-answer 경로를 쓴다.)
+    # Q 통합 2단계(0719): 퀴즈 승격·코인 지급 자체가 은퇴 — 정식 서버 채점 5문항 정답이어도
+    # done 승격이 없고 코인도 늘지 않는다(기록·정답률·SRS 상태만 남는다).
     _complete_subject(client, token, "국어")
     db.expire_all()
     quiz2 = (
@@ -300,8 +300,8 @@ def test_replay_attempt_no_status_no_coins(client, db, seed_org):
         )
         .first()
     )
-    assert quiz2 is not None and quiz2.status == "done"
-    assert db.get(StudentProfile, seed_org["student"].id).coins > before_coins  # 코인 지급됨
+    assert quiz2 is None or quiz2.status != "done"  # 승격 은퇴 — done이 되지 않는다
+    assert db.get(StudentProfile, seed_org["student"].id).coins == before_coins  # 코인 지급 중단
 
 
 def test_game_session_server_graded(client, db, seed_org):
@@ -576,34 +576,29 @@ def test_curriculum_lock_and_replay(client, db, seed_org):
 
 
 
-def test_all_subjects_sticker_awarded_once(client, db, seed_org):
-    """6과목 완주 스티커: 마지막 과목 done 순간 스티커+코인 지급, 하루 1회 멱등, 복습 미지급."""
+def test_all_subjects_sticker_retired(client, db, seed_org):
+    """Q 통합 2단계(0719): 6과목을 전부 서버 채점으로 완주해도 스티커·코인이 지급되지 않는다.
+
+    (구 스펙: 마지막 과목 done 순간 스티커+코인 — 게임화 은퇴의 완결로 지급 루프 제거.
+    기록·정답률·SRS 상태는 그대로 남는다.)"""
     from app.models import StudentProfile
 
     token = _student_token(client, seed_org)
     subjects = ["국어", "영어", "수학", "과학", "사회", "생활"]
     before = db.get(StudentProfile, seed_org["student"].id).coins
 
-    # 각 과목을 서버 채점(game-answer)으로 5문항 정답 완료 → 6번째 과목 done 순간 스티커.
-    # (무채점 /learning/attempts로는 이제 done·스티커가 안 되므로 서버 채점 경로를 쓴다.)
     last_res = None
     for subj in subjects:
         last_res = _complete_subject(client, token, subj)
-    # 여섯 번째 과목 완료 응답에 스티커+보너스 코인이 실린다
-    assert last_res["sticker_awarded"] is True
-    assert last_res["sticker_coins"] > 0
-    # 이미 done인 과목을 다시 정답 완료해도 중복 지급이 없는지 확인
-    again = _game_answer(client, token, "국어", correct=True, last=True)
-    assert again["sticker_awarded"] is False and again["sticker_coins"] == 0
+    assert last_res["sticker_awarded"] is False and last_res["sticker_coins"] == 0
+    assert last_res.get("quiz_bonus", 0) == 0 and last_res.get("coins_earned", 0) == 0
 
     db.expire_all()
-    after = db.get(StudentProfile, seed_org["student"].id).coins
-    # 학습 보상 + 스티커 보너스가 실제 잔액에 반영 (스티커 보너스는 정확히 1회)
-    assert after - before >= last_res["sticker_coins"]
+    assert db.get(StudentProfile, seed_org["student"].id).coins == before  # 잔액 불변
 
-    # 결과 API에 오늘의 스티커 표시
+    # 결과 API의 오늘의 스티커도 항상 False(지급 자체가 없음)
     res = client.get("/api/v1/students/me/result?subject=국어", headers=auth(token)).json()
-    assert res["sticker_today"] is True
+    assert res["sticker_today"] is False
 
 
 def test_chapter_history_before_cut(client, db, seed_org):
@@ -651,9 +646,12 @@ def test_chapter_replay_server_side_no_coin_farming(client, db, seed_org):
     db.expire_all()
     assert db.get(StudentProfile, student.id).coins == before  # 코인 재적립 없음
 
-    # 미완주 4단계는 정상 적립 경로(복습 아님)
+    # 미완주 4단계 — 복습 판정은 아님(기록 구분은 유지). 코인은 Q 통합 2단계(0719)로
+    # 전면 지급 중단이라 정상 플레이도 0이다(파밍 가드가 아니라 지급 자체가 없음).
     s2 = _credit_student(db, student, {"subj": "수학", "chapter": 1, "stage": 4}, True, "o1")
     db.commit()
-    assert s2["replay"] is False and s2["coins_earned"] > 0
+    assert s2["replay"] is False and s2["coins_earned"] == 0
+    db.expire_all()
+    assert db.get(StudentProfile, student.id).coins == before  # 잔액 불변
 
 # (배지·학년랭킹·프로필 편집 테스트는 게임화 은퇴(0718)로 대상 엔드포인트와 함께 제거)
