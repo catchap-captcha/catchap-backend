@@ -27,6 +27,12 @@ from app.models.learning import (
     StudentQuestionState,
     WrongAnswer,
 )
+from app.models.course_exam import (
+    CourseCompletion,
+    CourseExamAttempt,
+    CourseExamQuestion,
+    CourseExamSitting,
+)
 from app.models.lecture import (
     Course,
     Lecture,
@@ -99,6 +105,10 @@ __all__ = [
     "LearningAttempt",
     "LearningSummary",
     "Course",
+    "CourseCompletion",
+    "CourseExamAttempt",
+    "CourseExamQuestion",
+    "CourseExamSitting",
     "Lecture",
     "LectureCheckpointEvent",
     "LectureMaterial",

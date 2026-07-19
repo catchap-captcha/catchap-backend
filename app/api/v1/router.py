@@ -5,6 +5,7 @@ from fastapi import APIRouter
 from app.api.v1.endpoints import (
     auth,
     captcha_api,
+    course_exam,
     forest_captcha,
     health,
     institutions,
@@ -33,5 +34,6 @@ for _mod in (
     forest_captcha,
     widget,
     lectures,
+    course_exam,
 ):
     api_router.include_router(_mod.router)

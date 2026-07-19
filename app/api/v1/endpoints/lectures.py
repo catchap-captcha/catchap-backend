@@ -386,6 +386,11 @@ def list_student_courses(
     코스 → 강의로 묶기 위한 상위 메타다. 운영자용 `_course_row`와 달리 (1) 강사 스코프가
     없고(학생은 전부 본다) (2) instructor_id 대신 강사 실명을 준다. 활성 강의가 0개인
     코스는 학생 목록에서 뺀다 — 빈 코스는 보여 줄 이유가 없다."""
+    from app.models import (
+        CourseCompletion,
+        CourseExamAttempt,
+        CourseExamQuestion,
+    )
     from app.services import bank_mode
 
     q = db.query(Course).filter(Course.status == "active")
@@ -398,6 +403,33 @@ def list_student_courses(
     # 코스 Q 배지(3단계-b) 원천 — 이 학생의 완주 강의 + 과목별 강의 유래 문항 수(과목당 1회 집계)
     completed = bank_mode.completed_lecture_ids(db, principal.id)
     qcounts_by_subject: dict[str, dict[str, int]] = {}
+    # 수료 시험 요약(코스 목록 인라인 표시) — 코스별 N 호출 대신 학생 단위 벌크 3쿼리.
+    course_ids = [c.id for c in courses]
+    exam_active: dict[str, set[str]] = {}  # course_id → 활성 시험 문항 id 집합
+    for cid, qid in (
+        db.query(CourseExamQuestion.course_id, CourseExamQuestion.id)
+        .filter(CourseExamQuestion.course_id.in_(course_ids or [""]),
+                CourseExamQuestion.status == "active")
+        .all()
+    ):
+        exam_active.setdefault(cid, set()).add(qid)
+    exam_mastered: dict[str, set[str]] = {}  # course_id → 이 학생이 정복(정답 이력)한 문항 id
+    for cid, qid in (
+        db.query(CourseExamAttempt.course_id, CourseExamAttempt.question_id)
+        .filter(CourseExamAttempt.student_id == principal.id,
+                CourseExamAttempt.course_id.in_(course_ids or [""]),
+                CourseExamAttempt.result == "correct")
+        .distinct()
+        .all()
+    ):
+        exam_mastered.setdefault(cid, set()).add(qid)
+    passed_courses = {
+        r[0]: r[1]
+        for r in db.query(CourseCompletion.course_id, CourseCompletion.perfect)
+        .filter(CourseCompletion.student_id == principal.id,
+                CourseCompletion.course_id.in_(course_ids or [""]))
+        .all()
+    }
     out = []
     for c in courses:
         lec_ids = [
@@ -411,6 +443,9 @@ def list_student_courses(
         if c.subject not in qcounts_by_subject:
             qcounts_by_subject[c.subject] = bank_mode.lecture_question_counts(c.subject)
         counts = qcounts_by_subject[c.subject]
+        active_ids = exam_active.get(c.id, set())
+        mastered_ids = exam_mastered.get(c.id, set()) & active_ids
+        all_done = set(lec_ids) <= completed
         out.append(
             {
                 "id": c.id,
@@ -427,6 +462,17 @@ def list_student_courses(
                 "unlocked_question_count": sum(
                     counts.get(i, 0) for i in lec_ids if i in completed
                 ),
+                # 수료 시험 요약(#28) — 화면 상태 흐름: 없음/잠김/응시가능(진행)/수료
+                "exam": {
+                    "has_exam": bool(active_ids),
+                    "question_count": len(active_ids),
+                    "mastered_count": len(mastered_ids),
+                    "available": bool(active_ids) and all_done,
+                    "lectures_done": len(set(lec_ids) & completed),
+                    "lectures_total": len(lec_ids),
+                    "passed": c.id in passed_courses,
+                    "perfect": bool(passed_courses.get(c.id, False)),
+                },
             }
         )
     return out
