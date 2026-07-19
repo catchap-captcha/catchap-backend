@@ -204,10 +204,25 @@
 4. 테스트: 미완주 403 · mastery(틀린 것만 재출제·누적 수료) · perfect 판정 ·
    재제출 409 · source 필수 400 · 오답노트 연동 · 미제출 회차 재사용
 
-**2단계**
-- to-exam 복사 버튼, LLM 시험 문항 생성(기존 STT→LLM 파이프라인 재사용),
-  이미지 문항(강의 문항 이미지 인프라 이식), 수료증 PDF, 행동 데이터 연동,
-  대시보드 지표(강사: 시험 통과율·오래 걸린 문항 / 운영자: 수료율).
+**2단계 — 문항 채우기 가속(구현 완료 2026-07-19)**
+강사가 시험 문항을 하나씩 손으로 넣던 병목을 두 경로로 푼다. 둘 다 결과는 **draft**라
+강사 검수 후 공개(draft→active)한다.
+- **to-exam** `POST /ops/courses/{cid}/exam-questions/import-from-lectures` — 코스 소속
+  강의의 **active 확인 문항**을 시험 문항(origin=lecture)으로 일괄 복사. 강의·시험 문항이
+  둘 다 인덱스 기반(options[str]·answer_indexes)이라 **형식 변환이 없다**(to-bank와 다른
+  점 — to-bank는 옵션 id 기반이라 변환 필요). **멱등**: 원 강의 문항 payload에
+  `exam_imported` 마커(to-bank의 bank_placed와 동형)를 남겨 재실행 시 건너뛴다. 이미지
+  문항·형식 불량은 조용히 건너뛰되 개수를 정직하게 반환({imported, skipped}).
+- **LLM 생성** `POST /ops/courses/{cid}/exam-questions/generate` — 코스 강의 구성(제목·설명)을
+  근거로 **멀티프로바이더 LLM**(#26 — 운영자가 고른 생성 슬롯 모델·Anthropic/OpenAI)이
+  수료 시험 문항 초안(origin=llm)을 만든다. `ai_client.generate_course_exam_questions`가
+  `_post_messages`+`_parse_questions`를 재사용한다. **자기검증(봇저항)은 안 한다** —
+  수료 시험은 시청 검증 캡차가 아니라 지식·이해 확인이라 상식으로 풀리는 문항도 정당
+  (강의 캡차의 bank/captcha/discard 3분류와 목적이 다르다). 키 없으면 503, 생성 실패 502.
+- FE: 강사 시험 문항 모달에 '강의 문항 가져오기'·'AI로 생성' 버튼(둘 다 결과는 초안 안내).
+
+**2단계 — 잔여(미착수)**: 수료증 PDF, 행동 데이터 연동, 대시보드 지표(강사: 시험 통과율·
+오래 걸린 문항 / 운영자: 수료율), 이미지 문항.
 
 ## 10. 한계·리스크
 

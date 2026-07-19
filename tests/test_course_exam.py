@@ -451,3 +451,102 @@ def test_metrics_isolation_no_learning_attempt(client, db, seed_org):
         CourseExamAttempt.student_id == seed_org["student"].id).count() >= 1
     assert db.query(LearningAttempt).filter(
         LearningAttempt.student_id == seed_org["student"].id).count() == 0
+
+
+# ---------------------------------------------------- 2단계: 문항 채우기(to-exam · LLM 생성)
+def _add_lecture_q(db, lecture_id, *, prompt, options, answer_index,
+                   order_no=0, status="active", image=False):
+    from app.models import LectureQuestion
+
+    payload = {"prompt": prompt, "options": options, "explain": ""}
+    if image:
+        payload["prompt_image"] = "x.png"
+    lq = LectureQuestion(
+        lecture_id=lecture_id, position_sec=0, content_start_sec=None,
+        payload=payload, answer_index=answer_index, source="llm",
+        status=status, order_no=order_no,
+    )
+    db.add(lq)
+    db.commit()
+    return lq
+
+
+def test_import_exam_from_lectures(client, db, seed_org):
+    """코스 강의의 active 확인 문항 → 시험 문항(origin=lecture·draft) 복사. 이미지·draft 제외, 멱등."""
+    tok = _ops(client, db)
+    course = _mk_course(client, tok, db)
+    lec = _assign_lecture(client, tok, course["id"])
+    _add_lecture_q(db, lec["id"], prompt="1+1은?", options=["1", "2", "3", "4"], answer_index=1, order_no=1)
+    _add_lecture_q(db, lec["id"], prompt="이미지문항", options=["가", "나"], answer_index=0, order_no=2, image=True)
+    _add_lecture_q(db, lec["id"], prompt="초안", options=["가", "나"], answer_index=0, order_no=3, status="draft")
+
+    r = client.post(
+        f"/api/v1/ops/courses/{course['id']}/exam-questions/import-from-lectures", headers=auth(tok)
+    )
+    assert r.status_code == 200, r.text
+    assert r.json() == {"imported": 1, "skipped": 1}  # draft는 애초 대상 아님·이미지는 스킵
+
+    qs = client.get(f"/api/v1/ops/courses/{course['id']}/exam-questions", headers=auth(tok)).json()
+    assert len(qs) == 1
+    assert qs[0]["origin"] == "lecture" and qs[0]["status"] == "draft"
+    assert qs[0]["prompt"] == "1+1은?" and qs[0]["answer_indexes"] == [1]
+    assert "강의" in (qs[0]["source"] or "")  # 출처 추적
+
+    # 멱등 — 재실행하면 이미 가져온 건 스킵(중복 안 생김)
+    r2 = client.post(
+        f"/api/v1/ops/courses/{course['id']}/exam-questions/import-from-lectures", headers=auth(tok)
+    )
+    assert r2.json()["imported"] == 0
+    assert len(client.get(
+        f"/api/v1/ops/courses/{course['id']}/exam-questions", headers=auth(tok)).json()) == 1
+
+
+def test_generate_exam_questions_llm(client, db, seed_org, monkeypatch):
+    """LLM 코스 시험 문항 생성 — 코스 제목·과목·강의를 생성기에 넘기고 origin=llm·draft로 저장."""
+    from app.core.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "ANTHROPIC_API_KEY", "sk-x")
+    tok = _ops(client, db)
+    course = _mk_course(client, tok, db)
+    _assign_lecture(client, tok, course["id"], title="1강 분수")
+
+    import app.clients.ai_client as ai
+
+    seen = {}
+
+    def fake_gen(**kwargs):
+        seen.update(kwargs)
+        return [
+            {"prompt": "분수 개념?", "options": ["가", "나", "다", "라"], "answer_index": 2, "explain": "해설"},
+            {"prompt": "약분?", "options": ["가", "나", "다", "라"], "answer_index": 0, "explain": ""},
+        ]
+
+    monkeypatch.setattr(ai, "generate_course_exam_questions", fake_gen)
+    r = client.post(
+        f"/api/v1/ops/courses/{course['id']}/exam-questions/generate",
+        json={"n": 2}, headers=auth(tok),
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["created"] == 2
+    # 코스 맥락이 생성기에 전달됐는지
+    assert seen["course_title"] == "수학 개념완성" and seen["subject"] == "수학"
+    assert any(l["title"] == "1강 분수" for l in seen["lectures"])
+    # 저장 = origin llm·draft·answer_indexes=[answer_index]
+    qs = client.get(f"/api/v1/ops/courses/{course['id']}/exam-questions", headers=auth(tok)).json()
+    assert len(qs) == 2 and all(q["origin"] == "llm" and q["status"] == "draft" for q in qs)
+    assert qs[0]["answer_indexes"] == [2]
+
+
+def test_generate_exam_questions_no_key_503(client, db, seed_org, monkeypatch):
+    """키가 하나도 없으면 정직한 503(stub 문항 생성 금지)."""
+    from app.core.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "ANTHROPIC_API_KEY", "")
+    monkeypatch.setattr(get_settings(), "OPENAI_API_KEY", "")
+    tok = _ops(client, db)
+    course = _mk_course(client, tok, db)
+    r = client.post(
+        f"/api/v1/ops/courses/{course['id']}/exam-questions/generate",
+        json={"n": 2}, headers=auth(tok),
+    )
+    assert r.status_code == 503

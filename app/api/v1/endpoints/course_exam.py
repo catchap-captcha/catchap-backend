@@ -31,6 +31,7 @@ from app.models import (
     CourseExamQuestion,
     CourseExamSitting,
     Lecture,
+    LectureQuestion,
 )
 from app.services import bank_mode
 from app.utils.helpers import audit
@@ -346,6 +347,198 @@ def ops_delete_exam_question(
           target_type="course_exam_question", target_id=q.id, after=None)
     db.commit()
     return {"ok": True}
+
+
+# --------------------------------------------- 2단계: 문항 채우기 가속(to-exam · LLM 생성)
+@router.post("/ops/courses/{course_id}/exam-questions/import-from-lectures")
+def ops_import_exam_from_lectures(
+    course_id: str,
+    principal: Principal = Depends(require_lecture_manager),
+    db: Session = Depends(get_db),
+):
+    """코스 소속 강의의 활성 확인 문항 → 시험 문항(origin=lecture, draft) 일괄 복사(to-exam).
+
+    왜: 강사가 시험 문항을 하나씩 손으로 넣지 않게 — 이미 검수된 강의 확인 문항을 재활용한다.
+    강의 문항·시험 문항은 둘 다 인덱스 기반(options[str]·answer_indexes)이라 형식 변환이
+    없다(to-bank와 다른 점). **멱등**: 이미 가져온 강의 문항은 payload 마커(exam_imported)로
+    건너뛴다(to-bank의 bank_placed와 동형). 이미지 문항·형식 불량은 조용히 건너뛰되(전체
+    실패로 만들지 않음) 개수를 정직하게 반환한다. 가져온 문항은 draft — 강사 검수 후 active."""
+    from app.api.v1.endpoints.lectures import _get_ops_course
+
+    _get_ops_course(db, course_id, principal)
+    lec_ids = _course_lecture_ids(db, course_id)
+    if not lec_ids:
+        return {"imported": 0, "skipped": 0}
+    lec_titles = {
+        r[0]: r[1]
+        for r in db.query(Lecture.id, Lecture.title).filter(Lecture.id.in_(lec_ids)).all()
+    }
+    lqs = (
+        db.query(LectureQuestion)
+        .filter(LectureQuestion.lecture_id.in_(lec_ids), LectureQuestion.status == "active")
+        .order_by(LectureQuestion.lecture_id, LectureQuestion.order_no)
+        .all()
+    )
+    max_order = (
+        db.query(CourseExamQuestion).filter(CourseExamQuestion.course_id == course_id).count()
+    )
+    imported = 0
+    skipped = 0
+    for lq in lqs:
+        payload = lq.payload or {}
+        if (payload.get("exam_imported") or {}).get("course_id") == course_id:
+            skipped += 1  # 이미 이 코스 시험으로 가져옴(멱등)
+            continue
+        if payload.get("prompt_image") or payload.get("option_images"):
+            skipped += 1  # 이미지 문항은 시험 형식도 미지원
+            continue
+        prompt = (payload.get("prompt") or "").strip()
+        options = payload.get("options") or []
+        answers = sorted({int(i) for i in (lq.answer_indexes or [lq.answer_index])})
+        if not prompt or not (2 <= len(options) <= 6) or not all(
+            isinstance(o, str) and o.strip() for o in options
+        ):
+            skipped += 1
+            continue
+        if not answers or any(a < 0 or a >= len(options) for a in answers):
+            skipped += 1
+            continue
+        max_order += 1
+        q = CourseExamQuestion(
+            course_id=course_id,
+            prompt=prompt,
+            options=[o.strip() for o in options],
+            answer_indexes=answers,
+            explain=(payload.get("explain") or "").strip() or None,
+            origin="lecture",
+            source=f"강의: {lec_titles.get(lq.lecture_id, '')}".strip(),
+            order_no=max_order,
+            status="draft",
+            created_by=principal.id,
+        )
+        db.add(q)
+        db.flush()
+        # 원 강의 문항에 가져옴 표식 — 멱등 + 콘솔 '시험으로 가져옴' 배지 근거
+        lq.payload = {
+            **payload,
+            "exam_imported": {
+                "course_id": course_id,
+                "exam_qid": q.id,
+                "at": datetime.now().isoformat(timespec="seconds"),
+            },
+        }
+        imported += 1
+    audit(db, action="course.exam_question.import_lectures", actor_user_id=principal.id,
+          target_type="course", target_id=course_id,
+          after={"imported": imported, "skipped": skipped})
+    db.commit()
+    return {"imported": imported, "skipped": skipped}
+
+
+class _ExamGenerateReq(BaseModel):
+    n: int = 5
+
+
+@router.post("/ops/courses/{course_id}/exam-questions/generate")
+def ops_generate_exam_questions(
+    course_id: str,
+    req: _ExamGenerateReq,
+    principal: Principal = Depends(require_lecture_manager),
+    db: Session = Depends(get_db),
+):
+    """코스 강의 구성(제목·설명) 기반 LLM 수료 시험 문항 자동 생성(origin=llm, draft).
+
+    왜: 강사가 백지에서 시작하지 않게 — 운영자가 고른 생성 슬롯 모델(Anthropic/OpenAI, #26
+    멀티프로바이더)로 코스 전체를 아우르는 초안을 만든다. **자기검증은 하지 않는다**(시험은
+    시청 검증 캡차가 아니라 지식·이해 확인이라 상식으로 풀리는 문항도 정당). 학생 노출 전
+    강사 검수(draft→active). 정직성: 키 없으면 503, 생성/파싱 실패 502 — stub 문항 금지."""
+    from app.api.v1.endpoints.lectures import _get_ops_course
+    from app.clients.ai_client import (
+        AiGenerationError,
+        AiNotConfiguredError,
+        generate_course_exam_questions,
+    )
+    from app.services import ai_models_service, settings_service
+
+    course = _get_ops_course(db, course_id, principal)
+    llm_key = settings_service.resolve_anthropic_key(db)
+    openai_key = settings_service.resolve_openai_key(db)
+    if not llm_key and not openai_key:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="LLM API 키가 설정되지 않아 문항 자동 생성을 쓸 수 없습니다. 운영 콘솔 '설정'에서 키를 입력해 주세요.",
+        )
+    lec_ids = _course_lecture_ids(db, course_id)
+    lectures = (
+        [
+            {"title": r[0], "description": r[1]}
+            for r in db.query(Lecture.title, Lecture.description)
+            .filter(Lecture.id.in_(lec_ids))
+            .order_by(Lecture.order_no)
+            .all()
+        ]
+        if lec_ids
+        else []
+    )
+
+    def _to_models(cands):
+        return [
+            {"config_id": m.id, "model_id": m.model_id, "provider": m.provider} for m in cands
+        ] or None
+
+    gen_models = _to_models(ai_models_service.resolve_candidates(db, "generate"))
+
+    def _on_usage(config_id, tokens_in, tokens_out):
+        if config_id:
+            ai_models_service.record_usage(db, config_id, tokens_in, tokens_out)
+
+    try:
+        items = generate_course_exam_questions(
+            course_title=course.title,
+            subject=course.subject,
+            lectures=lectures,
+            n=req.n,
+            api_key=llm_key,
+            openai_key=openai_key,
+            models=gen_models,
+            on_usage=_on_usage,
+        )
+    except AiNotConfiguredError:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="LLM API 키가 설정되지 않아 문항 자동 생성을 쓸 수 없습니다. 운영 콘솔 '설정'에서 키를 입력해 주세요.",
+        )
+    except AiGenerationError as e:
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY, detail=f"시험 문항 자동 생성에 실패했습니다: {e}"
+        )
+
+    max_order = (
+        db.query(CourseExamQuestion).filter(CourseExamQuestion.course_id == course_id).count()
+    )
+    created: list[CourseExamQuestion] = []
+    for item in items:
+        max_order += 1
+        q = CourseExamQuestion(
+            course_id=course_id,
+            prompt=item["prompt"],
+            options=item["options"],
+            answer_indexes=[int(item["answer_index"])],
+            explain=item.get("explain") or None,
+            origin="llm",
+            source=None,
+            order_no=max_order,
+            status="draft",
+            created_by=principal.id,
+        )
+        db.add(q)
+        created.append(q)
+    db.flush()
+    audit(db, action="course.exam_question.generate", actor_user_id=principal.id,
+          target_type="course", target_id=course_id,
+          after={"created": len(created), "n": req.n})
+    db.commit()
+    return {"created": len(created), "questions": [_question_row(q) for q in created]}
 
 
 # ---------------------------------------------------------------- 학생: 상태·발급·채점

@@ -489,3 +489,59 @@ def generate_lecture_questions(
         openai_key=oa,
     )
     return _parse_questions(text, n)
+
+
+def _course_exam_prompt(course_title: str, subject: str, lectures: list[dict], n: int) -> str:
+    lines = "\n".join(
+        f"- {l.get('title', '')}" + (f": {l['description']}" if l.get("description") else "")
+        for l in lectures
+    ) or "- (강의 정보 없음)"
+    return (
+        "당신은 온라인 강의 코스의 '수료 시험' 출제자입니다.\n"
+        f"과목: {subject}\n코스 제목: {course_title}\n"
+        f"이 코스는 다음 강의들로 구성됩니다:\n{lines}\n\n"
+        f"이 강의들에서 다룬 내용을 '종합적으로 이해했는지' 확인하는 4지선다 수료 시험 문제 {n}개를 만드세요.\n"
+        "규칙:\n"
+        "- 코스 전체 범위를 골고루 다루되, 특정 강의 하나에만 치우치지 마세요.\n"
+        "- 각 문제는 보기 4개, 정답은 하나.\n"
+        "- 단순 암기보다 개념 이해·적용을 확인하는 문제를 우선하세요.\n"
+        "- explain에 정답 해설 1~2문장.\n\n"
+        "다음 JSON 배열만 출력하세요(코드펜스·설명 없이):\n"
+        '[{"prompt": "질문", "options": ["보기1", "보기2", "보기3", "보기4"], '
+        '"answer_index": 0, "explain": "해설"}]'
+    )
+
+
+def generate_course_exam_questions(
+    *,
+    course_title: str,
+    subject: str,
+    lectures: list[dict],
+    n: int = 5,
+    api_key: str | None = None,
+    openai_key: str | None = None,
+    models: list[dict] | None = None,
+    on_usage=None,
+) -> list[dict]:
+    """코스 강의 구성(제목·설명)에서 수료 시험 문항 n개 생성 — 멀티프로바이더 _post_messages 재사용.
+
+    반환 [{prompt, options, answer_index, explain}]. **자기검증(봇저항)은 하지 않는다** —
+    수료 시험은 시청 검증 캡차가 아니라 '지식·이해'를 확인하는 시험이라, 상식으로 풀리는
+    문항도 정당하다(강의 캡차 파이프라인의 bank/captcha/discard 3분류와 목적이 다르다).
+    생성 슬롯 모델·provider·키는 호출자가 넘긴다(lectures 생성과 동일). 키가 하나도 없으면
+    AiNotConfiguredError, 호출/파싱 실패는 AiGenerationError — stub 문항을 지어내지 않는다."""
+    settings = get_settings()
+    key = (api_key if api_key is not None else settings.ANTHROPIC_API_KEY or "").strip()
+    oa = (openai_key or "").strip()
+    if not key and not oa:
+        raise AiNotConfiguredError("LLM API 키가 설정되지 않았습니다.")
+    n = max(1, min(int(n), 20))
+    text = _post_messages(
+        key,
+        _course_exam_prompt(course_title, subject, lectures, n),
+        max_tokens=8192,
+        models=models,
+        on_usage=on_usage,
+        openai_key=oa,
+    )
+    return _parse_questions(text, n)
