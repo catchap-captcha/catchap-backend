@@ -617,6 +617,48 @@ def exam_state(
     return {"course_id": course_id, "title": c.title, **_exam_state(db, principal.id, course_id)}
 
 
+@router.get("/courses/{course_id}/exam/certificate")
+def exam_certificate(
+    course_id: str,
+    principal: Principal = Depends(require_student),
+    db: Session = Depends(get_db),
+):
+    """수료증 데이터 — 실제 수료한 학생에게만 발급(위조 방지).
+
+    수료증 이미지·PDF는 프론트에서 캔버스로 그리지만, **그 근거 데이터는 서버가 수료 사실을
+    검증한 뒤에만 내려준다.** 이렇게 나눠야 미수료 학생이 클라이언트에서 값을 지어내 위조하는
+    걸 막는다(수료 여부·수료일·문항수는 course_completions가 유일 원천). 학생 대면 산출물이라
+    실명이 아니라 nickname(가명)을 싣는다 — 이 코드베이스의 학생 화면 규약(실명은 교사·기관
+    화면 전용). serial은 completion.id에서 결정적으로 파생해 재발급해도 같은 번호가 나온다."""
+    from app.models import Course, User
+
+    c = db.get(Course, course_id)
+    if c is None or c.status != "active":
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="코스를 찾을 수 없습니다.")
+    completion = _completion(db, principal.id, course_id)
+    if completion is None:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            detail="아직 이 코스를 수료하지 않았어요. 모든 시험 문항을 정복하면 수료증이 발급돼요.",
+        )
+    instructor = db.get(User, c.instructor_id) if c.instructor_id else None
+    return {
+        "course_id": course_id,
+        "course_title": c.title,
+        "subject": c.subject,
+        # 학생 화면 규약 — 실명 대신 가명(nickname). 학생 계정은 nickname이 항상 존재한다.
+        "student_name": principal.student.nickname if principal.student else "",
+        # 강사가 삭제됐어도 수료증은 유효 — 발급 주체를 서비스명으로 폴백(수료 사실은 불변).
+        "instructor_name": instructor.name if instructor else "CatChap",
+        "passed_at": completion.passed_at.isoformat(),
+        "perfect": bool(completion.perfect),
+        "question_count": completion.question_count,
+        "sittings_count": completion.sittings_count,
+        # 검증용 일련번호 — completion.id에서 결정적 파생(재발급해도 동일). 위·변조 대조용.
+        "serial": "CATCHAP-" + completion.id.replace("-", "")[:12].upper(),
+    }
+
+
 def _shuffled_sitting(student_id: str, course_id: str, picked: list) -> CourseExamSitting:
     """회차 생성 헬퍼 — 문항별 보기 셔플 순열을 서버에 보관(표시 위치 → 원본 인덱스)."""
     return CourseExamSitting(

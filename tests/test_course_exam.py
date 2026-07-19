@@ -434,6 +434,52 @@ def test_courses_exam_summary_passed_at(client, db, seed_org):
     assert ex2["last_activity_at"]  # 진행 중 칸 최신순 정렬 근거(제출로 시험 활동 생김)
 
 
+def test_certificate_only_after_completion(client, db, seed_org):
+    """수료증 데이터는 실제 수료한 학생만 받는다(위조 방지) — 미수료 404, 수료 후 200.
+
+    수료증 이미지는 프론트가 그리지만 근거 데이터는 서버가 수료를 검증한 뒤에만 준다.
+    학생 화면 규약대로 실명이 아니라 nickname을 싣고, 과목·수료일·문항수는 완료 스냅샷에서 온다."""
+    tok = _ops(client, db)
+    stok = _student_token(client, seed_org)
+    course = _mk_course(client, tok, db, subject="수학", title="수학 개념완성")
+    lec = _assign_lecture(client, tok, course["id"])
+    _complete_lecture(db, seed_org["student"].id, lec["id"])
+    for i in range(2):
+        _add_exam_q(client, tok, course["id"], prompt=f"q{i}", options=["a", "b"], answer_indexes=[i % 2])
+
+    # 수료 전 → 404 (미수료 학생은 수료증 데이터를 못 받는다)
+    r = client.get(f"/api/v1/courses/{course['id']}/exam/certificate", headers=auth(stok))
+    assert r.status_code == 404
+
+    # 완벽 통과 수료
+    res = _submit_all_correct(client, stok, course["id"], db)
+    assert res["passed"] and res["perfect"]
+
+    # 수료 후 → 200, 서버가 검증한 데이터
+    r2 = client.get(f"/api/v1/courses/{course['id']}/exam/certificate", headers=auth(stok))
+    assert r2.status_code == 200, r2.text
+    cert = r2.json()
+    assert cert["course_title"] == "수학 개념완성" and cert["subject"] == "수학"
+    assert cert["student_name"] == seed_org["student"].nickname  # 실명 아님(가명)
+    assert cert["perfect"] is True and cert["question_count"] == 2
+    assert cert["passed_at"] and cert["serial"].startswith("CATCHAP-")
+
+
+def test_certificate_serial_stable(client, db, seed_org):
+    """일련번호는 completion.id에서 결정적 파생 — 재발급(재호출)해도 같은 번호(위·변조 대조용)."""
+    tok = _ops(client, db)
+    stok = _student_token(client, seed_org)
+    course = _mk_course(client, tok, db)
+    lec = _assign_lecture(client, tok, course["id"])
+    _complete_lecture(db, seed_org["student"].id, lec["id"])
+    _add_exam_q(client, tok, course["id"], prompt="q", options=["a", "b"], answer_indexes=[0])
+    _submit_all_correct(client, stok, course["id"], db)
+
+    a = client.get(f"/api/v1/courses/{course['id']}/exam/certificate", headers=auth(stok)).json()
+    b = client.get(f"/api/v1/courses/{course['id']}/exam/certificate", headers=auth(stok)).json()
+    assert a["serial"] == b["serial"] and len(a["serial"]) == len("CATCHAP-") + 12
+
+
 def test_metrics_isolation_no_learning_attempt(client, db, seed_org):
     """지표 격리(설계 §7) — 시험 응답은 LearningAttempt에 안 쌓인다(정답률 오염 방지)."""
     from app.models import LearningAttempt
