@@ -40,6 +40,7 @@ from app.models.lecture import (
     LectureCheckpointEvent,
     LectureMaterial,
     LectureQuestion,
+    LectureTranscript,
     LectureWatchProgress,
 )
 from app.models.membership import Invitation, Membership
@@ -115,6 +116,7 @@ __all__ = [
     "LectureCheckpointEvent",
     "LectureMaterial",
     "LectureQuestion",
+    "LectureTranscript",
     "LectureWatchProgress",
     "CaptchaStore",
     "LoginThrottle",

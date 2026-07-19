@@ -177,3 +177,27 @@ class LectureCheckpointEvent(Base, UUIDPk, Timestamps):
     lecture_id: Mapped[str] = mapped_column(CHAR(36), ForeignKey("lectures.id"), index=True)
     position_sec: Mapped[int] = mapped_column(default=0)
     result: Mapped[str] = mapped_column(String(20))  # passed|failed|exempted
+
+
+class LectureTranscript(Base, UUIDPk, Timestamps):
+    """강의 전사(자막) — LLM 문항 생성의 근거. 강사 제공(SRT/VTT/붙여넣기) 또는 자동 STT 결과.
+
+    왜 별도 테이블인가: 전사 JSON은 길 수 있는데(1시간 강의=수백 세그먼트), lectures 행은
+    목록 조회(학생 코스 목록·강사 강의 목록)에서 매번 SELECT된다 — 큰 컬럼을 lectures에
+    붙이면 그 목록들이 통째로 무거워진다. 1:1 분리로 lectures를 가볍게 유지하고, 전사는
+    문항 생성·자막 관리 때만 로드한다. 소프트 참조(FK 없음 — 라이브 덤프 collation 정합, 신규
+    모델 규약).
+
+    왜 이 기능(강사 제공 자막): 강사가 이미 정확한 자막(스크립트·전문 자막)을 가진 경우
+    Whisper 자동 STT를 다시 도는 건 (1) 품질 하락(자동 전사<원본 자막) (2) 비용·시간 낭비
+    (3) OpenAI 키 강제 (4) 25MB 한계로 긴 강의 실패. 강사 자막을 받으면 넷 다 해결된다.
+    자동 STT 결과도 여기 저장(source=stt)해 재생성 때 재전사하지 않는다."""
+
+    __tablename__ = "lecture_transcripts"
+    __table_args__ = (UniqueConstraint("lecture_id", name="uq_lecture_transcript"),)
+
+    lecture_id: Mapped[str] = mapped_column(CHAR(36), index=True)  # 소프트 참조(강의당 1개)
+    # 세그먼트 [{start, end, text}] — LLM(_prompt·_solve_prompt)이 먹는 포맷 그대로
+    segments: Mapped[list] = mapped_column(JSON, default=list)
+    source: Mapped[str] = mapped_column(String(20))  # srt|vtt|paste|stt
+    segment_count: Mapped[int] = mapped_column(default=0)  # 목록 배지용 비정규화(JSON 미로드)

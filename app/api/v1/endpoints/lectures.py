@@ -64,6 +64,7 @@ from app.models import (
     LectureCheckpointEvent,
     LectureMaterial,
     LectureQuestion,
+    LectureTranscript,
     LectureWatchProgress,
     User,
 )
@@ -2118,6 +2119,134 @@ def ops_delete_question_image(
     return _question_row(q)
 
 
+# -------------------------------------------------- 강사 제공 자막(전사) — 자동 STT 대체·캐시
+_TRANSCRIPT_MAX_BYTES = 2 * 1024 * 1024  # 자막 파일 상한(KB 규모라 넉넉)
+
+
+def _transcript_row(t: LectureTranscript | None) -> dict:
+    if t is None:
+        return {"has_transcript": False, "source": None, "segment_count": 0, "preview": [], "updated_at": None}
+    return {
+        "has_transcript": True,
+        "source": t.source,  # srt|vtt|paste|stt
+        "segment_count": int(t.segment_count or 0),
+        "preview": (t.segments or [])[:3],  # 앞 3개 미리보기(전체 로드 없이 확인)
+        "updated_at": t.updated_at.isoformat() if t.updated_at else None,
+    }
+
+
+def _upsert_transcript(db: Session, lecture_id: str, segments: list, source: str) -> LectureTranscript:
+    t = db.query(LectureTranscript).filter(LectureTranscript.lecture_id == lecture_id).first()
+    if t is None:
+        t = LectureTranscript(
+            lecture_id=lecture_id, segments=segments, source=source, segment_count=len(segments)
+        )
+        db.add(t)
+    else:
+        t.segments = segments
+        t.source = source
+        t.segment_count = len(segments)
+    db.flush()
+    return t
+
+
+@router.get("/ops/lectures/{lecture_id}/transcript")
+def ops_get_transcript(
+    lecture_id: str,
+    principal: Principal = Depends(require_lecture_manager),
+    db: Session = Depends(get_db),
+):
+    """강의 전사 상태 — 있으면 출처(강사 자막/자동 STT)·세그먼트 수·앞 3개 미리보기."""
+    lec = _get_ops_lecture(db, lecture_id, principal)
+    t = db.query(LectureTranscript).filter(LectureTranscript.lecture_id == lec.id).first()
+    return _transcript_row(t)
+
+
+class _TranscriptReq(BaseModel):
+    content: str
+    format: str = "auto"  # auto|srt|vtt|paste
+
+
+@router.put("/ops/lectures/{lecture_id}/transcript")
+def ops_put_transcript(
+    lecture_id: str,
+    req: _TranscriptReq,
+    principal: Principal = Depends(require_lecture_manager),
+    db: Session = Depends(get_db),
+):
+    """강사 제공 자막 저장(붙여넣기/텍스트) — 파싱 성공해야 저장(빈 자막 400).
+
+    저장되면 문항 생성이 자동 STT 대신 이 자막을 쓴다(품질↑·비용↓·OpenAI 키·25MB 한계 우회)."""
+    from app.services.transcript_parser import TranscriptParseError, parse_transcript
+
+    lec = _get_ops_lecture(db, lecture_id, principal)
+    try:
+        segs = parse_transcript(req.content, req.format)
+    except TranscriptParseError as e:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=str(e))
+    src = req.format.lower() if req.format.lower() in ("srt", "vtt") else "paste"
+    t = _upsert_transcript(db, lec.id, segs, src)
+    audit(db, action="lecture.transcript.set", actor_user_id=principal.id,
+          target_type="lecture", target_id=lec.id, after={"source": src, "segments": len(segs)})
+    db.commit()
+    return _transcript_row(t)
+
+
+@router.post("/ops/lectures/{lecture_id}/transcript/upload")
+async def ops_upload_transcript(
+    lecture_id: str,
+    file: UploadFile = File(...),
+    principal: Principal = Depends(require_lecture_manager),
+    db: Session = Depends(get_db),
+):
+    """SRT/VTT 자막 파일 업로드 → 파싱해 저장. 확장자로 형식 판별(.vtt / .srt / 그 외 auto)."""
+    from app.services.transcript_parser import TranscriptParseError, parse_transcript
+
+    lec = _get_ops_lecture(db, lecture_id, principal)
+    raw = await file.read()
+    if len(raw) > _TRANSCRIPT_MAX_BYTES:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="자막 파일이 너무 커요(2MB 이하).")
+    try:
+        text = raw.decode("utf-8-sig")  # BOM 허용
+    except UnicodeDecodeError:
+        try:
+            text = raw.decode("cp949")  # 한글 윈도우 자막 폴백
+        except UnicodeDecodeError:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST, detail="자막 파일 인코딩을 읽을 수 없어요(UTF-8 권장)."
+            )
+    name = (file.filename or "").lower()
+    fmt = "vtt" if name.endswith(".vtt") else ("srt" if name.endswith(".srt") else "auto")
+    try:
+        segs = parse_transcript(text, fmt)
+    except TranscriptParseError as e:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=str(e))
+    src = "vtt" if fmt == "vtt" else "srt"
+    t = _upsert_transcript(db, lec.id, segs, src)
+    audit(db, action="lecture.transcript.upload", actor_user_id=principal.id,
+          target_type="lecture", target_id=lec.id,
+          after={"source": src, "segments": len(segs), "file": name[:80]})
+    db.commit()
+    return _transcript_row(t)
+
+
+@router.delete("/ops/lectures/{lecture_id}/transcript")
+def ops_delete_transcript(
+    lecture_id: str,
+    principal: Principal = Depends(require_lecture_manager),
+    db: Session = Depends(get_db),
+):
+    """강의 전사 삭제 — 다음 생성부터 자동 STT로 되돌아간다."""
+    lec = _get_ops_lecture(db, lecture_id, principal)
+    t = db.query(LectureTranscript).filter(LectureTranscript.lecture_id == lec.id).first()
+    if t is not None:
+        db.delete(t)
+        audit(db, action="lecture.transcript.delete", actor_user_id=principal.id,
+              target_type="lecture", target_id=lec.id, after=None)
+        db.commit()
+    return {"ok": True}
+
+
 class _GenerateReq(BaseModel):
     n: int = 5
 
@@ -2176,14 +2305,24 @@ def ops_generate_questions(
         if config_id:
             ai_models_service.record_usage(db, config_id, tokens_in, tokens_out)
 
+    # 전사 우선순위: 강사 제공 자막(저장됨) > 자동 STT. 저장된 전사가 있으면 STT를 건너뛴다
+    # (강사 자막이 품질↑·비용↓·OpenAI 키·25MB 한계 우회). 없을 때만 자동 STT하고, 그 결과를
+    # 저장해 재생성 시 재전사하지 않는다(현재의 '매 생성 재STT' 낭비도 함께 해결).
     transcript: list[dict] | None = None
-    if openai_key:  # STT(Whisper)도 같은 OpenAI 키를 쓴다
+    transcript_source: str | None = None
+    stored_t = db.query(LectureTranscript).filter(LectureTranscript.lecture_id == lec.id).first()
+    if stored_t and stored_t.segments:
+        transcript = stored_t.segments
+        transcript_source = stored_t.source
+    elif openai_key:  # STT(Whisper) — 강사 자막이 없을 때만. 같은 OpenAI 키 사용
         try:
             transcript = transcribe_video(_video_path(lec), api_key=openai_key)
         except SttError as e:
             raise HTTPException(
                 status.HTTP_502_BAD_GATEWAY, detail=f"강의 음성 전사(STT)에 실패했습니다: {e}"
             )
+        transcript_source = "stt"
+        _upsert_transcript(db, lec.id, transcript, "stt")  # 캐시 — 다음 생성 때 재전사 방지
 
     try:
         items = generate_lecture_questions(
@@ -2290,6 +2429,8 @@ def ops_generate_questions(
         "created": len(created),
         # 전사 사용 여부를 정직하게 노출 — STT 미설정이면 콘솔이 '메타 기반 생성'임을 안내
         "transcript_used": transcript is not None,
+        # 전사 출처: 강사 자막(srt/vtt/paste) · 자동 STT(stt) · 없음(None) — 콘솔 안내용
+        "transcript_source": transcript_source,
         # 자기검증 요약 — captcha(강의 의존)/bank(상식)/discard(불량 의심). 미판정이면 verify_error.
         "self_verified": verdicts is not None,
         "bank_candidates": counts["bank"] if verdicts is not None else None,
