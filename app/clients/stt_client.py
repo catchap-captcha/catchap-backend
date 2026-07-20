@@ -15,6 +15,8 @@ import httpx
 _API_URL = "https://api.openai.com/v1/audio/transcriptions"
 _MODEL = "whisper-1"  # verbose_json(세그먼트 타임스탬프)을 지원하는 안정 모델
 _TIMEOUT_SEC = 300.0  # 수십 분짜리 강의 오디오 전사 여유
+# 자체 워커는 GPU라도 대용량 영상은 수 분 걸릴 수 있어 넉넉히(25MB 한계가 없어 큰 영상도 옴)
+_WORKER_TIMEOUT_SEC = 1800.0
 # Whisper API 업로드 상한(공식 25MB) — 넘으면 서버가 413을 주지만, 왕복 전에
 # 정직하게 거절해 운영자에게 원인(파일 크기)을 바로 알린다.
 _MAX_UPLOAD_BYTES = 25 * 1024 * 1024
@@ -86,3 +88,62 @@ def transcribe_video(path: Path, *, api_key: str) -> list[dict]:
     if not out:
         raise SttError("STT 전사 결과가 비어 있습니다(유효한 발화 세그먼트 없음).")
     return out
+
+
+def transcribe_via_worker(path: Path, *, worker_url: str, worker_token: str = "") -> list[dict]:
+    """자체 호스팅 faster-whisper 워커로 전사 → [{start, end, text}] (OpenAI 경로와 동일 형태).
+
+    stt-worker/(GPU·faster-whisper)로 영상을 그대로 POST한다. OpenAI와 달리 25MB 상한이 없고
+    과금이 없다. 반환 형태·예외(SttError)는 transcribe_video와 같아, 호출부는 소스를 모른 채
+    동일하게 쓴다. 빈 결과는 SttError — 가짜 성공 금지."""
+    url = (worker_url or "").strip().rstrip("/")
+    if not url:
+        raise SttNotConfiguredError("STT 워커 URL(STT_WORKER_URL)이 설정되지 않았습니다.")
+    if not path.is_file():
+        raise SttError(f"강의 영상 파일을 찾을 수 없습니다: {path.name}")
+    media_type = _MEDIA_TYPES.get(path.suffix.lower(), "application/octet-stream")
+    try:
+        with open(path, "rb") as f:
+            resp = httpx.post(
+                f"{url}/transcribe",
+                params={"language": "ko"},
+                headers={"X-Worker-Token": worker_token or ""},
+                files={"file": (path.name, f, media_type)},
+                timeout=_WORKER_TIMEOUT_SEC,
+            )
+    except httpx.HTTPError as e:
+        raise SttError(f"STT 워커 호출 실패(네트워크): {e}") from e
+    if resp.status_code != 200:
+        raise SttError(f"STT 워커 오류(HTTP {resp.status_code}): {resp.text[:300]}")
+    body = resp.json()
+    segments = body.get("segments")
+    if not isinstance(segments, list) or not segments:
+        raise SttError("STT 워커 응답에 전사 세그먼트가 없습니다(무음 영상이거나 전사 실패).")
+    out: list[dict] = []
+    for seg in segments:  # 워커가 정규화해 주지만 방어적으로 재검증
+        text = str(seg.get("text") or "").strip()
+        if not text:
+            continue
+        try:
+            start = max(0.0, float(seg.get("start", 0)))
+            end = max(start, float(seg.get("end", start)))
+        except (TypeError, ValueError):
+            continue
+        out.append({"start": round(start, 2), "end": round(end, 2), "text": text})
+    if not out:
+        raise SttError("STT 워커 전사 결과가 비어 있습니다(유효한 발화 세그먼트 없음).")
+    return out
+
+
+def transcribe_lecture(
+    path: Path, *, worker_url: str = "", worker_token: str = "", api_key: str = ""
+) -> list[dict]:
+    """전사 라우터 — 자체 워커가 설정되면 워커(무료·GPU·자사), 아니면 OpenAI(폴백).
+
+    우선순위: STT_WORKER_URL > OpenAI 키. 둘 다 없으면 SttNotConfiguredError. 반환 형태·예외는
+    두 경로가 동일하므로 호출부는 이 함수 하나만 부르면 된다(소스 분기 불필요)."""
+    if (worker_url or "").strip():
+        return transcribe_via_worker(path, worker_url=worker_url, worker_token=worker_token)
+    if (api_key or "").strip():
+        return transcribe_video(path, api_key=api_key)
+    raise SttNotConfiguredError("STT 워커(STT_WORKER_URL)도 OpenAI 키도 설정되지 않았습니다.")

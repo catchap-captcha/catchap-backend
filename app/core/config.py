@@ -62,6 +62,10 @@ class Settings(BaseSettings):
     ANTHROPIC_API_KEY: str = ""
     # STT(OpenAI Whisper) — 강의 음성 전사. 운영 콘솔 입력(DB)이 우선이고 이건 폴백.
     OPENAI_API_KEY: str = ""
+    # 자체 호스팅 STT 워커(faster-whisper on GPU) — 설정되면 OpenAI 대신 이 워커로 전사한다
+    # (과금 0·25MB 한계 없음·오디오 사내 보관). 비면 OpenAI 경로로 폴백(하위호환). stt-worker/ 참고.
+    STT_WORKER_URL: str = ""
+    STT_WORKER_TOKEN: str = ""  # 워커 인증 공유 시크릿(X-Worker-Token)
     LLM_MODEL: str = "claude-opus-4-8"
 
     ENV: str = "dev"

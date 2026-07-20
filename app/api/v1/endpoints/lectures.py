@@ -2294,7 +2294,7 @@ def ops_generate_questions(
         generate_lecture_questions,
         verify_questions,
     )
-    from app.clients.stt_client import SttError, transcribe_video
+    from app.clients.stt_client import SttError, transcribe_lecture
     from app.services import ai_models_service, settings_service
 
     lec = _get_ops_lecture(db, lecture_id, principal)
@@ -2328,15 +2328,23 @@ def ops_generate_questions(
     # 전사 우선순위: 강사 제공 자막(저장됨) > 자동 STT. 저장된 전사가 있으면 STT를 건너뛴다
     # (강사 자막이 품질↑·비용↓·OpenAI 키·25MB 한계 우회). 없을 때만 자동 STT하고, 그 결과를
     # 저장해 재생성 시 재전사하지 않는다(현재의 '매 생성 재STT' 낭비도 함께 해결).
+    # 전사 소스 우선순위: 자체 STT 워커(faster-whisper·무료·GPU) > OpenAI Whisper(폴백·유료).
+    # STT_WORKER_URL이 설정돼 있으면 워커를, 아니면 OpenAI 키를 쓴다(stt_client.transcribe_lecture).
+    stt_worker_url = get_settings().STT_WORKER_URL
     transcript: list[dict] | None = None
     transcript_source: str | None = None
     stored_t = db.query(LectureTranscript).filter(LectureTranscript.lecture_id == lec.id).first()
     if stored_t and stored_t.segments:
         transcript = stored_t.segments
         transcript_source = stored_t.source
-    elif openai_key:  # STT(Whisper) — 강사 자막이 없을 때만. 같은 OpenAI 키 사용
+    elif stt_worker_url or openai_key:  # STT — 강사 자막이 없을 때만(워커 우선, 없으면 OpenAI)
         try:
-            transcript = transcribe_video(_video_path(lec), api_key=openai_key)
+            transcript = transcribe_lecture(
+                _video_path(lec),
+                worker_url=stt_worker_url,
+                worker_token=get_settings().STT_WORKER_TOKEN,
+                api_key=openai_key,
+            )
         except SttError as e:
             raise HTTPException(
                 status.HTTP_502_BAD_GATEWAY, detail=f"강의 음성 전사(STT)에 실패했습니다: {e}"
