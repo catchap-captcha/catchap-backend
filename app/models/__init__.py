@@ -28,6 +28,7 @@ from app.models.learning import (
 )
 from app.models.ai_model_config import AiModelConfig
 from app.models.server_metric import ServerMetric
+from app.models.server_metric_sample import ServerMetricSample
 from app.models.course_exam import (
     CourseCompletion,
     CourseExamAttempt,
@@ -78,6 +79,7 @@ from app.models.user import User
 __all__ = [
     "AiModelConfig",
     "ServerMetric",
+    "ServerMetricSample",
     "AiPrediction",
     "ApiKey",
     "ApiUsageLog",

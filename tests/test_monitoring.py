@@ -14,6 +14,13 @@ def test_monitoring_dashboard_ops_only(client, db):
     # 백엔드는 요청 시 self-collect(psutil) — no_data가 아니고 실측값이 있어야
     be = next(s for s in body["servers"] if s["server_key"] == "backend")
     assert be["no_data"] is False and be["cpu_cores"] >= 1 and be["mem_total_mb"] > 0
+    # 추이(그래프) — self-collect가 표본을 append하므로 이력이 최소 1점 있어야
+    assert "history" in be and len(be["history"]["cpu"]) >= 1
+    # 두 번째 호출이면 표본이 하나 더 쌓인다(append-only 시계열)
+    n1 = len(be["history"]["cpu"])
+    be2 = next(s for s in client.get("/api/v1/ops/monitoring", headers=auth(otok)).json()["servers"]
+               if s["server_key"] == "backend")
+    assert len(be2["history"]["cpu"]) >= n1 + 1
     # LLM 집계 필드 존재
     assert "est_cost_usd" in body["llm"] and "providers" in body["llm"]
     # 비운영자(강사)는 403

@@ -9,7 +9,7 @@
 설계 주석(팀 학습용): push-based node metrics. 최신 1행/서버(현황판) — 시계열/추이는 v2.
 """
 
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends, Header, HTTPException, status
 from pydantic import BaseModel
@@ -18,10 +18,13 @@ from sqlalchemy.orm import Session
 from app.core.config import get_settings
 from app.core.permissions import Principal, require_ops
 from app.db.session import get_db
-from app.models import AiModelConfig, ServerMetric
+from app.models import AiModelConfig, ServerMetric, ServerMetricSample
 from app.services import host_metrics
 
 router = APIRouter()
+
+RETENTION_HOURS = 6  # 표본 보존창 — 그 밖은 인제스트/self-collect 때 정리(단기 추이가 목적)
+HISTORY_POINTS = 60  # 그래프에 내릴 최대 표본 수(초과분은 균등 다운샘플)
 
 # 대시보드가 보여줄 '기대 서버' — 데이터가 아직 없어도 카드로 노출(미수집 표시). CatChap 5대 VM.
 EXPECTED_SERVERS: list[tuple[str, str]] = [
@@ -62,7 +65,7 @@ _METRIC_FIELDS = (
 
 
 def _upsert(db: Session, snap: dict) -> ServerMetric:
-    """server_key 기준 upsert — 같은 서버가 다시 오면 최신값으로 덮어쓴다(최신 1행/서버)."""
+    """server_key 기준 upsert(최신 1행) + 시계열 표본 append(추이 그래프)."""
     key = snap["server_key"]
     row = db.query(ServerMetric).filter(ServerMetric.server_key == key).first()
     if row is None:
@@ -71,9 +74,46 @@ def _upsert(db: Session, snap: dict) -> ServerMetric:
     for f in _METRIC_FIELDS:
         if f in snap and snap[f] is not None:
             setattr(row, f, snap[f])
+    ts = snap.get("collected_at") or datetime.now()
     if snap.get("collected_at") is None:
-        row.collected_at = datetime.now()
+        row.collected_at = ts
+    # 추이용 표본 1개 append(가벼운 3지표만)
+    db.add(ServerMetricSample(
+        server_key=key,
+        cpu_pct=float(snap.get("cpu_pct") or 0.0),
+        mem_pct=float(snap.get("mem_pct") or 0.0),
+        gpu_util_pct=snap.get("gpu_util_pct"),
+        collected_at=ts,
+    ))
     return row
+
+
+def _prune(db: Session) -> None:
+    """보존창 밖 표본 정리 — 무한 증가 방지(현황+단기 추이만 유지)."""
+    cutoff = datetime.now() - timedelta(hours=RETENTION_HOURS)
+    db.query(ServerMetricSample).filter(ServerMetricSample.collected_at < cutoff).delete(
+        synchronize_session=False
+    )
+
+
+def _history(db: Session, server_key: str) -> dict:
+    """서버별 최근 표본을 그래프용 배열로 — HISTORY_POINTS 초과 시 균등 다운샘플."""
+    cutoff = datetime.now() - timedelta(hours=RETENTION_HOURS)
+    rows = (
+        db.query(ServerMetricSample)
+        .filter(ServerMetricSample.server_key == server_key, ServerMetricSample.collected_at >= cutoff)
+        .order_by(ServerMetricSample.collected_at)
+        .all()
+    )
+    if len(rows) > HISTORY_POINTS:
+        step = len(rows) / HISTORY_POINTS
+        rows = [rows[int(i * step)] for i in range(HISTORY_POINTS)]
+    return {
+        "t": [r.collected_at.isoformat(timespec="seconds") for r in rows],
+        "cpu": [round(r.cpu_pct, 1) for r in rows],
+        "mem": [round(r.mem_pct, 1) for r in rows],
+        "gpu": [round(r.gpu_util_pct, 1) if r.gpu_util_pct is not None else None for r in rows],
+    }
 
 
 @router.post("/internal/metrics")
@@ -90,6 +130,7 @@ def ingest_metrics(
     if not secret or x_metrics_token != secret:
         raise HTTPException(status.HTTP_403_FORBIDDEN, detail="메트릭 인제스트 인증 실패")
     _upsert(db, payload.model_dump())
+    _prune(db)
     db.commit()
     return {"ok": True}
 
@@ -131,9 +172,10 @@ def ops_monitoring(
 
     백엔드 자신은 요청 시 psutil로 즉시 측정해 upsert(항상 신선). 다른 서버는 에이전트가
     밀어넣은 최신값(없으면 no_data). LLM은 AiModelConfig 누적 토큰×단가로 추정 비용 집계."""
-    # 백엔드 self-collect — 에이전트 없이도 이 서버는 실데이터
+    # 백엔드 self-collect — 에이전트 없이도 이 서버는 실데이터(+표본 append로 추이가 쌓인다)
     try:
         _upsert(db, host_metrics.collect("backend", "백엔드 API", host="self"))
+        _prune(db)
         db.commit()
     except Exception:
         db.rollback()  # 측정 실패해도 대시보드 자체는 나머지로 뜬다(정직: 백엔드가 no_data로 보일 수 있음)
@@ -143,6 +185,10 @@ def ops_monitoring(
     # 기대 목록에 없는 추가 서버도 뒤에 붙인다(확장성)
     extra = [k for k in rows if k not in {k for k, _ in EXPECTED_SERVERS}]
     servers += [_row_out(rows[k], k, rows[k].label) for k in extra]
+    # 서버별 추이(그래프용) — 데이터 있는 서버에만
+    for s in servers:
+        if not s.get("no_data"):
+            s["history"] = _history(db, s["server_key"])
 
     # LLM 사용량·비용 — 모델별 누적 토큰 × 공시 단가($/1M). 실비용 아닌 운영 참고 추정치.
     models = db.query(AiModelConfig).all()
