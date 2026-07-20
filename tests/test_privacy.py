@@ -93,30 +93,3 @@ def test_anonymize_blocks_login(client, db, seed_org):
     assert login.status_code != 200
 
 
-def test_anonymize_purges_scratch_originals(db, seed_org):
-    """탈퇴 익명화 시 필기 원본(strokes) 파기 — 단 보존 동의(consent_retain) 레코드는 유지."""
-    from app.models import ScratchRecord
-    from app.services.privacy_service import anonymize_student
-
-    s = seed_org["student"]
-    r_purge = ScratchRecord(
-        student_id=s.id, organization_id=s.organization_id, subject="수학", content_id="m1",
-        strokes=[{"color": "#000", "width": 4, "points": [[0, 0.1, 0.2]]}], stroke_count=1,
-        consent_retain=False,
-    )
-    r_keep = ScratchRecord(
-        student_id=s.id, organization_id=s.organization_id, subject="국어", content_id="k1",
-        strokes=[{"color": "#000", "width": 4, "points": [[0, 0.3, 0.4]]}], stroke_count=1,
-        consent_retain=True,
-    )
-    db.add_all([r_purge, r_keep])
-    db.commit()
-
-    assert anonymize_student(db, s) is True
-    db.commit()
-    db.refresh(r_purge)
-    db.refresh(r_keep)
-    # 미동의 → 원본 파기(strokes 빈 값·purged), 집계 지표(stroke_count)는 남는다
-    assert r_purge.purged is True and r_purge.strokes == [] and r_purge.stroke_count == 1
-    # 보존 동의 → 원본 유지
-    assert r_keep.purged is False and len(r_keep.strokes) == 1

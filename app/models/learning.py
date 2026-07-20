@@ -261,34 +261,6 @@ class BehaviorTrace(Base, UUIDPk, Timestamps):
     box_h: Mapped[int] = mapped_column(default=0)
 
 
-class ScratchRecord(Base, UUIDPk, Timestamps):
-    """연습장 필기 원본 — 학습 인사이트(본인·교사·보호자 재생). 아동 필적이라 민감 개인정보다.
-
-    - strokes: [{color, width, points: [[t_ms, x, y], ...]}, ...] — JSON, 저장 제한 없음
-      (원본 보존 방침 — 아이가 아무리 많이 그어도 다 저장). content_id·과목별로 조회.
-    - 집계 지표(stroke_count·distance_px·first_write_ms·draw_ms)는 운영자 익명 집계·봇 신호용.
-    - consent_retain: 보호자 '원본 보존 동의'. True면 탈퇴 후에도 원본 유지, False(기본)면
-      탈퇴/보존기한 시 원본(strokes) 파기(집계 지표만 익명 보존). 필적은 익명화 불가하므로.
-    """
-
-    __tablename__ = "scratch_records"
-
-    student_id: Mapped[str] = mapped_column(
-        CHAR(36), ForeignKey("student_profiles.id"), index=True
-    )
-    organization_id: Mapped[str | None] = mapped_column(CHAR(36), index=True, nullable=True)
-    subject: Mapped[str] = mapped_column(String(20), index=True)
-    content_id: Mapped[str | None] = mapped_column(String(80), index=True, nullable=True)
-    strokes: Mapped[list] = mapped_column(JSON, default=list)
-    stroke_count: Mapped[int] = mapped_column(default=0)
-    distance_px: Mapped[int] = mapped_column(default=0)
-    first_write_ms: Mapped[int] = mapped_column(default=0)
-    draw_ms: Mapped[int] = mapped_column(default=0)
-    # 원본 파기 여부 — 탈퇴/보존기한으로 원본(strokes)을 지웠으면 True(집계 지표는 남김).
-    purged: Mapped[bool] = mapped_column(default=False)
-    consent_retain: Mapped[bool] = mapped_column(default=False)
-
-
 class ConceptRead(Base, UUIDPk, Timestamps):
     """개념설명 읽음 상태 (localStorage → 서버 동기화)"""
 

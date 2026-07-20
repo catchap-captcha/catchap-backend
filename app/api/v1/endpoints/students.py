@@ -242,8 +242,6 @@ def wrong_notes(
         "summary": {"total": len(items), "by_category": by_cat},
         "tags": D.WRONG_TAGS,
     }
-# ---------------------------------------------------------------- 연습장 필기 재생 (본인)
-# ---------------------------------------------------------------- 배지
 # ---------------------------------------------------------------- 추천
 @router.get("/students/me/recommendations")
 def recommendations(

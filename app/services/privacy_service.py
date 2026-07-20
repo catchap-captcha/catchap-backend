@@ -30,26 +30,7 @@ def anonymize_student(db: Session, student: StudentProfile) -> bool:
     student.password_hash = ""  # 로그인 불가
     student.class_id = None  # 학급 명단에서 제외
     student.status = "disabled"
-    # 연습장 필기 원본 파기 — 필적은 익명화 불가(재식별 가능)라 탈퇴 시 원본을 삭제한다.
-    # 보존 동의(consent_retain)한 레코드는 유지, 집계 지표(획수·거리)는 익명 통계용으로 남긴다.
-    purge_scratch_originals(db, student.id)
     return True
-
-
-def purge_scratch_originals(db: Session, student_id: str) -> int:
-    """필기 원본(strokes) 파기 — 보존 동의 없는(consent_retain=False) 미파기 레코드의 원본을
-    비우고 purged=True로. 집계 지표는 남긴다. 파기 건수 반환(멱등: 이미 파기/보존은 제외)."""
-    from app.models import ScratchRecord
-
-    return (
-        db.query(ScratchRecord)
-        .filter(
-            ScratchRecord.student_id == student_id,
-            ScratchRecord.consent_retain.is_(False),
-            ScratchRecord.purged.is_(False),
-        )
-        .update({ScratchRecord.strokes: [], ScratchRecord.purged: True}, synchronize_session=False)
-    )
 
 
 def anonymize_user(db: Session, user: User) -> bool:
@@ -118,8 +99,7 @@ def purge_minor_students(db: Session) -> int:
 
     (사용자 결정 0716·실행 승인 0718.) 행동데이터는 절대 삭제하지 않는다 —
     anonymize_student는 학습기록·behavior_summaries를 건드리지 않고(soft ref 유지),
-    기존 축적분은 성인(팀원) 생성이라 actor_band='adult'로 태깅된 채 계속 사용한다.
-    필기 원본만 보존 동의 없는 것에 한해 파기된다(기존 정책 그대로)."""
+    기존 축적분은 성인(팀원) 생성이라 actor_band='adult'로 태깅된 채 계속 사용한다."""
     n = 0
     for s in find_minor_students(db):
         if anonymize_student(db, s):
