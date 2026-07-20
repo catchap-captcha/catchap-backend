@@ -33,6 +33,11 @@
   기계 + 간격 반복(SRS)·"오늘의 큐"·세트 단위·20주 챕터의 한계와 코스 기반 재편.
 - **[onboarding-security-design.md](onboarding-security-design.md)** — 가입·코드 보안 설계.
 - **[BEHAVIOR_DATA.md](BEHAVIOR_DATA.md)** — 행동 데이터 수집·의미.
+- **[monitoring.md](monitoring.md)** — 서버 모니터링(자원·GPU·LLM + 임계 경보). 왜 push
+  기반·최신 1행/서버인지, 에이전트 배포(systemd)·실시간성·부하, 임계(CRIT) 기준.
+- **[privacy-anonymization-runbook.md](privacy-anonymization-runbook.md)** — ★운영자 제외
+  전원 익명화·탈퇴 런북. 행동데이터 절대 보존(4테이블 불변식), 백업→복원→배포(head)→실행
+  순서, 프로덕션이 코드보다 뒤처져 있어 익명화 전 마이그레이션 선행이 필요한 이유.
 
 ## 레퍼런스 (무엇이 있는가)
 
