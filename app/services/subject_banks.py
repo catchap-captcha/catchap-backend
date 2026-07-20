@@ -168,6 +168,20 @@ def refresh_from_db(db=None) -> bool:
     return True
 
 
+def is_live(subject: str) -> bool:
+    """지금 은행에 문항이 있는 과목인가 — 동적 판정(BANKS는 refresh_from_db가 제자리 갱신).
+
+    LIVE_SUBJECTS는 임포트 시 1회 고정이라, 강의→은행 배치로 과목이 재편돼도 재기동 전까지
+    새 과목을 못 받는다. 서빙·채점의 과목 검증은 하드코딩 6과목도, 고정 스냅샷도 아닌 이
+    동적 판정을 써야 '과목 재편'이 코드 수정 없이 반영된다."""
+    return subject in BANKS
+
+
+def live_subjects() -> list[str]:
+    """지금 은행에 있는 과목들(정렬) — q-today 등이 하드코딩 6과목 대신 이걸 순회한다."""
+    return sorted(BANKS.keys())
+
+
 def get_question(subject: str, qid: str) -> dict | None:
     """과목 스코프 문항 조회 — 타 과목 문항 id로 교차 제출하는 위조를 차단한다."""
     return _BY_ID.get(subject, {}).get(qid)

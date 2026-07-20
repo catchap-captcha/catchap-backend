@@ -309,9 +309,9 @@ def q_today(
     stats = bank_mode.q_daily_stats(db, me.id)
     subjects = []
     total_due = total_wrong = total_new = 0
-    for subject in D.SUBJECT_ORDER:
-        if subject not in subject_banks.LIVE_SUBJECTS:
-            continue
+    # 과목은 하드코딩 6개가 아니라 '은행에 실제로 있는 과목'(동적)을 돈다 — 어학·자격증 등
+    # 어떤 과목 재편도 코드 수정 없이 반영된다(과목 = 코스가 declare한 자유 라벨).
+    for subject in subject_banks.live_subjects():
         st = bank_mode.queue_status(db, me, subject)
         subjects.append({"subject": subject, **st, "meta": D.SUBJECT_META.get(subject, {})})
         total_due += st["due"]
@@ -340,7 +340,10 @@ def save_attempt(
 def _apply_attempt(
     req: AttemptCreate, me: StudentProfile, db: Session, graded: bool = False
 ) -> dict:
-    if req.subject not in D.SUBJECT_ORDER:
+    # 과목 검증은 하드코딩 6개가 아니라 '은행에 실제로 있는 과목'(동적)으로 — 과목 재편(어학·자격증)
+    # 시에도 코드 수정 없이 채점된다.
+    from app.services import subject_banks
+    if not subject_banks.is_live(req.subject):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="알 수 없는 과목입니다.")
     attempt = LearningAttempt(
         organization_id=me.organization_id,
@@ -611,9 +614,8 @@ def chapter_session(
     from app.services import chapters as _ch
     from app.services import subject_banks
     me = _me(principal)
-    if subject not in D.SUBJECT_ORDER:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="알 수 없는 과목입니다.")
-    if subject not in subject_banks.LIVE_SUBJECTS:
+    # 과목 검증은 '은행에 실제로 있는 과목'(동적)만 — 하드코딩 6과목 게이트 제거(과목 재편 지원)
+    if not subject_banks.is_live(subject):
         return {"available": False, "subject": subject, "questions": []}
     mx = _ch.max_chapters(subject)
     if chapter > mx:
