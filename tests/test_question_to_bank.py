@@ -10,7 +10,7 @@ import contextlib
 from app.models import Question
 from app.services import subject_banks
 
-from tests.test_captcha_api import _ops, auth
+from tests.test_captcha_api import _instructor, _ops, auth
 from tests.test_lectures import _upload_lecture, media_dir  # noqa: F401 (fixture 재사용)
 
 
@@ -51,7 +51,7 @@ def _make_question(client, tok, lec_id, **over):
 def test_to_bank_converts_and_hot_reloads(client, db, media_dir):
     """행복 경로: 형식 변환(옵션 객체화·answer=옵션id·말미 order_no) + 런타임 즉시 반영 + 중복 409."""
     with _bank_state_guard():
-        tok = _ops(client, db)
+        tok = _instructor(client, db)
         lec = _upload_lecture(client, tok, title="별의 일생", subject="과학").json()
         q = _make_question(client, tok, lec["id"])
 
@@ -110,7 +110,7 @@ def test_to_bank_demotes_active_out_of_captcha_pool(client, db, media_dir):
     verdict='bank'(봇도 상식으로 풀림) 문항이 활성 캡차로 남으면 약한 검증이 되는
     구멍(skeptic 0718)을 막는다. 캡차 출제는 active만 대상이므로 draft 강등으로 충분."""
     with _bank_state_guard():
-        tok = _ops(client, db)
+        tok = _instructor(client, db)
         lec = _upload_lecture(client, tok, title="암석", subject="과학", duration=600).json()
         db.add(Question(id="sci-seed-3", subject="과학", type="single", order_no=1,
                         playable=True, payload={"id": "sci-seed-3", "type": "single",
@@ -137,7 +137,7 @@ def test_to_bank_demotes_active_out_of_captcha_pool(client, db, media_dir):
 def test_to_bank_rejects_unconvertible(client, db, media_dir):
     """은행 single 형식이 못 담는 문항은 정직한 400 — 다답형·이미지."""
     with _bank_state_guard():
-        tok = _ops(client, db)
+        tok = _instructor(client, db)
         lec = _upload_lecture(client, tok, title="지층", subject="과학").json()
         db.add(Question(id="sci-seed-2", subject="과학", type="single", order_no=1,
                         playable=True, payload={"id": "sci-seed-2", "type": "single",
@@ -173,7 +173,7 @@ def test_bank_lecture_question_gated_by_completion(client, db, seed_org, media_d
     from app.services import bank_mode
 
     with _bank_state_guard():
-        tok = _ops(client, db)
+        tok = _instructor(client, db)
         lec = _upload_lecture(client, tok, title="별의 일생", subject="과학").json()
         # 은행 시드(강의 무관) — 파일 폴백 409 회피 + '항상 열림' 대조군
         db.add(Question(id="sci-seed-g", subject="과학", type="single", order_no=1,
@@ -229,7 +229,7 @@ def test_course_q_scoped_and_gated(client, db, seed_org, media_dir):
     from tests.test_bank_mode import _first_party_key, _student_token
 
     with _bank_state_guard():
-        tok = _ops(client, db)
+        tok = _instructor(client, db)
         lec = _upload_lecture(client, tok, title="화산 활동", subject="과학", duration=600).json()
         # 코스 생성 + 강의 소속 — ops API 경유(코스=과목 고정 계약 그대로 태운다)
         crs = client.post(

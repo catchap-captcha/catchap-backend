@@ -49,7 +49,12 @@ def test_instructor_scope_own_lectures_only(client, db, media_dir):
         client, "inst2@catchap.dev", created["temp_password"]
     ).json()["access_token"]
 
-    ops_lec = _upload_lecture(client, ops_tok, title="운영자 강의").json()
+    # '남의 강의'는 다른 강사가 올린다 — 운영자는 저작(업로드)을 하지 않으므로(감독·검수만, 0720).
+    other = _create_instructor(client, ops_tok, email="inst2b@catchap.dev")
+    other_tok = _instructor_login(
+        client, "inst2b@catchap.dev", other["temp_password"]
+    ).json()["access_token"]
+    ops_lec = _upload_lecture(client, other_tok, title="다른 강사 강의").json()
     my_lec = _upload_lecture(client, inst_tok, title="강사 강의", subject="영어").json()
 
     # 목록: 강사=자기 것만, 운영자=전체
@@ -98,13 +103,65 @@ def test_instructor_scope_own_lectures_only(client, db, media_dir):
 
     assert db.get(Lecture, my_lec["id"]).uploaded_by == created["id"]
 
-    # 운영자는 강사 강의도 감독 가능(전체 스코프)
+    # 운영자는 감독·검수만(0720) — 강사 강의를 공개/숨김(status)은 할 수 있지만(모더레이션),
+    # 내용(제목 등)은 편집할 수 없다(403). 저작은 강사 전용.
+    assert (
+        client.put(
+            f"/api/v1/ops/lectures/{my_lec['id']}", json={"status": "hidden"}, headers=auth(ops_tok)
+        ).status_code
+        == 200
+    )
     assert (
         client.put(
             f"/api/v1/ops/lectures/{my_lec['id']}", json={"title": "운영자 개입"}, headers=auth(ops_tok)
         ).status_code
-        == 200
+        == 403
     )
+
+
+def test_ops_is_review_only_not_author(client, db, media_dir):
+    """★ops 권한 B(0720) — 운영자는 감독·검수만: 콘텐츠 저작(생성·업로드·문항)은 403,
+    조회는 가능(감독), 공개/숨김(status)은 가능하지만 내용 편집은 403(모더레이션만)."""
+    ops_tok = _ops(client, db)
+    created = _create_instructor(client, ops_tok, email="author-inst@catchap.dev")
+    itok = _instructor_login(
+        client, "author-inst@catchap.dev", created["temp_password"]
+    ).json()["access_token"]
+
+    # 강사가 저작(강의·코스·문항)
+    lec = _upload_lecture(client, itok, title="강사 강의").json()
+    course = client.post(
+        "/api/v1/ops/courses", json={"title": "강사 코스", "subject": "수학"}, headers=auth(itok)
+    ).json()
+
+    # 운영자 저작 시도 → 전부 403 (require_content_author = instructor 전용)
+    assert client.post(
+        "/api/v1/ops/courses", json={"title": "운영자 코스", "subject": "수학"}, headers=auth(ops_tok)
+    ).status_code == 403
+    assert _upload_lecture(client, ops_tok, title="운영자 강의").status_code == 403
+    assert client.post(
+        f"/api/v1/ops/lectures/{lec['id']}/questions",
+        json={"position_sec": 1, "prompt": "x", "options": ["a", "b"], "answer_index": 0},
+        headers=auth(ops_tok),
+    ).status_code == 403
+
+    # 운영자 조회는 가능(감독)
+    assert client.get("/api/v1/ops/lectures", headers=auth(ops_tok)).status_code == 200
+    assert client.get(f"/api/v1/ops/lectures/{lec['id']}/questions", headers=auth(ops_tok)).status_code == 200
+
+    # 운영자 모더레이션: 공개/숨김은 OK, 내용 편집은 403
+    assert client.put(
+        f"/api/v1/ops/lectures/{lec['id']}", json={"status": "hidden"}, headers=auth(ops_tok)
+    ).status_code == 200
+    assert client.put(
+        f"/api/v1/ops/lectures/{lec['id']}", json={"title": "편집"}, headers=auth(ops_tok)
+    ).status_code == 403
+    assert client.put(
+        f"/api/v1/ops/courses/{course['id']}", json={"status": "hidden"}, headers=auth(ops_tok)
+    ).status_code == 200
+    assert client.put(
+        f"/api/v1/ops/courses/{course['id']}", json={"title": "편집"}, headers=auth(ops_tok)
+    ).status_code == 403
 
 
 def test_disabled_instructor_cannot_login(client, db):

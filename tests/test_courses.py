@@ -3,7 +3,7 @@
 설계: docs/product-direction.md(코스=과목 고정), 강사 스코프는 test_instructor와 동일 규약.
 """
 
-from tests.test_captcha_api import _ops, auth
+from tests.test_captcha_api import _instructor, _ops, auth
 from tests.test_instructor import _create_instructor, _instructor_login
 from tests.test_lectures import _student_token, _upload_lecture, media_dir  # noqa: F401 (fixture 재사용)
 
@@ -15,7 +15,7 @@ def _create_course(client, tok, *, title="수학 기초반", subject="수학"):
 
 
 def test_course_crud_and_subject_fixed(client, db, media_dir):
-    ops = _ops(client, db)
+    ops = _instructor(client, db)
     c = _create_course(client, ops, title="수학 기초반", subject="수학")
     assert c["subject"] == "수학" and c["lecture_count"] == 0
 
@@ -37,7 +37,10 @@ def test_course_scope_instructor_owns_only(client, db, media_dir):
     created = _create_instructor(client, ops, email="c-inst@catchap.dev")
     itok = _instructor_login(client, "c-inst@catchap.dev", created["temp_password"]).json()["access_token"]
 
-    ops_course = _create_course(client, ops, title="운영자 코스", subject="과학")
+    # '남의 코스'는 다른 강사가 만든다 — 운영자는 저작하지 않으므로(감독·검수만, 0720).
+    other = _create_instructor(client, ops, email="c-inst-b@catchap.dev")
+    otok = _instructor_login(client, "c-inst-b@catchap.dev", other["temp_password"]).json()["access_token"]
+    ops_course = _create_course(client, otok, title="다른 강사 코스", subject="과학")
     my_course = _create_course(client, itok, title="강사 코스", subject="영어")
 
     # 목록: 강사=자기 것만, 운영자=전체
@@ -54,7 +57,7 @@ def test_course_scope_instructor_owns_only(client, db, media_dir):
 
 def test_lecture_course_link_and_subject_match(client, db, media_dir):
     """강의를 코스에 담을 때 소유·과목 일치 강제. 코스 삭제 시 강의는 미분류로 보존."""
-    ops = _ops(client, db)
+    ops = _instructor(client, db)
     course = _create_course(client, ops, title="과학 코스", subject="과학")
 
     # 과목 불일치 — 국어 강의를 과학 코스에 담으려 하면 400
@@ -81,7 +84,7 @@ def test_lecture_course_link_and_subject_match(client, db, media_dir):
 
 def test_update_lecture_course_reassign(client, db, media_dir):
     """강의 수정으로 코스 이동/해제 — 명시 전송만 반영, 과목 일치 강제."""
-    ops = _ops(client, db)
+    ops = _instructor(client, db)
     c1 = _create_course(client, ops, title="수학A", subject="수학")
     c2 = _create_course(client, ops, title="영어A", subject="영어")
     lec = _upload_lecture(client, ops, title="수학강의", subject="수학", course_id=c1["id"]).json()
@@ -103,7 +106,7 @@ def test_lecture_reorder_within_course(client, db, media_dir):
     """드래그 재배열 — 넘어온 차례대로 order_no=1,2,3, 목록 순서도 그대로 바뀐다."""
     from app.models import Lecture
 
-    ops = _ops(client, db)
+    ops = _instructor(client, db)
     course = _create_course(client, ops, title="영어 코스", subject="영어")
     a = _upload_lecture(client, ops, title="A강", subject="영어", course_id=course["id"]).json()
     b = _upload_lecture(client, ops, title="B강", subject="영어", course_id=course["id"]).json()
@@ -144,7 +147,10 @@ def test_lecture_reorder_scope_foreign_404(client, db, media_dir):
     ops = _ops(client, db)
     created = _create_instructor(client, ops, email="reord-inst@catchap.dev")
     itok = _instructor_login(client, "reord-inst@catchap.dev", created["temp_password"]).json()["access_token"]
-    ops_lec = _upload_lecture(client, ops, title="운영자강의", subject="수학").json()
+    # '남의 강의'는 다른 강사 것 — 운영자는 저작하지 않으므로(감독·검수만, 0720).
+    other = _create_instructor(client, ops, email="reord-inst-b@catchap.dev")
+    otok = _instructor_login(client, "reord-inst-b@catchap.dev", other["temp_password"]).json()["access_token"]
+    ops_lec = _upload_lecture(client, otok, title="다른 강사 강의", subject="수학").json()
     my_lec = _upload_lecture(client, itok, title="강사강의", subject="수학").json()
 
     # 자기 것 + 남의 것을 섞어 보내면 404 — 그리고 order_no는 전혀 바뀌지 않는다(원자적)
@@ -176,7 +182,7 @@ def test_lecture_reorder_scope_foreign_404(client, db, media_dir):
 def test_student_sees_courses_and_lecture_course_id(client, db, seed_org, media_dir):
     """3단계 학생 화면 — 학생이 활성 코스 목록(강사명·강의수)과 강의별 course_id를 본다.
     빈 코스(활성 강의 0)는 학생 목록에서 빠지고, 상세 toc는 코스 스코프(미분류는 과목 스코프)."""
-    ops = _ops(client, db)
+    ops = _instructor(client, db)
     course = _create_course(client, ops, title="수학 코스", subject="수학")
     empty = _create_course(client, ops, title="빈 코스", subject="수학")  # 강의 없음 → 학생 목록 제외
     a = _upload_lecture(client, ops, title="1강", subject="수학", course_id=course["id"]).json()

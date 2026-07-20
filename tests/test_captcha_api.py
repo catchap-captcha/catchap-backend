@@ -21,6 +21,22 @@ def _ops(client, db):
     return r.json()["access_token"]
 
 
+def _instructor(client, db, *, email="inst@t.dev", name="강사"):
+    """강사(instructor) 계정 토큰 — 콘텐츠 저작(강의·문항·시험) 테스트용.
+    운영자(ops)는 저작이 막혔으므로(require_content_author) 저작 테스트는 이 헬퍼를 쓴다."""
+    from app.models import User as _User
+
+    existing = db.query(_User).filter(_User.email == email).first()
+    if existing is None:
+        db.add(_User(
+            email=email, password_hash=hash_password("Password123!"), name=name,
+            role="instructor", email_verified_at=datetime.utcnow(),
+        ))
+        db.commit()
+    r = client.post("/api/v1/auth/ops-login", json={"email": email, "password": "Password123!"})
+    return r.json()["access_token"]
+
+
 def _plans(db):
     basic = Plan(key="Basic", name="Basic", monthly_price=99000, api_quota=100)
     pro = Plan(key="Pro", name="Pro", monthly_price=290000, api_quota=1000)

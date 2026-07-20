@@ -4,7 +4,7 @@ import json
 
 from app.models import AuditLog, LectureQuestion, SystemSetting
 
-from tests.test_captcha_api import _ops, auth
+from tests.test_captcha_api import _instructor, _ops, auth
 
 
 def test_ai_settings_roundtrip_masked_and_encrypted(client, db, monkeypatch):
@@ -109,6 +109,7 @@ def test_generate_uses_console_key_and_reports_transcript_flag(
     monkeypatch.setattr(get_settings(), "OPENAI_API_KEY", "")
     monkeypatch.setattr(get_settings(), "LECTURE_MEDIA_DIR", str(tmp_path))
     ops_tok = _ops(client, db)
+    itok = _instructor(client, db)
 
     # 콘솔에서 LLM 키만 저장(STT는 미설정)
     r = client.put(
@@ -142,7 +143,7 @@ def test_generate_uses_console_key_and_reports_transcript_flag(
         "/api/v1/ops/lectures",
         data={"title": "설정 검증 강의", "subject": "국어", "duration_sec": "300"},
         files=files,
-        headers=auth(ops_tok),
+        headers=auth(itok),
     )
     assert up.status_code == 200, up.text
     lec_id = up.json()["id"]
@@ -150,7 +151,7 @@ def test_generate_uses_console_key_and_reports_transcript_flag(
     r = client.post(
         f"/api/v1/ops/lectures/{lec_id}/questions/generate",
         json={"n": 1},
-        headers=auth(ops_tok),
+        headers=auth(itok),
     )
     assert r.status_code == 200, r.text
     assert seen["api_key"] == "sk-console-key-7777", "콘솔 키가 LLM 호출에 쓰이지 않았다"
@@ -173,6 +174,7 @@ def test_self_verification_tags_bank_vs_captcha(client, db, monkeypatch, tmp_pat
     monkeypatch.setattr(get_settings(), "OPENAI_API_KEY", "")
     monkeypatch.setattr(get_settings(), "LECTURE_MEDIA_DIR", str(tmp_path))
     ops_tok = _ops(client, db)
+    itok = _instructor(client, db)
     client.put(
         "/api/v1/ops/settings/ai",
         json={"anthropic_api_key": "sk-console-key-7777"},
@@ -202,13 +204,13 @@ def test_self_verification_tags_bank_vs_captcha(client, db, monkeypatch, tmp_pat
         "/api/v1/ops/lectures",
         data={"title": "자기검증 강의", "subject": "국어", "duration_sec": "300"},
         files={"file": ("v.mp4", b"0" * 1024, "video/mp4")},
-        headers=auth(ops_tok),
+        headers=auth(itok),
     )
     lec_id = up.json()["id"]
     r = client.post(
         f"/api/v1/ops/lectures/{lec_id}/questions/generate",
         json={"n": 2},
-        headers=auth(ops_tok),
+        headers=auth(itok),
     )
     assert r.status_code == 200, r.text
     body = r.json()
@@ -228,6 +230,7 @@ def test_self_verification_failure_is_honest_not_swallowed(client, db, monkeypat
     monkeypatch.setattr(get_settings(), "OPENAI_API_KEY", "")
     monkeypatch.setattr(get_settings(), "LECTURE_MEDIA_DIR", str(tmp_path))
     ops_tok = _ops(client, db)
+    itok = _instructor(client, db)
     client.put(
         "/api/v1/ops/settings/ai",
         json={"anthropic_api_key": "sk-console-key-7777"},
@@ -252,12 +255,12 @@ def test_self_verification_failure_is_honest_not_swallowed(client, db, monkeypat
         "/api/v1/ops/lectures",
         data={"title": "검증실패 강의", "subject": "국어", "duration_sec": "300"},
         files={"file": ("v.mp4", b"0" * 1024, "video/mp4")},
-        headers=auth(ops_tok),
+        headers=auth(itok),
     )
     r = client.post(
         f"/api/v1/ops/lectures/{up.json()['id']}/questions/generate",
         json={"n": 1},
-        headers=auth(ops_tok),
+        headers=auth(itok),
     )
     assert r.status_code == 200, r.text  # 생성은 살아있다
     body = r.json()
@@ -275,6 +278,7 @@ def test_generate_stt_failure_is_honest_502(client, db, monkeypatch, tmp_path):
     monkeypatch.setattr(get_settings(), "OPENAI_API_KEY", "sk-stt-broken")
     monkeypatch.setattr(get_settings(), "LECTURE_MEDIA_DIR", str(tmp_path))
     ops_tok = _ops(client, db)
+    itok = _instructor(client, db)
 
     import app.clients.stt_client as stt_client
 
@@ -288,14 +292,14 @@ def test_generate_stt_failure_is_honest_502(client, db, monkeypatch, tmp_path):
         "/api/v1/ops/lectures",
         data={"title": "STT 실패 강의", "subject": "국어", "duration_sec": "300"},
         files=files,
-        headers=auth(ops_tok),
+        headers=auth(itok),
     )
     lec_id = up.json()["id"]
 
     r = client.post(
         f"/api/v1/ops/lectures/{lec_id}/questions/generate",
         json={"n": 1},
-        headers=auth(ops_tok),
+        headers=auth(itok),
     )
     assert r.status_code == 502
     assert "STT" in r.json()["detail"]

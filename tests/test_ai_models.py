@@ -12,7 +12,7 @@ import pytest
 from app.models import AiModelConfig
 from app.services import ai_models_service as svc
 
-from tests.test_captcha_api import _ops, auth
+from tests.test_captcha_api import _instructor, _ops, auth
 
 
 # ----------------------------------------------------------------- 서비스: 슬롯 해석
@@ -394,6 +394,7 @@ def test_generate_uses_slot_model_and_records_tokens(client, db, monkeypatch, tm
     monkeypatch.setattr(get_settings(), "OPENAI_API_KEY", "")
     monkeypatch.setattr(get_settings(), "LECTURE_MEDIA_DIR", str(tmp_path))
     ops_tok = _ops(client, db)
+    itok = _instructor(client, db)
     client.put(
         "/api/v1/ops/settings/ai",
         json={"anthropic_api_key": "sk-console-7777"},
@@ -436,13 +437,13 @@ def test_generate_uses_slot_model_and_records_tokens(client, db, monkeypatch, tm
         "/api/v1/ops/lectures",
         data={"title": "슬롯 생성 강의", "subject": "국어", "duration_sec": "300"},
         files={"file": ("v.mp4", b"0" * 1024, "video/mp4")},
-        headers=auth(ops_tok),
+        headers=auth(itok),
     )
     lec_id = up.json()["id"]
     r = client.post(
         f"/api/v1/ops/lectures/{lec_id}/questions/generate",
         json={"n": 1},
-        headers=auth(ops_tok),
+        headers=auth(itok),
     )
     assert r.status_code == 200, r.text
     assert seen["model"] == "gen-model-XYZ", "생성 슬롯 모델이 실제 호출에 쓰이지 않았다"

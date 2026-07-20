@@ -8,9 +8,11 @@
 """
 
 import io
+from datetime import datetime
 
 import pytest
 
+from app.core.security import hash_password
 from app.models import (
     AuditLog,
     CoinTransaction,
@@ -22,8 +24,9 @@ from app.models import (
     LectureWatchProgress,
     Plan,
     Subscription,
+    User,
 )
-from tests.test_captcha_api import _ops, auth
+from tests.test_captcha_api import _instructor, _ops, auth
 
 
 def _student_token(client, seed_org):
@@ -47,13 +50,27 @@ def media_dir(tmp_path, monkeypatch):
 
 
 def _edu_key(client, db, seed_org, ops_tok, *, first_party=True, subject="국어"):
-    """1st-party(또는 외부) edu 키 발급 — Pro 구독 필요(발급 게이트)."""
+    """1st-party(또는 외부) edu 키 발급 — Pro 구독 필요(발급 게이트).
+
+    API 키 발급은 운영자 전용(ops 권한 B, 0720)이라 호출부의 토큰(강의 저작용 강사 토큰)과
+    무관하게 내부에서 ops 토큰을 만들어 발급한다(멱등 — 같은 ops를 재사용)."""
     org = seed_org["org"]
-    pro = Plan(key="Pro", name="Pro", monthly_price=290000, api_quota=100000)
-    db.add(pro)
-    db.flush()
-    db.add(Subscription(organization_id=org.id, plan_id=pro.id, status="active"))
+    if not db.query(Plan).filter(Plan.key == "Pro").first():
+        db.add(Plan(key="Pro", name="Pro", monthly_price=290000, api_quota=100000))
+        db.flush()
+    pro = db.query(Plan).filter(Plan.key == "Pro").first()
+    if not db.query(Subscription).filter(
+        Subscription.organization_id == org.id, Subscription.plan_id == pro.id
+    ).first():
+        db.add(Subscription(organization_id=org.id, plan_id=pro.id, status="active"))
     db.commit()
+    # 키 발급용 운영자(호출부 토큰과 별개) — 멱등 생성
+    if not db.query(User).filter(User.email == "ops-key@t.dev").first():
+        db.add(User(email="ops-key@t.dev", password_hash=hash_password("Password123!"),
+                    name="키운영자", role="ops", email_verified_at=datetime.utcnow()))
+        db.commit()
+    okey = client.post("/api/v1/auth/ops-login",
+                       json={"email": "ops-key@t.dev", "password": "Password123!"}).json()["access_token"]
     r = client.post(
         "/api/v1/ops/api-keys",
         json={
@@ -62,7 +79,7 @@ def _edu_key(client, db, seed_org, ops_tok, *, first_party=True, subject="국어
             "subject": subject,
             "first_party": first_party,
         },
-        headers=auth(ops_tok),
+        headers=auth(okey),
     )
     assert r.status_code == 200, r.text
     return r.json()["site_key"]
@@ -142,7 +159,7 @@ def _add_question(
 # ================================================================ 업로드·본문 상한
 def test_upload_over_1mb_passes_but_other_posts_still_413(client, db, seed_org, media_dir):
     """업로드 경로(POST /ops/lectures)만 전역 1MB 예외 — 다른 경로는 여전히 413."""
-    tok = _ops(client, db)
+    tok = _instructor(client, db)
 
     # 2MB 업로드 — 미들웨어(경로 예외) 통과 + 파일이 실제로 최종 경로에 존재
     r = _upload_lecture(client, tok, size=2 * 1024 * 1024)
@@ -174,7 +191,7 @@ def test_upload_over_1mb_passes_but_other_posts_still_413(client, db, seed_org, 
 
 
 def test_upload_rejects_bad_ext_and_content_type(client, db, seed_org, media_dir):
-    tok = _ops(client, db)
+    tok = _instructor(client, db)
     r1 = _upload_lecture(client, tok, filename="v.exe", size=100)
     assert r1.status_code == 400
     r2 = _upload_lecture(client, tok, content_type="application/octet-stream", size=100)
@@ -204,7 +221,7 @@ def test_heartbeat_normal_advance_and_speed_clamp(client, db, seed_org, media_di
 
     직전 하트비트는 앱 쓰기 경로(POST /progress → _now() 로컬 naive)로 만들어진다 —
     픽스처가 시간 경로를 우회하면 이 테스트의 통과는 신호가 아니다."""
-    ops_tok = _ops(client, db)
+    ops_tok = _instructor(client, db)
     lec = _upload_lecture(client, ops_tok).json()
     _add_question(client, ops_tok, lec["id"], position=60)  # 60초 핀 → 첫 체크포인트 60
     tok = _student_token(client, seed_org)
@@ -239,7 +256,7 @@ def test_heartbeat_clamps_at_checkpoint_until_captcha(client, db, seed_org, medi
 
     from app.services.lecture_service import GRACE_SEC
 
-    ops_tok = _ops(client, db)
+    ops_tok = _instructor(client, db)
     lec = _upload_lecture(client, ops_tok).json()
     _add_question(client, ops_tok, lec["id"])  # 1초 핀 — 낼 문항이 있어야 체크포인트가 잡힌다
     tok = _student_token(client, seed_org)
@@ -269,7 +286,7 @@ def test_mutation_utcnow_breaks_normal_watch(client, db, seed_org, media_dir, mo
     if _time.timezone == 0:
         pytest.skip("로컬 TZ가 UTC라 utcnow 변이가 무해 — 판별 불가 환경")
 
-    ops_tok = _ops(client, db)
+    ops_tok = _instructor(client, db)
     lec = _upload_lecture(client, ops_tok).json()
     tok = _student_token(client, seed_org)
     client.get(f"/api/v1/lectures/{lec['id']}", headers=auth(tok))
@@ -295,7 +312,7 @@ def _reach_checkpoint(client, tok, lecture_id, cp=1):
 
 def test_lecture_checkpoint_gate_no_learning_side_effects(client, db, seed_org, media_dir):
     """게이트 전체 흐름 + meta.lec verify는 코인·LearningAttempt를 전혀 만들지 않는다."""
-    ops_tok = _ops(client, db)
+    ops_tok = _instructor(client, db)
     lec = _upload_lecture(client, ops_tok).json()
     _add_question(client, ops_tok, lec["id"], answer=2)  # 1초 핀 — 첫 게이트
     # 두 번째 핀(300초) — 첫 핀 통과 후 재예약이 다음 핀으로 잡히는지 본다
@@ -349,7 +366,7 @@ def test_lecture_checkpoint_gate_no_learning_side_effects(client, db, seed_org, 
 
 
 def test_lecture_checkpoint_wrong_answer_records_failed(client, db, seed_org, media_dir):
-    ops_tok = _ops(client, db)
+    ops_tok = _instructor(client, db)
     lec = _upload_lecture(client, ops_tok).json()
     _add_question(client, ops_tok, lec["id"], answer=2)
     site_key = _edu_key(client, db, seed_org, ops_tok, first_party=True)
@@ -406,7 +423,7 @@ def test_lecture_checkpoint_fail_cap_rewinds_and_blocks_challenge(
     발급을 거부한다(다시 시청해 cp까지 올라와야 다음 문항)."""
     from app.services.lecture_service import MAX_CHECKPOINT_FAILS, REWIND_SEC
 
-    ops_tok = _ops(client, db)
+    ops_tok = _instructor(client, db)
     lec = _upload_lecture(client, ops_tok).json()
     _add_question(client, ops_tok, lec["id"], answer=2)
     site_key = _edu_key(client, db, seed_org, ops_tok, first_party=True)
@@ -455,7 +472,7 @@ def test_rewind_not_undone_by_heartbeat_spam(client, db, seed_org, media_dir):
         REWIND_SEC,
     )
 
-    ops_tok = _ops(client, db)
+    ops_tok = _instructor(client, db)
     lec = _upload_lecture(client, ops_tok, duration=1000).json()
     _add_question(client, ops_tok, lec["id"], position=200, answer=2)
     site_key = _edu_key(client, db, seed_org, ops_tok, first_party=True)
@@ -509,7 +526,7 @@ def test_rewind_lands_at_question_content_start(client, db, seed_org, media_dir)
 
     from app.services.lecture_service import MAX_CHECKPOINT_FAILS
 
-    ops_tok = _ops(client, db)
+    ops_tok = _instructor(client, db)
     lec = _upload_lecture(client, ops_tok, duration=1000).json()
     _add_question(client, ops_tok, lec["id"], position=200, answer=2, content_start=185)
     site_key = _edu_key(client, db, seed_org, ops_tok, first_party=True)
@@ -539,7 +556,7 @@ def test_rewind_min_boundary_cp1_cs0(client, db, seed_org, media_dir):
     재시청이 강제됨을 경계값에서 고정한다(0 <= cs < position 검증의 하한)."""
     from app.services.lecture_service import MAX_CHECKPOINT_FAILS
 
-    ops_tok = _ops(client, db)
+    ops_tok = _instructor(client, db)
     lec = _upload_lecture(client, ops_tok).json()
     _add_question(client, ops_tok, lec["id"], position=1, answer=2, content_start=0)
     site_key = _edu_key(client, db, seed_org, ops_tok, first_party=True)
@@ -573,7 +590,7 @@ def test_rewind_clamped_when_question_moved_mid_challenge(client, db, seed_org, 
     from app.models import LectureQuestion
     from app.services.lecture_service import MAX_CHECKPOINT_FAILS
 
-    ops_tok = _ops(client, db)
+    ops_tok = _instructor(client, db)
     lec = _upload_lecture(client, ops_tok, duration=1000).json()
     qa = _add_question(client, ops_tok, lec["id"], position=200, answer=2, content_start=180)
     site_key = _edu_key(client, db, seed_org, ops_tok, first_party=True)
@@ -633,7 +650,7 @@ def test_rewind_clamped_when_question_moved_mid_challenge(client, db, seed_org, 
 def test_content_start_validation_and_clear(client, db, seed_org, media_dir):
     """내용 시작은 출제 시점보다 앞이어야 하고(=cp 이상 되감기는 무한 재도전 부활),
     수정에서 명시적 null이면 지정 해제(폴백 복귀), position만 옮겨 어긋나도 400."""
-    ops_tok = _ops(client, db)
+    ops_tok = _instructor(client, db)
     lec = _upload_lecture(client, ops_tok, duration=1000).json()
 
     def _try_create(cs, position=100):
@@ -702,7 +719,7 @@ def test_pass_inside_grace_still_reserves_adjacent_pin(client, db, seed_org, med
     watched가 이미 그 지점을 지났어도 다음 하트비트가 즉시 게이트를 연다."""
     from datetime import timedelta
 
-    ops_tok = _ops(client, db)
+    ops_tok = _instructor(client, db)
     lec = _upload_lecture(client, ops_tok, duration=1000).json()
     _add_question(client, ops_tok, lec["id"], position=3, answer=2)
     _add_question(client, ops_tok, lec["id"], position=10, answer=2, prompt="GRACE 안 인접 핀")
@@ -743,7 +760,7 @@ def test_reconcile_and_rereserve_respect_passed_pins(client, db, seed_org, media
 
     from app.services.lecture_service import MAX_CHECKPOINT_FAILS
 
-    ops_tok = _ops(client, db)
+    ops_tok = _instructor(client, db)
     lec = _upload_lecture(client, ops_tok, duration=1000).json()
     q100 = _add_question(client, ops_tok, lec["id"], position=100, answer=2, prompt="앞 핀")
     q120 = _add_question(client, ops_tok, lec["id"], position=120, answer=2, prompt="뒤 핀")
@@ -807,7 +824,7 @@ def test_lecture_challenge_is_multi_drag_and_never_leaks_explain(
     hint 유출 차단 회귀 고정 — 화면 억제와 무관하게 챌린지 응답에 explain이 실리면
     봇이 네트워크에서 읽는다(강사가 해설에 정답을 적으면 그대로 유출). verify의
     오답 응답도 마찬가지: 풀 문항은 반복 출제라 오답 응답의 정답이 파밍 재료가 된다."""
-    ops_tok = _ops(client, db)
+    ops_tok = _instructor(client, db)
     lec = _upload_lecture(client, ops_tok).json()
     _add_question(client, ops_tok, lec["id"], answer=2)  # explain="강의 앞부분에서 설명했어요."
     site_key = _edu_key(client, db, seed_org, ops_tok, first_party=True)
@@ -846,7 +863,7 @@ def test_lecture_challenge_serves_cropped_prompt_image(client, db, seed_org, med
     무인증으로 실제 서빙된다. 이미지 URL·챌린지에 정답/해설은 새지 않는다(파밍 차단)."""
     import base64
 
-    ops_tok = _ops(client, db)
+    ops_tok = _instructor(client, db)
     lec = _upload_lecture(client, ops_tok).json()
     q = _add_question(client, ops_tok, lec["id"], answer=2)  # 시점 핀 문항(position_sec=1)
     # 크롭 결과를 대신하는 1x1 PNG를 prompt 슬롯에 첨부(브라우저 크롭 → 이 엔드포인트로 업로드)
@@ -888,7 +905,7 @@ def test_lecture_token_verify_requires_first_party_edu_key(
     사이트키(무료 요금제가 자가 발급하는 captcha 키로 충분)로 강의 토큰을 채점시켜
     오답 응답의 정답 집합을 수확할 수 있다. 그 경로는 체크포인트 실패 기록도 남기지
     않아 대가가 0이고, 파밍한 답으로 영상을 안 보고 게이트를 연다."""
-    ops_tok = _ops(client, db)
+    ops_tok = _instructor(client, db)
     lec = _upload_lecture(client, ops_tok).json()
     _add_question(client, ops_tok, lec["id"], answer_indexes=[1, 3])
     site_key = _edu_key(client, db, seed_org, ops_tok, first_party=True)
@@ -896,11 +913,13 @@ def test_lecture_token_verify_requires_first_party_edu_key(
     _reach_checkpoint(client, tok, lec["id"])
     ch = _gate_challenge(client, site_key, tok, lec["id"])
 
-    # 일반 캡차 키(non-edu) — 채점 자체를 거절, 정답 미노출
+    # 일반 캡차 키(non-edu) — 채점 자체를 거절, 정답 미노출. API 키 발급은 운영자 전용(ops
+    # 권한 B)이라 별도 ops 토큰으로 발급한다(강의 저작용 강사 토큰과 무관).
+    ops_key_tok = _ops(client, db)
     other = client.post(
         "/api/v1/ops/api-keys",
         json={"organization_id": seed_org["org"].id, "product": "captcha"},
-        headers=auth(ops_tok),
+        headers=auth(ops_key_tok),
     )
     assert other.status_code == 200, other.text
     vr = client.post(
@@ -921,7 +940,7 @@ def test_lecture_token_verify_requires_first_party_edu_key(
             "subject": "국어",
             "first_party": False,
         },
-        headers=auth(ops_tok),
+        headers=auth(ops_key_tok),
     )
     assert ext.status_code == 200, ext.text
     ext_key = ext.json()["site_key"]
@@ -942,7 +961,7 @@ def test_lecture_token_verify_requires_first_party_edu_key(
 
 def test_multi_answer_graded_as_exact_set(client, db, seed_org, media_dir):
     """다답 문항 — 집합 정확 일치만 통과. 부분 선택·초과 선택은 오답(부분 정답 없음)."""
-    ops_tok = _ops(client, db)
+    ops_tok = _instructor(client, db)
     lec = _upload_lecture(client, ops_tok).json()
     q = _add_question(client, ops_tok, lec["id"], answer_indexes=[1, 3])
     # answer_index는 첫 값으로 동기화(구버전 읽기 경로 하위호환)
@@ -975,7 +994,7 @@ def test_multi_answer_graded_as_exact_set(client, db, seed_org, media_dir):
 
 def test_single_answer_row_backward_compat_as_multi(client, db, seed_org, media_dir):
     """answer_indexes NULL(기존 단일 정답 행) — multi로 나가고 1개만 담아 제출하면 통과."""
-    ops_tok = _ops(client, db)
+    ops_tok = _instructor(client, db)
     lec = _upload_lecture(client, ops_tok).json()
     q = _add_question(client, ops_tok, lec["id"], answer=2)  # answer_indexes 미전송
     site_key = _edu_key(client, db, seed_org, ops_tok, first_party=True)
@@ -1001,7 +1020,7 @@ def test_single_answer_row_backward_compat_as_multi(client, db, seed_org, media_
 
 def test_multi_answer_validation_400(client, db, seed_org, media_dir):
     """운영자 다답 검증 — 빈 배열·중복·범위 밖은 400 + 한국어 사유."""
-    ops_tok = _ops(client, db)
+    ops_tok = _instructor(client, db)
     lec = _upload_lecture(client, ops_tok).json()
 
     def _post(answer_indexes):
@@ -1048,7 +1067,7 @@ def test_multi_answer_validation_400(client, db, seed_org, media_dir):
 
 
 def test_challenge_before_checkpoint_409(client, db, seed_org, media_dir):
-    ops_tok = _ops(client, db)
+    ops_tok = _instructor(client, db)
     lec = _upload_lecture(client, ops_tok).json()
     _add_question(client, ops_tok, lec["id"], position=60)  # 60초 핀
     site_key = _edu_key(client, db, seed_org, ops_tok, first_party=True)
@@ -1069,7 +1088,7 @@ def test_challenge_no_questions_clear_4xx(client, db, seed_org, media_dir):
     학생이 게이트로 오는 사이에 삭제 트랜잭션이 커밋된 창. 그 좁은 창에서도 강의와 무관한
     과목 은행 문제로 때우지 않는다는 것이 이 테스트가 지키는 규약이다. 경합을 재현할 수
     없으므로 삭제가 예약 정합화보다 먼저 보이는 상태를 DB에서 직접 만든다."""
-    ops_tok = _ops(client, db)
+    ops_tok = _instructor(client, db)
     lec = _upload_lecture(client, ops_tok).json()
     q = _add_question(client, ops_tok, lec["id"])
     site_key = _edu_key(client, db, seed_org, ops_tok, first_party=True)
@@ -1099,7 +1118,7 @@ def test_deleting_last_question_does_not_strand_student(client, db, seed_org, me
 
     from app.services.lecture_service import GRACE_SEC
 
-    ops_tok = _ops(client, db)
+    ops_tok = _instructor(client, db)
     lec = _upload_lecture(client, ops_tok, duration=600).json()
     q = _add_question(client, ops_tok, lec["id"])  # 1초 핀
     tok = _student_token(client, seed_org)
@@ -1131,7 +1150,7 @@ def test_no_questions_schedules_no_checkpoint(client, db, seed_org, media_dir):
     문항이 없어 4xx로 안 뜨니 '캡차가 안 뜨는데 진도도 안 나가는' 상태로 갇혔다(라이브
     제보의 직접 원인). 낼 문제가 없으면 검증을 걸 수 없다는 사실을 예약 단계에서 인정하고,
     문항 0개는 운영자 콘솔의 문항 수로 드러낸다."""
-    ops_tok = _ops(client, db)
+    ops_tok = _instructor(client, db)
     lec = _upload_lecture(client, ops_tok).json()  # 문항 없음
     tok = _student_token(client, seed_org)
 
@@ -1146,7 +1165,7 @@ def test_no_questions_schedules_no_checkpoint(client, db, seed_org, media_dir):
 
 def test_external_key_lecture_forbidden(client, db, seed_org, media_dir):
     """외부 판매 키(first_party=False)는 강의 파라미터 사용 불가 — 403."""
-    ops_tok = _ops(client, db)
+    ops_tok = _instructor(client, db)
     lec = _upload_lecture(client, ops_tok).json()
     _add_question(client, ops_tok, lec["id"])
     ext_key = _edu_key(client, db, seed_org, ops_tok, first_party=False)
@@ -1162,7 +1181,7 @@ def test_external_key_lecture_forbidden(client, db, seed_org, media_dir):
 
 # ================================================================ 스트리밍
 def test_stream_requires_signature_and_serves_range(client, db, seed_org, media_dir):
-    ops_tok = _ops(client, db)
+    ops_tok = _instructor(client, db)
     lec = _upload_lecture(client, ops_tok, size=4096).json()
     tok = _student_token(client, seed_org)
 
@@ -1198,7 +1217,7 @@ def test_stream_token_dies_after_takeover(client, db, seed_org, media_dir):
 
     동시 차단이 '진도 인정'만이 아니라 영상 바이트 전달에도 걸린다(skeptic PLAUSIBLE
     지적의 수정): 두 번째 기기가 세션을 이어받는 순간 첫 기기는 영상 자체를 못 받는다."""
-    ops_tok = _ops(client, db)
+    ops_tok = _instructor(client, db)
     lec = _upload_lecture(client, ops_tok, size=4096).json()
     tok = _student_token(client, seed_org)
 
@@ -1226,7 +1245,7 @@ def test_stream_token_dies_after_takeover(client, db, seed_org, media_dir):
 
 # ================================================================ 문항 CRUD · LLM 생성
 def test_question_crud(client, db, seed_org, media_dir):
-    ops_tok = _ops(client, db)
+    ops_tok = _instructor(client, db)
     lec = _upload_lecture(client, ops_tok).json()
 
     q = _add_question(client, ops_tok, lec["id"], position=30, answer=1, status="draft")
@@ -1278,7 +1297,7 @@ def test_generate_without_api_key_returns_honest_503(client, db, seed_org, media
     from app.core.config import get_settings
 
     monkeypatch.setattr(get_settings(), "ANTHROPIC_API_KEY", "")
-    ops_tok = _ops(client, db)
+    ops_tok = _instructor(client, db)
     lec = _upload_lecture(client, ops_tok).json()
 
     r = client.post(
@@ -1294,7 +1313,7 @@ def test_generate_without_api_key_returns_honest_503(client, db, seed_org, media
 
 # ================================================================ 강의 메타 CRUD
 def test_lecture_update_delete_and_student_visibility(client, db, seed_org, media_dir):
-    ops_tok = _ops(client, db)
+    ops_tok = _instructor(client, db)
     lec = _upload_lecture(client, ops_tok).json()
     tok = _student_token(client, seed_org)
 
@@ -1353,7 +1372,7 @@ def test_concurrent_session_409_and_takeover(client, db, seed_org, media_dir):
     """같은 학생의 두 세션 동시 재생 — 두 번째는 발급부터 409(active_elsewhere), takeover 후 역전.
 
     다른 강의여도 같은 학생이면 동시 재생이다(한 사람이 두 강의를 동시에 볼 수 없음)."""
-    ops_tok = _ops(client, db)
+    ops_tok = _instructor(client, db)
     lec1 = _upload_lecture(client, ops_tok).json()
     lec2 = _upload_lecture(client, ops_tok, title="다른 강의").json()
     tok = _student_token(client, seed_org)
@@ -1391,7 +1410,7 @@ def test_forged_session_id_in_body_is_ignored(client, db, seed_org, media_dir):
     """클라가 본문에 session_id를 실어 보내도 무시된다 — 세션의 정본은 서버 발급 토큰뿐.
 
     (구계약 회귀 방지: session_id 본문 필드를 다시 읽기 시작하면 담합 우회가 부활한다.)"""
-    ops_tok = _ops(client, db)
+    ops_tok = _instructor(client, db)
     lec = _upload_lecture(client, ops_tok).json()
     tok = _student_token(client, seed_org)
     s = _start_session(client, tok, lec["id"]).json()
@@ -1415,7 +1434,7 @@ def test_collusion_and_forged_tokens_blocked(client, db, seed_org, media_dir):
     토큰 없이 / 학생 JWT를 세션 토큰인 척(type 검사) / 다른 강의의 세션 토큰(lec 바인딩)
     전부 403. 남는 한계: 발급된 '세션 토큰 자체'를 두 기기가 실시간 공유하면 서버에겐
     한 세션으로 보인다 — 기기 구분 수단이 없는 한 원리적으로 판별 불가(보고서에 명시)."""
-    ops_tok = _ops(client, db)
+    ops_tok = _instructor(client, db)
     lec = _upload_lecture(client, ops_tok).json()
     tok = _student_token(client, seed_org)
 
@@ -1454,7 +1473,7 @@ def test_dead_session_auto_reclaimed_after_ttl(client, db, seed_org, media_dir):
     from app.db.base import _now
     from app.services.lecture_service import SESSION_TTL_SEC
 
-    ops_tok = _ops(client, db)
+    ops_tok = _instructor(client, db)
     lec = _upload_lecture(client, ops_tok).json()
     tok = _student_token(client, seed_org)
     client.get(f"/api/v1/lectures/{lec['id']}", headers=auth(tok))
@@ -1495,7 +1514,7 @@ def test_mutation_utcnow_breaks_dead_session_reclaim(client, db, seed_org, media
     if _time.timezone == 0:
         pytest.skip("로컬 TZ가 UTC라 utcnow 변이가 무해 — 판별 불가 환경")
 
-    ops_tok = _ops(client, db)
+    ops_tok = _instructor(client, db)
     lec = _upload_lecture(client, ops_tok).json()
     tok = _student_token(client, seed_org)
     client.get(f"/api/v1/lectures/{lec['id']}", headers=auth(tok))
@@ -1517,7 +1536,7 @@ def test_takeover_spam_rate_limited(client, db, seed_org, media_dir):
     시간당 RATE_TAKEOVER_PER_HOUR 초과 시 429."""
     from app.api.v1.endpoints.lectures import RATE_TAKEOVER_PER_HOUR
 
-    ops_tok = _ops(client, db)
+    ops_tok = _instructor(client, db)
     lec = _upload_lecture(client, ops_tok).json()
     tok = _student_token(client, seed_org)
     client.get(f"/api/v1/lectures/{lec['id']}", headers=auth(tok))
@@ -1539,7 +1558,7 @@ def test_interacted_self_report_grants_no_exemption(client, db, seed_org, media_
     강사 지정 고정 문항을 건너뛰는 것이 실증됐다. 이제 체크포인트에 닿으면 예외 없이 캡차다.
 
     구버전 플레이어가 interacted·tab_hidden을 계속 보내도 무해해야 한다(조용히 무시)."""
-    ops_tok = _ops(client, db)
+    ops_tok = _instructor(client, db)
     lec = _upload_lecture(client, ops_tok).json()
     _add_question(client, ops_tok, lec["id"])  # 1초 핀 — 낼 문항이 있어야 체크포인트가 잡힌다
     tok = _student_token(client, seed_org)
@@ -1595,7 +1614,7 @@ def test_pinned_question_fires_at_its_position_and_is_served(
 
     뒤(500초) 핀 문항이 앞(3초) 게이트에 새어나오면 안 된다 — 미리 소진되면
     정작 지정 시점에 낼 문제가 사라진다."""
-    ops_tok = _ops(client, db)
+    ops_tok = _instructor(client, db)
     lec = _upload_lecture(client, ops_tok, duration=1000).json()
     # 핀 시점은 하트비트 헤드룸(5초) 안 — 속도 상한 때문에 먼 지점은 한 비트로 못 닿는다
     r = client.post(
@@ -1635,7 +1654,7 @@ def test_pinned_question_fires_at_its_position_and_is_served(
 
 def test_pin_added_later_reclaims_stale_reservation(client, db, seed_org, media_dir):
     """강사가 나중에 더 이른 핀을 추가하면, 그 지점을 지나칠 예약이 다시 잡힌다."""
-    ops_tok = _ops(client, db)
+    ops_tok = _instructor(client, db)
     lec = _upload_lecture(client, ops_tok, duration=1000).json()
     _add_question(client, ops_tok, lec["id"], position=600)
     tok = _student_token(client, seed_org)
@@ -1666,7 +1685,7 @@ def test_pin_validation_rejects_unreachable_positions(client, db, seed_org, medi
     핀은 watched < start 판정이라 0초 핀은 영영 안 뜨고, 영상 밖(100초 강의에 900 오타)
     시점은 예약 자체가 안 잡힌다. 유일 문항이면 그 강의의 시청 검증이 통째로 꺼지는데
     목록에는 멀쩡한 active로 보여 알아챌 방법이 없다(적대적 검토에서 실증)."""
-    ops_tok = _ops(client, db)
+    ops_tok = _instructor(client, db)
     lec = _upload_lecture(client, ops_tok, duration=600).json()
     body = {
         "prompt": "문항",
@@ -1694,7 +1713,7 @@ def test_draft_at_zero_allowed_until_activation(client, db, seed_org, media_dir)
 
     단 공개(활성화)하려면 시점을 지정해야 한다: 0초 핀은 활성화돼도 영영 안 떠서,
     승인만 하고 배치를 잊으면 검증이 조용히 꺼진 문항이 생기기 때문이다."""
-    ops_tok = _ops(client, db)
+    ops_tok = _instructor(client, db)
     lec = _upload_lecture(client, ops_tok, duration=600).json()
 
     # 시점 미배치 draft 생성 OK
@@ -1730,7 +1749,7 @@ def test_shrinking_duration_rejects_orphaned_questions(client, db, seed_org, med
 
     문항 PUT은 같은 상황을 400으로 막는데 강의 PUT만 통과시키면, 검증이 조용히 꺼지고
     강사는 나중에 설명만 고치려다 영문 모를 400을 맞는다(적대적 검토에서 실증)."""
-    ops_tok = _ops(client, db)
+    ops_tok = _instructor(client, db)
     lec = _upload_lecture(client, ops_tok, duration=1000).json()
     _add_question(client, ops_tok, lec["id"], position=500)
 
@@ -1761,7 +1780,7 @@ def test_shrinking_duration_rejects_orphaned_questions(client, db, seed_org, med
 
 def test_duplicate_pin_at_same_position_rejected(client, db, seed_org, media_dir):
     """★ 같은 시점에 공개 문항 둘 — 하나만 뜨고 나머지는 영구 사문이 되므로 거절한다."""
-    ops_tok = _ops(client, db)
+    ops_tok = _instructor(client, db)
     lec = _upload_lecture(client, ops_tok, duration=1000).json()
     body = {
         "position_sec": 300,
@@ -1793,7 +1812,7 @@ def test_ops_preview_stream_is_isolated_from_student_stream(
     ② 학생 스트림 토큰으로는 못 들어온다 — 들어가지면 세션 바인딩(동시재생 차단)이
        통째로 우회된다. 반대로 운영자 토큰도 학생 스트림에 못 들어간다.
     ③ 미리보기 발급은 운영자 권한이 필요하다."""
-    ops_tok = _ops(client, db)
+    ops_tok = _instructor(client, db)
     lec = _upload_lecture(client, ops_tok).json()
     tok = _student_token(client, seed_org)
 
@@ -1817,7 +1836,7 @@ def test_ops_preview_stream_is_isolated_from_student_stream(
 
 def test_ops_preview_does_not_steal_student_session(client, db, seed_org, media_dir):
     """운영자 미리보기는 세션을 점유하지 않는다 — 시청 중인 학생을 걷어차면 안 된다."""
-    ops_tok = _ops(client, db)
+    ops_tok = _instructor(client, db)
     lec = _upload_lecture(client, ops_tok).json()
     tok = _student_token(client, seed_org)
     client.get(f"/api/v1/lectures/{lec['id']}", headers=auth(tok))
@@ -1835,7 +1854,7 @@ def test_cleared_reservation_is_rescheduled(client, db, seed_org, media_dir):
     예전에는 next_checkpoint_sec=None을 되돌릴 경로가 없어, 예약이 해제되는 순간 그
     강의를 보던 학생은 남은 내내 캡차가 한 번도 안 떴다 = 시청 검증이 조용히 꺼졌다.
     주석은 '다음 하트비트가 다시 잡는다'고 적혀 있었지만 그런 코드가 없었다."""
-    ops_tok = _ops(client, db)
+    ops_tok = _instructor(client, db)
     lec = _upload_lecture(client, ops_tok, duration=1000).json()
     q = _add_question(client, ops_tok, lec["id"], position=300)
     tok = _student_token(client, seed_org)
@@ -1882,7 +1901,7 @@ def _add_link_material(client, ops_tok, lecture_id, *, title="참고 링크",
 
 def test_material_link_create_and_student_visible(client, db, seed_org, media_dir):
     """link 자료 — JSON 생성 → 학생 상세 materials에 외부 URL 그대로 노출 + audit."""
-    ops_tok = _ops(client, db)
+    ops_tok = _instructor(client, db)
     lec = _upload_lecture(client, ops_tok).json()
 
     r = _add_link_material(client, ops_tok, lec["id"])
@@ -1913,7 +1932,7 @@ def test_material_file_upload_and_download(client, db, seed_org, media_dir):
     """file 자료 — multipart 업로드(청크 복사·원자 이동) → 학생 다운로드 200 + attachment.
 
     학생 응답에 내부 경로·url 원본은 없고 download_url(엔드포인트 경로)만 노출된다."""
-    ops_tok = _ops(client, db)
+    ops_tok = _instructor(client, db)
     lec = _upload_lecture(client, ops_tok).json()
 
     r = _upload_material(client, ops_tok, lec["id"], size=2048)
@@ -1942,7 +1961,7 @@ def test_material_file_upload_and_download(client, db, seed_org, media_dir):
 
 def test_material_rejects_executable_and_web_exts(client, db, seed_org, media_dir):
     """실행파일·웹문서 확장자 거절(화이트리스트 밖) — 거절된 업로드는 파일을 남기지 않는다."""
-    ops_tok = _ops(client, db)
+    ops_tok = _instructor(client, db)
     lec = _upload_lecture(client, ops_tok).json()
     for bad in ("malware.exe", "run.bat", "s.sh", "x.js", "p.html", "v.svg", "noext"):
         r = _upload_material(client, ops_tok, lec["id"], filename=bad)
@@ -1958,7 +1977,7 @@ def test_material_upload_size_exception_and_other_paths_413(
     """자료 업로드 예외는 'POST materials + multipart'만 — 같은 경로 JSON·타 경로는 1MB 413."""
     from app.core.config import get_settings
 
-    ops_tok = _ops(client, db)
+    ops_tok = _instructor(client, db)
     lec = _upload_lecture(client, ops_tok).json()
 
     # 2MB multipart 자료 → 전역 1MB를 넘지만 자료 예외(50MB)로 통과·정상 저장
@@ -1990,7 +2009,7 @@ def test_material_upload_size_exception_and_other_paths_413(
 
 def test_material_update_soft_delete_and_order(client, db, seed_org, media_dir):
     """메타 수정(title·order_no)·order_no 자동 증가·소프트 삭제 후 목록/상세/다운로드 제외."""
-    ops_tok = _ops(client, db)
+    ops_tok = _instructor(client, db)
     lec = _upload_lecture(client, ops_tok).json()
     m1 = _upload_material(client, ops_tok, lec["id"], title="첫 자료").json()
     m2 = _add_link_material(client, ops_tok, lec["id"], title="둘째 링크").json()
@@ -2044,7 +2063,7 @@ def test_lecture_delete_cascades_materials(client, db, seed_org, media_dir):
 
     (skeptic REFUTED 회귀 방지: 이걸 안 하면 부모 강의 삭제 후 자료 CRUD가 전부 404가
     되어 자료 파일이 영구 고아로 남는다.)"""
-    ops_tok = _ops(client, db)
+    ops_tok = _instructor(client, db)
     lec = _upload_lecture(client, ops_tok).json()
     mf = _upload_material(client, ops_tok, lec["id"], title="파일 자료").json()
     ml = _add_link_material(client, ops_tok, lec["id"], title="링크 자료").json()
@@ -2076,7 +2095,7 @@ def test_material_broken_multipart_is_400_not_500(client, db, seed_org, media_di
 
     (skeptic REFUTED 회귀 방지: 손상·잘린 업로드나 프록시가 헤더를 건드린 정상 업로드가
     500으로 떨어지면 안 된다.)"""
-    ops_tok = _ops(client, db)
+    ops_tok = _instructor(client, db)
     lec = _upload_lecture(client, ops_tok).json()
     r = client.post(
         f"/api/v1/ops/lectures/{lec['id']}/materials",
@@ -2091,7 +2110,7 @@ def test_material_broken_multipart_is_400_not_500(client, db, seed_org, media_di
 
 def test_material_ops_only(client, db, seed_org, media_dir):
     """학생 토큰으로 자료 생성/수정/삭제 불가 — 운영자 전용."""
-    ops_tok = _ops(client, db)
+    ops_tok = _instructor(client, db)
     lec = _upload_lecture(client, ops_tok).json()
     m = _add_link_material(client, ops_tok, lec["id"]).json()
     tok = _student_token(client, seed_org)
@@ -2116,7 +2135,7 @@ def test_material_ops_only(client, db, seed_org, media_dir):
 # ================================================================ 강의 목차 순서
 def test_lecture_toc_order(client, db, seed_org, media_dir):
     """order_no 3,1,2로 만들어도 학생 목록·상세 toc·ops 목록이 1,2,3 순으로 나온다."""
-    ops_tok = _ops(client, db)
+    ops_tok = _instructor(client, db)
     _upload_lecture(client, ops_tok, title="3강", order_no=3)
     _upload_lecture(client, ops_tok, title="1강", order_no=1)
     l2 = _upload_lecture(client, ops_tok, title="2강", order_no=2).json()
@@ -2145,7 +2164,7 @@ def test_ops_list_question_counts(client, db, seed_org, media_dir):
 
     0이면 확인(캡차)이 아예 안 떠서 그 강의는 시청 검증이 없다. draft는 안 잡히고,
     승인해야 잡힌다. (풀 개념 제거로 pool_question_count 필드는 사라졌다 — 회귀 방지.)"""
-    ops_tok = _ops(client, db)
+    ops_tok = _instructor(client, db)
     lec = _upload_lecture(client, ops_tok).json()
 
     def row():
@@ -2185,7 +2204,7 @@ def test_ops_list_question_counts(client, db, seed_org, media_dir):
 
 def test_lecture_order_no_auto_assign_and_reorder(client, db, seed_org, media_dir):
     """생성 시 미지정 → 과목 내 max+1 자동 배정, PUT order_no 재배열이 목록에 반영."""
-    ops_tok = _ops(client, db)
+    ops_tok = _instructor(client, db)
     a = _upload_lecture(client, ops_tok, title="가").json()
     b = _upload_lecture(client, ops_tok, title="나").json()
     assert (a["order_no"], b["order_no"]) == (1, 2)
@@ -2226,7 +2245,7 @@ def _image_id_from_url(url: str) -> str:
 
 def test_question_image_attach_serve_and_replace(client, db, seed_org, media_dir):
     """프롬프트·보기 이미지 첨부 → 서빙 200(인라인·무인증) + 교체 시 옛 파일 물리 삭제."""
-    ops_tok = _ops(client, db)
+    ops_tok = _instructor(client, db)
     lec = _upload_lecture(client, ops_tok).json()
     q = _add_question(client, ops_tok, lec["id"])
     qdir = media_dir / "questions"
@@ -2277,7 +2296,7 @@ def test_question_image_attach_serve_and_replace(client, db, seed_org, media_dir
 
 def test_question_image_rejects_executable_svg_and_bad_slot(client, db, seed_org, media_dir):
     """실행파일·SVG·비이미지 Content-Type 거절 + 슬롯 지정 오류 400 — 파일을 남기지 않는다."""
-    ops_tok = _ops(client, db)
+    ops_tok = _instructor(client, db)
     lec = _upload_lecture(client, ops_tok).json()
     q = _add_question(client, ops_tok, lec["id"])
 
@@ -2305,7 +2324,7 @@ def test_question_image_replace_failure_leaves_no_tmp(client, db, seed_org, medi
     """os.replace 실패(디스크 풀·잠금) — 임시파일을 남기지 않고 payload도 오염되지 않는다."""
     import app.api.v1.endpoints.lectures as lectures_mod
 
-    ops_tok = _ops(client, db)
+    ops_tok = _instructor(client, db)
     lec = _upload_lecture(client, ops_tok).json()
     q = _add_question(client, ops_tok, lec["id"])
 
@@ -2327,7 +2346,7 @@ def test_question_image_replace_failure_leaves_no_tmp(client, db, seed_org, medi
 
 def test_question_image_delete_and_question_delete_cascade(client, db, seed_org, media_dir):
     """이미지 제거·문항 삭제 시 파일 물리 삭제 + 레코드(payload 참조 포함) 보존."""
-    ops_tok = _ops(client, db)
+    ops_tok = _instructor(client, db)
     lec = _upload_lecture(client, ops_tok).json()
     q = _add_question(client, ops_tok, lec["id"])
     qdir = media_dir / "questions"
@@ -2376,7 +2395,7 @@ def test_question_image_delete_and_question_delete_cascade(client, db, seed_org,
 
 def test_lecture_delete_cascades_question_images(client, db, seed_org, media_dir):
     """강의 삭제 — 문항 이미지 파일도 연쇄 물리 삭제(고아 파일 방지), 문항 행은 보존."""
-    ops_tok = _ops(client, db)
+    ops_tok = _instructor(client, db)
     lec = _upload_lecture(client, ops_tok).json()
     q = _add_question(client, ops_tok, lec["id"])
     pi = _attach_image(client, ops_tok, lec["id"], q["id"], slot="prompt").json()
@@ -2397,7 +2416,7 @@ def test_question_image_size_exception_and_other_paths_413(
     """이미지 업로드 예외는 'POST images + multipart'만 — 상한 초과·JSON·타 경로는 413."""
     from app.core.config import get_settings
 
-    ops_tok = _ops(client, db)
+    ops_tok = _instructor(client, db)
     lec = _upload_lecture(client, ops_tok).json()
     q = _add_question(client, ops_tok, lec["id"])
 
@@ -2429,7 +2448,7 @@ def test_question_image_size_exception_and_other_paths_413(
 
 def test_text_only_question_challenge_backward_compat(client, db, seed_org, media_dir):
     """기존 텍스트 전용 문항 — 챌린지 페이로드가 종전과 동일(이미지 키 자체가 없다)."""
-    ops_tok = _ops(client, db)
+    ops_tok = _instructor(client, db)
     lec = _upload_lecture(client, ops_tok).json()
     _add_question(client, ops_tok, lec["id"])
     site_key = _edu_key(client, db, seed_org, ops_tok, first_party=True)
@@ -2452,7 +2471,7 @@ def test_text_only_question_challenge_backward_compat(client, db, seed_org, medi
 
 def test_challenge_with_images_serves_and_never_leaks_answer(client, db, seed_org, media_dir):
     """이미지 문항 챌린지 — prompt_image·보기 image URL 전달, 정답 신호는 어디에도 없다."""
-    ops_tok = _ops(client, db)
+    ops_tok = _instructor(client, db)
     lec = _upload_lecture(client, ops_tok).json()
     q = _add_question(client, ops_tok, lec["id"], answer=2)
     _attach_image(client, ops_tok, lec["id"], q["id"], slot="prompt")
@@ -2491,7 +2510,7 @@ def test_challenge_with_images_serves_and_never_leaks_answer(client, db, seed_or
 
 def test_option_shrink_cleans_image_files_and_empty_text_rules(client, db, seed_org, media_dir):
     """보기 축소 시 범위 밖 이미지 정리 + 이미지 있는 보기만 빈 텍스트 허용."""
-    ops_tok = _ops(client, db)
+    ops_tok = _instructor(client, db)
     lec = _upload_lecture(client, ops_tok).json()
     q = _add_question(client, ops_tok, lec["id"])  # 보기 4개
     qdir = media_dir / "questions"

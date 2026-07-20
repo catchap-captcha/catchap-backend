@@ -55,7 +55,7 @@ from sqlalchemy import func, not_
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
-from app.core.permissions import Principal, require_lecture_manager, require_student
+from app.core.permissions import Principal, require_content_author, require_lecture_manager, require_student
 from app.core.security import decode_token, new_uuid
 from app.db.session import get_db
 from app.models import (
@@ -899,7 +899,7 @@ def ops_list_courses(
 @router.post("/ops/courses")
 def ops_create_course(
     req: _CourseCreate,
-    principal: Principal = Depends(require_lecture_manager),
+    principal: Principal = Depends(require_content_author),
     db: Session = Depends(get_db),
 ):
     """코스 생성 — 소유자는 생성한 본인(강사 또는 운영자). subject는 여기서 고정된다."""
@@ -941,6 +941,15 @@ def ops_update_course(
     c = _get_ops_course(db, course_id, principal)
     if req.status is not None and req.status not in ("active", "hidden"):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="status는 active|hidden만 가능합니다.")
+    # 운영자(ops)는 감독·검수만 — 공개/숨김(status)만 바꿀 수 있고 내용 편집(제목·소개·순서)은
+    # 강사 전용(사용자 결정 0720). 강사는 자기 코스 전체를 편집한다.
+    if principal.role == "ops" and (
+        req.title is not None or req.description is not None or req.order_no is not None
+    ):
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            detail="운영자는 코스의 공개/숨김만 변경할 수 있어요. 내용 편집은 강사가 합니다.",
+        )
     before = {"title": c.title, "order_no": c.order_no, "status": c.status}
     if req.title is not None:
         c.title = req.title.strip()
@@ -962,7 +971,7 @@ def ops_update_course(
 @router.delete("/ops/courses/{course_id}")
 def ops_delete_course(
     course_id: str,
-    principal: Principal = Depends(require_lecture_manager),
+    principal: Principal = Depends(require_content_author),
     db: Session = Depends(get_db),
 ):
     """코스 소프트 삭제 — 소속 강의는 미분류(course_id=NULL)로 풀어 준다(강의 자체는
@@ -1005,7 +1014,7 @@ class _LectureReorder(BaseModel):
 @router.put("/ops/lectures/reorder")
 def ops_reorder_lectures(
     req: _LectureReorder,
-    principal: Principal = Depends(require_lecture_manager),
+    principal: Principal = Depends(require_content_author),
     db: Session = Depends(get_db),
 ):
     """드래그로 바꾼 강의 순서를 저장 — 넘어온 차례대로 order_no=1,2,3…을 부여한다.
@@ -1069,7 +1078,7 @@ def ops_create_lecture(
     order_no: int | None = Form(default=None),  # 미지정 → 과목 맨 뒤(max+1)
     course_id: str | None = Form(default=None),  # 소속 코스(선택) — 미지정이면 미분류
     file: UploadFile = File(...),
-    principal: Principal = Depends(require_lecture_manager),
+    principal: Principal = Depends(require_content_author),
     db: Session = Depends(get_db),
 ):
     """강의 업로드(multipart) — 임시파일 청크 기록 → 원자적 이동 → DB commit.
@@ -1190,6 +1199,17 @@ def ops_update_lecture(
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="지원하지 않는 과목입니다.")
     if req.status is not None and req.status not in ("active", "hidden"):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="status는 active|hidden만 가능합니다.")
+    # 운영자(ops)는 감독·검수만 — 강의의 공개/숨김(status)만 바꿀 수 있고, 내용(제목·소개·과목·
+    # 길이·순서·코스 배정) 편집은 강사 전용(사용자 결정 0720).
+    if principal.role == "ops" and (
+        req.title is not None or req.description is not None or req.subject is not None
+        or req.duration_sec is not None or req.order_no is not None
+        or "course_id" in req.model_fields_set
+    ):
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            detail="운영자는 강의의 공개/숨김만 변경할 수 있어요. 내용 편집은 강사가 합니다.",
+        )
     # 코스 변경 — 명시적으로 전송된 경우만(미전송이면 유지). null이면 미분류로 뺀다.
     # 코스를 지정하면 소유 확인 + 과목 일치 강제(변경될 subject 기준). 코스=과목 고정.
     if "course_id" in req.model_fields_set:
@@ -1276,7 +1296,7 @@ def ops_update_lecture(
 @router.delete("/ops/lectures/{lecture_id}")
 def ops_delete_lecture(
     lecture_id: str,
-    principal: Principal = Depends(require_lecture_manager),
+    principal: Principal = Depends(require_content_author),
     db: Session = Depends(get_db),
 ):
     """소프트 삭제 + 영상·자료 파일 물리 삭제 — 레코드·시청 이력·문항·자료 행은 보존
@@ -1613,7 +1633,7 @@ def ops_list_questions(
 def ops_create_question(
     lecture_id: str,
     req: _QuestionCreate,
-    principal: Principal = Depends(require_lecture_manager),
+    principal: Principal = Depends(require_content_author),
     db: Session = Depends(get_db),
 ):
     lec = _get_ops_lecture(db, lecture_id, principal)
@@ -1685,7 +1705,7 @@ def ops_update_question(
     lecture_id: str,
     question_id: str,
     req: _QuestionUpdate,
-    principal: Principal = Depends(require_lecture_manager),
+    principal: Principal = Depends(require_content_author),
     db: Session = Depends(get_db),
 ):
     # FOR UPDATE(_get_ops_question) — 이 PUT도 payload(JSON)를 통째로 읽고-고쳐-재할당하므로
@@ -1795,7 +1815,7 @@ def ops_update_question(
 def ops_delete_question(
     lecture_id: str,
     question_id: str,
-    principal: Principal = Depends(require_lecture_manager),
+    principal: Principal = Depends(require_content_author),
     db: Session = Depends(get_db),
 ):
     # FOR UPDATE(_get_ops_question) — payload에서 이미지 경로를 수집한 뒤 상태를 바꾸므로,
@@ -1827,7 +1847,7 @@ def ops_delete_question(
 def ops_place_question_to_bank(
     lecture_id: str,
     question_id: str,
-    principal: Principal = Depends(require_lecture_manager),
+    principal: Principal = Depends(require_content_author),
     db: Session = Depends(get_db),
 ):
     """강의 문항 → 전체학습 문제은행 배치 — 자기검증 '은행 적합' 판정의 실행 단계.
@@ -1984,7 +2004,7 @@ def ops_attach_question_image(
     slot: str = Form(...),  # prompt|option — 문항의 어느 자리에 붙는 이미지인가
     option_index: int | None = Form(default=None),  # slot=option일 때 보기 인덱스
     file: UploadFile = File(...),
-    principal: Principal = Depends(require_lecture_manager),
+    principal: Principal = Depends(require_content_author),
     db: Session = Depends(get_db),
 ):
     """문항 이미지 첨부(multipart) — 영상·자료와 동일 패턴: 임시파일 청크 복사(누적 바이트
@@ -2070,7 +2090,7 @@ def ops_delete_question_image(
     question_id: str,
     slot: str,
     option_index: int | None = None,
-    principal: Principal = Depends(require_lecture_manager),
+    principal: Principal = Depends(require_content_author),
     db: Session = Depends(get_db),
 ):
     """문항 이미지 제거 — payload 참조 삭제 + commit '성공 후' 파일 물리 삭제.
@@ -2171,7 +2191,7 @@ class _TranscriptReq(BaseModel):
 def ops_put_transcript(
     lecture_id: str,
     req: _TranscriptReq,
-    principal: Principal = Depends(require_lecture_manager),
+    principal: Principal = Depends(require_content_author),
     db: Session = Depends(get_db),
 ):
     """강사 제공 자막 저장(붙여넣기/텍스트) — 파싱 성공해야 저장(빈 자막 400).
@@ -2196,7 +2216,7 @@ def ops_put_transcript(
 async def ops_upload_transcript(
     lecture_id: str,
     file: UploadFile = File(...),
-    principal: Principal = Depends(require_lecture_manager),
+    principal: Principal = Depends(require_content_author),
     db: Session = Depends(get_db),
 ):
     """SRT/VTT 자막 파일 업로드 → 파싱해 저장. 확장자로 형식 판별(.vtt / .srt / 그 외 auto)."""
@@ -2233,7 +2253,7 @@ async def ops_upload_transcript(
 @router.delete("/ops/lectures/{lecture_id}/transcript")
 def ops_delete_transcript(
     lecture_id: str,
-    principal: Principal = Depends(require_lecture_manager),
+    principal: Principal = Depends(require_content_author),
     db: Session = Depends(get_db),
 ):
     """강의 전사 삭제 — 다음 생성부터 자동 STT로 되돌아간다."""
@@ -2255,7 +2275,7 @@ class _GenerateReq(BaseModel):
 def ops_generate_questions(
     lecture_id: str,
     req: _GenerateReq,
-    principal: Principal = Depends(require_lecture_manager),
+    principal: Principal = Depends(require_content_author),
     db: Session = Depends(get_db),
 ):
     """AI 문항 자동 생성 — STT 전사(키 설정 시) → LLM 출제, source=llm·status=draft 저장.
@@ -2641,7 +2661,7 @@ async def _create_file_material(
 async def ops_create_material(
     lecture_id: str,
     request: Request,
-    principal: Principal = Depends(require_lecture_manager),
+    principal: Principal = Depends(require_content_author),
     db: Session = Depends(get_db),
 ):
     """자료 생성 — kind=file은 multipart(title+file), kind=link는 JSON(title+url).
@@ -2665,7 +2685,7 @@ def ops_update_material(
     lecture_id: str,
     material_id: str,
     req: _MaterialUpdate,
-    principal: Principal = Depends(require_lecture_manager),
+    principal: Principal = Depends(require_content_author),
     db: Session = Depends(get_db),
 ):
     """메타만 수정(title·order_no) — 파일 교체·URL 변경은 삭제 후 재등록으로 처리한다."""
@@ -2701,7 +2721,7 @@ def ops_update_material(
 def ops_delete_material(
     lecture_id: str,
     material_id: str,
-    principal: Principal = Depends(require_lecture_manager),
+    principal: Principal = Depends(require_content_author),
     db: Session = Depends(get_db),
 ):
     """소프트 삭제 + file 종류는 파일 물리 삭제 — 레코드·이력은 보존(status=deleted로

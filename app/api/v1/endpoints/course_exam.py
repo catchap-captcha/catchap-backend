@@ -28,7 +28,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
-from app.core.permissions import Principal, require_lecture_manager, require_student
+from app.core.permissions import Principal, require_content_author, require_lecture_manager, require_student
 from app.core.security import new_uuid
 from app.db.session import get_db
 from app.models import (
@@ -313,7 +313,7 @@ def ops_list_exam_questions(
 def ops_create_exam_question(
     course_id: str,
     req: _ExamQuestionCreate,
-    principal: Principal = Depends(require_lecture_manager),
+    principal: Principal = Depends(require_content_author),
     db: Session = Depends(get_db),
 ):
     from app.api.v1.endpoints.lectures import _get_ops_course
@@ -353,7 +353,7 @@ def ops_update_exam_question(
     course_id: str,
     question_id: str,
     req: _ExamQuestionUpdate,
-    principal: Principal = Depends(require_lecture_manager),
+    principal: Principal = Depends(require_content_author),
     db: Session = Depends(get_db),
 ):
     from app.api.v1.endpoints.lectures import _get_ops_course
@@ -407,7 +407,7 @@ def ops_update_exam_question(
 def ops_delete_exam_question(
     course_id: str,
     question_id: str,
-    principal: Principal = Depends(require_lecture_manager),
+    principal: Principal = Depends(require_content_author),
     db: Session = Depends(get_db),
 ):
     from app.api.v1.endpoints.lectures import _get_ops_course
@@ -434,7 +434,7 @@ def ops_delete_exam_question(
 @router.post("/ops/courses/{course_id}/exam-questions/import-from-lectures")
 def ops_import_exam_from_lectures(
     course_id: str,
-    principal: Principal = Depends(require_lecture_manager),
+    principal: Principal = Depends(require_content_author),
     db: Session = Depends(get_db),
 ):
     """코스 소속 강의의 활성 확인 문항 → 시험 문항(origin=lecture, draft) 일괄 복사(to-exam).
@@ -558,7 +558,7 @@ class _ExamGenerateReq(BaseModel):
 def ops_generate_exam_questions(
     course_id: str,
     req: _ExamGenerateReq,
-    principal: Principal = Depends(require_lecture_manager),
+    principal: Principal = Depends(require_content_author),
     db: Session = Depends(get_db),
 ):
     """코스 강의 구성(제목·설명) 기반 LLM 수료 시험 문항 자동 생성(origin=llm, draft).
@@ -732,7 +732,7 @@ def ops_attach_exam_image(
     slot: str = Form(...),  # prompt|option
     option_index: int | None = Form(default=None),
     file: UploadFile = File(...),
-    principal: Principal = Depends(require_lecture_manager),
+    principal: Principal = Depends(require_content_author),
     db: Session = Depends(get_db),
 ):
     """시험 문항 이미지 첨부(multipart) — 강의 문항 업로드와 동일 패턴: 임시파일 청크 복사 →
@@ -816,7 +816,7 @@ def ops_delete_exam_image(
     question_id: str,
     slot: str,
     option_index: int | None = None,
-    principal: Principal = Depends(require_lecture_manager),
+    principal: Principal = Depends(require_content_author),
     db: Session = Depends(get_db),
 ):
     """시험 문항 이미지 제거 — images 참조 삭제 + commit 성공 후 파일 물리 삭제."""

@@ -91,6 +91,10 @@ require_ops = require_roles("ops")
 # 강의(uploaded_by)만. 스코프 강제는 엔드포인트의 _get_ops_lecture/목록 필터가 담당한다.
 # 강사는 초대·승인제(운영자가 /ops/instructors에서 발급) — 공개 가입 경로가 없다.
 require_lecture_manager = require_roles("ops", "instructor")
+# 콘텐츠 저작(생성·편집·삭제·문항·이미지·AI·자막·자료) — 강사 전용. 운영자(ops)는 감독·검수만
+# 하고 직접 저작하지 않는다(사용자 결정 0720, 실무 표준: 콘텐츠=강사, 운영자=조회·검수·공개/숨김).
+# 조회(GET)·공개/숨김(PUT status)은 require_lecture_manager로 ops도 유지.
+require_content_author = require_roles("instructor")
 
 
 def check_org_scope(principal: Principal, organization_id: str) -> None:

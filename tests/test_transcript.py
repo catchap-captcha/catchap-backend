@@ -7,7 +7,7 @@
 import pytest
 
 from app.services.transcript_parser import TranscriptParseError, parse_transcript
-from tests.test_captcha_api import _ops, auth
+from tests.test_captcha_api import _instructor, _ops, auth
 from tests.test_lectures import _upload_lecture
 
 
@@ -37,7 +37,7 @@ def _lec(client, tok):
 
 
 def test_transcript_paste_get_delete(client, db, seed_org):
-    tok = _ops(client, db)
+    tok = _instructor(client, db)
     lec = _lec(client, tok)
     r = client.get(f"/api/v1/ops/lectures/{lec['id']}/transcript", headers=auth(tok))
     assert r.json()["has_transcript"] is False
@@ -68,7 +68,7 @@ def test_transcript_paste_get_delete(client, db, seed_org):
 
 
 def test_transcript_upload_srt(client, db, seed_org):
-    tok = _ops(client, db)
+    tok = _instructor(client, db)
     lec = _lec(client, tok)
     srt_text = "1\n00:00:01,000 --> 00:00:03,000\n한글 자막\n"
     r = client.post(
@@ -86,7 +86,7 @@ def test_generate_prefers_stored_transcript_over_stt(client, db, monkeypatch, tm
     monkeypatch.setattr(get_settings(), "ANTHROPIC_API_KEY", "sk-x")
     monkeypatch.setattr(get_settings(), "OPENAI_API_KEY", "sk-stt")  # STT 키 있어도 안 써야 함
     monkeypatch.setattr(get_settings(), "LECTURE_MEDIA_DIR", str(tmp_path))
-    tok = _ops(client, db)
+    tok = _instructor(client, db)
     lec = _lec(client, tok)
     client.put(
         f"/api/v1/ops/lectures/{lec['id']}/transcript",
@@ -126,7 +126,7 @@ def test_generate_caches_auto_stt(client, db, monkeypatch, tmp_path, seed_org):
     monkeypatch.setattr(get_settings(), "ANTHROPIC_API_KEY", "sk-x")
     monkeypatch.setattr(get_settings(), "OPENAI_API_KEY", "sk-stt")
     monkeypatch.setattr(get_settings(), "LECTURE_MEDIA_DIR", str(tmp_path))
-    tok = _ops(client, db)
+    tok = _instructor(client, db)
     lec = _lec(client, tok)
 
     import app.clients.ai_client as ai

@@ -7,7 +7,7 @@
 """
 
 from app.models import Course, CourseExamAttempt, CourseExamQuestion, LectureWatchProgress
-from tests.test_captcha_api import _ops, auth
+from tests.test_captcha_api import _instructor, _ops, auth
 from tests.test_lectures import (
     _attach_image,
     _image_id_from_url,
@@ -77,7 +77,7 @@ def _submit_all_correct(client, stok, course_id, db, *, perfect=False):
 
 # ---------------------------------------------------------------- 강사 CRUD·검증
 def test_past_exam_requires_source(client, db, seed_org):
-    tok = _ops(client, db)
+    tok = _instructor(client, db)
     course = _mk_course(client, tok, db)
     # 기출인데 출처 없음 → 400 (비영리 교육용 이용 전제, 설계 §2)
     r = _add_exam_q(client, tok, course["id"], prompt="2+3=?", options=["4", "5", "6"],
@@ -90,7 +90,7 @@ def test_past_exam_requires_source(client, db, seed_org):
 
 
 def test_exam_question_validation(client, db, seed_org):
-    tok = _ops(client, db)
+    tok = _instructor(client, db)
     course = _mk_course(client, tok, db)
     # 정답 번호가 보기 범위를 벗어남 → 400
     r = _add_exam_q(client, tok, course["id"], prompt="q", options=["a", "b"], answer_indexes=[5])
@@ -105,7 +105,7 @@ def test_exam_question_scope_other_instructor_404(client, db, seed_org):
     from app.core.security import hash_password
     from app.models import User
 
-    tok = _ops(client, db)
+    tok = _instructor(client, db)
     course = _mk_course(client, tok, db)
     # 다른 강사
     other = User(email="inst2@t.dev", password_hash=hash_password("Password123!"),
@@ -121,7 +121,7 @@ def test_exam_question_scope_other_instructor_404(client, db, seed_org):
 
 # ---------------------------------------------------------------- 학생: 응시 자격
 def test_exam_locked_until_all_lectures_done(client, db, seed_org):
-    tok = _ops(client, db)
+    tok = _instructor(client, db)
     course = _mk_course(client, tok, db)
     _assign_lecture(client, tok, course["id"], title="1강")
     lec2 = _assign_lecture(client, tok, course["id"], title="2강")
@@ -144,7 +144,7 @@ def test_exam_locked_until_all_lectures_done(client, db, seed_org):
 
 def test_no_exam_when_no_active_questions(client, db, seed_org):
     """활성 문항 0개 = '시험 없는 코스'. has_exam False, 세션 발급 404."""
-    tok = _ops(client, db)
+    tok = _instructor(client, db)
     course = _mk_course(client, tok, db)
     lec = _assign_lecture(client, tok, course["id"])
     _complete_lecture(db, seed_org["student"].id, lec["id"])
@@ -163,7 +163,7 @@ def test_no_exam_when_no_active_questions(client, db, seed_org):
 def test_mastery_retry_only_wrong_until_pass(client, db, seed_org):
     """완전학습 — 회차마다 정복 못 한 것만 나오고, 누적 전 문항 정답 시 수료.
     한 문항을 일부러 틀리면 다음 회차에 그것만 다시 나온다(만점 1회 강제 아님)."""
-    tok = _ops(client, db)
+    tok = _instructor(client, db)
     course = _mk_course(client, tok, db)
     lec = _assign_lecture(client, tok, course["id"])
     _complete_lecture(db, seed_org["student"].id, lec["id"])
@@ -216,7 +216,7 @@ def test_mastery_retry_only_wrong_until_pass(client, db, seed_org):
 def test_perfect_when_all_correct_one_sitting(client, db, seed_org):
     """완벽 통과 = 현재 활성 전 문항을 한 회차에 모두 맞힘(0719 재정의). 작은 코스는
     첫 회차가 곧 전 문항이라 첫 판 무결점이 그대로 완벽 통과."""
-    tok = _ops(client, db)
+    tok = _instructor(client, db)
     course = _mk_course(client, tok, db)
     lec = _assign_lecture(client, tok, course["id"])
     _complete_lecture(db, seed_org["student"].id, lec["id"])
@@ -232,7 +232,7 @@ def test_perfect_challenge_upgrade_after_pass(client, db, seed_org):
     """★0719 정책 재설계 — 한 번 틀려 완벽을 놓치고 수료해도, '완벽 도전'(전 문항 한 판)을
     아싸면 완벽 통과로 승급한다(옛 규칙의 '한 번 틀리면 영구 박탈' 폐지 = 재도전 경로).
     perfect 판정은 오답 이력을 보지 않으므로 공정성 문제(삭제 문항 오답)도 함께 사라진다."""
-    tok = _ops(client, db)
+    tok = _instructor(client, db)
     course = _mk_course(client, tok, db)
     lec = _assign_lecture(client, tok, course["id"])
     _complete_lecture(db, seed_org["student"].id, lec["id"])
@@ -278,7 +278,7 @@ def test_perfect_challenge_upgrade_after_pass(client, db, seed_org):
 def test_perfect_challenge_only_after_pass(client, db, seed_org):
     """완벽 도전은 수료 후 전용 — 미수료 학생이 perfect=true를 보내도 일반 회차로 처리하고,
     can_perfect_challenge는 수료 전까지 False(두 모드가 학생 상태로 유일하게 갈린다)."""
-    tok = _ops(client, db)
+    tok = _instructor(client, db)
     course = _mk_course(client, tok, db)
     lec = _assign_lecture(client, tok, course["id"])
     _complete_lecture(db, seed_org["student"].id, lec["id"])
@@ -295,7 +295,7 @@ def test_perfect_challenge_only_after_pass(client, db, seed_org):
 
 def test_no_answer_is_wrong(client, db, seed_org):
     """무응답('잘 모르겠어요' = 빈 picks)은 오답 — 운 좋은 정답 없음(설계 §3)."""
-    tok = _ops(client, db)
+    tok = _instructor(client, db)
     course = _mk_course(client, tok, db)
     lec = _assign_lecture(client, tok, course["id"])
     _complete_lecture(db, seed_org["student"].id, lec["id"])
@@ -313,7 +313,7 @@ def test_no_answer_is_wrong(client, db, seed_org):
 # ---------------------------------------------------------------- 방어: 재제출·재사용
 def test_resubmit_conflict_and_open_sitting_reuse(client, db, seed_org):
     """제출된 회차 재제출 409 + 미제출 회차는 재발급 시 그대로 재사용(파밍 차단)."""
-    tok = _ops(client, db)
+    tok = _instructor(client, db)
     course = _mk_course(client, tok, db)
     lec = _assign_lecture(client, tok, course["id"])
     _complete_lecture(db, seed_org["student"].id, lec["id"])
@@ -339,7 +339,7 @@ def test_stale_sitting_reissued_after_option_edit(client, db, seed_org):
     """★skeptic CONFIRMED 회귀 — 발급된 회차 중 강사가 보기 수를 바꾸면 저장된 순열이
     어긋나 채점 시 500(그 학생 시험 영구 봉쇄)이던 버그. 이제: 재발급 시 그 회차를
     폐기하고 새 순열로 다시 내고, 제출해도 500 없이 stale로 정직하게 처리한다."""
-    tok = _ops(client, db)
+    tok = _instructor(client, db)
     course = _mk_course(client, tok, db)
     lec = _assign_lecture(client, tok, course["id"])
     _complete_lecture(db, seed_org["student"].id, lec["id"])
@@ -373,7 +373,7 @@ def test_stale_sitting_reissued_after_option_edit(client, db, seed_org):
 def test_shrink_options_mid_flight_no_crash(client, db, seed_org):
     """옵션 축소 — 발급 시점 순열이 사라진 큰 인덱스를 참조해 session·submit이 IndexError로
     터지던 경로. 재발급이 크래시 없이 유효 회차를 준다."""
-    tok = _ops(client, db)
+    tok = _instructor(client, db)
     course = _mk_course(client, tok, db)
     lec = _assign_lecture(client, tok, course["id"])
     _complete_lecture(db, seed_org["student"].id, lec["id"])
@@ -396,7 +396,7 @@ def test_shrink_options_mid_flight_no_crash(client, db, seed_org):
 def test_negative_and_out_of_range_picks_rejected(client, db, seed_org):
     """음수·범위 밖 picks는 무응답(오답)으로 — order[-1] 같은 파이썬 음수 인덱싱으로
     표시-순서 계약을 우회하는 것 차단(skeptic 경미 지적)."""
-    tok = _ops(client, db)
+    tok = _instructor(client, db)
     course = _mk_course(client, tok, db)
     lec = _assign_lecture(client, tok, course["id"])
     _complete_lecture(db, seed_org["student"].id, lec["id"])
@@ -417,7 +417,7 @@ def test_negative_and_out_of_range_picks_rejected(client, db, seed_org):
 def test_courses_exam_summary_passed_at(client, db, seed_org):
     """'나의 기록' 수료 현황 원천 — GET /courses의 exam{} 요약. 수료 시 passed/perfect/
     passed_at을 담아, 화면이 수료 완료/진행 중/잠김을 한 곳에서 나눠 보여줄 수 있게 한다."""
-    tok = _ops(client, db)
+    tok = _instructor(client, db)
     stok = _student_token(client, seed_org)
     course = _mk_course(client, tok, db, subject="수학", title="수학 개념완성")
     lec = _assign_lecture(client, tok, course["id"])
@@ -444,7 +444,7 @@ def test_certificate_only_after_completion(client, db, seed_org):
 
     수료증 이미지는 프론트가 그리지만 근거 데이터는 서버가 수료를 검증한 뒤에만 준다.
     학생 화면 규약대로 실명이 아니라 nickname을 싣고, 과목·수료일·문항수는 완료 스냅샷에서 온다."""
-    tok = _ops(client, db)
+    tok = _instructor(client, db)
     stok = _student_token(client, seed_org)
     course = _mk_course(client, tok, db, subject="수학", title="수학 개념완성")
     lec = _assign_lecture(client, tok, course["id"])
@@ -472,7 +472,7 @@ def test_certificate_only_after_completion(client, db, seed_org):
 
 def test_certificate_serial_stable(client, db, seed_org):
     """일련번호는 completion.id에서 결정적 파생 — 재발급(재호출)해도 같은 번호(위·변조 대조용)."""
-    tok = _ops(client, db)
+    tok = _instructor(client, db)
     stok = _student_token(client, seed_org)
     course = _mk_course(client, tok, db)
     lec = _assign_lecture(client, tok, course["id"])
@@ -490,7 +490,7 @@ def test_exam_stats_pass_rate_and_completion(client, db, seed_org):
 
     한 문항을 일부러 틀렸다가 정복하면 그 문항의 wrong_attempts가 잡히고, 전 문항 정복 시
     수료율이 오른다. 통과율=정복 학생/시도 학생(아무도 안 풀면 None)."""
-    tok = _ops(client, db)
+    tok = _instructor(client, db)
     stok = _student_token(client, seed_org)
     course = _mk_course(client, tok, db)
     lec = _assign_lecture(client, tok, course["id"])
@@ -536,7 +536,7 @@ def test_exam_stats_scope_other_instructor_404(client, db, seed_org):
     from app.core.security import hash_password
     from app.models import User
 
-    tok = _ops(client, db)
+    tok = _instructor(client, db)
     course = _mk_course(client, tok, db)
     other = User(email="inst3@t.dev", password_hash=hash_password("Password123!"),
                  name="다른강사", role="instructor",
@@ -553,7 +553,7 @@ def test_metrics_isolation_no_learning_attempt(client, db, seed_org):
     """지표 격리(설계 §7) — 시험 응답은 LearningAttempt에 안 쌓인다(정답률 오염 방지)."""
     from app.models import LearningAttempt
 
-    tok = _ops(client, db)
+    tok = _instructor(client, db)
     course = _mk_course(client, tok, db)
     lec = _assign_lecture(client, tok, course["id"])
     _complete_lecture(db, seed_org["student"].id, lec["id"])
@@ -589,7 +589,7 @@ def _add_lecture_q(db, lecture_id, *, prompt, options, answer_index,
 def test_import_exam_from_lectures(client, db, seed_org, media_dir):
     """코스 강의의 active 확인 문항 → 시험 문항(origin=lecture·draft) 복사. draft 제외·멱등,
     ★이미지 문항도 가져오되 이미지 파일은 새 UUID로 복사(강의 문항 생명주기와 독립)."""
-    tok = _ops(client, db)
+    tok = _instructor(client, db)
     course = _mk_course(client, tok, db)
     lec = _assign_lecture(client, tok, course["id"])
     _add_lecture_q(db, lec["id"], prompt="1+1은?", options=["1", "2", "3", "4"], answer_index=1, order_no=1)
@@ -642,7 +642,7 @@ def _attach_exam_image(client, tok, course_id, qid, *, slot="prompt", option_ind
 
 def test_exam_question_image_attach_serve_delete(client, db, seed_org, media_dir):
     """시험 문항 이미지 첨부 → 무인증 서빙 200 → 삭제 후 404. 학생 응시 화면에 URL이 실린다."""
-    tok = _ops(client, db)
+    tok = _instructor(client, db)
     stok = _student_token(client, seed_org)
     course = _mk_course(client, tok, db)
     lec = _assign_lecture(client, tok, course["id"])
@@ -684,7 +684,7 @@ def test_generate_exam_questions_llm(client, db, seed_org, monkeypatch):
     from app.core.config import get_settings
 
     monkeypatch.setattr(get_settings(), "ANTHROPIC_API_KEY", "sk-x")
-    tok = _ops(client, db)
+    tok = _instructor(client, db)
     course = _mk_course(client, tok, db)
     _assign_lecture(client, tok, course["id"], title="1강 분수")
 
@@ -721,7 +721,7 @@ def test_generate_exam_uses_lecture_transcript(client, db, seed_org, monkeypatch
     from app.models import LectureTranscript
 
     monkeypatch.setattr(get_settings(), "ANTHROPIC_API_KEY", "sk-x")
-    tok = _ops(client, db)
+    tok = _instructor(client, db)
     course = _mk_course(client, tok, db)
     lec = _assign_lecture(client, tok, course["id"], title="1강")
     db.add(LectureTranscript(
@@ -759,7 +759,7 @@ def test_generate_exam_questions_no_key_503(client, db, seed_org, monkeypatch):
 
     monkeypatch.setattr(get_settings(), "ANTHROPIC_API_KEY", "")
     monkeypatch.setattr(get_settings(), "OPENAI_API_KEY", "")
-    tok = _ops(client, db)
+    tok = _instructor(client, db)
     course = _mk_course(client, tok, db)
     r = client.post(
         f"/api/v1/ops/courses/{course['id']}/exam-questions/generate",
