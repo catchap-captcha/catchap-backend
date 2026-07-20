@@ -1212,6 +1212,60 @@ def ops_instructor_dashboard(
         weak_lectures.sort(key=lambda w: w["pass_rate"])  # 어려운(낮은 통과율) 강의 먼저
         weak_lectures = weak_lectures[:6]
 
+    # --- 문항별 확인문항 통계 — '특정 문항이 유독 어렵거나 잘못 만들어졌나'(사용자 요청 0720).
+    #     question_id 계측(lecture_cp_qid_01) 이후 데이터만. 통과율 매우 낮음+충분한 시도 = 이상
+    #     의심(검토 권장). 구버전 이벤트(question_id NULL)는 제외.
+    weak_checkpoint_qs: list[dict] = []
+    if lec_ids:
+        cq_rows = (
+            db.query(
+                LectureCheckpointEvent.question_id,
+                LectureCheckpointEvent.lecture_id,
+                func.sum(case((LectureCheckpointEvent.result == "passed", 1), else_=0)),
+                func.sum(case((LectureCheckpointEvent.result == "failed", 1), else_=0)),
+                func.count(func.distinct(LectureCheckpointEvent.student_id)),
+            )
+            .filter(
+                LectureCheckpointEvent.lecture_id.in_(lec_ids),
+                LectureCheckpointEvent.question_id.isnot(None),
+                LectureCheckpointEvent.result.in_(("passed", "failed")),
+            )
+            .group_by(LectureCheckpointEvent.question_id, LectureCheckpointEvent.lecture_id)
+            .all()
+        )
+        cq_qids = [r[0] for r in cq_rows]
+        prompts = (
+            {
+                q.id: (q.payload or {}).get("prompt", "")
+                for q in db.query(LectureQuestion).filter(LectureQuestion.id.in_(cq_qids)).all()
+            }
+            if cq_qids
+            else {}
+        )
+        title_by2 = {lec.id: lec.title for lec in my_lectures}
+        for qid, lid, passed, failed, learners in cq_rows:
+            p = int(passed or 0)
+            f = int(failed or 0)
+            total = p + f
+            if total == 0:
+                continue
+            rate = p / total
+            weak_checkpoint_qs.append(
+                {
+                    "question_id": qid,
+                    "lecture_id": lid,
+                    "lecture_title": title_by2.get(lid, ""),
+                    "prompt": (prompts.get(qid) or "")[:120],
+                    "pass_rate": round(rate, 3),
+                    "attempts": total,
+                    "learners": int(learners or 0),
+                    # 통과율 매우 낮음(35% 미만)+시도 3회↑ = 너무 어렵거나 불량 의심 → 검토 권장
+                    "review": rate < 0.35 and total >= 3,
+                }
+            )
+        weak_checkpoint_qs.sort(key=lambda w: w["pass_rate"])  # 어려운/이상한 문항 먼저
+        weak_checkpoint_qs = weak_checkpoint_qs[:6]
+
     return {
         "lecture_count": len(my_lectures),
         "course_count": len(my_courses),
@@ -1225,6 +1279,7 @@ def ops_instructor_dashboard(
         "course_completions": course_completions,
         "weak_questions": weak_questions,
         "weak_lectures": weak_lectures,
+        "weak_checkpoint_questions": weak_checkpoint_qs,
     }
 
 

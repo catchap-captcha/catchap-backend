@@ -567,6 +567,7 @@ def _verify_lecture_checkpoint(
     updated = lecture_service.record_checkpoint(
         db, student_id=student.id, lecture_id=lecture_id,
         position_sec=int(cp or 0), passed=success, rewind_to_sec=rewind_to,
+        question_id=str(meta["qid"]) if meta.get("qid") else None,  # 문항별 통계 계측
     )
     return {
         "watched_max_sec": int(updated.watched_max_sec or 0),

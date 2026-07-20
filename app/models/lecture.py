@@ -175,6 +175,9 @@ class LectureCheckpointEvent(Base, UUIDPk, Timestamps):
 
     student_id: Mapped[str] = mapped_column(CHAR(36), ForeignKey("student_profiles.id"))
     lecture_id: Mapped[str] = mapped_column(CHAR(36), ForeignKey("lectures.id"), index=True)
+    # 어느 확인문항이었는지 — 문항별 난이도·불량(이상) 탐지용(0720 계측 추가). 소프트 참조(FK 없음:
+    # 문항 삭제와 독립·charset 회피). 구버전 이벤트는 NULL(문항별 집계에서 제외).
+    question_id: Mapped[str | None] = mapped_column(CHAR(36), nullable=True, index=True)
     position_sec: Mapped[int] = mapped_column(default=0)
     result: Mapped[str] = mapped_column(String(20))  # passed|failed|exempted
 

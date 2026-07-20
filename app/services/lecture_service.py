@@ -326,6 +326,7 @@ def record_checkpoint(
     position_sec: int,
     passed: bool,
     rewind_to_sec: int | None = None,
+    question_id: str | None = None,
 ) -> LectureWatchProgress | None:
     """체크포인트 캡차 결과 기록 — 이벤트 적재 + 통과 시 카운트 증가·다음 지점 재예약.
 
@@ -336,6 +337,7 @@ def record_checkpoint(
         LectureCheckpointEvent(
             student_id=student_id,
             lecture_id=lecture_id,
+            question_id=question_id,  # 문항별 난이도·불량 탐지용(없으면 NULL)
             position_sec=int(position_sec),
             result="passed" if passed else "failed",
         )

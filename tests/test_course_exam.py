@@ -907,3 +907,32 @@ def test_instructor_dashboard_weak_lectures(client, db, seed_org):
     assert wl[0]["lecture_id"] == hard["id"] and wl[0]["pass_rate"] == 0.25  # 어려운 강의 먼저
     assert wl[0]["attempts"] == 4 and wl[0]["learners"] == 3
     assert wl[1]["lecture_id"] == easy["id"] and wl[1]["pass_rate"] == 1.0
+
+
+def test_instructor_dashboard_weak_checkpoint_questions(client, db, seed_org):
+    """문항별 확인문항 — 특정 문항의 통과율·검토 권장(매우 낮음+충분 시도)."""
+    from app.models import LectureCheckpointEvent, LectureQuestion
+
+    tok = _instructor(client, db)
+    course = _mk_course(client, tok, db)
+    lec = _assign_lecture(client, tok, course["id"])
+    q_hard = LectureQuestion(lecture_id=lec["id"], payload={"prompt": "이상한 문항", "options": ["a", "b"]},
+                             answer_index=0, status="active", position_sec=30)
+    q_easy = LectureQuestion(lecture_id=lec["id"], payload={"prompt": "쉬운 문항", "options": ["a", "b"]},
+                             answer_index=0, status="active", position_sec=60)
+    db.add_all([q_hard, q_easy])
+    db.commit()
+    # 어려운: 1통과/4실패=20%(검토 권장) · 쉬운: 4통과/1실패=80%
+    for i in range(4):
+        db.add(LectureCheckpointEvent(student_id=f"s{i}", lecture_id=lec["id"], question_id=q_hard.id, position_sec=30, result="failed"))
+    db.add(LectureCheckpointEvent(student_id="s4", lecture_id=lec["id"], question_id=q_hard.id, position_sec=30, result="passed"))
+    for i in range(4):
+        db.add(LectureCheckpointEvent(student_id=f"s{i}", lecture_id=lec["id"], question_id=q_easy.id, position_sec=60, result="passed"))
+    db.add(LectureCheckpointEvent(student_id="s4", lecture_id=lec["id"], question_id=q_easy.id, position_sec=60, result="failed"))
+    db.commit()
+
+    cq = client.get("/api/v1/ops/instructor/dashboard", headers=auth(tok)).json()["weak_checkpoint_questions"]
+    assert len(cq) == 2
+    assert cq[0]["question_id"] == q_hard.id and cq[0]["pass_rate"] == 0.2 and cq[0]["review"] is True
+    assert cq[0]["prompt"] == "이상한 문항"
+    assert cq[1]["question_id"] == q_easy.id and cq[1]["pass_rate"] == 0.8 and cq[1]["review"] is False
