@@ -1671,6 +1671,9 @@ def _question_row(q: LectureQuestion) -> dict:
         "position_sec": q.position_sec,
         # 되감기 지점(내용 시작) — null = 미지정(cp-REWIND_SEC 폴백)
         "content_start_sec": q.content_start_sec,
+        # AI가 시점을 제안했고 강사가 아직 확정 안 함 — 폼·목록 'AI 제안' 배지 근거(확정 시 서버가 지움)
+        "position_suggested": bool(payload.get("position_suggested")),
+        "content_start_suggested": bool(payload.get("content_start_suggested")),
         "prompt": payload.get("prompt"),
         "options": options,
         "explain": payload.get("explain"),
@@ -2042,6 +2045,9 @@ def ops_update_question(
     payload["options"] = [str(o).strip() for o in new_options]
     if req.explain is not None:
         payload["explain"] = req.explain.strip()
+    # 강사가 폼에서 저장(수정)하거나 승인(공개)하면 AI 시점 제안은 확정된 것 — 'AI 제안' 표식을 지운다.
+    payload.pop("position_suggested", None)
+    payload.pop("content_start_suggested", None)
     q.payload = payload
     q.answer_index = int(new_answer)
     q.answer_indexes = new_answer_indexes
@@ -2763,6 +2769,10 @@ def _generate_questions_now(db: Session, lec: Lecture, n: int, actor_id: str, on
                 "prompt": item["prompt"],
                 "options": item["options"],
                 "explain": item.get("explain", ""),
+                # AI가 시점을 제안했는지(강사 확인 대상) — 폼·목록의 'AI 제안' 배지 근거.
+                # 강사가 값을 바꾸거나 공개(active)하면 확인된 것으로 보고 서버가 이 표식을 지운다.
+                "position_suggested": pos >= 1,
+                "content_start_suggested": cs is not None,
                 # 자기검증(봇 저항) 판정 — 강사 검수 화면이 읽어 배치를 돕는다.
                 # solver_passed = 블라인드로 풀렸는지(하위호환 명칭 유지).
                 "solver_passed": None if v is None else v["blind_passed"],
