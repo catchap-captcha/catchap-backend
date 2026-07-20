@@ -165,6 +165,61 @@ def test_to_bank_rejects_unconvertible(client, db, media_dir):
         assert r.status_code == 400 and "이미지" in r.json()["detail"]
 
 
+def test_bulk_promote_only_reviewed_bank_candidates(client, db, media_dir):
+    """★대량 승격은 '강사가 검수(active)한 verdict=bank' 문항만 — 사람 검토를 건너뛰지 않는다.
+
+    verdict=bank는 '봇이 상식으로 푼다(캡차 부적합·연습 재활용 가능)'는 용도 분류일 뿐
+    정오·품질 보증이 아니라, draft(미검수)·verdict=captcha는 제외한다. 다답형·이미지 등
+    은행 미지원 형식은 사유별로 건너뛰고 보고한다."""
+    from app.models import LectureQuestion
+
+    with _bank_state_guard():
+        tok = _instructor(client, db)
+        lec = _upload_lecture(client, tok, title="세포 분열", subject="과학", duration=600).json()
+        db.add(Question(id="sci-seed-bulk", subject="과학", type="single", order_no=1,
+                        playable=True, payload={"id": "sci-seed-bulk", "type": "single",
+                                                "topic": "seed", "stage": 1, "prompt": "p",
+                                                "hint": "", "options": [{"id": "o1", "text": "x"}],
+                                                "answer": "o1", "explain": "", "playable": True}))
+        db.commit()
+
+        qa = _make_question(client, tok, lec["id"], position_sec=30, status="active")   # active+bank → 승격
+        qd = _make_question(client, tok, lec["id"], status="draft")                     # draft+bank → 미검수 제외
+        qc = _make_question(client, tok, lec["id"], position_sec=60, status="active")   # active+captcha → 부적합 제외
+        qm = _make_question(client, tok, lec["id"], position_sec=90, status="active",
+                            answer_indexes=[0, 1])                                       # active+bank+다답형 → skip
+
+        # 자기검증 결과(payload.suggested_placement)를 재현
+        for qid, verdict in [(qa["id"], "bank"), (qd["id"], "bank"),
+                             (qc["id"], "captcha"), (qm["id"], "bank")]:
+            row = db.get(LectureQuestion, qid)
+            row.payload = {**(row.payload or {}), "suggested_placement": verdict}
+        db.commit()
+
+        r = client.post(
+            f"/api/v1/ops/lectures/{lec['id']}/questions/promote-bank-candidates", headers=auth(tok)
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        # 후보 = active+bank인 qa·qm(qd=draft·qc=captcha 제외). qa 성공, qm 다답형 skip.
+        assert body["candidates"] == 2, body
+        assert body["placed"] == 1, body
+        assert body["skipped"].get("multi_answer") == 1, body
+
+        qs = {x["id"]: x for x in client.get(
+            f"/api/v1/ops/lectures/{lec['id']}/questions", headers=auth(tok)).json()}
+        assert qs[qa["id"]]["status"] == "draft" and qs[qa["id"]]["bank_placed"]  # 배치+강등
+        assert qs[qd["id"]]["status"] == "draft" and not qs[qd["id"]]["bank_placed"]  # 미검수 그대로
+        assert qs[qc["id"]]["status"] == "active" and not qs[qc["id"]]["bank_placed"]  # 캡차 유지
+        assert qs[qm["id"]]["status"] == "active" and not qs[qm["id"]]["bank_placed"]  # 다답형 skip
+
+        # 재실행 멱등 — 이미 배치·강등돼 후보 없음
+        r2 = client.post(
+            f"/api/v1/ops/lectures/{lec['id']}/questions/promote-bank-candidates", headers=auth(tok)
+        )
+        assert r2.status_code == 200 and r2.json()["placed"] == 0
+
+
 def test_bank_lecture_question_gated_by_completion(client, db, seed_org, media_dir):
     """★문제은행 강의 잠금(3단계) — 강의에서 배치한 은행 문항은 그 강의를 완주해야 출제된다.
     강의 무관(기존) 문항은 항상 열림. 비로그인(외부 임베드)은 강의 문항 제외. 진도(split_pool)

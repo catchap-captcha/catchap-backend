@@ -2120,6 +2120,60 @@ def ops_delete_question(
     return {"ok": True}
 
 
+_BANK_SKIP_MSG = {
+    "already_placed": "이미 은행에 배치된 문항입니다.",
+    "multi_answer": "다답형 문항은 은행(단일 정답형)으로 보낼 수 없어요. 단일 정답으로 수정 후 시도해 주세요.",
+    "image": "이미지가 붙은 문항은 은행 형식이 지원하지 않아 보낼 수 없어요.",
+    "bad_options": "보기 형식이 올바르지 않습니다.",
+}
+
+
+def _place_one_to_bank(db: Session, lec: Lecture, q: LectureQuestion) -> dict:
+    """강의 문항 1개를 은행 문항으로 변환·삽입(부수효과 포함). 성공/불가를 예외 없이 dict로
+    돌려줘 대량 승격이 건별로 건너뛸 수 있게 한다(단건 엔드포인트는 사유→HTTP로 변환).
+
+    형식 변환이 핵심 — 강의(인덱스형)와 은행(옵션 id형)은 스키마가 다르다:
+      강의: options=["가","나"]·answer_index=0  →  은행: options=[{id,text}]·answer="o1"·type="single"
+    부수효과: Question 1행 삽입 + 원 문항에 bank_placed 표식 + active면 draft 강등(은행행=봇이
+    상식으로 푸는 문항이라 캡차로 남기면 시청 검증이 약해짐 — 캡차 풀에서 뺀다). commit·런타임
+    갱신(refresh_from_db)·감사·진행 정합은 호출자 책임(대량은 1회로 묶는다). DB 은행 적재
+    여부(파일 폴백) 선검사도 호출자가 한다."""
+    from app.models import Question
+
+    payload = q.payload or {}
+    if (payload.get("bank_placed") or {}).get("bank_id"):
+        return {"ok": False, "reason": "already_placed"}
+    answers = q.answer_indexes or [q.answer_index]
+    if len(answers) != 1:
+        return {"ok": False, "reason": "multi_answer"}
+    if payload.get("prompt_image") or payload.get("option_images"):
+        return {"ok": False, "reason": "image"}
+    options = payload.get("options") or []
+    if not (2 <= len(options) <= 6) or not all(isinstance(o, str) and o.strip() for o in options):
+        return {"ok": False, "reason": "bad_options"}
+    ans_i = int(answers[0])
+    slug = f"lec-{lec.id[:8]}-{q.id[:8]}"  # 출처 추적 슬러그(PK 유니크가 최종 방어)
+    max_order = (
+        db.query(func.max(Question.order_no)).filter(Question.subject == lec.subject).scalar() or 0
+    )
+    bank_payload = {
+        "id": slug, "type": "single", "topic": lec.title, "lecture_id": lec.id, "stage": 1,
+        "prompt": payload.get("prompt") or "", "hint": "",
+        "options": [{"id": f"o{i + 1}", "text": t.strip()} for i, t in enumerate(options)],
+        "answer": f"o{ans_i + 1}", "explain": payload.get("explain") or "", "playable": True,
+    }
+    db.add(
+        Question(id=slug, subject=lec.subject, type="single",
+                 order_no=max_order + 1, playable=True, payload=bank_payload)
+    )
+    q.payload = {**payload, "bank_placed": {"bank_id": slug, "at": datetime.now().isoformat(timespec="seconds")}}
+    demoted = q.status == "active"
+    if demoted:
+        q.status = "draft"
+    db.flush()
+    return {"ok": True, "bank_id": slug, "order_no": max_order + 1, "demoted": demoted}
+
+
 @router.post("/ops/lectures/{lecture_id}/questions/{question_id}/to-bank")
 def ops_place_question_to_bank(
     lecture_id: str,
@@ -2152,82 +2206,23 @@ def ops_place_question_to_bank(
 
     q = _get_ops_question(db, lecture_id, question_id, principal)
     lec = db.get(Lecture, lecture_id)
-    payload = q.payload or {}
-
-    if (payload.get("bank_placed") or {}).get("bank_id"):
-        raise HTTPException(
-            status.HTTP_409_CONFLICT, detail="이미 은행에 배치된 문항입니다."
-        )
-    answers = q.answer_indexes or [q.answer_index]
-    if len(answers) != 1:
-        raise HTTPException(
-            status.HTTP_400_BAD_REQUEST,
-            detail="다답형 문항은 은행(단일 정답형)으로 보낼 수 없어요. 단일 정답으로 수정 후 시도해 주세요.",
-        )
-    if payload.get("prompt_image") or payload.get("option_images"):
-        raise HTTPException(
-            status.HTTP_400_BAD_REQUEST,
-            detail="이미지가 붙은 문항은 은행 형식이 지원하지 않아 보낼 수 없어요.",
-        )
-    options = payload.get("options") or []
-    if not (2 <= len(options) <= 6) or not all(isinstance(o, str) and o.strip() for o in options):
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="보기 형식이 올바르지 않습니다.")
     if db.query(Question).count() == 0:
         raise HTTPException(
             status.HTTP_409_CONFLICT,
             detail="문제은행이 아직 DB에 적재되지 않았어요(파일 폴백 상태). 은행 로더로 기존 문항을 먼저 적재해야 배치할 수 있어요.",
         )
-
-    ans_i = int(answers[0])
-    slug = f"lec-{lec.id[:8]}-{q.id[:8]}"  # 출처 추적 가능한 유일 슬러그(PK 유니크가 최종 방어)
-    max_order = (
-        db.query(func.max(Question.order_no)).filter(Question.subject == lec.subject).scalar()
-        or 0
-    )
-    bank_payload = {
-        "id": slug,
-        "type": "single",
-        # topic=강의 제목 — 오답노트·챕터 제목 파생이 topic을 쓴다(출처가 화면에 보인다)
-        "topic": lec.title,
-        # 출처 강의의 '전체' id — 문제은행 코스/강의별 잠금 해제의 정본 매핑이다(3단계).
-        # 슬러그는 앞 8자만 담아 손실이 있어(lec-{id[:8]}) 역추적에 못 쓴다. 서빙 시점에
-        # 이 값으로 "이 문항을 낸 강의를 학생이 완주했는가"를 판정할 수 있다. 배치 이전에
-        # 넣은 문항엔 이 필드가 없어(=강의 무관 취급) 게이팅에서 열려 있는다(호환).
-        "lecture_id": lec.id,
-        "stage": 1,
-        "prompt": payload.get("prompt") or "",
-        "hint": "",
-        # 위젯은 emoji 없으면 text로 렌더한다(catchap-widget.js: o.emoji || o.text)
-        "options": [{"id": f"o{i + 1}", "text": t.strip()} for i, t in enumerate(options)],
-        "answer": f"o{ans_i + 1}",
-        "explain": payload.get("explain") or "",
-        "playable": True,
-    }
-    db.add(
-        Question(
-            id=slug, subject=lec.subject, type="single",
-            order_no=max_order + 1, playable=True, payload=bank_payload,
-        )
-    )
-    # 원 문항에 배치 이력 표식 — 중복 배치 방지 + 콘솔 '은행 배치됨' 배지의 근거
-    q.payload = {**payload, "bank_placed": {"bank_id": slug, "at": datetime.now().isoformat(timespec="seconds")}}
-    # ★은행으로 옮긴 문항은 강의 캡차 출제에서 뺀다(active→draft 강등). 은행 배치는
-    # 자기검증 verdict='bank'(봇도 상식으로 풀림) 문항의 경로라, 활성 캡차로 남겨두면
-    # 봇이 그냥 통과하는 약한 시청 검증이 된다(skeptic 0718). 캡차 출제는 active만
-    # 대상이므로(_lecture_challenge) draft로 내리면 캡차 풀에서 빠지되, 문항 목록엔
-    # 남아 '은행 배치됨' 배지를 유지한다. 완전 삭제가 아닌 이유: 은행에 payload를
-    # 복사했어도 원 문항은 '이 강의에서 이 개념을 냈다'는 이력이라 보존한다.
-    demoted = q.status == "active"
-    if demoted:
-        q.status = "draft"
-    db.flush()
+    res = _place_one_to_bank(db, lec, q)
+    if not res["ok"]:
+        code = status.HTTP_409_CONFLICT if res["reason"] == "already_placed" else status.HTTP_400_BAD_REQUEST
+        raise HTTPException(code, detail=_BANK_SKIP_MSG[res["reason"]])
+    slug, demoted = res["bank_id"], res["demoted"]
     audit(
         db,
         action="lecture.question.to_bank",
         actor_user_id=principal.id,
         target_type="lecture_question",
         target_id=q.id,
-        after={"bank_id": slug, "subject": lec.subject, "order_no": max_order + 1,
+        after={"bank_id": slug, "subject": lec.subject, "order_no": res["order_no"],
                "demoted_from_active": demoted},
     )
     # 활성 문항 하나가 줄었으면(강등) 그 시점 예약을 정합 — 마지막 활성 핀을 은행으로
@@ -2235,9 +2230,71 @@ def ops_place_question_to_bank(
     if demoted:
         _reconcile_progress(db, lecture_id)
     db.commit()
-    # 런타임 은행 갱신 — 재기동 없이 오늘의퀴즈·은행 풀에 즉시 반영(요청 세션 주입)
+    # 런타임 은행 갱신 — 재기동 없이 오늘의 Q·은행 풀에 즉시 반영(요청 세션 주입)
     runtime_visible = subject_banks.refresh_from_db(db)
     return {"ok": True, "bank_id": slug, "runtime_visible": runtime_visible, "demoted_from_active": demoted}
+
+
+@router.post("/ops/lectures/{lecture_id}/questions/promote-bank-candidates")
+def ops_promote_bank_candidates(
+    lecture_id: str,
+    principal: Principal = Depends(require_content_author),
+    db: Session = Depends(get_db),
+):
+    """자기검증 '은행 적합'(verdict=bank)이면서 **강사가 검수해 공개(active)한** 문항을 한 번에
+    문제은행으로 승격한다.
+
+    ★'자동'이되 사람 검토를 건너뛰지 않는 게 핵심: verdict=bank는 '봇이 자막 없이 상식으로
+    푼다(=시청 검증 캡차엔 부적합, 연습용으론 재활용 가능)'는 **용도 분류**일 뿐, 문항의 정오·
+    품질을 보증하지 않는다(AI가 만든 문항은 정답 키가 틀리거나 애매할 수 있다). 그래서
+    draft(미검수)는 제외하고 **active(강사 공개)만** 대상으로 삼아, 강사의 최종 판단을 게이트로
+    둔다 — 한 개씩 to-bank 누르던 걸 대량으로 묶어줄 뿐이다.
+    다답형·이미지 문항은 은행(단일형)이 못 담아 건너뛰고 사유별 수를 보고한다."""
+    from app.models import Question
+    from app.services import subject_banks
+
+    _get_ops_lecture(db, lecture_id, principal)  # 소유 스코프(남의 강의 404)
+    lec = db.get(Lecture, lecture_id)
+    if db.query(Question).count() == 0:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail="문제은행이 아직 DB에 적재되지 않았어요(파일 폴백 상태). 은행 로더로 기존 문항을 먼저 적재해야 배치할 수 있어요.",
+        )
+    rows = (
+        db.query(LectureQuestion)
+        .filter(LectureQuestion.lecture_id == lecture_id, LectureQuestion.status == "active")
+        .all()
+    )
+    cands = [
+        q for q in rows
+        if (q.payload or {}).get("suggested_placement") == "bank"
+        and not ((q.payload or {}).get("bank_placed") or {}).get("bank_id")
+    ]
+    placed = 0
+    skipped: dict[str, int] = {}
+    any_demoted = False
+    for q in cands:
+        res = _place_one_to_bank(db, lec, q)
+        if res["ok"]:
+            placed += 1
+            any_demoted = any_demoted or res["demoted"]
+        else:
+            skipped[res["reason"]] = skipped.get(res["reason"], 0) + 1
+    if placed:
+        audit(
+            db,
+            action="lecture.question.bulk_to_bank",
+            actor_user_id=principal.id,
+            target_type="lecture",
+            target_id=lecture_id,
+            after={"placed": placed, "skipped": skipped},
+        )
+        # 다수 활성 문항이 강등됐으면 예약을 1회 정합(단건과 동일 처치, 대량은 묶어서)
+        if any_demoted:
+            _reconcile_progress(db, lecture_id)
+    db.commit()
+    runtime_visible = subject_banks.refresh_from_db(db) if placed else True
+    return {"placed": placed, "skipped": skipped, "candidates": len(cands), "runtime_visible": runtime_visible}
 
 
 # ---------------------------------------------------------------- 문항 이미지 첨부
