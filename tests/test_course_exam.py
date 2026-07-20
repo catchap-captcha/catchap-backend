@@ -884,3 +884,26 @@ def test_instructor_dashboard_weak_questions_ranked(client, db, seed_org):
     assert len(wq) == 2
     assert wq[0]["question_id"] == hard["id"] and wq[0]["pass_rate"] == 0.0  # 가장 약한 게 먼저
     assert wq[1]["question_id"] == easy["id"] and wq[1]["pass_rate"] == 1.0
+
+
+def test_instructor_dashboard_weak_lectures(client, db, seed_org):
+    """강의별 확인문항 통과율 — 강의마다 pass/fail 이벤트로 통과율 산출, 낮은 순 정렬."""
+    from app.models import LectureCheckpointEvent
+
+    tok = _instructor(client, db)
+    course = _mk_course(client, tok, db)
+    easy = _assign_lecture(client, tok, course["id"], title="쉬운 강의")
+    hard = _assign_lecture(client, tok, course["id"], title="어려운 강의")
+    # 쉬운: 3통과/0실패=100% · 어려운: 1통과/3실패=25%
+    for i in range(3):
+        db.add(LectureCheckpointEvent(student_id=f"s{i}", lecture_id=easy["id"], position_sec=10, result="passed"))
+    db.add(LectureCheckpointEvent(student_id="s0", lecture_id=hard["id"], position_sec=10, result="passed"))
+    for i in range(3):
+        db.add(LectureCheckpointEvent(student_id=f"s{i}", lecture_id=hard["id"], position_sec=10, result="failed"))
+    db.commit()
+
+    wl = client.get("/api/v1/ops/instructor/dashboard", headers=auth(tok)).json()["weak_lectures"]
+    assert len(wl) == 2
+    assert wl[0]["lecture_id"] == hard["id"] and wl[0]["pass_rate"] == 0.25  # 어려운 강의 먼저
+    assert wl[0]["attempts"] == 4 and wl[0]["learners"] == 3
+    assert wl[1]["lecture_id"] == easy["id"] and wl[1]["pass_rate"] == 1.0

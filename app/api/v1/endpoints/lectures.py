@@ -52,7 +52,7 @@ from fastapi import (
 from fastapi.responses import FileResponse
 from jwt import PyJWTError
 from pydantic import BaseModel, Field
-from sqlalchemy import func, not_
+from sqlalchemy import case, func, not_
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
@@ -1173,6 +1173,45 @@ def ops_instructor_dashboard(
             weak_questions.sort(key=lambda w: w["pass_rate"])
             weak_questions = weak_questions[:5]
 
+    # --- 강의별 확인문항 통과율(각 강의마다) — 학생이 어려워하는 '강의'. 코스 시험(문항)이
+    #     per-course인 것과 달리 강의마다 문항이 달라 강의 단위로 본다(사용자 요청 0720).
+    #     통과율 = passed / (passed+failed) 체크포인트 시도. exempted(면제)는 제외. 시도 0 제외.
+    #     ★한계: LectureCheckpointEvent에 question_id가 없어 '강의 안 문항별'은 불가(계측 필요).
+    weak_lectures: list[dict] = []
+    if lec_ids:
+        ev_rows = (
+            db.query(
+                LectureCheckpointEvent.lecture_id,
+                func.sum(case((LectureCheckpointEvent.result == "passed", 1), else_=0)),
+                func.sum(case((LectureCheckpointEvent.result == "failed", 1), else_=0)),
+                func.count(func.distinct(LectureCheckpointEvent.student_id)),
+            )
+            .filter(
+                LectureCheckpointEvent.lecture_id.in_(lec_ids),
+                LectureCheckpointEvent.result.in_(("passed", "failed")),
+            )
+            .group_by(LectureCheckpointEvent.lecture_id)
+            .all()
+        )
+        title_by = {lec.id: lec.title for lec in my_lectures}
+        for lid, passed, failed, learners in ev_rows:
+            p = int(passed or 0)
+            f = int(failed or 0)
+            total = p + f
+            if total == 0:
+                continue
+            weak_lectures.append(
+                {
+                    "lecture_id": lid,
+                    "title": title_by.get(lid, ""),
+                    "pass_rate": round(p / total, 3),  # 통과 시도 / 전체 시도
+                    "attempts": total,
+                    "learners": int(learners or 0),
+                }
+            )
+        weak_lectures.sort(key=lambda w: w["pass_rate"])  # 어려운(낮은 통과율) 강의 먼저
+        weak_lectures = weak_lectures[:6]
+
     return {
         "lecture_count": len(my_lectures),
         "course_count": len(my_courses),
@@ -1185,6 +1224,7 @@ def ops_instructor_dashboard(
         "completed_watches": completed_watches,
         "course_completions": course_completions,
         "weak_questions": weak_questions,
+        "weak_lectures": weak_lectures,
     }
 
 
