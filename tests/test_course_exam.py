@@ -8,7 +8,12 @@
 
 from app.models import Course, CourseExamAttempt, CourseExamQuestion, LectureWatchProgress
 from tests.test_captcha_api import _ops, auth
-from tests.test_lectures import _upload_lecture
+from tests.test_lectures import (
+    _attach_image,
+    _image_id_from_url,
+    _upload_lecture,
+    media_dir,  # noqa: F401 (fixture — LECTURE_MEDIA_DIR을 tmp로, 리포에 파일 안 남김)
+)
 from tests.test_student_data import _student_token
 
 
@@ -581,26 +586,39 @@ def _add_lecture_q(db, lecture_id, *, prompt, options, answer_index,
     return lq
 
 
-def test_import_exam_from_lectures(client, db, seed_org):
-    """코스 강의의 active 확인 문항 → 시험 문항(origin=lecture·draft) 복사. 이미지·draft 제외, 멱등."""
+def test_import_exam_from_lectures(client, db, seed_org, media_dir):
+    """코스 강의의 active 확인 문항 → 시험 문항(origin=lecture·draft) 복사. draft 제외·멱등,
+    ★이미지 문항도 가져오되 이미지 파일은 새 UUID로 복사(강의 문항 생명주기와 독립)."""
     tok = _ops(client, db)
     course = _mk_course(client, tok, db)
     lec = _assign_lecture(client, tok, course["id"])
     _add_lecture_q(db, lec["id"], prompt="1+1은?", options=["1", "2", "3", "4"], answer_index=1, order_no=1)
-    _add_lecture_q(db, lec["id"], prompt="이미지문항", options=["가", "나"], answer_index=0, order_no=2, image=True)
+    img_lq = _add_lecture_q(db, lec["id"], prompt="이미지문항", options=["가", "나"], answer_index=0, order_no=2)
     _add_lecture_q(db, lec["id"], prompt="초안", options=["가", "나"], answer_index=0, order_no=3, status="draft")
+    # 강의 이미지 문항에 실제 프롬프트 이미지 첨부(파일 생성) — 가져오기가 복사하는지 검증
+    ai = _attach_image(client, tok, lec["id"], img_lq.id, slot="prompt")
+    assert ai.status_code == 200, ai.text
+    lec_img_id = _image_id_from_url(ai.json()["prompt_image_url"])
 
     r = client.post(
         f"/api/v1/ops/courses/{course['id']}/exam-questions/import-from-lectures", headers=auth(tok)
     )
     assert r.status_code == 200, r.text
-    assert r.json() == {"imported": 1, "skipped": 1}  # draft는 애초 대상 아님·이미지는 스킵
+    # 텍스트+이미지 두 active 문항 모두 가져옴. draft는 쿼리(status=active)에서 아예 빠져
+    # skipped에 안 잡힌다(가져올 대상이 아니었던 것 ≠ 대상인데 스킵된 것).
+    assert r.json() == {"imported": 2, "skipped": 0}
 
     qs = client.get(f"/api/v1/ops/courses/{course['id']}/exam-questions", headers=auth(tok)).json()
-    assert len(qs) == 1
-    assert qs[0]["origin"] == "lecture" and qs[0]["status"] == "draft"
-    assert qs[0]["prompt"] == "1+1은?" and qs[0]["answer_indexes"] == [1]
-    assert "강의" in (qs[0]["source"] or "")  # 출처 추적
+    assert len(qs) == 2 and all(q["origin"] == "lecture" and q["status"] == "draft" for q in qs)
+    text_q = next(q for q in qs if q["prompt"] == "1+1은?")
+    assert text_q["answer_indexes"] == [1] and "강의" in (text_q["source"] or "")
+    assert text_q["prompt_image_url"] is None  # 텍스트 문항은 이미지 없음
+
+    # 이미지 문항 — 복사됐고, 이미지 id가 강의 원본과 다르며(독립), 무인증 서빙 200
+    img_q = next(q for q in qs if q["prompt"] == "이미지문항")
+    assert img_q["prompt_image_url"], "이미지가 복사되지 않았다"
+    assert _image_id_from_url(img_q["prompt_image_url"]) != lec_img_id, "원본을 공유(복사 안 됨)"
+    assert client.get(img_q["prompt_image_url"]).status_code == 200
 
     # 멱등 — 재실행하면 이미 가져온 건 스킵(중복 안 생김)
     r2 = client.post(
@@ -608,7 +626,57 @@ def test_import_exam_from_lectures(client, db, seed_org):
     )
     assert r2.json()["imported"] == 0
     assert len(client.get(
-        f"/api/v1/ops/courses/{course['id']}/exam-questions", headers=auth(tok)).json()) == 1
+        f"/api/v1/ops/courses/{course['id']}/exam-questions", headers=auth(tok)).json()) == 2
+
+
+def _attach_exam_image(client, tok, course_id, qid, *, slot="prompt", option_index=None,
+                       filename="캡처.png", content_type="image/png", size=2048):
+    data = {"slot": slot}
+    if option_index is not None:
+        data["option_index"] = str(option_index)
+    return client.post(
+        f"/api/v1/ops/courses/{course_id}/exam-questions/{qid}/images",
+        data=data, files={"file": (filename, b"\x02" * size, content_type)}, headers=auth(tok),
+    )
+
+
+def test_exam_question_image_attach_serve_delete(client, db, seed_org, media_dir):
+    """시험 문항 이미지 첨부 → 무인증 서빙 200 → 삭제 후 404. 학생 응시 화면에 URL이 실린다."""
+    tok = _ops(client, db)
+    stok = _student_token(client, seed_org)
+    course = _mk_course(client, tok, db)
+    lec = _assign_lecture(client, tok, course["id"])
+    _complete_lecture(db, seed_org["student"].id, lec["id"])
+    q = _add_exam_q(client, tok, course["id"], prompt="이 사진은?", options=["가", "나"],
+                    answer_indexes=[0]).json()
+
+    # 프롬프트 이미지 첨부 → row에 URL, 파일 서빙 200(무인증 — <img>가 로드)
+    r = _attach_exam_image(client, tok, course["id"], q["id"], slot="prompt")
+    assert r.status_code == 200, r.text
+    url = r.json()["prompt_image_url"]
+    assert url and client.get(url).status_code == 200
+    # 보기 이미지도 첨부
+    r2 = _attach_exam_image(client, tok, course["id"], q["id"], slot="option", option_index=1)
+    assert r2.status_code == 200 and r2.json()["option_image_urls"][1]
+
+    # svg·잘못된 확장자는 400(인라인 렌더 안전 — 래스터만)
+    bad = _attach_exam_image(client, tok, course["id"], q["id"], filename="x.svg",
+                             content_type="image/svg+xml")
+    assert bad.status_code == 400
+
+    # 학생 응시 화면(session)에 이미지 URL이 보기 순서에 맞춰 실린다
+    sess = client.post(f"/api/v1/courses/{course['id']}/exam/session", headers=auth(stok)).json()
+    sq = sess["questions"][0]
+    assert sq["prompt_image_url"] and len(sq["option_image_urls"]) == 2
+    assert any(u for u in sq["option_image_urls"])  # 보기 이미지 하나는 실려 있음
+
+    # 삭제 → images 참조 제거 + 파일 물리 삭제(서빙 404)
+    d = client.delete(
+        f"/api/v1/ops/courses/{course['id']}/exam-questions/{q['id']}/images?slot=prompt",
+        headers=auth(tok),
+    )
+    assert d.status_code == 200 and d.json()["prompt_image_url"] is None
+    assert client.get(url).status_code == 404
 
 
 def test_generate_exam_questions_llm(client, db, seed_org, monkeypatch):

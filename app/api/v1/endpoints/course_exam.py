@@ -15,16 +15,21 @@
 - 기출(origin=past_exam)은 source 필수 — 비영리 교육용 이용 전제(§2), 화면 상시 노출.
 """
 
+import os
 import random
+import shutil
 from datetime import datetime
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile, status
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import case, func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.core.config import get_settings
 from app.core.permissions import Principal, require_lecture_manager, require_student
+from app.core.security import new_uuid
 from app.db.session import get_db
 from app.models import (
     CourseCompletion,
@@ -219,7 +224,52 @@ def _validate_question(options: list[str], answer_indexes: list[int], origin: st
     return idxs
 
 
+# ---------------------------------------------------------------- 이미지 문항 헬퍼
+# 강의 문항과 같은 참조 구조({id, ext}·서버 발급 UUID)를 시험 문항 전용 JSON 컬럼(images)에
+# 담는다. 파일은 강의 문항과 같은 media/questions/ 디렉터리를 공유(UUID 키라 충돌 없음) —
+# 파일 경로 유도·확장자 화이트리스트·업로드 청크 복사 헬퍼를 lectures에서 재사용한다.
+def _exam_image_refs(images: dict | None) -> list[dict]:
+    """images의 이미지 참조 전부(prompt + options 값들) — 삭제 연쇄·서빙 검증용."""
+    refs: list[dict] = []
+    if not isinstance(images, dict):
+        return refs
+    pi = images.get("prompt")
+    if isinstance(pi, dict) and pi.get("id"):
+        refs.append(pi)
+    for ref in (images.get("options") or {}).values():
+        if isinstance(ref, dict) and ref.get("id"):
+            refs.append(ref)
+    return refs
+
+
+def _exam_image_url(course_id: str, question_id: str, ref: dict) -> str:
+    """학생·콘솔 <img>가 로드할 서빙 경로 — 내부 파일 경로는 노출하지 않는다."""
+    return f"/api/v1/courses/{course_id}/exam-questions/{question_id}/images/{ref['id']}"
+
+
+def _exam_image_urls(q: CourseExamQuestion) -> tuple[str | None, list[str | None]]:
+    """(프롬프트 이미지 URL, 보기별 이미지 URL 리스트[원본 순서]) — 이미지 없으면 None."""
+    images = q.images if isinstance(q.images, dict) else {}
+    pi = images.get("prompt")
+    opt_imgs = images.get("options") or {}
+    prompt_url = (
+        _exam_image_url(q.course_id, q.id, pi)
+        if isinstance(pi, dict) and pi.get("id")
+        else None
+    )
+    option_urls = [
+        (
+            _exam_image_url(q.course_id, q.id, opt_imgs[str(i)])
+            if isinstance(opt_imgs.get(str(i)), dict) and opt_imgs[str(i)].get("id")
+            else None
+        )
+        for i in range(len(q.options))
+    ]
+    return prompt_url, option_urls
+
+
 def _question_row(q: CourseExamQuestion) -> dict:
+    prompt_url, option_urls = _exam_image_urls(q)
     return {
         "id": q.id,
         "course_id": q.course_id,
@@ -231,6 +281,9 @@ def _question_row(q: CourseExamQuestion) -> dict:
         "source": q.source,
         "order_no": q.order_no,
         "status": q.status,
+        # 이미지 문항 — 내부 경로 대신 서빙 URL만(강의 문항 _question_row와 동일 규약)
+        "prompt_image_url": prompt_url,
+        "option_image_urls": option_urls,  # 보기와 같은 길이(이미지 없는 보기는 None)
         "created_at": q.created_at.isoformat() if q.created_at else None,
     }
 
@@ -328,10 +381,25 @@ def ops_update_exam_question(
         q.status = req.status
     if req.order_no is not None:
         q.order_no = req.order_no
+    # 보기가 줄면 범위 밖 보기 이미지 참조를 정리한다 — 안 그러면 없는 보기의 이미지가
+    # 유령 참조로 남는다(강의 문항 update의 remap과 같은 취지). 파일은 commit 후 물리 삭제.
+    orphan_paths = []
+    if isinstance(q.images, dict) and q.images.get("options"):
+        from app.api.v1.endpoints.lectures import _question_image_path
+
+        images = {"prompt": q.images.get("prompt"), "options": {}}
+        for k, ref in (q.images.get("options") or {}).items():
+            if str(k).isdigit() and int(k) < len(q.options):
+                images["options"][k] = ref
+            elif isinstance(ref, dict) and ref.get("id"):
+                orphan_paths.append(_question_image_path(ref))
+        q.images = images  # JSON 컬럼은 재할당으로만 변경 감지
     audit(db, action="course.exam_question.update", actor_user_id=principal.id,
           target_type="course_exam_question", target_id=q.id,
           after={"status": q.status, "origin": q.origin})
     db.commit()
+    for p in orphan_paths:
+        p.unlink(missing_ok=True)  # commit 성공 후(멱등) — 잘려나간 보기의 이미지 파일 정리
     return _question_row(q)
 
 
@@ -344,14 +412,21 @@ def ops_delete_exam_question(
 ):
     from app.api.v1.endpoints.lectures import _get_ops_course
 
+    from app.api.v1.endpoints.lectures import _question_image_path
+
     _get_ops_course(db, course_id, principal)
     q = db.get(CourseExamQuestion, question_id)
     if q is None or q.course_id != course_id or q.status == "deleted":
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="문항을 찾을 수 없습니다.")
+    # 소프트 삭제 문항의 이미지는 서빙이 막히므로(status=deleted) 파일을 남길 이유가 없다 —
+    # commit 성공 후 물리 삭제해 디스크 누수를 막는다(응답 기록 attempts는 이미지와 무관).
+    image_paths = [_question_image_path(r) for r in _exam_image_refs(q.images)]
     q.status = "deleted"  # 소프트 삭제 — 응답 기록(attempts)의 참조 대상을 보존
     audit(db, action="course.exam_question.delete", actor_user_id=principal.id,
           target_type="course_exam_question", target_id=q.id, after=None)
     db.commit()
+    for p in image_paths:
+        p.unlink(missing_ok=True)
     return {"ok": True}
 
 
@@ -367,9 +442,11 @@ def ops_import_exam_from_lectures(
     왜: 강사가 시험 문항을 하나씩 손으로 넣지 않게 — 이미 검수된 강의 확인 문항을 재활용한다.
     강의 문항·시험 문항은 둘 다 인덱스 기반(options[str]·answer_indexes)이라 형식 변환이
     없다(to-bank와 다른 점). **멱등**: 이미 가져온 강의 문항은 payload 마커(exam_imported)로
-    건너뛴다(to-bank의 bank_placed와 동형). 이미지 문항·형식 불량은 조용히 건너뛰되(전체
-    실패로 만들지 않음) 개수를 정직하게 반환한다. 가져온 문항은 draft — 강사 검수 후 active."""
-    from app.api.v1.endpoints.lectures import _get_ops_course
+    건너뛴다(to-bank의 bank_placed와 동형). **이미지 문항도 가져온다**(course_exam_img_01) —
+    이미지 파일은 새 UUID로 복사해 시험 문항이 강의 문항 생명주기와 독립되게 한다(강의 문항을
+    지워도 시험 이미지는 남는다). 형식 불량은 조용히 건너뛰되 개수를 정직하게 반환한다.
+    가져온 문항은 draft — 강사 검수 후 active."""
+    from app.api.v1.endpoints.lectures import _get_ops_course, _question_image_path
 
     _get_ops_course(db, course_id, principal)
     lec_ids = _course_lecture_ids(db, course_id)
@@ -390,54 +467,86 @@ def ops_import_exam_from_lectures(
     )
     imported = 0
     skipped = 0
-    for lq in lqs:
-        payload = lq.payload or {}
-        if (payload.get("exam_imported") or {}).get("course_id") == course_id:
-            skipped += 1  # 이미 이 코스 시험으로 가져옴(멱등)
-            continue
-        if payload.get("prompt_image") or payload.get("option_images"):
-            skipped += 1  # 이미지 문항은 시험 형식도 미지원
-            continue
-        prompt = (payload.get("prompt") or "").strip()
-        options = payload.get("options") or []
-        answers = sorted({int(i) for i in (lq.answer_indexes or [lq.answer_index])})
-        if not prompt or not (2 <= len(options) <= 6) or not all(
-            isinstance(o, str) and o.strip() for o in options
-        ):
-            skipped += 1
-            continue
-        if not answers or any(a < 0 or a >= len(options) for a in answers):
-            skipped += 1
-            continue
-        max_order += 1
-        q = CourseExamQuestion(
-            course_id=course_id,
-            prompt=prompt,
-            options=[o.strip() for o in options],
-            answer_indexes=answers,
-            explain=(payload.get("explain") or "").strip() or None,
-            origin="lecture",
-            source=f"강의: {lec_titles.get(lq.lecture_id, '')}".strip(),
-            order_no=max_order,
-            status="draft",
-            created_by=principal.id,
-        )
-        db.add(q)
-        db.flush()
-        # 원 강의 문항에 가져옴 표식 — 멱등 + 콘솔 '시험으로 가져옴' 배지 근거
-        lq.payload = {
-            **payload,
-            "exam_imported": {
-                "course_id": course_id,
-                "exam_qid": q.id,
-                "at": datetime.now().isoformat(timespec="seconds"),
-            },
-        }
-        imported += 1
-    audit(db, action="course.exam_question.import_lectures", actor_user_id=principal.id,
-          target_type="course", target_id=course_id,
-          after={"imported": imported, "skipped": skipped})
-    db.commit()
+    copied_paths: list = []  # commit 실패 시 정리할 새로 복사된 이미지 파일들
+
+    def _copy_ref(ref: dict) -> dict | None:
+        """강의 문항 이미지 파일을 새 UUID로 복사 → 새 참조(원본이 없으면 None)."""
+        if not (isinstance(ref, dict) and ref.get("id")):
+            return None
+        src = _question_image_path(ref)
+        if not src.is_file():
+            return None
+        new_ref = {"id": new_uuid(), "ext": ref.get("ext") or ""}
+        dst = _question_image_path(new_ref)
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(src, dst)
+        copied_paths.append(dst)
+        return new_ref
+
+    try:
+        for lq in lqs:
+            payload = lq.payload or {}
+            if (payload.get("exam_imported") or {}).get("course_id") == course_id:
+                skipped += 1  # 이미 이 코스 시험으로 가져옴(멱등)
+                continue
+            prompt = (payload.get("prompt") or "").strip()
+            options = payload.get("options") or []
+            answers = sorted({int(i) for i in (lq.answer_indexes or [lq.answer_index])})
+            if not prompt or not (2 <= len(options) <= 6) or not all(
+                isinstance(o, str) and o.strip() for o in options
+            ):
+                skipped += 1
+                continue
+            if not answers or any(a < 0 or a >= len(options) for a in answers):
+                skipped += 1
+                continue
+            # 이미지 복사 — 프롬프트 + 보기(보기 텍스트는 위에서 전부 채워졌음을 보장). 새 UUID라
+            # 강의 문항을 지워도 시험 이미지는 살아남는다.
+            new_prompt_img = _copy_ref(payload.get("prompt_image"))
+            new_opt_imgs = {}
+            for k, ref in (payload.get("option_images") or {}).items():
+                if str(k).isdigit() and int(k) < len(options):
+                    nr = _copy_ref(ref)
+                    if nr:
+                        new_opt_imgs[str(k)] = nr
+            images = None
+            if new_prompt_img or new_opt_imgs:
+                images = {"prompt": new_prompt_img, "options": new_opt_imgs}
+            max_order += 1
+            q = CourseExamQuestion(
+                course_id=course_id,
+                prompt=prompt,
+                options=[o.strip() for o in options],
+                answer_indexes=answers,
+                images=images,
+                explain=(payload.get("explain") or "").strip() or None,
+                origin="lecture",
+                source=f"강의: {lec_titles.get(lq.lecture_id, '')}".strip(),
+                order_no=max_order,
+                status="draft",
+                created_by=principal.id,
+            )
+            db.add(q)
+            db.flush()
+            # 원 강의 문항에 가져옴 표식 — 멱등 + 콘솔 '시험으로 가져옴' 배지 근거
+            lq.payload = {
+                **payload,
+                "exam_imported": {
+                    "course_id": course_id,
+                    "exam_qid": q.id,
+                    "at": datetime.now().isoformat(timespec="seconds"),
+                },
+            }
+            imported += 1
+        audit(db, action="course.exam_question.import_lectures", actor_user_id=principal.id,
+              target_type="course", target_id=course_id,
+              after={"imported": imported, "skipped": skipped})
+        db.commit()
+    except BaseException:
+        db.rollback()
+        for p in copied_paths:  # DB에 참조가 안 남았으니 복사한 파일도 되돌린다(유령 파일 방지)
+            p.unlink(missing_ok=True)
+        raise
     return {"imported": imported, "skipped": skipped}
 
 
@@ -568,6 +677,179 @@ def ops_generate_exam_questions(
         "lecture_count": len(lecture_rows),
         "questions": [_question_row(q) for q in created],
     }
+
+
+# ---------------------------------------------------------------- 이미지 문항: 서빙·업로드·삭제
+@router.get("/courses/{course_id}/exam-questions/{question_id}/images/{image_id}")
+def exam_question_image(
+    course_id: str,
+    question_id: str,
+    image_id: str,
+    db: Session = Depends(get_db),
+):
+    """시험 문항 이미지 서빙(인라인) — 학생 응시 화면·강사 콘솔의 <img src>가 로드한다.
+
+    강의 문항 이미지 서빙과 동일 원칙: 인증 의존성 없음(<img>는 Authorization 못 실음·경로가
+    코스·문항·이미지 세 UUID 조합이라 추측 불가), 정답 미노출(모든 보기 이미지가 같은 형태 URL),
+    경로는 서버 발급 UUID + 화이트리스트 확장자로만 유도(경로조작·SVG 차단). deleted 문항만 차단."""
+    from app.api.v1.endpoints.lectures import _QUESTION_IMAGE_MEDIA, _question_image_path
+
+    q = db.get(CourseExamQuestion, question_id)
+    if q is None or q.course_id != course_id or q.status == "deleted":
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="이미지를 찾을 수 없습니다.")
+    ref = next((r for r in _exam_image_refs(q.images) if r.get("id") == image_id), None)
+    if ref is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="이미지를 찾을 수 없습니다.")
+    media_type = _QUESTION_IMAGE_MEDIA.get(str(ref.get("ext") or "").lower())
+    if media_type is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="이미지를 찾을 수 없습니다.")
+    path = _question_image_path(ref)
+    if not path.is_file():
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="이미지 파일을 찾을 수 없습니다.")
+    return FileResponse(
+        str(path),
+        media_type=media_type,
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
+
+
+def _resolve_exam_image_slot(q: CourseExamQuestion, slot: str, option_index: int | None):
+    """이미지 슬롯 검증 → (slot, options 키). prompt는 키 None. 강의 문항과 같은 규약."""
+    if slot not in ("prompt", "option"):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="slot은 prompt|option만 가능합니다.")
+    if slot == "prompt":
+        return slot, None
+    if option_index is None or not (0 <= option_index < len(q.options)):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="option_index가 보기 범위를 벗어납니다.")
+    return slot, str(option_index)
+
+
+@router.post("/ops/courses/{course_id}/exam-questions/{question_id}/images")
+def ops_attach_exam_image(
+    course_id: str,
+    question_id: str,
+    request: Request,
+    slot: str = Form(...),  # prompt|option
+    option_index: int | None = Form(default=None),
+    file: UploadFile = File(...),
+    principal: Principal = Depends(require_lecture_manager),
+    db: Session = Depends(get_db),
+):
+    """시험 문항 이미지 첨부(multipart) — 강의 문항 업로드와 동일 패턴: 임시파일 청크 복사 →
+    원자적 이동 → images 참조 갱신 → commit. 같은 슬롯에 이미 있으면 교체(새 id 저장·옛 파일은
+    commit 성공 후 삭제). 실패 시 파일·참조를 남기지 않는다."""
+    from app.api.v1.endpoints.lectures import (
+        RATE_QUESTION_IMAGE_UPLOAD_PER_HOUR,
+        _QUESTION_IMAGE_CONTENT_TYPES,
+        _QUESTION_IMAGE_EXTS,
+        _client_ip,
+        _copy_upload_to_tmp,
+        _get_ops_course,
+        _question_image_path,
+        _question_images_dir,
+    )
+    from app.services import auth_service
+
+    auth_service.rate_limit(
+        db, f"exam-qimg-upload:{_client_ip(request)}",
+        limit=RATE_QUESTION_IMAGE_UPLOAD_PER_HOUR, window_seconds=3600,
+    )
+    _get_ops_course(db, course_id, principal)  # 소유 스코프 — 남의 코스 404
+    q = db.get(CourseExamQuestion, question_id)
+    if q is None or q.course_id != course_id or q.status == "deleted":
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="문항을 찾을 수 없습니다.")
+    slot, opt_key = _resolve_exam_image_slot(q, slot, option_index)
+
+    ext = os.path.splitext(file.filename or "")[1].lower()
+    if ext not in _QUESTION_IMAGE_EXTS:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            detail="이미지 파일만 업로드할 수 있습니다(png/jpg/jpeg/gif/webp — svg 금지).",
+        )
+    if (file.content_type or "").lower() not in _QUESTION_IMAGE_CONTENT_TYPES:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="이미지 Content-Type(image/png 등)이 아닙니다.")
+
+    ref = {"id": new_uuid(), "ext": ext}
+    qdir = _question_images_dir()
+    qdir.mkdir(parents=True, exist_ok=True)
+    tmp_path = qdir / f".upload-{ref['id']}.tmp"
+    final_path = _question_image_path(ref)
+    try:
+        total = _copy_upload_to_tmp(file, tmp_path, get_settings().MAX_QUESTION_IMAGE_BYTES)
+        if total == 0:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="빈 파일은 업로드할 수 없습니다.")
+        os.replace(tmp_path, final_path)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+    images = dict(q.images) if isinstance(q.images, dict) else {}
+    old_ref = None
+    if slot == "prompt":
+        old_ref = images.get("prompt")
+        images["prompt"] = ref
+    else:
+        opt_imgs = dict(images.get("options") or {})
+        old_ref = opt_imgs.get(opt_key)
+        opt_imgs[opt_key] = ref
+        images["options"] = opt_imgs
+    try:
+        q.images = images  # JSON 컬럼은 재할당으로만 변경 감지
+        audit(db, action="course.exam_question.image.create", actor_user_id=principal.id,
+              target_type="course_exam_question", target_id=q.id,
+              after={"course_id": course_id, "slot": slot,
+                     "option_index": option_index if slot == "option" else None,
+                     "image_id": ref["id"], "bytes": total, "replaced": bool(old_ref)})
+        db.commit()
+    except BaseException:
+        db.rollback()
+        final_path.unlink(missing_ok=True)
+        raise
+    if isinstance(old_ref, dict) and old_ref.get("id"):
+        _question_image_path(old_ref).unlink(missing_ok=True)  # 교체된 옛 파일 정리(멱등)
+    return _question_row(q)
+
+
+@router.delete("/ops/courses/{course_id}/exam-questions/{question_id}/images")
+def ops_delete_exam_image(
+    course_id: str,
+    question_id: str,
+    slot: str,
+    option_index: int | None = None,
+    principal: Principal = Depends(require_lecture_manager),
+    db: Session = Depends(get_db),
+):
+    """시험 문항 이미지 제거 — images 참조 삭제 + commit 성공 후 파일 물리 삭제."""
+    from app.api.v1.endpoints.lectures import _get_ops_course, _question_image_path
+
+    _get_ops_course(db, course_id, principal)
+    q = db.get(CourseExamQuestion, question_id)
+    if q is None or q.course_id != course_id or q.status == "deleted":
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="문항을 찾을 수 없습니다.")
+    slot, opt_key = _resolve_exam_image_slot(q, slot, option_index)
+
+    images = dict(q.images) if isinstance(q.images, dict) else {}
+    if slot == "prompt":
+        old_ref = images.pop("prompt", None)
+    else:
+        opt_imgs = dict(images.get("options") or {})
+        old_ref = opt_imgs.pop(opt_key, None)
+        if opt_imgs:
+            images["options"] = opt_imgs
+        else:
+            images.pop("options", None)
+    if not (isinstance(old_ref, dict) and old_ref.get("id")):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="해당 슬롯에 이미지가 없습니다.")
+
+    q.images = images or None
+    audit(db, action="course.exam_question.image.delete", actor_user_id=principal.id,
+          target_type="course_exam_question", target_id=q.id,
+          after={"course_id": course_id, "slot": slot,
+                 "option_index": option_index if slot == "option" else None,
+                 "image_id": old_ref["id"]})
+    db.commit()
+    _question_image_path(old_ref).unlink(missing_ok=True)  # commit 성공 후(멱등)
+    return _question_row(q)
 
 
 # ------------------------------------------------------- 강사·운영자: 시험 통계(대시보드)
@@ -870,12 +1152,16 @@ def exam_session(
     questions = []
     for item in sitting.questions:
         q = by_id[item["question_id"]]
+        prompt_url, opt_urls = _exam_image_urls(q)
         questions.append(
             {
                 "question_id": q.id,
                 "prompt": q.prompt,
                 # 표시 순서 = order[i]번째 원본 보기. 정답·해설은 제출 후에만.
                 "options": [q.options[i] for i in item["order"]],
+                # 이미지도 보기와 같은 셔플 순서로 재정렬 — 표시-순서 계약을 이미지도 따른다
+                "prompt_image_url": prompt_url,
+                "option_image_urls": [opt_urls[i] for i in item["order"]],
                 "multi": len(q.answer_indexes) > 1,
                 "origin": q.origin,
                 "source": q.source,  # 기출 출처 — 비영리 이용 전제라 응시 화면에도 상시 노출
@@ -954,11 +1240,15 @@ def exam_submit(
                 solve_time_ms=per_ms,
             )
         )
+        prompt_url, opt_urls = _exam_image_urls(q)
         results.append(
             {
                 "question_id": q.id,
                 "prompt": q.prompt,
                 "options": [q.options[i] for i in order],  # 학생이 본 표시 순서 그대로
+                # 이미지도 같은 표시 순서로 재정렬(결과지가 학생이 본 화면과 일치)
+                "prompt_image_url": prompt_url,
+                "option_image_urls": [opt_urls[i] for i in order],
                 "picked": picks,
                 # 정답의 표시 위치 — 결과지가 학생이 본 화면 기준으로 정답을 보여준다
                 "answer": sorted(order.index(i) for i in answer_set),

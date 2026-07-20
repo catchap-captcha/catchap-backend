@@ -35,6 +35,11 @@ class CourseExamQuestion(Base, UUIDPk, Timestamps):
     prompt: Mapped[str] = mapped_column(Text)
     options: Mapped[list] = mapped_column(JSON)  # ["보기1", "보기2", ...] 2~6개
     answer_indexes: Mapped[list] = mapped_column(JSON)  # [0] 단일 / [0,2] 다답(집합 일치)
+    # 이미지 문항 — 강의 문항과 같은 참조 구조({id, ext}·서버 발급 UUID)를 별도 JSON 컬럼에.
+    # 형태: {"prompt": ref|None, "options": {"0": ref, "2": ref}}. None=텍스트 전용 문항.
+    # 파일은 강의 문항과 같은 media/questions/ 디렉터리를 공유(UUID 키라 충돌 없음). 서빙은
+    # 전용 무인증 엔드포인트(경로=코스·문항·이미지 UUID 조합이라 추측 불가). course_exam_img_01.
+    images: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     explain: Mapped[str | None] = mapped_column(Text, nullable=True)
     # manual(자작) | past_exam(기출) | lecture(강의 문항 복사, 1.5단계) | llm(2단계)
     origin: Mapped[str] = mapped_column(String(20), default="manual")
