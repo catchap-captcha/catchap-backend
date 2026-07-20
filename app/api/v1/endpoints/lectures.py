@@ -39,6 +39,7 @@ from pathlib import Path
 import jwt
 from fastapi import (
     APIRouter,
+    BackgroundTasks,
     Depends,
     File,
     Form,
@@ -57,13 +58,14 @@ from sqlalchemy.orm import Session
 from app.core.config import get_settings
 from app.core.permissions import Principal, require_content_author, require_lecture_manager, require_student
 from app.core.security import decode_token, new_uuid
-from app.db.session import get_db
+from app.db.session import SessionLocal, get_db
 from app.models import (
     Course,
     Lecture,
     LectureCheckpointEvent,
     LectureMaterial,
     LectureQuestion,
+    LectureQuestionGenJob,
     LectureTranscript,
     LectureWatchProgress,
     User,
@@ -2451,23 +2453,16 @@ class _GenerateReq(BaseModel):
     n: int = 5
 
 
-@router.post("/ops/lectures/{lecture_id}/questions/generate")
-def ops_generate_questions(
-    lecture_id: str,
-    req: _GenerateReq,
-    principal: Principal = Depends(require_content_author),
-    db: Session = Depends(get_db),
-):
-    """AI 문항 자동 생성 — STT 전사(키 설정 시) → LLM 출제, source=llm·status=draft 저장.
+def _generate_questions_now(db: Session, lec: Lecture, n: int, actor_id: str) -> dict:
+    """AI 문항 자동 생성 실작업 — STT 전사(키 설정 시) → LLM 출제, source=llm·status=draft 저장.
 
-    키는 요청 시점마다 해석한다(운영 콘솔 입력(DB) → .env 폴백) — 콘솔에서 키를 넣으면
-    재기동 없이 바로 켜진다. 정직성 규약:
+    키는 호출 시점마다 해석한다(운영 콘솔 입력(DB) → .env 폴백). 정직성 규약:
     - LLM 키 없음 → 503(설정 페이지 안내). stub 문항 생성 금지.
-    - STT 키가 '설정돼 있는데' 전사 실패 → 502로 원인 노출(메타데이터 폴백으로 조용히
-      강등하지 않는다 — 키 오류·용량 초과를 운영자가 알아야 고친다).
-    - STT 키 미설정 → 메타(제목·설명) 기반 생성 + 응답에 transcript_used=false 명시.
-    전사가 있으면 LLM이 출제 시점(position)과 되감기 지점(content_start)까지 제안하고,
-    영상 범위를 벗어나는 제안은 버려 '시점 미배치' draft로 남긴다(운영자 검수)."""
+    - STT 키가 '설정돼 있는데' 전사 실패 → 502로 원인 노출(조용한 강등 없음).
+    - STT 키 미설정 → 메타(제목·설명) 기반 생성 + transcript_used=false.
+    전사가 있으면 LLM이 출제 시점·되감기 지점까지 제안하고, 영상 밖 제안은 '미배치' draft로.
+    ★백그라운드 러너(_run_question_gen_job)가 자기 세션으로 호출한다(강사 동기 대기 제거,
+    2026-07-20). 여기서 raise되는 503/502는 러너가 잡아 잡을 error로 남긴다(성공 위장 없음)."""
     from app.clients.ai_client import (
         AiGenerationError,
         AiNotConfiguredError,
@@ -2477,7 +2472,6 @@ def ops_generate_questions(
     from app.clients.stt_client import SttError, transcribe_lecture
     from app.services import ai_models_service, settings_service
 
-    lec = _get_ops_lecture(db, lecture_id, principal)
     # LLM 키 — Anthropic(기본·폴백)과 OpenAI(GPT 슬롯·STT 공용) 둘 다 해석한다.
     # 하나라도 있으면 진행: provider별로 후보에 맞는 키를 골라 쓰고, 없는 provider의
     # 후보는 자동 스왑으로 건너뛴다(#26 다음 단계 — GPT 모델도 실제 호출).
@@ -2537,7 +2531,7 @@ def ops_generate_questions(
             lecture_title=lec.title,
             description=lec.description,
             subject=lec.subject,
-            n=req.n,
+            n=n,
             api_key=llm_key,
             transcript=transcript,
             models=gen_models,
@@ -2619,7 +2613,7 @@ def ops_generate_questions(
     audit(
         db,
         action="lecture.question.generate",
-        actor_user_id=principal.id,
+        actor_user_id=actor_id,
         target_type="lecture",
         target_id=lec.id,
         after={
@@ -2647,6 +2641,126 @@ def ops_generate_questions(
         "verify_error": verify_error,
         "questions": [_question_row(q) for q in created],
     }
+
+
+@router.post("/ops/lectures/{lecture_id}/questions/generate", status_code=status.HTTP_202_ACCEPTED)
+def ops_generate_questions(
+    lecture_id: str,
+    req: _GenerateReq,
+    background_tasks: BackgroundTasks,
+    principal: Principal = Depends(require_content_author),
+    db: Session = Depends(get_db),
+):
+    """AI 문항 생성 '시작' — 잡을 만들고 즉시 반환, 실제 STT+생성은 백그라운드가 한다(비동기).
+
+    왜(사용자 요청 0720): 종전 동기 방식은 강사가 창을 열고 STT+생성(긴 영상은 수분)이 끝날
+    때까지 기다려야 했고 HTTP 타임아웃 위험도 있었다. 이제 잡(pending)을 만들고 BackgroundTasks로
+    러너를 예약한 뒤 job_id만 돌려준다 — 강사는 창을 닫아도 되고, 프론트는 gen-jobs/{job_id}를
+    폴링해 done이면 문항 목록을 새로고침한다. LLM 키가 하나도 없으면 잡을 만들지 않고 즉시
+    503(즉각 피드백). STT/생성 실패는 러너가 잡을 error로 남겨 원인을 노출한다."""
+    from app.services import settings_service
+
+    lec = _get_ops_lecture(db, lecture_id, principal)
+    if not settings_service.resolve_anthropic_key(db) and not settings_service.resolve_openai_key(db):
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="LLM API 키가 설정되지 않아 문제 자동 생성을 사용할 수 없습니다. 운영 콘솔 '설정'에서 키를 입력해 주세요.",
+        )
+    job = LectureQuestionGenJob(
+        lecture_id=lec.id, requested_by=principal.id, n=req.n, status="pending"
+    )
+    db.add(job)
+    db.commit()
+    background_tasks.add_task(_run_question_gen_job, job.id)
+    return {"job_id": job.id, "status": job.status, "n": job.n}
+
+
+def _gen_job_row(job: LectureQuestionGenJob) -> dict:
+    verified = bool(job.self_verified)
+    return {
+        "job_id": job.id,
+        "status": job.status,  # pending|running|done|error
+        "n": int(job.n),
+        "created": int(job.created_count or 0),
+        "transcript_used": bool(job.transcript_used),
+        "transcript_source": job.transcript_source,
+        "self_verified": verified,
+        "captcha_candidates": int(job.captcha_candidates or 0) if verified else None,
+        "bank_candidates": int(job.bank_candidates or 0) if verified else None,
+        "discard_candidates": int(job.discard_candidates or 0) if verified else None,
+        "verify_error": job.verify_error,  # 자기검증만 실패(생성은 성공)
+        "error": job.error_detail,  # 잡 자체 실패 원인
+        "finished_at": job.finished_at.isoformat() if job.finished_at else None,
+    }
+
+
+@router.get("/ops/lectures/{lecture_id}/questions/gen-jobs/{job_id}")
+def ops_question_gen_job(
+    lecture_id: str,
+    job_id: str,
+    principal: Principal = Depends(require_content_author),
+    db: Session = Depends(get_db),
+):
+    """생성 잡 상태 폴링(강사 스코프) — done이면 프론트가 문항 목록을 새로고침한다."""
+    _get_ops_lecture(db, lecture_id, principal)  # 소유 스코프 — 남의 강의 404
+    job = db.get(LectureQuestionGenJob, job_id)
+    if job is None or job.lecture_id != lecture_id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="생성 작업을 찾을 수 없습니다.")
+    return _gen_job_row(job)
+
+
+def _fail_gen_job(db: Session, job_id: str, detail: str) -> None:
+    """잡을 error로 표기 — 실패 원인을 정직하게 남긴다(성공 위장 금지)."""
+    try:
+        db.rollback()
+        job = db.get(LectureQuestionGenJob, job_id)
+        if job is not None:
+            job.status = "error"
+            job.error_detail = (detail or "생성 실패")[:2000]
+            job.finished_at = datetime.now()
+            db.commit()
+    except Exception:
+        db.rollback()
+
+
+def _run_question_gen_job(job_id: str, *, session_factory=SessionLocal) -> None:
+    """백그라운드 러너 — 잡의 STT+생성+자기검증+draft 저장을 수행하고 잡 상태를 갱신한다.
+
+    자체 세션을 연다(요청 세션은 응답 후 닫힌다). 예외는 삼키지 않고 잡을 error로 남겨
+    프론트가 원인을 본다. session_factory는 테스트에서 교체 가능(SessionLocal 몽키패치)."""
+    db = session_factory()
+    try:
+        job = db.get(LectureQuestionGenJob, job_id)
+        if job is None:
+            return
+        lec = db.get(Lecture, job.lecture_id)
+        if lec is None or lec.status == "deleted":
+            job.status = "error"
+            job.error_detail = "강의를 찾을 수 없습니다."
+            job.finished_at = datetime.now()
+            db.commit()
+            return
+        job.status = "running"
+        db.commit()
+        # 실작업은 동기 헬퍼 재사용 — 문항·감사를 db에 commit하고 요약 dict를 돌려준다.
+        summary = _generate_questions_now(db, lec, job.n, job.requested_by)
+        job.status = "done"
+        job.created_count = int(summary.get("created") or 0)
+        job.transcript_used = bool(summary.get("transcript_used"))
+        job.transcript_source = summary.get("transcript_source")
+        job.self_verified = bool(summary.get("self_verified"))
+        job.captcha_candidates = int(summary.get("captcha_candidates") or 0)
+        job.bank_candidates = int(summary.get("bank_candidates") or 0)
+        job.discard_candidates = int(summary.get("discard_candidates") or 0)
+        job.verify_error = summary.get("verify_error")
+        job.finished_at = datetime.now()
+        db.commit()
+    except HTTPException as e:  # 헬퍼의 503/502(키없음·STT실패) — 잡 error로 정직 노출
+        _fail_gen_job(db, job_id, str(e.detail))
+    except Exception as e:  # 예기치 못한 실패도 잡에 남긴다(조용한 실패 금지)
+        _fail_gen_job(db, job_id, f"예상치 못한 오류: {e}")
+    finally:
+        db.close()
 
 
 # ---------------------------------------------------------------- 자료실(강의 자료) CRUD

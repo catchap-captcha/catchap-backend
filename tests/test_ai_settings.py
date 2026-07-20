@@ -2,9 +2,19 @@
 
 import json
 
-from app.models import AuditLog, LectureQuestion, SystemSetting
+import pytest
+
+from app.models import AuditLog, Lecture, LectureQuestion, SystemSetting
 
 from tests.test_captcha_api import _instructor, _ops, auth
+
+
+def _gen_now(db, lec_id, n):
+    """생성 로직(추출된 헬퍼)을 직접 구동 — 비동기 전환(0720)으로 POST는 잡만 만든다.
+    실제 STT+생성 로직은 _generate_questions_now가 담당하므로 여기서 바로 호출해 검증한다."""
+    from app.api.v1.endpoints.lectures import _generate_questions_now
+
+    return _generate_questions_now(db, db.get(Lecture, lec_id), n, "actor")
 
 
 def test_ai_settings_roundtrip_masked_and_encrypted(client, db, monkeypatch):
@@ -148,15 +158,9 @@ def test_generate_uses_console_key_and_reports_transcript_flag(
     assert up.status_code == 200, up.text
     lec_id = up.json()["id"]
 
-    r = client.post(
-        f"/api/v1/ops/lectures/{lec_id}/questions/generate",
-        json={"n": 1},
-        headers=auth(itok),
-    )
-    assert r.status_code == 200, r.text
+    body = _gen_now(db, lec_id, 1)
     assert seen["api_key"] == "sk-console-key-7777", "콘솔 키가 LLM 호출에 쓰이지 않았다"
     assert seen["transcript"] is None  # STT 미설정 — 전사 없음
-    body = r.json()
     assert body["transcript_used"] is False
     assert body["questions"][0]["position_sec"] == 0  # 시점 미배치 draft
     assert body["questions"][0]["status"] == "draft"
@@ -207,13 +211,7 @@ def test_self_verification_tags_bank_vs_captcha(client, db, monkeypatch, tmp_pat
         headers=auth(itok),
     )
     lec_id = up.json()["id"]
-    r = client.post(
-        f"/api/v1/ops/lectures/{lec_id}/questions/generate",
-        json={"n": 2},
-        headers=auth(itok),
-    )
-    assert r.status_code == 200, r.text
-    body = r.json()
+    body = _gen_now(db, lec_id, 2)
     assert body["self_verified"] is True
     assert body["bank_candidates"] == 1 and body["captcha_candidates"] == 1
     assert body["verify_error"] is None
@@ -257,13 +255,7 @@ def test_self_verification_failure_is_honest_not_swallowed(client, db, monkeypat
         files={"file": ("v.mp4", b"0" * 1024, "video/mp4")},
         headers=auth(itok),
     )
-    r = client.post(
-        f"/api/v1/ops/lectures/{up.json()['id']}/questions/generate",
-        json={"n": 1},
-        headers=auth(itok),
-    )
-    assert r.status_code == 200, r.text  # 생성은 살아있다
-    body = r.json()
+    body = _gen_now(db, up.json()["id"], 1)  # 생성은 살아있다(자기검증만 실패)
     assert body["created"] == 1
     assert body["self_verified"] is False
     assert "solver" in (body["verify_error"] or "")  # 조용히 삼키지 않음
@@ -296,13 +288,11 @@ def test_generate_stt_failure_is_honest_502(client, db, monkeypatch, tmp_path):
     )
     lec_id = up.json()["id"]
 
-    r = client.post(
-        f"/api/v1/ops/lectures/{lec_id}/questions/generate",
-        json={"n": 1},
-        headers=auth(itok),
-    )
-    assert r.status_code == 502
-    assert "STT" in r.json()["detail"]
+    from fastapi import HTTPException
+
+    with pytest.raises(HTTPException) as ei:
+        _gen_now(db, lec_id, 1)
+    assert ei.value.status_code == 502 and "STT" in str(ei.value.detail)
     assert db.query(LectureQuestion).count() == 0  # 어떤 문항도 생성되지 않는다
 
 

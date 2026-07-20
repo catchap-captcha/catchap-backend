@@ -11,6 +11,14 @@ from tests.test_captcha_api import _instructor, _ops, auth
 from tests.test_lectures import _upload_lecture
 
 
+def _gen_now(db, lec_id, n):
+    """생성 로직(추출 헬퍼) 직접 구동 — 비동기 전환(0720)으로 POST는 잡만 만들기 때문."""
+    from app.api.v1.endpoints.lectures import _generate_questions_now
+    from app.models import Lecture
+
+    return _generate_questions_now(db, db.get(Lecture, lec_id), n, "actor")
+
+
 # ------------------------------------------------------------------ 파서 단위
 def test_parse_srt_vtt_paste():
     srt = "1\n00:00:01,000 --> 00:00:04,000\n안녕\n\n2\n00:00:05,000 --> 00:00:07,000\n분수"
@@ -112,10 +120,9 @@ def test_generate_prefers_stored_transcript_over_stt(client, db, monkeypatch, tm
     monkeypatch.setattr(ai, "generate_lecture_questions", fake_gen)
     monkeypatch.setattr(ai, "verify_questions", lambda items, **k: None)
 
-    r = client.post(f"/api/v1/ops/lectures/{lec['id']}/questions/generate", json={"n": 1}, headers=auth(tok))
-    assert r.status_code == 200, r.text
+    body = _gen_now(db, lec["id"], 1)
     assert called["stt"] is False  # STT 미호출
-    assert r.json()["transcript_source"] == "paste"
+    assert body["transcript_source"] == "paste"
     assert seen["transcript"][0]["text"] == "강사자막 내용"  # 저장 자막이 LLM에 전달(STT_LEAK 아님)
 
 
@@ -141,9 +148,8 @@ def test_generate_caches_auto_stt(client, db, monkeypatch, tmp_path, seed_org):
     )
     monkeypatch.setattr(ai, "verify_questions", lambda items, **k: None)
 
-    r = client.post(f"/api/v1/ops/lectures/{lec['id']}/questions/generate", json={"n": 1}, headers=auth(tok))
-    assert r.status_code == 200, r.text
-    assert r.json()["transcript_source"] == "stt"
+    body = _gen_now(db, lec["id"], 1)
+    assert body["transcript_source"] == "stt"
     # 자동 STT 결과가 캐시됐는지 — 다음 생성은 재전사 안 함
     t = client.get(f"/api/v1/ops/lectures/{lec['id']}/transcript", headers=auth(tok)).json()
     assert t["has_transcript"] and t["source"] == "stt" and t["segment_count"] == 1

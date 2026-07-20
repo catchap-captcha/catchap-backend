@@ -440,12 +440,11 @@ def test_generate_uses_slot_model_and_records_tokens(client, db, monkeypatch, tm
         headers=auth(itok),
     )
     lec_id = up.json()["id"]
-    r = client.post(
-        f"/api/v1/ops/lectures/{lec_id}/questions/generate",
-        json={"n": 1},
-        headers=auth(itok),
-    )
-    assert r.status_code == 200, r.text
+    # 비동기 전환(0720): POST는 잡만 만든다 — 생성 로직(추출 헬퍼)을 직접 구동해 검증한다.
+    from app.api.v1.endpoints.lectures import _generate_questions_now
+    from app.models import Lecture
+
+    _generate_questions_now(db, db.get(Lecture, lec_id), 1, "actor")
     assert seen["model"] == "gen-model-XYZ", "생성 슬롯 모델이 실제 호출에 쓰이지 않았다"
 
     # 생성 슬롯 모델에 토큰이 누적됐는지(추정 비용 근거)

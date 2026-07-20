@@ -39,6 +39,7 @@ from app.models.lecture import (
     LectureCheckpointEvent,
     LectureMaterial,
     LectureQuestion,
+    LectureQuestionGenJob,
     LectureTranscript,
     LectureWatchProgress,
 )
@@ -114,6 +115,7 @@ __all__ = [
     "LectureCheckpointEvent",
     "LectureMaterial",
     "LectureQuestion",
+    "LectureQuestionGenJob",
     "LectureTranscript",
     "LectureWatchProgress",
     "CaptchaStore",

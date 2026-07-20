@@ -201,3 +201,33 @@ class LectureTranscript(Base, UUIDPk, Timestamps):
     segments: Mapped[list] = mapped_column(JSON, default=list)
     source: Mapped[str] = mapped_column(String(20))  # srt|vtt|paste|stt
     segment_count: Mapped[int] = mapped_column(default=0)  # 목록 배지용 비정규화(JSON 미로드)
+
+
+class LectureQuestionGenJob(Base, UUIDPk, Timestamps):
+    """AI 확인문항 자동 생성 '잡' — 동기 대기 대신 백그라운드로 돌리려 상태를 남긴다(2026-07-20).
+
+    왜: STT(자막 변환)+LLM 생성은 긴 영상이면 수십 초~분 걸린다. 종전엔 요청이 끝날 때까지
+    강사가 창을 열고 기다려야 했고(HTTP 타임아웃 위험도), 이 잡 레코드로 '시작→진행→완료'를
+    비동기화한다. 엔드포인트는 잡을 만들고 즉시 반환, BackgroundTasks 러너가 실제 생성을
+    수행하며 이 행을 갱신한다. 프론트는 gen-jobs/{id}를 폴링해 done이면 목록을 새로고침한다.
+
+    한계(팀 학습용): 전용 잡 큐가 아니라 프로세스 내 BackgroundTasks라, 프로세스가 재시작되면
+    'running' 잡은 고아가 될 수 있다(우리 규모=강사 소수·생성 드묾이라 수용). 영속 큐로 키우려면
+    Celery/RQ 등으로 확장한다."""
+
+    __tablename__ = "lecture_question_gen_jobs"
+
+    lecture_id: Mapped[str] = mapped_column(CHAR(36), index=True)  # 소프트 참조(강의 삭제와 독립)
+    requested_by: Mapped[str] = mapped_column(CHAR(36), index=True)  # 요청 강사 user id(소프트 참조)
+    n: Mapped[int] = mapped_column(default=3)  # 요청 문항 수
+    status: Mapped[str] = mapped_column(String(20), default="pending")  # pending|running|done|error
+    created_count: Mapped[int] = mapped_column(default=0)  # 실제 생성된 draft 수
+    transcript_used: Mapped[bool] = mapped_column(default=False)
+    transcript_source: Mapped[str | None] = mapped_column(String(20), nullable=True)  # srt|vtt|paste|stt|None
+    self_verified: Mapped[bool] = mapped_column(default=False)
+    captcha_candidates: Mapped[int] = mapped_column(default=0)  # 자기검증 3분류 요약
+    bank_candidates: Mapped[int] = mapped_column(default=0)
+    discard_candidates: Mapped[int] = mapped_column(default=0)
+    verify_error: Mapped[str | None] = mapped_column(String(255), nullable=True)  # 자기검증만 실패(생성은 성공)
+    error_detail: Mapped[str | None] = mapped_column(Text, nullable=True)  # 잡 자체 실패 원인(정직 노출)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
