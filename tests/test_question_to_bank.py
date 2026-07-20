@@ -165,12 +165,12 @@ def test_to_bank_rejects_unconvertible(client, db, media_dir):
         assert r.status_code == 400 and "이미지" in r.json()["detail"]
 
 
-def test_bulk_promote_only_reviewed_bank_candidates(client, db, media_dir):
-    """★대량 승격은 '강사가 검수(active)한 verdict=bank' 문항만 — 사람 검토를 건너뛰지 않는다.
+def test_bulk_promote_selected_questions(client, db, media_dir):
+    """★대량 승격은 '강사가 다중 선택한' 문항만 — 선택 자체가 검토(자동 무검토 아님).
 
-    verdict=bank는 '봇이 상식으로 푼다(캡차 부적합·연습 재활용 가능)'는 용도 분류일 뿐
-    정오·품질 보증이 아니라, draft(미검수)·verdict=captcha는 제외한다. 다답형·이미지 등
-    은행 미지원 형식은 사유별로 건너뛰고 보고한다."""
+    은행 문항은 캡차로 안 쓰여 보통 draft로 남으므로 status가 아니라 강사의 선택이 게이트.
+    verdict=bank는 '봇이 상식으로 푼다(캡차 부적합·연습 재활용)'는 용도 분류일 뿐 정오·품질
+    보증이 아니라, 강사가 고른 것만 옮긴다. 다답형·이미지는 은행 미지원이라 사유별 skip."""
     from app.models import LectureQuestion
 
     with _bank_state_guard():
@@ -183,41 +183,48 @@ def test_bulk_promote_only_reviewed_bank_candidates(client, db, media_dir):
                                                 "answer": "o1", "explain": "", "playable": True}))
         db.commit()
 
-        qa = _make_question(client, tok, lec["id"], position_sec=30, status="active")   # active+bank → 승격
-        qd = _make_question(client, tok, lec["id"], status="draft")                     # draft+bank → 미검수 제외
-        qc = _make_question(client, tok, lec["id"], position_sec=60, status="active")   # active+captcha → 부적합 제외
+        qa = _make_question(client, tok, lec["id"], position_sec=30, status="active")   # active+bank
+        qd = _make_question(client, tok, lec["id"], status="draft")                     # draft+bank
+        qc = _make_question(client, tok, lec["id"], position_sec=60, status="active")   # active+captcha (미선택)
         qm = _make_question(client, tok, lec["id"], position_sec=90, status="active",
                             answer_indexes=[0, 1])                                       # active+bank+다답형 → skip
 
-        # 자기검증 결과(payload.suggested_placement)를 재현
         for qid, verdict in [(qa["id"], "bank"), (qd["id"], "bank"),
                              (qc["id"], "captcha"), (qm["id"], "bank")]:
             row = db.get(LectureQuestion, qid)
             row.payload = {**(row.payload or {}), "suggested_placement": verdict}
         db.commit()
 
+        # 강사가 qa·qd·qm 다중 선택 — draft(qd)도 선택했으면 옮긴다(선택=검토). qm은 다답형 skip.
         r = client.post(
-            f"/api/v1/ops/lectures/{lec['id']}/questions/promote-bank-candidates", headers=auth(tok)
+            f"/api/v1/ops/lectures/{lec['id']}/questions/promote-bank-candidates",
+            json={"question_ids": [qa["id"], qd["id"], qm["id"]]}, headers=auth(tok),
         )
         assert r.status_code == 200, r.text
         body = r.json()
-        # 후보 = active+bank인 qa·qm(qd=draft·qc=captcha 제외). qa 성공, qm 다답형 skip.
-        assert body["candidates"] == 2, body
-        assert body["placed"] == 1, body
-        assert body["skipped"].get("multi_answer") == 1, body
+        assert body["candidates"] == 3, body            # 선택 중 미배치 = qa·qd·qm
+        assert body["placed"] == 2, body                # qa·qd 성공
+        assert body["skipped"].get("multi_answer") == 1, body  # qm 다답형
 
         qs = {x["id"]: x for x in client.get(
             f"/api/v1/ops/lectures/{lec['id']}/questions", headers=auth(tok)).json()}
-        assert qs[qa["id"]]["status"] == "draft" and qs[qa["id"]]["bank_placed"]  # 배치+강등
-        assert qs[qd["id"]]["status"] == "draft" and not qs[qd["id"]]["bank_placed"]  # 미검수 그대로
-        assert qs[qc["id"]]["status"] == "active" and not qs[qc["id"]]["bank_placed"]  # 캡차 유지
+        assert qs[qa["id"]]["status"] == "draft" and qs[qa["id"]]["bank_placed"]  # active→강등+배치
+        assert qs[qd["id"]]["status"] == "draft" and qs[qd["id"]]["bank_placed"]  # draft 그대로+배치
+        assert qs[qc["id"]]["status"] == "active" and not qs[qc["id"]]["bank_placed"]  # 미선택 유지
         assert qs[qm["id"]]["status"] == "active" and not qs[qm["id"]]["bank_placed"]  # 다답형 skip
 
-        # 재실행 멱등 — 이미 배치·강등돼 후보 없음
+        # 재선택 멱등 — 이미 배치돼 후보 없음
         r2 = client.post(
+            f"/api/v1/ops/lectures/{lec['id']}/questions/promote-bank-candidates",
+            json={"question_ids": [qa["id"], qd["id"]]}, headers=auth(tok),
+        )
+        assert r2.status_code == 200 and r2.json()["candidates"] == 0 and r2.json()["placed"] == 0
+
+        # 선택 없이(빈 본문) = '은행 적합 미배치 후보 전체' — qa·qd 배치됨·qc=captcha 제외 → qm만(다답형 skip)
+        r3 = client.post(
             f"/api/v1/ops/lectures/{lec['id']}/questions/promote-bank-candidates", headers=auth(tok)
         )
-        assert r2.status_code == 200 and r2.json()["placed"] == 0
+        assert r3.status_code == 200 and r3.json()["candidates"] == 1 and r3.json()["placed"] == 0
 
 
 def test_bank_lecture_question_gated_by_completion(client, db, seed_org, media_dir):

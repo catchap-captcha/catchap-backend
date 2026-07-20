@@ -2235,20 +2235,27 @@ def ops_place_question_to_bank(
     return {"ok": True, "bank_id": slug, "runtime_visible": runtime_visible, "demoted_from_active": demoted}
 
 
+class _PromoteBankReq(BaseModel):
+    # 강사가 다중 선택한 문항 id — 지정 시 그것만 승격(선택은 강사 판단). None/빈 리스트면
+    # '은행 적합(verdict=bank) 후보 전체'(하위호환·전체 선택 편의).
+    question_ids: list[str] | None = None
+
+
 @router.post("/ops/lectures/{lecture_id}/questions/promote-bank-candidates")
 def ops_promote_bank_candidates(
     lecture_id: str,
+    req: _PromoteBankReq = _PromoteBankReq(),
     principal: Principal = Depends(require_content_author),
     db: Session = Depends(get_db),
 ):
-    """자기검증 '은행 적합'(verdict=bank)이면서 **강사가 검수해 공개(active)한** 문항을 한 번에
-    문제은행으로 승격한다.
+    """강사가 **다중 선택한** 문항(question_ids)을 문제은행으로 대량 승격한다 — 한 개씩 to-bank
+    누르던 걸 묶어준다. 선택이 없으면 '은행 적합(verdict=bank) 미배치 후보 전체'가 대상(전체 선택 편의).
 
     ★'자동'이되 사람 검토를 건너뛰지 않는 게 핵심: verdict=bank는 '봇이 자막 없이 상식으로
-    푼다(=시청 검증 캡차엔 부적합, 연습용으론 재활용 가능)'는 **용도 분류**일 뿐, 문항의 정오·
-    품질을 보증하지 않는다(AI가 만든 문항은 정답 키가 틀리거나 애매할 수 있다). 그래서
-    draft(미검수)는 제외하고 **active(강사 공개)만** 대상으로 삼아, 강사의 최종 판단을 게이트로
-    둔다 — 한 개씩 to-bank 누르던 걸 대량으로 묶어줄 뿐이다.
+    푼다(=시청 검증 캡차엔 부적합, 연습용으론 재활용 가능)'는 **용도 분류**일 뿐 문항의 정오·
+    품질을 보증하지 않는다(AI 문항은 정답 키가 틀리거나 애매할 수 있다). 그래서 **강사의 선택
+    자체가 검토·판단**이다 — 은행 문항은 캡차로 안 쓰여 보통 draft로 남으므로 status로 검토
+    여부를 가늠하지 않고, 강사가 체크해 보낸 것만 옮긴다(단건 '은행으로' 버튼의 대량판).
     다답형·이미지 문항은 은행(단일형)이 못 담아 건너뛰고 사유별 수를 보고한다."""
     from app.models import Question
     from app.services import subject_banks
@@ -2260,16 +2267,24 @@ def ops_promote_bank_candidates(
             status.HTTP_409_CONFLICT,
             detail="문제은행이 아직 DB에 적재되지 않았어요(파일 폴백 상태). 은행 로더로 기존 문항을 먼저 적재해야 배치할 수 있어요.",
         )
-    rows = (
-        db.query(LectureQuestion)
-        .filter(LectureQuestion.lecture_id == lecture_id, LectureQuestion.status == "active")
-        .all()
+    base = db.query(LectureQuestion).filter(
+        LectureQuestion.lecture_id == lecture_id, LectureQuestion.status != "deleted"
     )
-    cands = [
-        q for q in rows
-        if (q.payload or {}).get("suggested_placement") == "bank"
-        and not ((q.payload or {}).get("bank_placed") or {}).get("bank_id")
-    ]
+
+    def _not_placed(r: LectureQuestion) -> bool:
+        return not ((r.payload or {}).get("bank_placed") or {}).get("bank_id")
+
+    if req.question_ids:
+        # 강사가 고른 것만 — 선택이 곧 검토. 이 강의 소속·미배치·미삭제(draft·active 모두 가능).
+        rows = base.filter(LectureQuestion.id.in_(set(req.question_ids))).all()
+        cands = [r for r in rows if _not_placed(r)]
+    else:
+        # 선택 없음 → 은행 적합(verdict=bank) 미배치 후보 전체(전체 선택 편의)
+        rows = base.all()
+        cands = [
+            r for r in rows
+            if (r.payload or {}).get("suggested_placement") == "bank" and _not_placed(r)
+        ]
     placed = 0
     skipped: dict[str, int] = {}
     any_demoted = False
