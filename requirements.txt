@@ -13,3 +13,4 @@ python-multipart>=0.0.17
 httpx>=0.27
 pytest>=8.3
 sentry-sdk>=2.0
+psutil>=5.9  # 서버 모니터링 self-collect(CPU/메모리/디스크) — host_metrics가 사용

@@ -28,6 +28,23 @@ def test_monitoring_dashboard_ops_only(client, db):
     assert client.get("/api/v1/ops/monitoring", headers=auth(itok)).status_code == 403
 
 
+def test_monitoring_threshold_alerts(client, db):
+    """임계 초과 지표는 경보로 잡힌다 — CPU>90·메모리>85는 경보, 디스크 50%는 아님."""
+    from datetime import datetime
+
+    from app.models import ServerMetric
+
+    db.add(ServerMetric(server_key="db", label="DB", cpu_pct=96.0, mem_pct=91.0, disk_pct=50.0,
+                        mem_used_mb=1, mem_total_mb=2, collected_at=datetime.now()))
+    db.commit()
+    otok = _ops(client, db)
+    body = client.get("/api/v1/ops/monitoring", headers=auth(otok)).json()
+    db_s = next(s for s in body["servers"] if s["server_key"] == "db")
+    metrics = {a["metric"] for a in db_s["alerts"]}
+    assert "CPU" in metrics and "메모리" in metrics and "디스크" not in metrics
+    assert body["alert_count"] >= 2
+
+
 def test_metrics_ingest_requires_token(client, db, monkeypatch):
     from app.api.v1.endpoints import monitoring
     from app.models import ServerMetric

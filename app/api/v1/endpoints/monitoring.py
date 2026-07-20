@@ -26,6 +26,27 @@ router = APIRouter()
 RETENTION_HOURS = 6  # 표본 보존창 — 그 밖은 인제스트/self-collect 때 정리(단기 추이가 목적)
 HISTORY_POINTS = 60  # 그래프에 내릴 최대 표본 수(초과분은 균등 다운샘플)
 
+# 임계 경보 기준(%) — 이 이상이면 '경보'. 색 임계(60/85)보다 높은 '위험' 티어(운영 개입 신호).
+# 서버에 두는 이유: 화면 강조뿐 아니라 향후 알림(웹훅·메일) 훅이 같은 기준을 쓰게 하려고.
+CRIT = {"CPU": 90.0, "메모리": 85.0, "디스크": 90.0, "GPU": 90.0, "VRAM": 90.0}
+
+
+def _alerts(row: ServerMetric) -> list[dict]:
+    """이 서버의 임계 초과 지표 목록 — 각 {metric, value, threshold}."""
+    out: list[dict] = []
+
+    def chk(metric: str, value: float | None) -> None:
+        if value is not None and value >= CRIT[metric]:
+            out.append({"metric": metric, "value": round(value, 1), "threshold": CRIT[metric]})
+
+    chk("CPU", row.cpu_pct)
+    chk("메모리", row.mem_pct)
+    chk("디스크", row.disk_pct)
+    chk("GPU", row.gpu_util_pct)
+    if row.gpu_mem_total_mb:
+        chk("VRAM", (row.gpu_mem_used_mb or 0) / row.gpu_mem_total_mb * 100)
+    return out
+
 # 대시보드가 보여줄 '기대 서버' — 데이터가 아직 없어도 카드로 노출(미수집 표시). CatChap 5대 VM.
 EXPECTED_SERVERS: list[tuple[str, str]] = [
     ("backend", "백엔드 API"),
@@ -139,6 +160,10 @@ def _row_out(row: ServerMetric | None, key: str, label: str) -> dict:
     if row is None:
         return {"server_key": key, "label": label, "no_data": True}
     age = (datetime.now() - row.collected_at).total_seconds() if row.collected_at else None
+    stale = age is not None and age > STALE_AFTER_SEC
+    alerts = _alerts(row)
+    if stale:
+        alerts = [{"metric": "수집", "value": None, "threshold": None}, *alerts]
     return {
         "server_key": row.server_key,
         "label": row.label,
@@ -158,7 +183,8 @@ def _row_out(row: ServerMetric | None, key: str, label: str) -> dict:
         "gpu_mem_used_mb": row.gpu_mem_used_mb,
         "gpu_mem_total_mb": row.gpu_mem_total_mb,
         "age_sec": int(age) if age is not None else None,
-        "stale": age is not None and age > STALE_AFTER_SEC,
+        "stale": stale,
+        "alerts": alerts,
         "no_data": False,
     }
 
@@ -205,8 +231,11 @@ def ops_monitoring(
         p["tokens_out"] += m.tokens_out
         p["cost_usd"] += cost
 
+    alert_count = sum(len(s.get("alerts") or []) for s in servers)
     return {
         "servers": servers,
+        "alert_count": alert_count,
+        "thresholds": CRIT,
         "llm": {
             "tokens_in": tot_in,
             "tokens_out": tot_out,
