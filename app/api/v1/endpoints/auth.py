@@ -50,6 +50,12 @@ def student_login(req: s.StudentLoginRequest, db: Session = Depends(get_db)):
     return auth_service.student_login(db, req)
 
 
+@router.post("/public-login", response_model=s.TokenPair)
+def public_login(req: s.StudentLoginRequest, db: Session = Depends(get_db)):
+    """공개 로그인 폼(/login)의 단일 진입 — 서버가 학생·강사를 판별(운영자는 제외)."""
+    return auth_service.public_login(db, req)
+
+
 @router.post("/refresh", response_model=s.TokenPair)
 def refresh(req: s.RefreshRequest, db: Session = Depends(get_db)):
     return auth_service.refresh_tokens(db, req.refresh_token)

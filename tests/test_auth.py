@@ -156,6 +156,100 @@ def test_ops_login_rejects_non_ops(client, db, seed_org):
     assert ops_login(client, "ops@test.dev", "wrong").status_code == 401
 
 
+def _add_instructor(db, email="inst@test.dev"):
+    from datetime import datetime
+
+    from app.core.security import hash_password
+    from app.models import User
+
+    u = User(
+        email=email,
+        password_hash=hash_password("Password123!"),
+        name="강사",
+        role="instructor",
+        status="active",
+        email_verified_at=datetime.utcnow(),
+    )
+    db.add(u)
+    db.commit()
+    return u
+
+
+def test_public_ops_login_excludes_ops(client, db, seed_org):
+    """운영자 분리(0720) — 공개 로그인 폼(public=true)에서는 운영자를 인증하지 않는다.
+
+    운영자는 전용 /ops/login(public 미지정)에서만 로그인. 강사는 공개 폼에서도 로그인된다."""
+    _add_ops(db)
+    _add_instructor(db)
+    # 공개 폼(public=true): 운영자는 정답 비번이어도 401(분리) — 존재/정답 오라클도 없음
+    res = client.post(
+        "/api/v1/auth/ops-login",
+        json={"email": "ops@test.dev", "password": "Password123!", "public": True},
+    )
+    assert res.status_code == 401
+    # 같은 공개 폼에서 강사는 성공
+    ok = client.post(
+        "/api/v1/auth/ops-login",
+        json={"email": "inst@test.dev", "password": "Password123!", "public": True},
+    )
+    assert ok.status_code == 200
+    me = client.get(
+        "/api/v1/auth/me",
+        headers={"Authorization": f"Bearer {ok.json()['access_token']}"},
+    )
+    assert me.json()["role"] == "instructor"
+
+
+def test_ops_portal_still_allows_ops(client, db, seed_org):
+    """전용 /ops/login(public 미지정/false)에서는 운영자가 그대로 로그인된다(회귀 방지)."""
+    _add_ops(db)
+    assert ops_login(client, "ops@test.dev", "Password123!").status_code == 200
+    res = client.post(
+        "/api/v1/auth/ops-login",
+        json={"email": "ops@test.dev", "password": "Password123!", "public": False},
+    )
+    assert res.status_code == 200
+
+
+def _public_login(client, identifier, password, organization_id=None):
+    body = {"student_login_id": identifier, "password": password}
+    if organization_id:
+        body["organization_id"] = organization_id
+    return client.post("/api/v1/auth/public-login", json=body)
+
+
+def test_public_login_authenticates_student(client, db, seed_org):
+    """공개 단일 진입(/auth/public-login) — 학생은 학생 경로로 로그인된다."""
+    res = _public_login(client, "stu01", "1234")
+    assert res.status_code == 200
+    me = client.get(
+        "/api/v1/auth/me", headers={"Authorization": f"Bearer {res.json()['access_token']}"}
+    )
+    assert me.json()["role"] == "student"
+
+
+def test_public_login_falls_back_to_instructor(client, db, seed_org):
+    """학생이 아닌 이메일이면 서버가 강사로 폴백해 로그인시킨다(프론트 폴백 제거)."""
+    _add_instructor(db)
+    res = _public_login(client, "inst@test.dev", "Password123!")
+    assert res.status_code == 200
+    me = client.get(
+        "/api/v1/auth/me", headers={"Authorization": f"Bearer {res.json()['access_token']}"}
+    )
+    assert me.json()["role"] == "instructor"
+
+
+def test_public_login_excludes_ops(client, db, seed_org):
+    """공개 단일 진입에서는 운영자를 인증하지 않는다 — 전용 /ops/login만."""
+    _add_ops(db)
+    assert _public_login(client, "ops@test.dev", "Password123!").status_code == 401
+
+
+def test_public_login_wrong_password_is_401(client, db, seed_org):
+    """존재하는 학생이라도 비번이 틀리면 학생 경로 그대로 401(강사로 넘어가지 않음)."""
+    assert _public_login(client, "stu01", "wrongpw").status_code == 401
+
+
 def test_student_login_and_me(client, db, seed_org):
     org = seed_org["org"]
     res = client.post(

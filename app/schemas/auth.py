@@ -18,6 +18,10 @@ class LoginRequest(BaseModel):
     password: str
     # 5회 이상 실패해 캡차가 요구된 뒤, 메인 캡차(forest)를 통과하고 받은 단일사용 토큰.
     captcha_token: str | None = None
+    # 공개 로그인 폼(/login)에서 온 요청이면 True — 운영자(ops)는 여기서 인증하지 않고
+    # 강사(instructor)만 허용한다(운영자 분리, 2026-07-20). 운영자는 전용 /ops/login에서만
+    # 로그인한다(고권한 내부 계정을 공개 로그인 공격면에 노출하지 않기 위함).
+    public: bool = False
 
 
 class StudentLoginRequest(BaseModel):

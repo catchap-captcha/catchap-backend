@@ -278,18 +278,28 @@ def ops_login(db: Session, req: s.LoginRequest) -> s.TokenPair:
     일반 사용자 계정으로는 여기서 토큰을 받을 수 없고(존재 여부도 흘리지 않음),
     운영자·강사 계정은 일반 로그인 폼(/auth/login)으로는 인증되지 않는다.
     강사(instructor)는 운영자가 초대·발급하는 내부 계정이라 같은 진입구를 쓴다.
+
+    단, 공개 로그인 폼(req.public=True — /login 통합 폴백)에서 온 요청은 운영자(ops)를
+    인증하지 않고 강사만 허용한다(운영자 분리, 2026-07-20). 운영자는 고권한 내부 계정이라
+    공개 로그인 공격면에 노출하지 않는다 — 운영자 계정 조회 자체를 안 해 비번 대조도 없다
+    (존재/정답 오라클 차단). 운영자는 전용 /ops/login(req.public=False)에서만 로그인한다.
     """
     identifier = f"user:{req.email.strip().lower()}"
     _check_locked(db, identifier)  # H1: 과도한 실패 시 실제 차단
     _require_captcha_if_needed(db, identifier, req.captcha_token)  # 5회+ 실패 → 메인 캡차 요구
-    user = db.query(User).filter(User.email == req.email.strip().lower()).first()
+    allowed_roles = ("instructor",) if req.public else ("ops", "instructor")
+    user = (
+        db.query(User)
+        .filter(User.email == req.email.strip().lower(), User.role.in_(allowed_roles))
+        .first()
+    )
     # 임시 비밀번호는 이메일에서 복사해 붙여넣는 흐름이라 앞뒤 공백·개행이 섞이기 쉽다.
     # 원문 실패 시 strip본을 한 번 더 대조한다(공백 패딩만 허용 — 보안 영향 무시 수준).
     pw_ok = user is not None and (
         verify_password(req.password, user.password_hash)
         or (req.password.strip() != req.password and verify_password(req.password.strip(), user.password_hash))
     )
-    if user is None or user.role not in ("ops", "instructor") or not pw_ok:
+    if user is None or not pw_ok:
         raise _login_failed(db, identifier, "이메일 또는 비밀번호가 올바르지 않습니다.")
     if user.status == "disabled":
         raise HTTPException(status.HTTP_403_FORBIDDEN, detail="비활성화된 계정입니다.")
@@ -347,6 +357,38 @@ def student_login(db: Session, req: s.StudentLoginRequest) -> s.TokenPair:
     student.last_login_at = datetime.now()  # 사용자 노출 시각 → 로컬(KST) 규약
     db.commit()
     return issue_tokens(db, student.id, "student", "student")
+
+
+def public_login(db: Session, req: s.StudentLoginRequest) -> s.TokenPair:
+    """공개 로그인 폼(/login)의 단일 진입 — 학생·강사를 서버가 판별한다(2026-07-20).
+
+    종전에는 프론트가 학생 로그인 실패 시 강사 로그인을 재시도(try-then-fallback)했다.
+    그 라우팅을 서버로 옮겨 요청 1회·일관된 실패처리로 정리한다. 운영자(ops)는 여기서
+    인증하지 않는다 — 고권한 내부 계정은 전용 /ops/login에서만(public=True로 제외).
+
+    판별 규칙: 해당 login_id의 (비활성 아님) 학생이 존재하면 학생 경로에 그대로 위임한다
+    — 다기관 409·오답 처리·캡차가 기존 student_login과 완전히 동일하다(학생 무영향).
+    학생이 아니고 이메일 형태면 강사 로그인으로 폴백한다. 존재 확인은 비밀번호를 대조하지
+    않으므로(카운터 증가 없음) 강사 이메일이 실재 학생의 실패 카운터를 오염시키지 않는다.
+    """
+    login_id = req.student_login_id.strip()
+    is_student = (
+        db.query(StudentProfile.id)
+        .filter(
+            StudentProfile.student_login_id == login_id,
+            StudentProfile.status != "disabled",
+        )
+        .first()
+        is not None
+    )
+    if is_student or "@" not in login_id:
+        # 학생이거나 이메일이 아니면 학생 경로로 — 후자는 통일된 학생 오류로 실패(존재 미노출).
+        return student_login(db, req)
+    # 학생이 아닌 이메일 → 강사 로그인(공개 폼이라 ops 제외). 실패 시 강사 오류 그대로 전파.
+    return ops_login(
+        db,
+        s.LoginRequest(email=login_id, password=req.password, captcha_token=req.captcha_token, public=True),
+    )
 
 
 def refresh_tokens(db: Session, refresh_token: str) -> s.TokenPair:
