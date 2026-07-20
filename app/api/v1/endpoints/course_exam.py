@@ -20,6 +20,7 @@ from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
+from sqlalchemy import case, func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -566,6 +567,117 @@ def ops_generate_exam_questions(
         "used_transcripts": used_transcripts,
         "lecture_count": len(lecture_rows),
         "questions": [_question_row(q) for q in created],
+    }
+
+
+# ------------------------------------------------------- 강사·운영자: 시험 통계(대시보드)
+@router.get("/ops/courses/{course_id}/exam-stats")
+def ops_exam_stats(
+    course_id: str,
+    principal: Principal = Depends(require_lecture_manager),
+    db: Session = Depends(get_db),
+):
+    """코스 수료 시험 지표 — 강사(약한 문항·오래 걸린 문항)·운영자(수료율)용 대시보드 원천.
+
+    왜: 문항을 넣고 끝이 아니라 '학생이 어디서 막히나'를 강사가 보고 문항을 고칠 수 있게 —
+    통과율 낮은 문항 = 잘못 냈거나 강의가 부족한 대목, 오답 재시도 많은 문항 = 어려운 대목.
+    운영자는 코스별 수료율로 커리큘럼 건강도를 본다. 스코프는 _get_ops_course 재사용(강사는
+    자기 코스만·남의 코스 404, 운영자는 전체).
+
+    집계 규칙:
+    - 코스 레벨: 응시 학생(제출 회차가 있는 distinct 학생)·수료·완벽 통과·수료율(수료/응시).
+    - 문항 레벨(활성 문항만 — 강사가 고칠 수 있는 대상): 통과율 = 그 문항을 맞힌 적 있는 학생 /
+      시도한 학생(정복률), 오답 시도 수(재시도 부담), 평균 풀이 시간. **평균 풀이 시간은 근사값**
+      — solve_time_ms가 회차 전체 시간을 문항 수로 나눈 값이라(제출 경로) 문항 고유 시간이
+      아니다. 그래도 '오래 걸린 회차에 든 문항' 신호로는 쓸 만해 secondary로 노출한다.
+    """
+    from app.api.v1.endpoints.lectures import _get_ops_course
+
+    _get_ops_course(db, course_id, principal)  # 소유 스코프 — 남의 코스 404
+    active = _active_questions(db, course_id)
+
+    # --- 코스 레벨: 응시·수료·완벽·수료율
+    attempted_students = (
+        db.query(func.count(func.distinct(CourseExamSitting.student_id)))
+        .filter(
+            CourseExamSitting.course_id == course_id,
+            CourseExamSitting.submitted_at.isnot(None),
+        )
+        .scalar()
+        or 0
+    )
+    completions = (
+        db.query(func.count(CourseCompletion.id))
+        .filter(CourseCompletion.course_id == course_id)
+        .scalar()
+        or 0
+    )
+    perfects = (
+        db.query(func.count(CourseCompletion.id))
+        .filter(CourseCompletion.course_id == course_id, CourseCompletion.perfect.is_(True))
+        .scalar()
+        or 0
+    )
+
+    # --- 문항 레벨: 한 번의 그룹 집계로 시도/정답/distinct 학생/평균 시간
+    agg = {
+        r[0]: r
+        for r in db.query(
+            CourseExamAttempt.question_id,
+            func.count(CourseExamAttempt.id),  # 총 시도 수(재시도 포함)
+            func.sum(case((CourseExamAttempt.result == "correct", 1), else_=0)),  # 정답 시도
+            func.count(func.distinct(CourseExamAttempt.student_id)),  # 시도한 distinct 학생
+            func.avg(CourseExamAttempt.solve_time_ms),  # 근사 평균 풀이 시간
+        )
+        .filter(CourseExamAttempt.course_id == course_id)
+        .group_by(CourseExamAttempt.question_id)
+        .all()
+    }
+    # 정복(맞힌 적 있는) distinct 학생 — 통과율 분자
+    mastered = {
+        r[0]: int(r[1])
+        for r in db.query(
+            CourseExamAttempt.question_id,
+            func.count(func.distinct(CourseExamAttempt.student_id)),
+        )
+        .filter(
+            CourseExamAttempt.course_id == course_id,
+            CourseExamAttempt.result == "correct",
+        )
+        .group_by(CourseExamAttempt.question_id)
+        .all()
+    }
+
+    questions = []
+    for q in active:
+        row = agg.get(q.id)
+        total_attempts = int(row[1]) if row else 0
+        correct_attempts = int(row[2] or 0) if row else 0
+        students_attempted = int(row[3]) if row else 0
+        avg_ms = int(row[4] or 0) if row else 0
+        students_mastered = mastered.get(q.id, 0)
+        questions.append({
+            "id": q.id,
+            "prompt": q.prompt,
+            "origin": q.origin,
+            "students_attempted": students_attempted,
+            "students_mastered": students_mastered,
+            # 통과율 = 정복 학생 / 시도 학생 (아무도 안 풀었으면 None — 0%로 오해 방지)
+            "pass_rate": round(students_mastered / students_attempted, 3) if students_attempted else None,
+            "total_attempts": total_attempts,
+            "wrong_attempts": total_attempts - correct_attempts,  # 재시도 부담(어려움 신호)
+            "avg_solve_ms": avg_ms,  # 근사값(회차 시간/문항 수)
+        })
+
+    return {
+        "course_id": course_id,
+        "attempted_students": int(attempted_students),
+        "completions": int(completions),
+        "perfects": int(perfects),
+        # 수료율 = 수료 학생 / 응시 학생(응시 0이면 None — 분모 0 방지)
+        "completion_rate": round(completions / attempted_students, 3) if attempted_students else None,
+        "active_question_count": len(active),
+        "questions": questions,
     }
 
 

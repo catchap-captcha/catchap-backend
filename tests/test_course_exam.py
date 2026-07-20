@@ -480,6 +480,70 @@ def test_certificate_serial_stable(client, db, seed_org):
     assert a["serial"] == b["serial"] and len(a["serial"]) == len("CATCHAP-") + 12
 
 
+def test_exam_stats_pass_rate_and_completion(client, db, seed_org):
+    """시험 통계 — 문항별 통과율·오답 시도·코스 수료율(강사·운영자 대시보드 원천).
+
+    한 문항을 일부러 틀렸다가 정복하면 그 문항의 wrong_attempts가 잡히고, 전 문항 정복 시
+    수료율이 오른다. 통과율=정복 학생/시도 학생(아무도 안 풀면 None)."""
+    tok = _ops(client, db)
+    stok = _student_token(client, seed_org)
+    course = _mk_course(client, tok, db)
+    lec = _assign_lecture(client, tok, course["id"])
+    _complete_lecture(db, seed_org["student"].id, lec["id"])
+    for i in range(2):
+        _add_exam_q(client, tok, course["id"], prompt=f"q{i}", options=["a", "b", "c"], answer_indexes=[i % 3])
+
+    # 통계(응시 전) — 응시 0, 통과율/수료율 None(0%로 오해 방지)
+    st0 = client.get(f"/api/v1/ops/courses/{course['id']}/exam-stats", headers=auth(tok)).json()
+    assert st0["attempted_students"] == 0 and st0["completions"] == 0
+    assert st0["completion_rate"] is None
+    assert all(q["pass_rate"] is None for q in st0["questions"])
+
+    # 1회차: q0 정답, q1 오답
+    sess = client.post(f"/api/v1/courses/{course['id']}/exam/session", headers=auth(stok)).json()
+    answers, wrong_qid = [], None
+    for idx, item in enumerate(sess["questions"]):
+        q = db.get(CourseExamQuestion, item["question_id"])
+        ct = {q.options[a] for a in q.answer_indexes}
+        picks = [i for i, o in enumerate(item["options"]) if o in ct]
+        if q.prompt == "q1":
+            wrong_qid = q.id
+            picks = [i for i, o in enumerate(item["options"]) if o not in ct][:1]
+        answers.append({"question_id": q.id, "picks": picks})
+    client.post(f"/api/v1/courses/{course['id']}/exam/submit",
+                json={"sitting_id": sess["sitting_id"], "answers": answers}, headers=auth(stok))
+    # 2회차: 틀린 q1 정답 → 수료
+    _submit_all_correct(client, stok, course["id"], db)
+
+    st = client.get(f"/api/v1/ops/courses/{course['id']}/exam-stats", headers=auth(tok)).json()
+    assert st["attempted_students"] == 1
+    assert st["completions"] == 1 and st["completion_rate"] == 1.0
+    byq = {q["prompt"]: q for q in st["questions"]}
+    # q0: 첫 시도 정답 → 오답 0·통과율 1.0
+    assert byq["q0"]["wrong_attempts"] == 0 and byq["q0"]["pass_rate"] == 1.0
+    # q1: 한 번 틀리고 정복 → 오답 1·통과율 1.0(결국 맞힘)·시도 학생 1
+    assert byq["q1"]["wrong_attempts"] == 1 and byq["q1"]["pass_rate"] == 1.0
+    assert byq["q1"]["students_attempted"] == 1 and byq["q1"]["students_mastered"] == 1
+
+
+def test_exam_stats_scope_other_instructor_404(client, db, seed_org):
+    """통계도 코스 소유 스코프 — 남의 코스는 404(_get_ops_course 재사용)."""
+    from app.core.security import hash_password
+    from app.models import User
+
+    tok = _ops(client, db)
+    course = _mk_course(client, tok, db)
+    other = User(email="inst3@t.dev", password_hash=hash_password("Password123!"),
+                 name="다른강사", role="instructor",
+                 email_verified_at=__import__("datetime").datetime.utcnow())
+    db.add(other)
+    db.commit()
+    otok = client.post("/api/v1/auth/ops-login",
+                       json={"email": "inst3@t.dev", "password": "Password123!"}).json()["access_token"]
+    r = client.get(f"/api/v1/ops/courses/{course['id']}/exam-stats", headers=auth(otok))
+    assert r.status_code == 404
+
+
 def test_metrics_isolation_no_learning_attempt(client, db, seed_org):
     """지표 격리(설계 §7) — 시험 응답은 LearningAttempt에 안 쌓인다(정답률 오염 방지)."""
     from app.models import LearningAttempt
