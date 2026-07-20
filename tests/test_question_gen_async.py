@@ -135,3 +135,26 @@ def test_gen_job_status_scoped_to_owner(client, db, monkeypatch, tmp_path):
     other = _instructor(client, db, email="other-gen@t.dev")
     r2 = client.get(f"/api/v1/ops/lectures/{lec_id}/questions/gen-jobs/{job.id}", headers=auth(other))
     assert r2.status_code == 404
+
+
+def test_phase_hooks_report_steps(client, db, monkeypatch, tmp_path):
+    """생성 세부 단계(자막 변환→문항 생성→검증)가 on_phase 콜백으로 순서대로 보고된다."""
+    import app.clients.stt_client as stt
+
+    monkeypatch.setattr(get_settings(), "ANTHROPIC_API_KEY", "sk-x")
+    monkeypatch.setattr(get_settings(), "OPENAI_API_KEY", "sk-stt")  # STT 유발(자막 없음)
+    monkeypatch.setattr(get_settings(), "LECTURE_MEDIA_DIR", str(tmp_path))
+    monkeypatch.setattr(stt, "transcribe_video", lambda path, *, api_key: [{"start": 0, "end": 1, "text": "t"}])
+    monkeypatch.setattr(
+        ai_client, "generate_lecture_questions",
+        lambda **k: [{"prompt": "q", "options": ["가", "나"], "answer_index": 0, "explain": ""}],
+    )
+    monkeypatch.setattr(ai_client, "verify_questions", lambda items, **k: None)
+    tok = _instructor(client, db)
+    lec_id = _upload_lecture(client, tok, title="단계 강의", subject="국어", duration=300).json()["id"]
+
+    from app.api.v1.endpoints.lectures import _generate_questions_now
+
+    phases = []
+    _generate_questions_now(db, db.get(Lecture, lec_id), 1, "actor", on_phase=phases.append)
+    assert phases == ["transcribing", "generating", "verifying"]

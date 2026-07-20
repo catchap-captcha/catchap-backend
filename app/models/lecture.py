@@ -221,6 +221,9 @@ class LectureQuestionGenJob(Base, UUIDPk, Timestamps):
     requested_by: Mapped[str] = mapped_column(CHAR(36), index=True)  # 요청 강사 user id(소프트 참조)
     n: Mapped[int] = mapped_column(default=3)  # 요청 문항 수
     status: Mapped[str] = mapped_column(String(20), default="pending")  # pending|running|done|error
+    # running 중 세부 단계 표시용 — transcribing(자막 변환)|generating(문항 생성)|verifying(자기검증).
+    # done/error/대기 중엔 None. 실시간 %가 아니라 '지금 뭐 하는 중'을 강사에게 알리는 거친 단계.
+    phase: Mapped[str | None] = mapped_column(String(20), nullable=True)
     created_count: Mapped[int] = mapped_column(default=0)  # 실제 생성된 draft 수
     transcript_used: Mapped[bool] = mapped_column(default=False)
     transcript_source: Mapped[str | None] = mapped_column(String(20), nullable=True)  # srt|vtt|paste|stt|None

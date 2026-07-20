@@ -2453,7 +2453,7 @@ class _GenerateReq(BaseModel):
     n: int = 5
 
 
-def _generate_questions_now(db: Session, lec: Lecture, n: int, actor_id: str) -> dict:
+def _generate_questions_now(db: Session, lec: Lecture, n: int, actor_id: str, on_phase=None) -> dict:
     """AI 문항 자동 생성 실작업 — STT 전사(키 설정 시) → LLM 출제, source=llm·status=draft 저장.
 
     키는 호출 시점마다 해석한다(운영 콘솔 입력(DB) → .env 폴백). 정직성 규약:
@@ -2512,6 +2512,8 @@ def _generate_questions_now(db: Session, lec: Lecture, n: int, actor_id: str) ->
         transcript = stored_t.segments
         transcript_source = stored_t.source
     elif stt_worker_url or openai_key:  # STT — 강사 자막이 없을 때만(워커 우선, 없으면 OpenAI)
+        if on_phase:
+            on_phase("transcribing")  # 단계 표시: 자막 변환 중(가장 오래 걸리는 구간)
         try:
             transcript = transcribe_lecture(
                 _video_path(lec),
@@ -2526,6 +2528,8 @@ def _generate_questions_now(db: Session, lec: Lecture, n: int, actor_id: str) ->
         transcript_source = "stt"
         _upsert_transcript(db, lec.id, transcript, "stt")  # 캐시 — 다음 생성 때 재전사 방지
 
+    if on_phase:
+        on_phase("generating")  # 단계 표시: 문항 생성 중
     try:
         items = generate_lecture_questions(
             lecture_title=lec.title,
@@ -2554,6 +2558,8 @@ def _generate_questions_now(db: Session, lec: Lecture, n: int, actor_id: str) ->
     # 줘도 못 풂 = 불량 의심). '참고 신호'라 실패해도 생성은 살린다(verify_error로 정직 노출).
     verdicts: list[dict] | None = None
     verify_error: str | None = None
+    if on_phase:
+        on_phase("verifying")  # 단계 표시: 봇 저항 자기검증 중
     try:
         verdicts = verify_questions(
             items,
@@ -2680,6 +2686,7 @@ def _gen_job_row(job: LectureQuestionGenJob) -> dict:
     return {
         "job_id": job.id,
         "status": job.status,  # pending|running|done|error
+        "phase": job.phase,  # running 중 세부 단계(transcribing|generating|verifying) 또는 None
         "n": int(job.n),
         "created": int(job.created_count or 0),
         "transcript_used": bool(job.transcript_used),
@@ -2742,9 +2749,15 @@ def _run_question_gen_job(job_id: str, *, session_factory=SessionLocal) -> None:
             return
         job.status = "running"
         db.commit()
+
+        def _set_phase(p: str) -> None:
+            job.phase = p  # 강사 폴링이 읽는 세부 단계(자막 변환/문항 생성/검증)
+            db.commit()
+
         # 실작업은 동기 헬퍼 재사용 — 문항·감사를 db에 commit하고 요약 dict를 돌려준다.
-        summary = _generate_questions_now(db, lec, job.n, job.requested_by)
+        summary = _generate_questions_now(db, lec, job.n, job.requested_by, on_phase=_set_phase)
         job.status = "done"
+        job.phase = None  # 완료 — 단계 표시 종료
         job.created_count = int(summary.get("created") or 0)
         job.transcript_used = bool(summary.get("transcript_used"))
         job.transcript_source = summary.get("transcript_source")
