@@ -801,3 +801,86 @@ def test_generate_exam_questions_no_key_503(client, db, seed_org, monkeypatch):
         json={"n": 2}, headers=auth(tok),
     )
     assert r.status_code == 503
+
+
+# ---------------------------------------------------------------- 강사 홈 대시보드
+def _draft_lecture_q(db, lecture_id):
+    from app.models import LectureQuestion
+
+    db.add(LectureQuestion(
+        lecture_id=lecture_id, payload={"prompt": "검수대기", "options": ["a", "b"]},
+        answer_index=0, status="draft",
+    ))
+    db.commit()
+
+
+def test_instructor_dashboard_counts_and_drafts(client, db, seed_org):
+    """강사 홈 — 내 강의/코스 수 + 검수 대기(draft) 문항을 강의 가로질러 합산·나열."""
+    tok = _instructor(client, db)
+    course = _mk_course(client, tok, db)
+    lec = _assign_lecture(client, tok, course["id"])
+    _draft_lecture_q(db, lec["id"])  # 강의 draft 확인문항 1
+    _add_exam_q(client, tok, course["id"], prompt="dq", options=["a", "b"],
+                answer_indexes=[0], status="draft")  # 시험 draft 1
+
+    d = client.get("/api/v1/ops/instructor/dashboard", headers=auth(tok)).json()
+    assert d["lecture_count"] == 1 and d["course_count"] == 1
+    assert d["draft_lecture_questions"] == 1
+    assert d["draft_exam_questions"] == 1
+    assert d["draft_question_count"] == 2
+    # 강의별 검수 대기 목록(바로가기) — 강의가 여럿이어도 한곳에서 보게
+    assert len(d["draft_by_lecture"]) == 1
+    assert d["draft_by_lecture"][0]["lecture_id"] == lec["id"]
+    assert d["draft_by_lecture"][0]["draft_count"] == 1
+    # 활성 확인문항 0개 강의 = 시청 검증 없음 경고
+    assert d["lectures_without_checkpoint"] == 1
+
+
+def test_instructor_dashboard_scope_isolated(client, db, seed_org):
+    """다른 강사의 강의/코스/검수대기는 내 대시보드에 절대 잡히지 않는다."""
+    from datetime import datetime
+
+    from app.core.security import hash_password
+    from app.models import User
+
+    tok = _instructor(client, db)
+    # 남의 강사 + 그의 코스·강의·draft
+    db.add(User(email="inst9@t.dev", password_hash=hash_password("Password123!"),
+                name="남강사", role="instructor", status="active",
+                email_verified_at=datetime.utcnow()))
+    db.commit()
+    otok = client.post("/api/v1/auth/ops-login",
+                       json={"email": "inst9@t.dev", "password": "Password123!"}).json()["access_token"]
+    ocourse = _mk_course(client, otok, db, title="남코스")
+    olec = _assign_lecture(client, otok, ocourse["id"], title="남1강")
+    _draft_lecture_q(db, olec["id"])
+
+    # 내 대시보드는 전부 0 (남의 것 미포함)
+    d = client.get("/api/v1/ops/instructor/dashboard", headers=auth(tok)).json()
+    assert d["lecture_count"] == 0 and d["course_count"] == 0
+    assert d["draft_question_count"] == 0 and d["draft_by_lecture"] == []
+
+
+def test_instructor_dashboard_weak_questions_ranked(client, db, seed_org):
+    """이해도(약한 대목) — 내 코스 활성 시험문항을 통과율 낮은 순 Top으로 정렬."""
+    from app.models import CourseExamAttempt
+
+    tok = _instructor(client, db)
+    course = _mk_course(client, tok, db)
+    easy = _add_exam_q(client, tok, course["id"], prompt="쉬움", options=["a", "b"],
+                       answer_indexes=[0]).json()
+    hard = _add_exam_q(client, tok, course["id"], prompt="어려움", options=["a", "b"],
+                       answer_indexes=[0]).json()
+    # easy: 2명 시도·2명 정복(통과율 1.0) / hard: 2명 시도·0명 정복(통과율 0.0)
+    for sid in ("s1", "s2"):
+        db.add(CourseExamAttempt(student_id=sid, course_id=course["id"],
+                                 question_id=easy["id"], sitting_id="x", result="correct"))
+        db.add(CourseExamAttempt(student_id=sid, course_id=course["id"],
+                                 question_id=hard["id"], sitting_id="x", result="incorrect"))
+    db.commit()
+
+    d = client.get("/api/v1/ops/instructor/dashboard", headers=auth(tok)).json()
+    wq = d["weak_questions"]
+    assert len(wq) == 2
+    assert wq[0]["question_id"] == hard["id"] and wq[0]["pass_rate"] == 0.0  # 가장 약한 게 먼저
+    assert wq[1]["question_id"] == easy["id"] and wq[1]["pass_rate"] == 1.0

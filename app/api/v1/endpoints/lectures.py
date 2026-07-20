@@ -1006,6 +1006,186 @@ def ops_list_lectures(
     return [_lecture_row(db, lec) for lec in rows]
 
 
+@router.get("/ops/instructor/dashboard")
+def ops_instructor_dashboard(
+    principal: Principal = Depends(require_content_author),  # 강사 홈 — 콘텐츠 저작자 전용
+    db: Session = Depends(get_db),
+):
+    """강사 홈 대시보드 — 자기 강의/코스 전반의 '할 일'과 '이해도'를 한 화면에 모은다.
+
+    왜(팀 학습용): 강사가 로그인하면 강의 목록만 덩그러니 뜨던 걸, '지금 검수할 게 몇 개인지',
+    '학생이 어느 시험 문항에서 막히는지'를 먼저 보여줘 콘텐츠를 고칠 판단 근거를 준다. 특히
+    강의별로 따로 열어 보던 검수 대기(draft) 문항을 강의를 가로질러 합산·나열한다 — 강의가
+    여러 개인 강사가 한 화면에서 어디에 몇 개 검수 대기인지 보게(사용자 요청 0720).
+
+    스코프: Lecture.uploaded_by / Course.instructor_id == 본인 — 남의 강의·코스는 세지 않는다
+    (목록 엔드포인트와 동일 소유 규약). 되감기 히트맵·문항별 확인문항 이해도는 계측이 없어
+    제외(P1 — LectureCheckpointEvent에 question_id 없음, 시청 seek 미로깅).
+    """
+    from app.models import CourseCompletion, CourseExamAttempt, CourseExamQuestion
+
+    uid = principal.id
+    my_lectures = (
+        db.query(Lecture)
+        .filter(Lecture.uploaded_by == uid, Lecture.status == "active")
+        .all()
+    )
+    lec_ids = [lec.id for lec in my_lectures]
+    my_courses = (
+        db.query(Course)
+        .filter(Course.instructor_id == uid, Course.status == "active")
+        .all()
+    )
+    course_ids = [c.id for c in my_courses]
+
+    # --- 검수 대기(draft) 확인문항 — 강의별 합산 + 강의 목록(바로가기)
+    draft_by_lecture: list[dict] = []
+    draft_lecture_q = 0
+    lectures_without_checkpoint = 0
+    if lec_ids:
+        draft_counts = dict(
+            db.query(LectureQuestion.lecture_id, func.count(LectureQuestion.id))
+            .filter(
+                LectureQuestion.lecture_id.in_(lec_ids),
+                LectureQuestion.status == "draft",
+            )
+            .group_by(LectureQuestion.lecture_id)
+            .all()
+        )
+        active_counts = dict(
+            db.query(LectureQuestion.lecture_id, func.count(LectureQuestion.id))
+            .filter(
+                LectureQuestion.lecture_id.in_(lec_ids),
+                LectureQuestion.status == "active",
+            )
+            .group_by(LectureQuestion.lecture_id)
+            .all()
+        )
+        for lec in my_lectures:
+            n = int(draft_counts.get(lec.id, 0))
+            if n:
+                draft_by_lecture.append(
+                    {"lecture_id": lec.id, "title": lec.title, "draft_count": n}
+                )
+                draft_lecture_q += n
+            # 활성 확인문항 0개 = 시청 검증이 없는 강의(콘솔 경고와 동일 정의)
+            if int(active_counts.get(lec.id, 0)) == 0:
+                lectures_without_checkpoint += 1
+    draft_by_lecture.sort(key=lambda r: r["draft_count"], reverse=True)
+
+    # --- 검수 대기(draft) 시험문항(내 코스)
+    draft_exam_q = 0
+    if course_ids:
+        draft_exam_q = int(
+            db.query(func.count(CourseExamQuestion.id))
+            .filter(
+                CourseExamQuestion.course_id.in_(course_ids),
+                CourseExamQuestion.status == "draft",
+            )
+            .scalar()
+            or 0
+        )
+
+    # --- 학생 참여: 내 강의를 학습한 distinct 학생 + 완주(done) 건수
+    active_learners = 0
+    completed_watches = 0
+    if lec_ids:
+        active_learners = int(
+            db.query(func.count(func.distinct(LectureWatchProgress.student_id)))
+            .filter(LectureWatchProgress.lecture_id.in_(lec_ids))
+            .scalar()
+            or 0
+        )
+        completed_watches = int(
+            db.query(func.count(LectureWatchProgress.id))
+            .filter(
+                LectureWatchProgress.lecture_id.in_(lec_ids),
+                LectureWatchProgress.status == "done",
+            )
+            .scalar()
+            or 0
+        )
+
+    # --- 코스 수료 총합
+    course_completions = 0
+    if course_ids:
+        course_completions = int(
+            db.query(func.count(CourseCompletion.id))
+            .filter(CourseCompletion.course_id.in_(course_ids))
+            .scalar()
+            or 0
+        )
+
+    # --- 이해도(약한 대목): 내 코스 활성 시험문항 중 통과율 낮은 Top 5
+    #     통과율 = 그 문항을 맞힌 적 있는 distinct 학생 / 시도한 distinct 학생. 시도 0은 제외
+    #     (판단 근거 없음 — 0%로 오해 방지). 문항별 상세는 강의 콘솔 시험 모달에서 본다.
+    weak_questions: list[dict] = []
+    if course_ids:
+        active_q = (
+            db.query(CourseExamQuestion)
+            .filter(
+                CourseExamQuestion.course_id.in_(course_ids),
+                CourseExamQuestion.status == "active",
+            )
+            .all()
+        )
+        if active_q:
+            qids = [q.id for q in active_q]
+            attempted = dict(
+                db.query(
+                    CourseExamAttempt.question_id,
+                    func.count(func.distinct(CourseExamAttempt.student_id)),
+                )
+                .filter(CourseExamAttempt.question_id.in_(qids))
+                .group_by(CourseExamAttempt.question_id)
+                .all()
+            )
+            mastered = dict(
+                db.query(
+                    CourseExamAttempt.question_id,
+                    func.count(func.distinct(CourseExamAttempt.student_id)),
+                )
+                .filter(
+                    CourseExamAttempt.question_id.in_(qids),
+                    CourseExamAttempt.result == "correct",
+                )
+                .group_by(CourseExamAttempt.question_id)
+                .all()
+            )
+            ctitle = {c.id: c.title for c in my_courses}
+            for q in active_q:
+                att = int(attempted.get(q.id, 0))
+                if att == 0:
+                    continue
+                mas = int(mastered.get(q.id, 0))
+                weak_questions.append(
+                    {
+                        "course_id": q.course_id,
+                        "course_title": ctitle.get(q.course_id, ""),
+                        "question_id": q.id,
+                        "prompt": (q.prompt or "")[:120],
+                        "pass_rate": round(mas / att, 3),
+                        "attempted_students": att,
+                    }
+                )
+            weak_questions.sort(key=lambda w: w["pass_rate"])
+            weak_questions = weak_questions[:5]
+
+    return {
+        "lecture_count": len(my_lectures),
+        "course_count": len(my_courses),
+        "draft_question_count": draft_lecture_q + draft_exam_q,
+        "draft_lecture_questions": draft_lecture_q,
+        "draft_exam_questions": draft_exam_q,
+        "draft_by_lecture": draft_by_lecture,
+        "lectures_without_checkpoint": lectures_without_checkpoint,
+        "active_learners": active_learners,
+        "completed_watches": completed_watches,
+        "course_completions": course_completions,
+        "weak_questions": weak_questions,
+    }
+
+
 class _LectureReorder(BaseModel):
     # 한 그룹(한 코스, 또는 한 과목의 미분류)의 강의 전체를 새 순서대로. 콘솔이 그룹 단위로 보낸다.
     lecture_ids: list[str] = Field(min_length=1, max_length=500)
