@@ -531,6 +531,41 @@ def test_exam_stats_pass_rate_and_completion(client, db, seed_org):
     assert byq["q1"]["students_attempted"] == 1 and byq["q1"]["students_mastered"] == 1
 
 
+def test_exam_stats_first_try_and_distractors(client, db, seed_org):
+    """시험 전용 지표 — 첫 시도 정답률(난이도·변별 신호) + 오답 선택지 분석(어느 보기가 낚나).
+
+    학생이 처음에 특정 오답 보기('c')를 고르고 틀린 뒤 정답으로 정복하면: 첫 시도 정답률 0,
+    그 오답 보기의 wrong_picks=1, 정답 보기 is_answer=True."""
+    tok = _instructor(client, db)
+    stok = _student_token(client, seed_org)
+    course = _mk_course(client, tok, db)
+    lec = _assign_lecture(client, tok, course["id"])
+    _complete_lecture(db, seed_org["student"].id, lec["id"])
+    q = _add_exam_q(client, tok, course["id"], prompt="정답은 a", options=["a", "b", "c"],
+                    answer_indexes=[0]).json()
+
+    # 1회차: 일부러 'c'(원본 인덱스 2)를 골라 오답
+    sess = client.post(f"/api/v1/courses/{course['id']}/exam/session", headers=auth(stok)).json()
+    item = sess["questions"][0]
+    c_display = next(i for i, o in enumerate(item["options"]) if o == "c")
+    client.post(f"/api/v1/courses/{course['id']}/exam/submit",
+                json={"sitting_id": sess["sitting_id"],
+                      "answers": [{"question_id": q["id"], "picks": [c_display]}]},
+                headers=auth(stok))
+    # 2회차: 정답 'a'로 정복
+    _submit_all_correct(client, stok, course["id"], db)
+
+    st = client.get(f"/api/v1/ops/courses/{course['id']}/exam-stats", headers=auth(tok)).json()
+    qs = st["questions"][0]
+    assert qs["students_attempted"] == 1
+    assert qs["first_try_correct"] == 0 and qs["first_try_rate"] == 0.0  # 첫 시도 틀림
+    assert qs["pass_rate"] == 1.0  # 결국 정복
+    opts = {o["index"]: o for o in qs["options"]}
+    assert opts[0]["is_answer"] is True and opts[0]["text"] == "a"
+    assert opts[2]["text"] == "c" and opts[2]["wrong_picks"] == 1  # 'c'가 낚은 오답 1건
+    assert opts[1]["wrong_picks"] == 0  # 아무도 안 고른 보기
+
+
 def test_exam_stats_scope_other_instructor_404(client, db, seed_org):
     """통계도 코스 소유 스코프 — 남의 코스는 404(_get_ops_course 재사용)."""
     from app.core.security import hash_password

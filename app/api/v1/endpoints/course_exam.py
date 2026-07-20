@@ -930,6 +930,36 @@ def ops_exam_stats(
         .all()
     }
 
+    # --- 시험 전용 지표: 첫 시도 정답률 + 오답 선택지 분석(distractor analysis).
+    # 최종 통과율은 완전학습이라 완료자 기준 ~100%로 수렴해 난이도 신호가 약하다. **첫 시도
+    # 정답률**(학생이 그 문항을 처음 만났을 때 맞힌 비율)이 실제 난이도·변별을 보여준다.
+    # **오답 선택지 분석**은 틀린 학생이 어느 보기를 골랐나 — 헷갈리는(잘못 낚는) 보기를 드러낸다.
+    # 시험 규모가 작아(코스당 소수 학생·문항) 전체 시도를 파이썬으로 집계해도 안전하다.
+    all_attempts = (
+        db.query(
+            CourseExamAttempt.student_id,
+            CourseExamAttempt.question_id,
+            CourseExamAttempt.result,
+            CourseExamAttempt.answer,
+        )
+        .filter(CourseExamAttempt.course_id == course_id)
+        .order_by(CourseExamAttempt.created_at, CourseExamAttempt.id)
+        .all()
+    )
+    first_correct: dict[str, int] = {}  # question_id → 첫 시도에 맞힌 학생 수
+    seen_pairs: set = set()  # (student, question) 최초 시도만 첫 시도로 센다
+    wrong_picks: dict[str, dict[int, int]] = {}  # question_id → {보기 인덱스: 오답 선택 수}
+    for a in all_attempts:
+        pair = (a.student_id, a.question_id)
+        if pair not in seen_pairs:
+            seen_pairs.add(pair)  # created_at 오름차순이라 첫 등장이 첫 시도
+            if a.result == "correct":
+                first_correct[a.question_id] = first_correct.get(a.question_id, 0) + 1
+        if a.result == "incorrect":
+            wp = wrong_picks.setdefault(a.question_id, {})
+            for idx in a.answer or []:
+                wp[int(idx)] = wp.get(int(idx), 0) + 1
+
     questions = []
     for q in active:
         row = agg.get(q.id)
@@ -938,6 +968,19 @@ def ops_exam_stats(
         students_attempted = int(row[3]) if row else 0
         avg_ms = int(row[4] or 0) if row else 0
         students_mastered = mastered.get(q.id, 0)
+        ft_correct = first_correct.get(q.id, 0)
+        answer_set = {int(i) for i in q.answer_indexes}
+        wp = wrong_picks.get(q.id, {})
+        # 보기별 통계 — 오답 선택 수 + 정답 여부(distractor analysis). 텍스트는 강사 검수용.
+        options_stat = [
+            {
+                "index": i,
+                "text": (q.options[i] if i < len(q.options) else ""),
+                "is_answer": i in answer_set,
+                "wrong_picks": int(wp.get(i, 0)),
+            }
+            for i in range(len(q.options))
+        ]
         questions.append({
             "id": q.id,
             "prompt": q.prompt,
@@ -946,9 +989,13 @@ def ops_exam_stats(
             "students_mastered": students_mastered,
             # 통과율 = 정복 학생 / 시도 학생 (아무도 안 풀었으면 None — 0%로 오해 방지)
             "pass_rate": round(students_mastered / students_attempted, 3) if students_attempted else None,
+            # 첫 시도 정답률 = 첫 시도에 맞힌 학생 / 시도 학생 (난이도·변별의 실제 신호)
+            "first_try_correct": ft_correct,
+            "first_try_rate": round(ft_correct / students_attempted, 3) if students_attempted else None,
             "total_attempts": total_attempts,
             "wrong_attempts": total_attempts - correct_attempts,  # 재시도 부담(어려움 신호)
             "avg_solve_ms": avg_ms,  # 근사값(회차 시간/문항 수)
+            "options": options_stat,  # 오답 선택지 분석(보기별 오답 선택 수)
         })
 
     return {
