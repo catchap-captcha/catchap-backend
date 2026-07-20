@@ -66,6 +66,9 @@ class Settings(BaseSettings):
     # (과금 0·25MB 한계 없음·오디오 사내 보관). 비면 OpenAI 경로로 폴백(하위호환). stt-worker/ 참고.
     STT_WORKER_URL: str = ""
     STT_WORKER_TOKEN: str = ""  # 워커 인증 공유 시크릿(X-Worker-Token)
+    # 각 VM의 메트릭 에이전트가 POST /internal/metrics 할 때 쓰는 공유 시크릿(X-Metrics-Token).
+    # 비면 인제스트 비활성(백엔드 self-collect·시드만) — 배포 시 설정.
+    METRICS_INGEST_TOKEN: str = ""
     LLM_MODEL: str = "claude-opus-4-8"
 
     ENV: str = "dev"
