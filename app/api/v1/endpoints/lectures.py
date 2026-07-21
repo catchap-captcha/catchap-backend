@@ -898,6 +898,15 @@ def ops_list_courses(
     return [_course_row(db, c) for c in rows]
 
 
+@router.get("/ops/subjects")
+def ops_list_subjects(principal: Principal = Depends(require_lecture_manager)):
+    """강의·코스 폼이 쓰는 과목 목록 — 하드코딩(옛 6과목) 대신 런타임 은행에서 동적으로.
+    과목 재편이 반영되도록 subject_banks.live_subjects()를 정본으로 쓴다(강사 콘솔 과목 연동)."""
+    from app.services import subject_banks
+
+    return {"subjects": subject_banks.live_subjects()}
+
+
 @router.post("/ops/courses")
 def ops_create_course(
     req: _CourseCreate,
