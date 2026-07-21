@@ -192,11 +192,16 @@ def test_upload_over_1mb_passes_but_other_posts_still_413(client, db, seed_org, 
 
 def test_upload_rejects_bad_ext_and_content_type(client, db, seed_org, media_dir):
     tok = _instructor(client, db)
-    r1 = _upload_lecture(client, tok, filename="v.exe", size=100)
+    r1 = _upload_lecture(client, tok, filename="v.exe", size=100)  # 확장자가 영상이 아님
     assert r1.status_code == 400
-    r2 = _upload_lecture(client, tok, content_type="application/octet-stream", size=100)
+    # 확장자는 mp4라도 명백히 영상이 아닌 content-type(이미지 등)은 거부
+    r2 = _upload_lecture(client, tok, content_type="image/png", size=100)
     assert r2.status_code == 400
     assert list(media_dir.iterdir()) == []  # 거절된 업로드는 파일을 남기지 않는다
+    # 확장자가 mp4면 application/octet-stream은 허용한다 — 브라우저·OS가 정상 mp4를 그렇게
+    # 주기도 하므로 확장자를 정본으로 삼는다(강의 업로드 간헐 실패 수정과 짝). 파일이 남는다.
+    r3 = _upload_lecture(client, tok, content_type="application/octet-stream", size=100)
+    assert r3.status_code == 200
 
 
 def test_copy_upload_recheck_enforces_limit(tmp_path):
