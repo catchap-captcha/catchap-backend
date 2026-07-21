@@ -21,6 +21,7 @@ from app.models import (
     Lecture,
     LectureCheckpointEvent,
     LectureQuestion,
+    LectureQuestionGenJob,
     LectureWatchProgress,
 )
 
@@ -400,3 +401,38 @@ def record_checkpoint(
         else:
             progress.checkpoint_fails = fails
     return progress
+
+
+# ---- 기동 시 고아 잡 정리 (스위퍼) ----
+# AI 확인문항 생성 잡(LectureQuestionGenJob)은 프로세스 내 BackgroundTasks로 돈다.
+# 프로세스가 재배포·크래시로 죽으면 'running'(또는 아직 안 잡힌 'pending') 잡을 마감할
+# 코드가 다시 실행되지 않아, DB에 유령 행으로 영원히 남는다(프론트는 done을 기다리며
+# "생성 중…"을 무한 표시). 기동 시 이 스위퍼가 한 번 돌아 '오래 멈춰 있는' 잡만 error로
+# 정직하게 마감한다(_run_question_gen_job의 실패 마감과 동일 규약).
+STUCK_GEN_JOB_MINUTES = 30  # updated_at이 이만큼 지난 pending/running만 고아로 간주
+
+
+def sweep_stuck_gen_jobs(db: Session, stale_minutes: int = STUCK_GEN_JOB_MINUTES) -> int:
+    """오래 멈춰 있는 생성 잡을 error로 마감하고, 정리한 개수를 반환한다.
+
+    stale_minutes 임계값을 두는 이유: 워커를 2개 이상 띄운 경우, 한 워커가 재시작하는
+    순간 '다른 워커에서 정상 작동 중'인 잡(updated_at이 방금 갱신됨)까지 죽이면 안 된다.
+    updated_at은 status/phase 갱신마다 onupdate로 새로고쳐지므로, 임계값을 넘겨 멈춰 있는
+    잡만 진짜 고아다. commit은 이 함수가 직접 한다(기동 훅에서 세션 하나로 호출)."""
+    cutoff = _now() - timedelta(minutes=stale_minutes)
+    stuck = (
+        db.query(LectureQuestionGenJob)
+        .filter(
+            LectureQuestionGenJob.status.in_(["pending", "running"]),
+            LectureQuestionGenJob.updated_at < cutoff,
+        )
+        .all()
+    )
+    for job in stuck:
+        job.status = "error"
+        job.phase = None
+        job.error_detail = "서버 재시작으로 생성이 중단되었습니다. 다시 시도해 주세요."
+        job.finished_at = _now()
+    if stuck:
+        db.commit()
+    return len(stuck)

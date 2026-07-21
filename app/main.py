@@ -1,10 +1,11 @@
 import logging
 import re
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from app.api.v1.router import api_router
 from app.core.config import get_settings
@@ -12,6 +13,30 @@ from app.core.logging_config import setup_logging
 
 setup_logging()  # 모든 모듈 로거 일관 초기화 (조용한 실패 방지)
 settings = get_settings()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """기동 시 1회: 프로세스 재시작으로 고아가 된 AI 문항 생성 잡을 정리한다.
+
+    생성 잡은 프로세스 내 BackgroundTasks로 돌아, 재배포·크래시 순간 'running'이던 잡은
+    마감 코드가 다시 안 돌아 DB에 유령 행으로 남는다(프론트는 "생성 중…" 무한 표시).
+    여기서 오래 멈춘 잡만 error로 정직하게 마감한다. DB가 아직 준비 안 됐어도(마이그레이션
+    전 등) 기동은 막지 않는다 — 정리는 다음 기동에 다시 시도된다."""
+    from app.db.session import SessionLocal
+    from app.services.lecture_service import sweep_stuck_gen_jobs
+
+    try:
+        db = SessionLocal()
+        try:
+            swept = sweep_stuck_gen_jobs(db)
+            if swept:
+                _log.warning("기동 정리: 고아 문항생성 잡 %d개를 error로 마감", swept)
+        finally:
+            db.close()
+    except SQLAlchemyError as exc:
+        _log.warning("기동 정리 건너뜀(DB 미준비 등): %s", exc)
+    yield
 
 
 def _init_sentry() -> None:
@@ -64,6 +89,7 @@ app = FastAPI(
     docs_url=_docs_url,
     redoc_url=_redoc_url,
     openapi_url=_openapi_url,
+    lifespan=lifespan,
 )
 
 app.add_middleware(
