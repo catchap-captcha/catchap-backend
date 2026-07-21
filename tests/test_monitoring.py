@@ -74,3 +74,44 @@ def test_metrics_ingest_requires_token(client, db, monkeypatch):
     db.expire_all()
     assert db.query(ServerMetric).filter(ServerMetric.server_key == "gpu-stt").count() == 1
     assert db.query(ServerMetric).filter(ServerMetric.server_key == "gpu-stt").first().gpu_util_pct == 88.0
+
+
+def test_monitoring_hourly_rollup_and_range(client, db, monkeypatch):
+    """시간별 롤업 누적(평균=sum/count) + 기간(range)별 소스 분기(6h=raw / 7d=hourly)."""
+    from app.api.v1.endpoints import monitoring
+    from app.models import ServerMetricHourly
+
+    class _S:
+        METRICS_INGEST_TOKEN = "tok"
+
+    monkeypatch.setattr(monitoring, "get_settings", lambda: _S())
+
+    # 같은 서버를 3회 인제스트(같은 시간 버킷에 누적) — cpu 10/20/30, gpu 20/40/60
+    for cpu in (10.0, 20.0, 30.0):
+        r = client.post(
+            "/api/v1/internal/metrics",
+            json={"server_key": "gpu-x", "label": "GPU", "cpu_pct": cpu, "mem_pct": 50.0,
+                  "gpu_present": True, "gpu_util_pct": cpu * 2},
+            headers={"X-Metrics-Token": "tok"},
+        )
+        assert r.status_code == 200, r.text
+
+    # 롤업 1행에 합계·개수가 누적됐는지(평균은 조회 때 sum/count)
+    h = db.query(ServerMetricHourly).filter(ServerMetricHourly.server_key == "gpu-x").first()
+    assert h is not None and h.samples == 3
+    assert h.cpu_sum == 60.0 and h.mem_sum == 150.0
+    assert h.gpu_samples == 3 and h.gpu_sum == 120.0
+
+    otok = _ops(client, db)
+    # range=7d → hourly 평균 소스
+    body = client.get("/api/v1/ops/monitoring?range=7d", headers=auth(otok)).json()
+    gx = next(s for s in body["servers"] if s["server_key"] == "gpu-x")
+    assert gx["history"]["range"] == "7d"
+    assert gx["history"]["cpu"][-1] == 20.0  # (10+20+30)/3
+    assert gx["history"]["gpu"][-1] == 40.0  # (20+40+60)/3
+
+    # range=6h → raw 표본 소스(원시 3점)
+    body = client.get("/api/v1/ops/monitoring?range=6h", headers=auth(otok)).json()
+    gx = next(s for s in body["servers"] if s["server_key"] == "gpu-x")
+    assert gx["history"]["range"] == "6h"
+    assert len(gx["history"]["cpu"]) >= 3
