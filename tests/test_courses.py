@@ -213,3 +213,45 @@ def test_student_sees_courses_and_lecture_course_id(client, db, seed_org, media_
     assert solo_detail["course_id"] is None
     toc_ids = {t["id"] for t in solo_detail["toc"]}
     assert solo["id"] in toc_ids and a["id"] not in toc_ids
+
+
+def test_course_enroll_unenroll_and_flag(client, db, seed_org, media_dir):
+    """수강신청 → 목록 enrolled=true → 취소(withdrawn) → false → 재신청(같은 행 되살림·1행
+    유지·진도 이어감). 없는 코스는 404. 무료 자유 신청·취소(Coursera 무료 모델)."""
+    from app.models import CourseEnrollment
+
+    ops = _instructor(client, db)
+    course = _create_course(client, ops, title="영어 코스", subject="영어")
+    _upload_lecture(client, ops, title="1강", subject="영어", course_id=course["id"])
+    cid = course["id"]
+    stok = _student_token(client, seed_org)
+
+    def enrolled():
+        cs = client.get("/api/v1/courses", headers=auth(stok)).json()
+        return next((c["enrolled"] for c in cs if c["id"] == cid), None)
+
+    # 신청 전 — 목록에 코스는 보이되 enrolled=false(둘러보기 가능, 오픈 카탈로그)
+    assert enrolled() is False
+
+    # 수강신청 → enrolled=true, DB active
+    r = client.post(f"/api/v1/courses/{cid}/enroll", headers=auth(stok))
+    assert r.status_code == 200 and r.json()["enrolled"] is True
+    assert enrolled() is True
+    assert db.query(CourseEnrollment).filter_by(course_id=cid).first().status == "active"
+
+    # 수강취소 → enrolled=false, DB withdrawn(행은 남아 진도 보존)
+    r = client.delete(f"/api/v1/courses/{cid}/enroll", headers=auth(stok))
+    assert r.status_code == 200 and r.json()["enrolled"] is False
+    assert enrolled() is False
+    db.expire_all()
+    assert db.query(CourseEnrollment).filter_by(course_id=cid).first().status == "withdrawn"
+
+    # 재신청 → 같은 행을 active로 되살림(1행 유지)
+    assert client.post(f"/api/v1/courses/{cid}/enroll", headers=auth(stok)).json()["enrolled"] is True
+    db.expire_all()
+    assert db.query(CourseEnrollment).filter_by(course_id=cid).count() == 1
+    assert db.query(CourseEnrollment).filter_by(course_id=cid).first().status == "active"
+
+    # 없는 코스는 404
+    bad = client.post("/api/v1/courses/00000000-0000-0000-0000-000000000000/enroll", headers=auth(stok))
+    assert bad.status_code == 404

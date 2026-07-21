@@ -61,6 +61,7 @@ from app.core.security import decode_token, new_uuid
 from app.db.session import SessionLocal, get_db
 from app.models import (
     Course,
+    CourseEnrollment,
     Lecture,
     LectureCheckpointEvent,
     LectureMaterial,
@@ -447,6 +448,16 @@ def list_student_courses(
                 CourseCompletion.course_id.in_(course_ids or [""]))
         .all()
     }
+    # 이 학생이 수강신청(active)한 코스 집합 — 목록의 '신청함' 배지·수강신청/취소 버튼 상태 근거
+    enrolled_ids = {
+        r[0]
+        for r in db.query(CourseEnrollment.course_id)
+        .filter(
+            CourseEnrollment.student_id == principal.id,
+            CourseEnrollment.status == "active",
+        )
+        .all()
+    }
     out = []
     for c in courses:
         lec_ids = [
@@ -472,6 +483,8 @@ def list_student_courses(
                 "order_no": int(c.order_no or 0),
                 "instructor_name": names.get(c.instructor_id),
                 "lecture_count": len(lec_ids),
+                # 수강신청 여부 — true면 '내 코스'(신청함), false면 카탈로그(수강신청 버튼)
+                "enrolled": c.id in enrolled_ids,
                 # 코스 Q — 이 코스 강의에서 은행으로 배치된 문항 수. 화면 규칙:
                 # unlocked>0 → '이 코스 문제 풀기(N)' 버튼 / total>0 & unlocked=0 →
                 # "완주하면 열려요" 잠금 안내 / total=0 → 아무것도 안 보임(아직 없음).
@@ -505,6 +518,62 @@ def list_student_courses(
             }
         )
     return out
+
+
+@router.post("/courses/{course_id}/enroll")
+def enroll_course(
+    course_id: str,
+    principal: Principal = Depends(require_student),
+    db: Session = Depends(get_db),
+):
+    """코스 수강신청 — 무료 자유 신청(Coursera 무료 모델). 재신청(취소했던 코스)이면 같은 행을
+    active로 되살려 이전 진도를 이어간다((student_id, course_id) 1행 upsert). 활성 코스만 가능."""
+    c = db.get(Course, course_id)
+    if c is None or c.status != "active":
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="코스를 찾을 수 없어요.")
+    e = (
+        db.query(CourseEnrollment)
+        .filter(
+            CourseEnrollment.student_id == principal.id,
+            CourseEnrollment.course_id == course_id,
+        )
+        .first()
+    )
+    if e is None:
+        e = CourseEnrollment(
+            student_id=principal.id,
+            course_id=course_id,
+            status="active",
+            enrolled_at=datetime.now(),
+        )
+        db.add(e)
+    else:
+        e.status = "active"  # 재신청 — 진도(시청·시험)는 별도 테이블이라 그대로 이어간다
+    db.commit()
+    return {"ok": True, "enrolled": True}
+
+
+@router.delete("/courses/{course_id}/enroll")
+def unenroll_course(
+    course_id: str,
+    principal: Principal = Depends(require_student),
+    db: Session = Depends(get_db),
+):
+    """수강 취소 — 내 코스에서 빠진다(status='withdrawn'). 진행 이력(시청·수료·시험)은 지우지
+    않아 재신청하면 이어갈 수 있다. 무료 서비스라 환불 개념 없음(Coursera 무료 모델)."""
+    e = (
+        db.query(CourseEnrollment)
+        .filter(
+            CourseEnrollment.student_id == principal.id,
+            CourseEnrollment.course_id == course_id,
+            CourseEnrollment.status == "active",
+        )
+        .first()
+    )
+    if e is not None:
+        e.status = "withdrawn"
+        db.commit()
+    return {"ok": True, "enrolled": False}
 
 
 @router.get("/lectures/{lecture_id}")
