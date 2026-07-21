@@ -2209,6 +2209,54 @@ def ops_test_ai_key(
     return {"ok": ok, "detail": detail}
 
 
+def _ai_prompt_payload(db: Session) -> dict:
+    from app.clients.ai_client import DEFAULT_GEN_RULES
+    from app.services import settings_service
+
+    custom = settings_service.get_setting(db, "llm_gen_rules")
+    has = bool(custom and custom.strip())
+    return {
+        "rules": custom if has else DEFAULT_GEN_RULES,  # 지금 실제로 쓰이는 규칙
+        "default_rules": DEFAULT_GEN_RULES,  # '기본값으로 복원'용
+        "is_custom": has,
+    }
+
+
+class _AiPromptUpdate(BaseModel):
+    rules: str = ""  # 빈 문자열 = 기본값으로 복원
+
+
+@router.get("/settings/ai/prompt")
+def ops_get_ai_prompt(principal: Principal = Depends(require_ops), db: Session = Depends(get_db)):
+    """문항 생성 '출제 규칙' 조회 — 운영자 수정값(없으면 기본값) + 기본값. 구조부(JSON 형식·
+    변수 주입·시점 지침)는 서버가 고정하고, 여기서 바꾸는 건 '규칙' 부분뿐(파서 보호)."""
+    return _ai_prompt_payload(db)
+
+
+@router.put("/settings/ai/prompt")
+def ops_put_ai_prompt(
+    req: _AiPromptUpdate,
+    principal: Principal = Depends(require_ops),
+    db: Session = Depends(get_db),
+):
+    """출제 규칙 저장 — 빈 값이면 기본값으로 복원. 다음 문항 생성부터 즉시 반영(재기동 불필요)."""
+    from app.services import settings_service
+
+    settings_service.set_setting(
+        db, "llm_gen_rules", (req.rules or "").strip(), updated_by=principal.id
+    )
+    audit(
+        db,
+        action="system.settings.ai_prompt",
+        actor_user_id=principal.id,
+        target_type="system_setting",
+        target_id=None,
+        after={"len": len((req.rules or "").strip())},  # 원문은 안 남기고 길이만
+    )
+    db.commit()
+    return _ai_prompt_payload(db)
+
+
 # ---------------------------------------------------------------- AI 모델 선택(런타임) #26
 # 실제 LLM 호출(문항 생성·자기검증)이 쓰는 모델을 운영자가 고른다. 표시용 카탈로그
 # (/ops/ai-models = ModelVersion, 기관 콘솔 노출)와 '다른' 것 — 경로도 /ai-runtime 로 분리.

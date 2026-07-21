@@ -29,12 +29,23 @@ class AiGenerationError(Exception):
     """LLM 호출/파싱 실패 — 원인을 담아 정직하게 전파한다."""
 
 
+# 문항 생성 '출제 규칙' 기본값 — 운영자가 콘솔에서 수정하면 이 자리를 대체한다(llm_gen_rules).
+# 구조부(JSON 형식·변수 주입·시점 지침)는 아래 _prompt에 고정 — 규칙만 편집 가능(파서 보호).
+DEFAULT_GEN_RULES = (
+    "규칙:\n"
+    "- 강의 수준에 맞는 명확한 한국어 문장(그 강의를 본 사람이 이해할 수 있게).\n"
+    "- 각 문제는 보기 4개, 정답은 하나.\n"
+    "- explain에 정답 해설 1~2문장.\n"
+)
+
+
 def _prompt(
     lecture_title: str,
     description: str | None,
     subject: str,
     n: int,
     transcript: list[dict] | None,
+    rules_override: str | None = None,
 ) -> str:
     head = (
         # 대상 중립화(2026-07-20): 옛 아동 제품 잔재('초등학생용') 제거 — 성인 인강으로 전환됐고,
@@ -43,12 +54,9 @@ def _prompt(
         f"과목: {subject}\n강의 제목: {lecture_title}\n"
         f"강의 설명: {description or '(없음)'}\n"
     )
-    rules = (
-        "규칙:\n"
-        "- 강의 수준에 맞는 명확한 한국어 문장(그 강의를 본 사람이 이해할 수 있게).\n"
-        "- 각 문제는 보기 4개, 정답은 하나.\n"
-        "- explain에 정답 해설 1~2문장.\n"
-    )
+    # 운영자가 콘솔에서 출제 규칙을 바꿨으면 그것을, 아니면 기본값을 쓴다. 끝에 개행 보장.
+    over = (rules_override or "").strip()
+    rules = (over + "\n") if over else DEFAULT_GEN_RULES
     if not transcript:
         return (
             head
@@ -501,6 +509,7 @@ def generate_lecture_questions(
     models: list[dict] | None = None,
     on_usage=None,
     openai_key: str | None = None,
+    rules_override: str | None = None,
 ) -> list[dict]:
     """강의 메타(+전사)에서 확인 문항 n개 생성.
 
@@ -519,7 +528,7 @@ def generate_lecture_questions(
     n = max(1, min(int(n), 20))
     text = _post_messages(
         key,
-        _prompt(lecture_title, description, subject, n, transcript),
+        _prompt(lecture_title, description, subject, n, transcript, rules_override),
         max_tokens=8192,
         models=models,
         on_usage=on_usage,

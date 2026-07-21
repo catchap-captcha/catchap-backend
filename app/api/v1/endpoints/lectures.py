@@ -2728,6 +2728,8 @@ def _generate_questions_now(db: Session, lec: Lecture, n: int, actor_id: str, on
             models=gen_models,
             on_usage=_on_usage,
             openai_key=openai_key,
+            # 운영자가 콘솔에서 수정한 출제 규칙(비었으면 기본값 사용)
+            rules_override=settings_service.get_setting(db, "llm_gen_rules"),
         )
     except AiNotConfiguredError:
         raise HTTPException(
