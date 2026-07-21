@@ -1382,9 +1382,14 @@ def ops_create_lecture(
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST, detail="mp4/webm 영상만 업로드할 수 있습니다."
         )
-    if (file.content_type or "").lower() not in _ALLOWED_CONTENT_TYPES:
+    # 확장자(위)가 정본. content_type은 브라우저·OS마다 정상 mp4를 application/octet-stream 등으로
+    # 주기도 해서, 정확히 video/mp4|webm만 허용하면 멀쩡한 영상이 간헐 400으로 막혔다. 명백히
+    # 영상이 아닐 때(이미지·텍스트 등)만 막고, 영상/일반(octet-stream)/빈값은 확장자를 믿는다.
+    ct = (file.content_type or "").lower()
+    if ct and not (ct.startswith("video/") or ct == "application/octet-stream"):
         raise HTTPException(
-            status.HTTP_400_BAD_REQUEST, detail="영상 Content-Type(video/mp4·video/webm)이 아닙니다."
+            status.HTTP_400_BAD_REQUEST,
+            detail=f"업로드한 파일이 영상이 아닌 것 같아요(형식: {ct}). mp4/webm 영상을 올려주세요.",
         )
     if order_no is None:
         # 목차 맨 뒤 자동 배정 — 같은 과목의 현재 최대 order_no + 1
