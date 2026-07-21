@@ -843,14 +843,17 @@ def _lecture_row(db: Session, lec: Lecture) -> dict:
 # 규약 — 남의 코스는 404로 존재 미노출). 학생 화면: 과목 → 강사별 코스 → 강의(order_no).
 class _CourseCreate(BaseModel):
     title: str = Field(min_length=1, max_length=200)
-    subject: str  # 이 코스의 고정 과목 — 담기는 모든 강의가 이 과목이어야 한다
+    # 코스 중심 전환(2026-07-21): 학교식 과목은 화면에서 안 받는다 — 기본 '일반'(정합용).
+    # 분류는 category(브라우징용 대분류)로 한다.
+    subject: str = "일반"
+    category: str | None = Field(default=None, max_length=40)
     description: str | None = Field(default=None, max_length=2000)
 
 
 class _CourseUpdate(BaseModel):
-    # 미전송(None)은 변경 안 함. subject는 못 바꾼다 — 코스=과목 고정이라 소속 강의와
-    # 어긋나기 때문(바꾸려면 새 코스를 만든다).
+    # 미전송(None)은 변경 안 함. subject는 못 바꾼다(레거시·정합 고정).
     title: str | None = Field(default=None, min_length=1, max_length=200)
+    category: str | None = Field(default=None, max_length=40)
     description: str | None = Field(default=None, max_length=2000)
     order_no: int | None = None
     status: str | None = None  # active|hidden
@@ -878,6 +881,7 @@ def _course_row(db: Session, c: Course) -> dict:
         "id": c.id,
         "title": c.title,
         "subject": c.subject,
+        "category": c.category,  # 브라우징용 대분류(과목 대체) — 없으면 null
         "description": c.description,
         "order_no": int(c.order_no or 0),
         "status": c.status,
@@ -913,10 +917,11 @@ def ops_create_course(
     principal: Principal = Depends(require_content_author),
     db: Session = Depends(get_db),
 ):
-    """코스 생성 — 소유자는 생성한 본인(강사 또는 운영자). subject는 여기서 고정된다."""
-    if req.subject not in EDU_SUBJECTS:
+    """코스 생성 — 소유자는 생성한 본인(강사 또는 운영자). 코스 중심 전환(2026-07-21) 후 학교식
+    과목 대신 category(선택)로 분류하고, subject는 기본 '일반'(레거시·정합용)으로 둔다."""
+    if req.subject not in EDU_SUBJECTS and req.subject != "일반":
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="지원하지 않는 과목입니다.")
-    # 과목 내 맨 뒤 배정(학생 화면의 코스 나열 순서). 내 코스 기준 max+1.
+    # 맨 뒤 배정(학생 화면의 코스 나열 순서). 내 코스 기준 max+1.
     max_no = (
         db.query(func.max(Course.order_no))
         .filter(Course.subject == req.subject, Course.status != "deleted")
@@ -926,6 +931,7 @@ def ops_create_course(
     c = Course(
         instructor_id=principal.id,
         subject=req.subject,
+        category=((req.category or "").strip() or None),
         title=req.title.strip(),
         description=req.description,
         order_no=int(max_no) + 1,
@@ -955,7 +961,10 @@ def ops_update_course(
     # 운영자(ops)는 감독·검수만 — 공개/숨김(status)만 바꿀 수 있고 내용 편집(제목·소개·순서)은
     # 강사 전용(사용자 결정 0720). 강사는 자기 코스 전체를 편집한다.
     if principal.role == "ops" and (
-        req.title is not None or req.description is not None or req.order_no is not None
+        req.title is not None
+        or req.description is not None
+        or req.order_no is not None
+        or "category" in req.model_fields_set
     ):
         raise HTTPException(
             status.HTTP_403_FORBIDDEN,
@@ -966,6 +975,8 @@ def ops_update_course(
         c.title = req.title.strip()
     if req.description is not None:
         c.description = req.description
+    if "category" in req.model_fields_set:  # 빈 값 전송 = 분류 해제
+        c.category = (req.category or "").strip() or None
     if req.order_no is not None:
         c.order_no = int(req.order_no)
     if req.status is not None:

@@ -35,7 +35,9 @@ class Course(Base, UUIDPk, Timestamps):
     # 이 코드베이스는 relationship을 안 쓰고 명시적 db.get/query로 조회하며, DB FK는
     # collation 일치를 강제해(라이브/로컬 collation 불일치 시 생성 실패) 이식성만 해친다.
     instructor_id: Mapped[str] = mapped_column(CHAR(36), index=True)
-    subject: Mapped[str] = mapped_column(String(20))  # 과목 고정 — 이 코스의 모든 강의가 이 과목
+    subject: Mapped[str] = mapped_column(String(20))  # (레거시) 정합용 — 코스 중심 전환 후 '일반' 기본
+    # 코스 브라우징용 대분류(학교식 subject 대체, 실무 표준) — 법정의무·자격증·어학 등. 선택(nullable).
+    category: Mapped[str | None] = mapped_column(String(40), nullable=True, index=True)
     title: Mapped[str] = mapped_column(String(200))
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     # 과목 안에서의 코스 정렬(학생 화면: 같은 과목의 코스들 순서). 미지정 시 max+1로 맨 뒤.
