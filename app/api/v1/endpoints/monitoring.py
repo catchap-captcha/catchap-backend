@@ -81,8 +81,8 @@ class MetricIn(BaseModel):
 _METRIC_FIELDS = (
     "label", "host", "cpu_pct", "cpu_cores", "load1", "mem_pct", "mem_used_mb",
     "mem_total_mb", "disk_pct", "disk_used_gb", "disk_total_gb", "gpu_present",
-    "gpu_name", "gpu_util_pct", "gpu_mem_used_mb", "gpu_mem_total_mb",
-)  # collected_at은 payload에서 받지 않는다 — _upsert가 '수신 시각'으로 찍는다(아래 주석)
+    "gpu_name", "gpu_util_pct", "gpu_mem_used_mb", "gpu_mem_total_mb", "collected_at",
+)
 
 
 def _upsert(db: Session, snap: dict) -> ServerMetric:
@@ -95,11 +95,13 @@ def _upsert(db: Session, snap: dict) -> ServerMetric:
     for f in _METRIC_FIELDS:
         if f in snap and snap[f] is not None:
             setattr(row, f, snap[f])
-    # collected_at은 payload를 신뢰하지 않고 '수신 시각'으로 통일한다 — 에이전트/VM의 로컬
-    # tz가 제각각이어도(예: OS tz를 UTC→KST로 바꿔도 이미 뜬 프로세스는 옛 tz를 캐시해 계속
-    # UTC로 보냄) 신선도(age)가 9시간씩 어긋나지 않는다. 서버 한 곳의 시계로 일관 판정.
-    ts = datetime.now()
-    row.collected_at = ts
+    # collected_at은 각 서버가 측정한 시각을 그대로 쓴다(백엔드 시각으로 덮지 않는다) —
+    # 5대 VM이 전부 KST로 통일돼 있어 서버별 시각을 그대로 비교해도 신선도가 어긋나지 않는다.
+    # (과거 GPU만 어긋난 건 그 VM의 에이전트 프로세스가 OS tz 변경 전 UTC를 물고 있어서였고,
+    #  재부팅/재시작으로 KST 프로세스가 뜨면 자연히 정렬된다. 서버 tz 자체가 정본.)
+    ts = snap.get("collected_at") or datetime.now()
+    if snap.get("collected_at") is None:
+        row.collected_at = ts
     # 추이용 표본 1개 append(가벼운 3지표만)
     db.add(ServerMetricSample(
         server_key=key,
