@@ -53,6 +53,7 @@ from fastapi.responses import FileResponse
 from jwt import PyJWTError
 from pydantic import BaseModel, Field
 from sqlalchemy import case, func, not_
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
@@ -549,7 +550,23 @@ def enroll_course(
         db.add(e)
     else:
         e.status = "active"  # 재신청 — 진도(시청·시험)는 별도 테이블이라 그대로 이어간다
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        # 동시 신청 경합(두 탭/기기가 같이 e=None을 보고 INSERT) — 유니크 인덱스가 한쪽을
+        # 막는다. 신청 자체는 성공한 것이므로 롤백 후 기존 행을 active로 맞추고 멱등하게 성공 처리.
+        db.rollback()
+        e = (
+            db.query(CourseEnrollment)
+            .filter(
+                CourseEnrollment.student_id == principal.id,
+                CourseEnrollment.course_id == course_id,
+            )
+            .first()
+        )
+        if e is not None and e.status != "active":
+            e.status = "active"
+            db.commit()
     return {"ok": True, "enrolled": True}
 
 
