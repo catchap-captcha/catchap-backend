@@ -2212,15 +2212,17 @@ def ops_test_ai_key(
     return {"ok": ok, "detail": detail}
 
 
-def _ai_prompt_payload(db: Session) -> dict:
-    from app.clients.ai_client import DEFAULT_GEN_RULES
+# 프롬프트 편집은 2종 — 생성('출제 규칙')과 검증('자기검증 판정 지침'). 둘 다 같은 규약:
+# 구조부(생성=JSON형식·변수주입·시점지침 / 검증=근거소스·JSON출력)는 서버가 고정하고,
+# '규칙' 부분만 편집 가능(파서·판정 로직 보호). setting key와 기본값 상수만 다르다.
+def _ai_prompt_payload(db: Session, *, setting_key: str, default_rules: str) -> dict:
     from app.services import settings_service
 
-    custom = settings_service.get_setting(db, "llm_gen_rules")
+    custom = settings_service.get_setting(db, setting_key)
     has = bool(custom and custom.strip())
     return {
-        "rules": custom if has else DEFAULT_GEN_RULES,  # 지금 실제로 쓰이는 규칙
-        "default_rules": DEFAULT_GEN_RULES,  # '기본값으로 복원'용
+        "rules": custom if has else default_rules,  # 지금 실제로 쓰이는 규칙
+        "default_rules": default_rules,  # '기본값으로 복원'용
         "is_custom": has,
     }
 
@@ -2233,7 +2235,9 @@ class _AiPromptUpdate(BaseModel):
 def ops_get_ai_prompt(principal: Principal = Depends(require_ops), db: Session = Depends(get_db)):
     """문항 생성 '출제 규칙' 조회 — 운영자 수정값(없으면 기본값) + 기본값. 구조부(JSON 형식·
     변수 주입·시점 지침)는 서버가 고정하고, 여기서 바꾸는 건 '규칙' 부분뿐(파서 보호)."""
-    return _ai_prompt_payload(db)
+    from app.clients.ai_client import DEFAULT_GEN_RULES
+
+    return _ai_prompt_payload(db, setting_key="llm_gen_rules", default_rules=DEFAULT_GEN_RULES)
 
 
 @router.put("/settings/ai/prompt")
@@ -2243,6 +2247,7 @@ def ops_put_ai_prompt(
     db: Session = Depends(get_db),
 ):
     """출제 규칙 저장 — 빈 값이면 기본값으로 복원. 다음 문항 생성부터 즉시 반영(재기동 불필요)."""
+    from app.clients.ai_client import DEFAULT_GEN_RULES
     from app.services import settings_service
 
     settings_service.set_setting(
@@ -2257,7 +2262,43 @@ def ops_put_ai_prompt(
         after={"len": len((req.rules or "").strip())},  # 원문은 안 남기고 길이만
     )
     db.commit()
-    return _ai_prompt_payload(db)
+    return _ai_prompt_payload(db, setting_key="llm_gen_rules", default_rules=DEFAULT_GEN_RULES)
+
+
+@router.get("/settings/ai/verify-prompt")
+def ops_get_ai_verify_prompt(
+    principal: Principal = Depends(require_ops), db: Session = Depends(get_db)
+):
+    """자기검증 '판정 지침' 조회 — 봇저항 검증(생성 문항을 봇으로 풀어보는) LLM의 판단 태도.
+    근거 소스(블라인드/자막)·JSON 출력 형식은 서버가 고정하고, '얼마나 엄격히 볼지'만 편집한다."""
+    from app.clients.ai_client import DEFAULT_VERIFY_RULES
+
+    return _ai_prompt_payload(db, setting_key="llm_verify_rules", default_rules=DEFAULT_VERIFY_RULES)
+
+
+@router.put("/settings/ai/verify-prompt")
+def ops_put_ai_verify_prompt(
+    req: _AiPromptUpdate,
+    principal: Principal = Depends(require_ops),
+    db: Session = Depends(get_db),
+):
+    """판정 지침 저장 — 빈 값이면 기본값으로 복원. 다음 문항 생성의 자기검증부터 즉시 반영."""
+    from app.clients.ai_client import DEFAULT_VERIFY_RULES
+    from app.services import settings_service
+
+    settings_service.set_setting(
+        db, "llm_verify_rules", (req.rules or "").strip(), updated_by=principal.id
+    )
+    audit(
+        db,
+        action="system.settings.ai_verify_prompt",
+        actor_user_id=principal.id,
+        target_type="system_setting",
+        target_id=None,
+        after={"len": len((req.rules or "").strip())},  # 원문은 안 남기고 길이만
+    )
+    db.commit()
+    return _ai_prompt_payload(db, setting_key="llm_verify_rules", default_rules=DEFAULT_VERIFY_RULES)
 
 
 # ---------------------------------------------------------------- AI 모델 선택(런타임) #26

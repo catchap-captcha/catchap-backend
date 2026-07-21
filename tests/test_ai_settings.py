@@ -348,7 +348,7 @@ def test_verify_questions_majority_and_three_way_verdict(monkeypatch):
     ]
     calls = {"blind": 0}
 
-    def fake_solve(questions, *, api_key=None, context=None, transcript=None, models=None, on_usage=None, openai_key=None):
+    def fake_solve(questions, *, api_key=None, context=None, transcript=None, models=None, on_usage=None, openai_key=None, rules_override=None):
         # 공개 맥락이 항상 전달되는지(공격자 조건 일치) 고정
         assert context and context.get("title") == "T"
         if transcript is not None:
@@ -384,3 +384,44 @@ def test_shuffled_variants_remap_answer(monkeypatch):
         v = ai._shuffled_variants([q], random.Random(seed))[0]
         assert v["options"][v["answer_index"]] == "정답"
         assert sorted(v["options"]) == sorted(q["options"])
+
+
+def test_ai_verify_prompt_edit_roundtrip(client, db):
+    """검증(자기검증) 판정 지침 편집 — 기본값 조회 → 저장 → is_custom → 빈 값 복원.
+    생성 '출제 규칙'(llm_gen_rules)과 별개 key(llm_verify_rules)로 독립 저장되는지 고정한다."""
+    from app.clients.ai_client import DEFAULT_GEN_RULES, DEFAULT_VERIFY_RULES
+
+    ops_tok = _ops(client, db)
+
+    # 초기 — 미설정이면 기본값 그대로, is_custom False
+    r = client.get("/api/v1/ops/settings/ai/verify-prompt", headers=auth(ops_tok))
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["is_custom"] is False
+    assert body["rules"] == DEFAULT_VERIFY_RULES
+    assert body["default_rules"] == DEFAULT_VERIFY_RULES
+
+    # 저장 — 커스텀 판정 지침. 응답이 사용자 지정 상태로 갱신된다(가짜 성공 금지 — 서버 응답 확인).
+    r = client.put(
+        "/api/v1/ops/settings/ai/verify-prompt",
+        json={"rules": "매우 엄격하게 판단하세요."},
+        headers=auth(ops_tok),
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["is_custom"] is True
+    assert r.json()["rules"] == "매우 엄격하게 판단하세요."
+
+    # 생성 규칙과 '별개 key'로 저장되고, 생성 프롬프트 조회는 영향받지 않는다
+    from app.services import settings_service
+
+    assert settings_service.get_setting(db, "llm_verify_rules") == "매우 엄격하게 판단하세요."
+    r = client.get("/api/v1/ops/settings/ai/prompt", headers=auth(ops_tok))
+    assert r.json()["is_custom"] is False and r.json()["rules"] == DEFAULT_GEN_RULES
+
+    # 빈 값 = 기본값 복원
+    r = client.put(
+        "/api/v1/ops/settings/ai/verify-prompt", json={"rules": ""}, headers=auth(ops_tok)
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["is_custom"] is False
+    assert r.json()["rules"] == DEFAULT_VERIFY_RULES

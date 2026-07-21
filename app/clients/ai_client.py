@@ -38,6 +38,16 @@ DEFAULT_GEN_RULES = (
     "- explain에 정답 해설 1~2문장.\n"
 )
 
+# 자기검증(solver) '판정 지침' 기본값 — 운영자가 콘솔에서 수정하면 이 자리를 대체한다
+# (llm_verify_rules). 구조부(무엇을 근거로 푸는가=블라인드/자막·JSON 출력 형식)는 _solve_prompt에
+# 고정하고, 여기 '판정 태도'만 편집 가능하다(생성 프롬프트 DEFAULT_GEN_RULES와 대칭).
+# 왜 태도만 여나: 근거 소스(블라인드 vs 자막)와 출력 JSON을 바꾸면 봇저항 판정 로직·파서가
+# 깨진다. 반면 '얼마나 엄격히 볼지'는 운영자가 조절해도 안전하다.
+# ★주의: 블라인드 경로는 '상식으로 풀리는지'를 봐야 하므로 배경지식 사용을 막으면 안 된다
+# (막으면 상식 문제가 bank 대신 captcha로 오분류). 기본값은 head가 이미 지정한 근거(블라인드=
+# 상식·자막=전사)에 중립적인 '반드시 하나 고르기'만 둔다 — 종전 head 말미 문구를 여기로 옮긴 것.
+DEFAULT_VERIFY_RULES = "판정 지침:\n- 확신이 없어도 가장 그럴듯한 보기를 반드시 하나 고르세요(빈 답 금지).\n"
+
 
 def _prompt(
     lecture_title: str,
@@ -264,13 +274,16 @@ def _solve_prompt(
     *,
     context: dict | None = None,
     transcript: list[dict] | None = None,
+    rules_override: str | None = None,
 ) -> str:
     """자기검증(solver)용 프롬프트 — 정답·해설은 항상 숨긴다.
 
     - context(제목·과목·설명): 실제 공격자가 강의 화면에서 '보는' 공개 정보 — 블라인드
       판정에도 항상 준다(안 주면 검증자가 공격자보다 불리해 판정이 후해진다).
     - transcript 없음 = 블라인드(상식으로 풀리는지 = 봇도 풀 수 있는지).
-    - transcript 있음 = 자막 기준으로 풀리는지(못 풀면 문항 자체가 불량이라는 신호)."""
+    - transcript 있음 = 자막 기준으로 풀리는지(못 풀면 문항 자체가 불량이라는 신호).
+    - rules_override: 운영자가 콘솔에서 바꾼 '판정 지침'(비었으면 DEFAULT_VERIFY_RULES).
+      근거 소스(블라인드/자막)와 JSON 출력 형식은 여기 고정 — 판정 태도만 대체된다."""
     blocks = []
     for i, q in enumerate(questions):
         opts = "\n".join(f"  {j}) {o}" for j, o in enumerate(q["options"]))
@@ -282,22 +295,24 @@ def _solve_prompt(
             f"강의 제목: {context.get('title') or '(미상)'}\n"
             f"강의 설명: {context.get('description') or '(없음)'}\n\n"
         )
+    # 운영자가 판정 지침을 바꿨으면 그것을, 아니면 기본값을 쓴다(생성 _prompt와 동일 규약).
+    over = (rules_override or "").strip()
+    rules = (over + "\n\n") if over else (DEFAULT_VERIFY_RULES + "\n")
     if transcript is None:
         head = (
             "당신은 아래 강의를 '전혀 보지 않았습니다'. 강의 페이지에서 보이는 공개 정보"
             "(과목·제목·설명)와 문제·보기 텍스트만으로, 일반 상식과 추론을 총동원해 "
             "각 문제의 정답 보기 번호를 고르세요.\n"
-            "모르면 가장 그럴듯한 것을 고르되, 반드시 하나를 고르세요.\n\n"
         )
     else:
         lines = "\n".join(f"[{seg['start']:.0f}s~{seg['end']:.0f}s] {seg['text']}" for seg in transcript)
         head = (
             "아래는 어느 강의의 음성 전사(자막)입니다. 자막에 나온 내용을 근거로 "
-            "각 문제의 정답 보기 번호를 고르세요. 자막에 근거가 없으면 가장 그럴듯한 것을 "
-            "고르되, 반드시 하나를 고르세요.\n\n---\n" + lines + "\n---\n\n"
+            "각 문제의 정답 보기 번호를 고르세요.\n\n---\n" + lines + "\n---\n\n"
         )
     return (
         head
+        + rules
         + ctx
         + "\n\n".join(blocks)
         + '\n\n각 문제의 답을 이 JSON 배열로만 출력하세요(코드펜스·설명 없이):\n'
@@ -314,6 +329,7 @@ def solve_questions(
     models: list[dict] | None = None,
     on_usage=None,
     openai_key: str | None = None,
+    rules_override: str | None = None,
 ) -> list[bool]:
     """solver 1회 호출 — questions 순서대로 '맞혔는지'(bool) 리스트.
 
@@ -332,7 +348,7 @@ def solve_questions(
 
     text = _post_messages(
         key,
-        _solve_prompt(questions, context=context, transcript=transcript),
+        _solve_prompt(questions, context=context, transcript=transcript, rules_override=rules_override),
         max_tokens=1024,
         models=models,
         on_usage=on_usage,
@@ -384,6 +400,7 @@ def verify_questions(
     models: list[dict] | None = None,
     on_usage=None,
     openai_key: str | None = None,
+    rules_override: str | None = None,
 ) -> list[dict]:
     """자기검증 오케스트레이터 — 문항별 {blind_passed, transcript_passed, verdict}.
 
@@ -408,7 +425,7 @@ def verify_questions(
         variants = _shuffled_variants(questions, rng)
         result = solve_questions(
             variants, api_key=api_key, context=context, models=models,
-            on_usage=on_usage, openai_key=openai_key,
+            on_usage=on_usage, openai_key=openai_key, rules_override=rules_override,
         )
         for i, ok in enumerate(result):
             if ok:
@@ -426,6 +443,7 @@ def verify_questions(
             models=models,
             on_usage=on_usage,
             openai_key=openai_key,
+            rules_override=rules_override,
         )
 
     out = []

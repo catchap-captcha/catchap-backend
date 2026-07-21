@@ -2771,6 +2771,8 @@ def _generate_questions_now(db: Session, lec: Lecture, n: int, actor_id: str, on
             models=verify_models,
             on_usage=_on_usage,
             openai_key=openai_key,
+            # 운영자가 콘솔에서 수정한 검증(자기검증) 판정 지침(비었으면 기본값 사용)
+            rules_override=settings_service.get_setting(db, "llm_verify_rules"),
         )
     except (AiNotConfiguredError, AiGenerationError) as e:
         verify_error = str(e)
