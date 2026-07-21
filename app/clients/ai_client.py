@@ -115,6 +115,41 @@ def _openai_request(key: str, model_id: str, prompt: str, max_tokens: int):
     )
 
 
+def test_key(provider: str | None, key: str) -> tuple[bool, str]:
+    """API 키 유효성만 가볍게 확인 — 모델 목록 조회로 '인증'만 검사한다(문항 생성 X, 과금 최소).
+    반환: (성공?, 사람이 읽는 상세). 잘못된 키를 저장 시점에 바로 잡기 위한 실무용(연결 테스트)."""
+    key = (key or "").strip()
+    if not key:
+        return False, "키가 설정돼 있지 않아요."
+    try:
+        if _is_openai(provider):
+            r = httpx.get(
+                "https://api.openai.com/v1/models",
+                headers={"Authorization": f"Bearer {key}"},
+                timeout=_TIMEOUT_SEC,
+            )
+        else:
+            r = httpx.get(
+                "https://api.anthropic.com/v1/models",
+                headers={"x-api-key": key, "anthropic-version": _API_VERSION},
+                timeout=_TIMEOUT_SEC,
+            )
+    except httpx.HTTPError as e:
+        return False, f"제공사에 연결하지 못했어요: {type(e).__name__}"
+    if r.status_code == 200:
+        return True, "연결 성공 — 키가 유효해요."
+    if r.status_code in (401, 403):
+        return False, f"키가 유효하지 않아요(인증 실패 {r.status_code}). 키를 다시 확인하세요."
+    if r.status_code == 429:
+        return False, "키는 유효하지만 지금 사용량 한도(429)에 걸렸어요."
+    detail = ""
+    try:
+        detail = str((r.json().get("error") or {}).get("message", ""))[:140]
+    except Exception:
+        detail = (r.text or "")[:140]
+    return False, f"확인 실패({r.status_code}){': ' + detail if detail else ''}."
+
+
 def _anthropic_extract(body: dict) -> tuple[str, int, int, bool]:
     """Anthropic 응답 → (text, tokens_in, tokens_out, refused)."""
     usage = body.get("usage") or {}

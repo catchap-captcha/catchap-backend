@@ -2187,6 +2187,28 @@ def ops_put_ai_settings(
     return _ai_settings_payload(db)
 
 
+class _AiKeyTest(BaseModel):
+    provider: str = "anthropic"  # "anthropic" | "openai"
+
+
+@router.post("/settings/ai/test")
+def ops_test_ai_key(
+    req: _AiKeyTest,
+    principal: Principal = Depends(require_ops),
+    db: Session = Depends(get_db),
+):
+    """저장된 AI 키의 유효성만 가볍게 확인(연결 테스트) — 모델 목록 조회로 인증만 검사한다
+    (문항 생성 X). 원문 키는 서버 밖으로 나가지 않는다: FE는 provider만 보내고 서버가 저장키로
+    호출한다. 잘못된 키를 저장 시점에 바로 잡기 위한 실무 기능."""
+    from app.clients import ai_client
+    from app.services import settings_service
+
+    name = "openai_api_key" if "openai" in (req.provider or "").lower() else "anthropic_api_key"
+    key = settings_service.get_setting(db, name) or ""
+    ok, detail = ai_client.test_key(req.provider, key)
+    return {"ok": ok, "detail": detail}
+
+
 # ---------------------------------------------------------------- AI 모델 선택(런타임) #26
 # 실제 LLM 호출(문항 생성·자기검증)이 쓰는 모델을 운영자가 고른다. 표시용 카탈로그
 # (/ops/ai-models = ModelVersion, 기관 콘솔 노출)와 '다른' 것 — 경로도 /ai-runtime 로 분리.
