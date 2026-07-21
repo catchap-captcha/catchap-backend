@@ -356,15 +356,18 @@ def ops_delete_org(
             status.HTTP_409_CONFLICT,
             detail=f"소속 학생 {student_count}명이 있어 삭제할 수 없습니다. 이용을 막으려면 '중지'로 변경하세요.",
         )
+    # ★활성(active) 키만 삭제를 막는다. '폐기'는 키를 status='disabled'로 바꾸는데(deleted 아님),
+    # 삭제 시 아래 cascade가 어차피 모든 키 행을 지우므로 폐기된 키까지 막을 이유가 없다.
+    # (구버전은 status != 'deleted' 로 막아, 폐기해도 disabled라서 기관을 영영 못 지우는 버그였다.)
     key_count = (
         db.query(ApiKey)
-        .filter(ApiKey.organization_id == org_id, ApiKey.status != "deleted")
+        .filter(ApiKey.organization_id == org_id, ApiKey.status == "active")
         .count()
     )
     if key_count:
         raise HTTPException(
             status.HTTP_409_CONFLICT,
-            detail=f"발급된 API 키 {key_count}개가 있어 삭제할 수 없습니다. 키를 먼저 폐기하세요.",
+            detail=f"활성 API 키 {key_count}개가 있어 삭제할 수 없습니다. '시스템 → API 발급'에서 해당 기관 키를 폐기한 뒤 다시 삭제하세요.",
         )
     # 빈 기관: organizations.id 를 참조하는 기관 스코프 행을 모두 정리한 뒤 기관을 지운다.
     # (classes·invitations·sites·captcha_settings 는 organizations 에 FK 가 걸려 있어
