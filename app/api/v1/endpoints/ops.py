@@ -2140,6 +2140,9 @@ def _ai_settings_payload(db: Session) -> dict:
         "llm": settings_service.masked_status(db, "anthropic_api_key", s.ANTHROPIC_API_KEY),
         "stt": settings_service.masked_status(db, "openai_api_key", s.OPENAI_API_KEY),
         "llm_model": s.LLM_MODEL,
+        # 자체 호스팅 STT 워커(faster-whisper/GPU) 설정 여부 — 켜져 있으면 STT는 무료로 이 워커가
+        # 처리하고, OpenAI 키는 STT에 필요 없다(폴백·GPT 모델용). 화면 문구를 이 값으로 정확히 표기.
+        "stt_worker": {"configured": bool(s.STT_WORKER_URL)},
     }
 
 
