@@ -2525,16 +2525,21 @@ def ops_delete_question_image(
 _TRANSCRIPT_MAX_BYTES = 2 * 1024 * 1024  # 자막 파일 상한(KB 규모라 넉넉)
 
 
-def _transcript_row(t: LectureTranscript | None) -> dict:
+def _transcript_row(t: LectureTranscript | None, *, full: bool = False) -> dict:
     if t is None:
         return {"has_transcript": False, "source": None, "segment_count": 0, "preview": [], "updated_at": None}
-    return {
+    row = {
         "has_transcript": True,
         "source": t.source,  # srt|vtt|paste|stt
         "segment_count": int(t.segment_count or 0),
-        "preview": (t.segments or [])[:3],  # 앞 3개 미리보기(전체 로드 없이 확인)
+        "preview": (t.segments or [])[:3],  # 앞 3개 미리보기(목록 로드는 가볍게)
         "updated_at": t.updated_at.isoformat() if t.updated_at else None,
     }
+    # 전체 보기 요청(full)일 때만 세그먼트 전부를 싣는다 — 강사가 전사가 잘 됐는지 끝까지
+    # 검수할 수 있게. 기본 응답(목록/상태 갱신)은 preview만 실어 가볍게 유지한다.
+    if full:
+        row["segments"] = t.segments or []
+    return row
 
 
 def _upsert_transcript(db: Session, lecture_id: str, segments: list, source: str) -> LectureTranscript:
@@ -2555,13 +2560,15 @@ def _upsert_transcript(db: Session, lecture_id: str, segments: list, source: str
 @router.get("/ops/lectures/{lecture_id}/transcript")
 def ops_get_transcript(
     lecture_id: str,
+    full: bool = False,
     principal: Principal = Depends(require_lecture_manager),
     db: Session = Depends(get_db),
 ):
-    """강의 전사 상태 — 있으면 출처(강사 자막/자동 STT)·세그먼트 수·앞 3개 미리보기."""
+    """강의 전사 상태 — 출처(강사 자막/자동 STT)·세그먼트 수·앞 3개 미리보기.
+    full=true면 세그먼트 전부를 함께 준다(강사가 전사를 끝까지 검수하는 '전체 보기')."""
     lec = _get_ops_lecture(db, lecture_id, principal)
     t = db.query(LectureTranscript).filter(LectureTranscript.lecture_id == lec.id).first()
-    return _transcript_row(t)
+    return _transcript_row(t, full=full)
 
 
 class _TranscriptReq(BaseModel):
