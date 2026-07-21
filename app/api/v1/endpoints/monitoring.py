@@ -81,8 +81,8 @@ class MetricIn(BaseModel):
 _METRIC_FIELDS = (
     "label", "host", "cpu_pct", "cpu_cores", "load1", "mem_pct", "mem_used_mb",
     "mem_total_mb", "disk_pct", "disk_used_gb", "disk_total_gb", "gpu_present",
-    "gpu_name", "gpu_util_pct", "gpu_mem_used_mb", "gpu_mem_total_mb", "collected_at",
-)
+    "gpu_name", "gpu_util_pct", "gpu_mem_used_mb", "gpu_mem_total_mb",
+)  # collected_at은 payload에서 받지 않는다 — _upsert가 '수신 시각'으로 찍는다(아래 주석)
 
 
 def _upsert(db: Session, snap: dict) -> ServerMetric:
@@ -95,9 +95,11 @@ def _upsert(db: Session, snap: dict) -> ServerMetric:
     for f in _METRIC_FIELDS:
         if f in snap and snap[f] is not None:
             setattr(row, f, snap[f])
-    ts = snap.get("collected_at") or datetime.now()
-    if snap.get("collected_at") is None:
-        row.collected_at = ts
+    # collected_at은 payload를 신뢰하지 않고 '수신 시각'으로 통일한다 — 에이전트/VM의 로컬
+    # tz가 제각각이어도(예: OS tz를 UTC→KST로 바꿔도 이미 뜬 프로세스는 옛 tz를 캐시해 계속
+    # UTC로 보냄) 신선도(age)가 9시간씩 어긋나지 않는다. 서버 한 곳의 시계로 일관 판정.
+    ts = datetime.now()
+    row.collected_at = ts
     # 추이용 표본 1개 append(가벼운 3지표만)
     db.add(ServerMetricSample(
         server_key=key,
