@@ -1384,7 +1384,9 @@ def ops_create_lecture(
     auth_service.rate_limit(
         db, f"lect-upload:{_client_ip(request)}", limit=RATE_UPLOAD_PER_HOUR, window_seconds=3600
     )
-    if subject not in EDU_SUBJECTS:
+    # 코스 중심 전환(2026-07-21): 코스 유래 강의는 subject='일반'일 수 있다(코스의 기본 과목).
+    # 옛 6과목 + '일반'을 허용한다(그 외 무효값만 차단).
+    if subject not in EDU_SUBJECTS and subject != "일반":
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="지원하지 않는 과목입니다.")
     # 코스 지정 시 — 소유(강사는 자기 코스만: _get_ops_course가 404) + 과목 일치 강제
     # (코스=과목 고정: 수학 코스엔 수학 강의만).
