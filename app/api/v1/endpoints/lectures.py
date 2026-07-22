@@ -1618,7 +1618,9 @@ def ops_update_lecture(
 ):
     """메타만 수정 — 영상 파일 교체는 별도 업로드(새 강의)로 처리한다."""
     lec = _get_ops_lecture(db, lecture_id, principal)  # 강사는 자기 강의만(스코프)
-    if req.subject is not None and req.subject not in EDU_SUBJECTS:
+    # ★'일반'(코스 중심 전환 기본 과목)도 허용 — 업로드(POST)는 허용하는데 수정(PUT)만 빠져,
+    # '일반' 과목 코스(인라인 생성 코스 등)를 강의 수정으로 배정하면 "지원하지 않는 과목"으로 막혔다.
+    if req.subject is not None and req.subject not in EDU_SUBJECTS and req.subject != "일반":
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="지원하지 않는 과목입니다.")
     if req.status is not None and req.status not in ("active", "hidden"):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="status는 active|hidden만 가능합니다.")

@@ -260,6 +260,23 @@ def test_course_enroll_unenroll_and_flag(client, db, seed_org, media_dir):
     assert bad.status_code == 404
 
 
+def test_edit_lecture_into_general_subject_course(client, db, seed_org, media_dir):
+    """강의 수정으로 '일반' 과목 코스(인라인 생성 코스 등)에 배정 가능.
+    (회귀: PUT 검증이 '일반'을 '지원하지 않는 과목'으로 막아, 강의 수정→코스 배정이 실패했다.)"""
+    ops = _instructor(client, db)
+    course = _create_course(client, ops, title="안전", subject="일반")  # 코스 중심 기본 과목
+    lec = _upload_lecture(client, ops, title="응급처치", subject="국어").json()
+
+    # 강의 수정으로 '일반' 코스 배정 — subject도 코스 따라 '일반'(프론트 동작). 이제 200(전엔 400).
+    r = client.put(
+        f"/api/v1/ops/lectures/{lec['id']}",
+        json={"course_id": course["id"], "subject": "일반"},
+        headers=auth(ops),
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["course_id"] == course["id"] and r.json()["subject"] == "일반"
+
+
 def test_enrollment_gates_lecture_watch(client, db, seed_org, media_dir):
     """수강신청 게이트 — 코스 강의는 신청해야 시청·재생 가능(미신청 403·reason=not_enrolled),
     신청하면 200, 취소하면 다시 403. 미분류(course 없는) 강의는 신청 없이도 열린다."""
