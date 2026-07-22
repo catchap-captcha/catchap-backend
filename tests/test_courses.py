@@ -203,6 +203,9 @@ def test_student_sees_courses_and_lecture_course_id(client, db, seed_org, media_
     assert lects[a["id"]]["course_id"] == course["id"]
     assert lects[solo["id"]]["course_id"] is None
 
+    # 코스 강의 상세 — 수강신청 게이트가 생겨(0722) 신청해야 상세·시청 가능. 목록·카탈로그는
+    # 게이트 밖(둘러보기 유지)이라 위 assert들은 신청 전에도 통과한다. 상세부터 신청 필요.
+    assert client.post(f"/api/v1/courses/{course['id']}/enroll", headers=auth(stok)).status_code == 200
     # 코스 강의 상세 — course_id + toc는 코스 스코프(같은 코스 2강, 미분류 solo 제외)
     detail = client.get(f"/api/v1/lectures/{a['id']}", headers=auth(stok)).json()
     assert detail["course_id"] == course["id"]
@@ -255,3 +258,31 @@ def test_course_enroll_unenroll_and_flag(client, db, seed_org, media_dir):
     # 없는 코스는 404
     bad = client.post("/api/v1/courses/00000000-0000-0000-0000-000000000000/enroll", headers=auth(stok))
     assert bad.status_code == 404
+
+
+def test_enrollment_gates_lecture_watch(client, db, seed_org, media_dir):
+    """수강신청 게이트 — 코스 강의는 신청해야 시청·재생 가능(미신청 403·reason=not_enrolled),
+    신청하면 200, 취소하면 다시 403. 미분류(course 없는) 강의는 신청 없이도 열린다."""
+    ops = _instructor(client, db)
+    course = _create_course(client, ops, title="게이트 코스", subject="수학")
+    lec = _upload_lecture(client, ops, title="1강", subject="수학", course_id=course["id"]).json()
+    free = _upload_lecture(client, ops, title="미분류강의", subject="수학").json()  # course_id 없음
+    stok = _student_token(client, seed_org)
+
+    # 미신청 — 코스 강의 상세·재생 모두 403(not_enrolled)
+    d = client.get(f"/api/v1/lectures/{lec['id']}", headers=auth(stok))
+    assert d.status_code == 403
+    assert d.json()["detail"]["reason"] == "not_enrolled"
+    assert client.post(f"/api/v1/lectures/{lec['id']}/session", headers=auth(stok)).status_code == 403
+
+    # 미분류 강의는 신청 없이도 열린다(신청할 코스가 없으므로)
+    assert client.get(f"/api/v1/lectures/{free['id']}", headers=auth(stok)).status_code == 200
+
+    # 수강신청 후 — 코스 강의 상세·재생 200
+    client.post(f"/api/v1/courses/{course['id']}/enroll", headers=auth(stok))
+    assert client.get(f"/api/v1/lectures/{lec['id']}", headers=auth(stok)).status_code == 200
+    assert client.post(f"/api/v1/lectures/{lec['id']}/session", headers=auth(stok)).status_code == 200
+
+    # 수강취소하면 다시 막힌다
+    client.delete(f"/api/v1/courses/{course['id']}/enroll", headers=auth(stok))
+    assert client.get(f"/api/v1/lectures/{lec['id']}", headers=auth(stok)).status_code == 403

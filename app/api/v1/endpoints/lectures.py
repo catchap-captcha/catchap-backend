@@ -308,6 +308,35 @@ def _get_active_lecture(db: Session, lecture_id: str) -> Lecture:
     return lec
 
 
+def _require_enrolled(db: Session, lec: Lecture, principal: Principal) -> None:
+    """수강신청 게이트 — 코스에 담긴 강의는 그 코스에 수강신청(active)해야 시청·풀이할 수 있다.
+
+    미분류(course_id NULL) 강의는 신청할 코스가 없으므로 열어 둔다(영영 잠기는 것 방지).
+    403 detail은 구조화(reason=not_enrolled·course_id)해 프론트가 '수강신청' 유도 화면을
+    띄우게 한다. 재신청이면 진도가 이어지므로(취소=withdrawn·이력 보존) 게이트가 학습을
+    지우지 않는다. 강사·운영자 미리보기는 ops 경로(require_content_author)라 여기 오지 않는다."""
+    if not lec.course_id:
+        return
+    enrolled = (
+        db.query(CourseEnrollment.id)
+        .filter(
+            CourseEnrollment.student_id == principal.id,
+            CourseEnrollment.course_id == lec.course_id,
+            CourseEnrollment.status == "active",
+        )
+        .first()
+    )
+    if enrolled is None:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            detail={
+                "message": "수강신청 후 수강할 수 있어요. 코스를 신청하면 바로 볼 수 있어요.",
+                "reason": "not_enrolled",
+                "course_id": lec.course_id,
+            },
+        )
+
+
 # ================================================================ 학생
 def _progress_map(db: Session, student_id: str, lecture_ids: list[str]) -> dict:
     return {
@@ -602,6 +631,7 @@ def lecture_detail(
     db: Session = Depends(get_db),
 ):
     lec = _get_active_lecture(db, lecture_id)
+    _require_enrolled(db, lec, principal)  # 수강신청 게이트 — 미신청이면 403(프론트가 신청 유도)
     progress = lecture_service.ensure_progress(db, principal.id, lec)
     db.commit()  # 최초 진입 시 진행 행(첫 체크포인트 예약 포함) 확정
     # 강의실 사이드바 목차 — 코스에 담긴 강의면 '그 코스'의 강의들(같은 커리큘럼 묶음),
@@ -667,6 +697,7 @@ def lecture_session_start(
         db, f"lect-ss:{principal.id}", limit=RATE_SESSION_PER_HOUR, window_seconds=3600
     )
     lec = _get_active_lecture(db, lecture_id)
+    _require_enrolled(db, lec, principal)  # 수강신청 게이트 — 재생 시작도 신청 필수(이중 방어)
     progress = lecture_service.ensure_progress(db, principal.id, lec)
     session_id = new_uuid()  # 서버 발급 — 클라 입력이 끼어들 자리가 없다
     lecture_service.claim_session(db, progress, session_id)  # 동시 세션이면 409
