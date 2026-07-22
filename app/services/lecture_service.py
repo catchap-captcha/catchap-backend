@@ -290,7 +290,13 @@ def advance(
     # 영상을 끝까지 본 뒤에는 next_checkpoint가 다시 None을 돌려주므로 완주 판정은 그대로다.
     # 통과한 핀은 제외(reservable_pins) — 되감긴 학생(watched < 통과한 핀)의 예약이
     # 정합화로 풀린 경우, watched 기준만 보면 이미 통과한 핀을 다시 잡아 소급 재출제된다.
-    if progress.next_checkpoint_sec is None and watched < duration:
+    # ★영상 밖(≥duration) 낡은 예약 자가치유: duration을 줄이거나 낡은 예약이 남으면
+    # next_checkpoint_sec이 '도달 불가한 핀'(≥duration)에 묶여, 게이트가 영영 안 뜨고
+    # watched_max가 duration에 닿아도 status가 done으로 못 넘어간다 = 완주 불가 → 문제은행
+    # 영구 잠금(라이브 버그). next_checkpoint가 영상 밖 핀을 제외하므로 재계산하면 유효 핀
+    # 또는 None으로 풀린다. 유효한 '영상 안(<duration)' 예약은 건드리지 않아 정상 잠금은 유지된다.
+    cp_cur = progress.next_checkpoint_sec
+    if cp_cur is None or cp_cur >= duration:
         pins = reservable_pins(db, progress.student_id, progress.lecture_id)
         progress.next_checkpoint_sec = next_checkpoint(watched, duration, pins)
 
