@@ -58,6 +58,33 @@ def _q_played_today(db: Session, student_id: str) -> dict[str, int]:
         .group_by(LearningAttempt.subject)
         .all()
     )
+# ---------------------------------------------------------------- 프로필 수정
+class _ProfileUpdate(_GBaseModel):
+    name: str | None = None  # nickname(표시 이름)
+    age: int | None = None
+
+
+@router.patch("/students/me/profile")
+def update_my_profile(
+    req: _ProfileUpdate,
+    principal: Principal = Depends(require_student),
+    db: Session = Depends(get_db),
+):
+    """학생 본인 프로필(이름·나이) 수정 — 프로필 수정 페이지에서 호출. 보낸 필드만 바꾼다."""
+    st = _me(principal)
+    if req.name is not None:
+        n = req.name.strip()
+        if not (1 <= len(n) <= 50):
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="이름은 1~50자로 입력해 주세요.")
+        st.nickname = n
+    if req.age is not None:
+        if not (1 <= int(req.age) <= 120):
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="나이는 1~120 사이로 입력해 주세요.")
+        st.age = int(req.age)
+    db.commit()
+    return {"ok": True, "name": st.nickname, "age": st.age}
+
+
 # ---------------------------------------------------------------- 학습 홈
 @router.get("/students/me/dashboard")
 def dashboard(

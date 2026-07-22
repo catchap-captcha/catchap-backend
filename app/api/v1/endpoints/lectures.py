@@ -1185,15 +1185,23 @@ def ops_instructor_dashboard(
     draft_lecture_q = 0
     lectures_without_checkpoint = 0
     if lec_ids:
-        draft_counts = dict(
-            db.query(LectureQuestion.lecture_id, func.count(LectureQuestion.id))
+        # 검수 대기(draft) 집계 — 단, '문제은행으로 보낸(payload.bank_placed)' 문항은 이미
+        # 처리된 것이라 제외한다. to-bank가 active 문항을 draft로 강등시키므로(은행행=봇이 푸는
+        # 문항이라 캡차 부적합), 제외하지 않으면 은행에 보낸 문항이 검수 대기로 영영 남는다(버그).
+        # JSON 필드(bank_placed) 조건은 DB 방언차가 있어, draft 행을 받아 파이썬에서 센다
+        # (강사당 draft 수는 작아 부담 없음).
+        draft_counts: dict[str, int] = {}
+        for lid, payload in (
+            db.query(LectureQuestion.lecture_id, LectureQuestion.payload)
             .filter(
                 LectureQuestion.lecture_id.in_(lec_ids),
                 LectureQuestion.status == "draft",
             )
-            .group_by(LectureQuestion.lecture_id)
             .all()
-        )
+        ):
+            if (payload or {}).get("bank_placed"):
+                continue
+            draft_counts[lid] = draft_counts.get(lid, 0) + 1
         active_counts = dict(
             db.query(LectureQuestion.lecture_id, func.count(LectureQuestion.id))
             .filter(
