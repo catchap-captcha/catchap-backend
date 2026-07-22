@@ -2862,6 +2862,51 @@ class _GenerateReq(BaseModel):
     n: int = 5
 
 
+_DUP_SIM_THRESHOLD = 0.85  # 프롬프트 정규화 후 유사도 이상이면 중복(near-dup)으로 본다
+
+
+def _norm_prompt(s: str) -> str:
+    """중복 판정용 정규화 — 소문자 + 공백·문장부호·기호 제거로 표기 흔들림을 흡수한다."""
+    return re.sub(r"[\s\W_]+", "", (s or "").lower())
+
+
+def _dedupe_generated(db: Session, lec: Lecture, items: list[dict]) -> tuple[list[dict], int]:
+    """생성 문항에서 서로/기존과 유사한(near-dup) 것을 제거 — 대량 생성 시 검수 대기·문제은행
+    오염을 막는다(문제은행 2단계). 판정: 프롬프트를 정규화(_norm_prompt)해 difflib 유사도가
+    _DUP_SIM_THRESHOLD 이상이면 중복. 비교 대상 = 이 배치에서 이미 남긴 것 + 이 강의의 기존
+    (비삭제) 문항. 반환 = (남긴 items, 건너뛴 수). verify 앞에 두어 유사 문항에 검증 LLM을
+    쓰지 않는다."""
+    from difflib import SequenceMatcher
+
+    existing = [
+        n
+        for n in (
+            _norm_prompt((r.payload or {}).get("prompt", ""))
+            for r in db.query(LectureQuestion)
+            .filter(LectureQuestion.lecture_id == lec.id, LectureQuestion.status != "deleted")
+            .all()
+        )
+        if n
+    ]
+    kept: list[dict] = []
+    kept_norms: list[str] = []
+    skipped = 0
+    for it in items:
+        norm = _norm_prompt(it.get("prompt", ""))
+        if not norm:
+            kept.append(it)  # 빈 프롬프트는 뒤 파서/검증이 거른다 — 여기선 통과
+            continue
+        if any(
+            norm == s or SequenceMatcher(None, norm, s).ratio() >= _DUP_SIM_THRESHOLD
+            for s in (*existing, *kept_norms)
+        ):
+            skipped += 1
+            continue
+        kept.append(it)
+        kept_norms.append(norm)
+    return kept, skipped
+
+
 def _generate_questions_now(db: Session, lec: Lecture, n: int, actor_id: str, on_phase=None) -> dict:
     """AI 문항 자동 생성 실작업 — STT 전사(키 설정 시) → LLM 출제, source=llm·status=draft 저장.
 
@@ -2962,6 +3007,12 @@ def _generate_questions_now(db: Session, lec: Lecture, n: int, actor_id: str, on
         raise HTTPException(
             status.HTTP_502_BAD_GATEWAY, detail=f"문항 자동 생성에 실패했습니다: {e}"
         )
+
+    # 중복 감지(문제은행 2단계) — 서로/기존 문항과 유사한 것을 verify 전에 걸러 검수 대기·은행
+    # 오염을 막고 유사 문항에 검증 LLM 비용도 아낀다(같은 강의 반복 생성 시 특히 유효).
+    items, dup_skipped = _dedupe_generated(db, lec, items)
+    if dup_skipped:
+        _log.info("생성 중복 제거 lecture=%s: 유사 문항 %d개 제외", lec.id, dup_skipped)
 
     # 자기검증(2번째 LLM) — 공개 맥락(공격자가 보는 제목·과목·설명)을 준 블라인드 풀이를
     # '보기 셔플 3회 다수결'로(우연 정답·위치 편향 완화), 자막이 있으면 자막-포함 풀이도
