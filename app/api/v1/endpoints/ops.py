@@ -48,6 +48,7 @@ from app.models import (
 )
 from app.services import ai_models_service
 from app.services import captcha_service as _cs
+from app.services import question_metrics as question_metrics_service
 
 router = APIRouter(prefix="/ops", tags=["ops"])
 
@@ -91,6 +92,23 @@ def _api_calls_today(db: Session) -> dict:
         "api_calls_today": int(total),
         "error_rate": f"{(errors / total * 100):.1f}%" if total else "0%",
     }
+
+
+@router.get("/question-metrics")
+def question_metrics(
+    subject: str | None = None,  # 특정 과목만(없으면 전체)
+    sort: str = "most_shown",  # most_shown|least_shown|hardest|easiest
+    min_attempts: int = 1,  # 이 미만 시도 문항은 제외
+    limit: int = 50,
+    offset: int = 0,
+    principal: Principal = Depends(require_ops),
+    db: Session = Depends(get_db),
+):
+    """문항 지표 — 문제은행 각 문항의 노출수·정답률(문제은행 2단계). 너무 쉬운/너무 어려운/
+    표본 적은 문항 정비용. graded(서버 채점) 시도만 집계한다."""
+    return question_metrics_service.compute(
+        db, subject=subject, sort=sort, min_attempts=min_attempts, limit=limit, offset=offset
+    )
 
 
 @router.get("/orgs")
