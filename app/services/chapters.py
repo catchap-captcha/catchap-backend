@@ -9,18 +9,10 @@ ChapterProgress(단계 커서) + LearningAttempt(푼 문항 집합) + StudentPro
 저장하므로, 랜덤풀 전환 시에도 마이그레이션 없이 진도를 그릴 수 있다.
 """
 
-import os
 from datetime import date
 
 from app.services import subject_banks
 
-
-def _unlock_all() -> bool:
-    """임시 전체 해제 스위치 — 켜면 달력(월요일) 잠금을 무시하고 모든 챕터를 연다.
-
-    되돌리기: 환경변수 CATCHAP_UNLOCK_ALL_CHAPTERS 를 지우고 백엔드 재기동하면 원상복구.
-    코드 변경/재배포 없이 env 토글만으로 켜고 끌 수 있게 한 임시 조치다(2026-07-13)."""
-    return os.environ.get("CATCHAP_UNLOCK_ALL_CHAPTERS", "").strip().lower() in ("1", "true", "yes", "on")
 
 CHAPTER_SIZE = 10  # 한 챕터 = 10문제
 STAGE_SIZE = 2  # 한 단계 = 2문제
@@ -28,7 +20,8 @@ STAGES = 5  # 챕터당 5단계
 # 전체학습 주차 수 — 임시 확정(2026-07-14): 전 과목 20주차 고정. 문항이 20*10=200 미만인
 # 과목(수학 153→15주치, 과학 91→9주치)은 _cycle_slice가 문항을 순환 반복해 20주차를 채운다.
 MAX_CHAPTERS = 20
-# 챕터1 = 이번 주(2026-07-06 월요일) — 전체 공통 달력 기준(모든 학생 같은 주에 같은 챕터).
+# 전체학습 첫 주(2026-07-06 월요일) 기준 날짜 — 주간 달력 잠금은 폐지(2026-07-22)됐고,
+# 이제 students 챕터 API가 참고용 `anchor_monday`로만 내보낸다(게이팅에는 미사용).
 ANCHOR_MONDAY = date(2026, 7, 6)
 
 
@@ -56,17 +49,13 @@ def _cycle_slice(subject: str, start: int, count: int) -> list[dict]:
 
 
 def unlocked_count(subject: str, today: date | None = None) -> int:
-    """오늘 기준 열린 챕터 수 = min(max_chapters, 앵커 이후 지난 주 + 1). 최소 1(음수 방지).
+    """열린 챕터 수 — 성인 자유학습 전환(2026-07-22)으로 주간 달력 잠금을 폐지했다.
+    이제 그 과목의 전 챕터를 항상 연다(playable 문항이 없으면 0).
 
-    임시 전체 해제(_unlock_all)가 켜져 있으면 달력 잠금을 무시하고 그 과목의 전 챕터를 연다."""
-    mx = max_chapters(subject)
-    if mx <= 0:
-        return 0
-    if _unlock_all():
-        return mx  # 임시 전체 해제 — 모든 챕터 개방
-    today = today or date.today()
-    weeks = max(0, (today - ANCHOR_MONDAY).days // 7)
-    return max(1, min(mx, weeks + 1))
+    과거엔 앵커(ANCHOR_MONDAY) 이후 지난 주차로 게이팅하고 그 위에 임시 env 스위치
+    (CATCHAP_UNLOCK_ALL_CHAPTERS)로 잠금을 껐다. 개방이 기본 동작이 되면서 둘 다 제거했다.
+    today 인자는 호출부 호환을 위해 남기지만 더는 쓰지 않는다."""
+    return max_chapters(subject)
 
 
 def chapter_title(subject: str, chapter_no: int) -> str:

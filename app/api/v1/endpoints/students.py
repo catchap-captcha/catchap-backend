@@ -531,10 +531,10 @@ def chapters(
     principal: Principal = Depends(require_student),
     db: Session = Depends(get_db),
 ):
-    """전체학습 주간 챕터 — 과목별 챕터 목록 + 5단계 진행 + 달력 잠금(월요일 해제).
-    오늘의 퀴즈(매일 습관·연속도전)와 분리된 '학습(숙련도)' 축이다. 챕터는 문제은행을
-    10문제(5단계×2)씩 자른 것이고, 잠금은 전체 공통 달력(chapters.ANCHOR_MONDAY) 기준이라
-    모든 학생이 같은 주에 같은 챕터를 본다. 문제은행이 작은 과목은 채울 수 있는 만큼만 챕터 생성.
+    """전체학습 챕터 — 과목별 챕터 목록 + 5단계 진행. 성인 자유학습 전환(2026-07-22)으로
+    주간 달력 잠금을 폐지해 전 챕터가 항상 열린다(unlocked_count=max_chapters). 오늘의 퀴즈
+    (매일 습관·연속도전)와 분리된 '학습(숙련도)' 축이다. 챕터는 문제은행을 10문제(5단계×2)씩
+    자른 것이고, 문제은행이 작은 과목은 채울 수 있는 만큼만 챕터 생성. anchor_monday는 참고용.
     """
     from app.services import chapters as _ch
     me = _me(principal)
