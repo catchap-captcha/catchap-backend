@@ -49,8 +49,8 @@ class Settings(BaseSettings):
     # 강의 시청 검증 — 영상 저장 디렉터리(경로는 DB에 저장하지 않고 {id}{ext}로 유도)와
     # 업로드 상한. 전역 1MB 본문 제한의 예외 처리는 main.py 미들웨어가 담당한다.
     LECTURE_MEDIA_DIR: str = "./media/lectures"
-    MAX_UPLOAD_BYTES: int = 500_000_000
-    # 강의 자료(자료실) 파일 상한 — 영상 상한(500MB)과 분리. 자료는 문서류(pdf/pptx/zip 등)라
+    MAX_UPLOAD_BYTES: int = 5 * 1024 * 1024 * 1024  # 5GB (2026-07-22 상향)
+    # 강의 자료(자료실) 파일 상한 — 영상 상한(5GB)과 분리. 자료는 문서류(pdf/pptx/zip 등)라
     # 50MB면 충분하고, 영상 상한을 그대로 열면 자료 경로가 대용량 업로드 표면(디스크 소모)이 된다.
     MAX_MATERIAL_UPLOAD_BYTES: int = 50_000_000
     # 확인 문항 이미지(강의 화면 캡처) 상한 — 캡처 PNG가 보통 1~3MB라 5MB면 충분하다.

@@ -117,8 +117,8 @@ _log = logging.getLogger("catchap.main")
 MAX_BODY_BYTES = 1_000_000
 _UPLOAD_PATH = "/api/v1/ops/lectures"  # 정확 일치(하위 경로 PUT/questions 등은 1MB 유지)
 # 강의 자료(자료실) 파일 업로드 — POST /ops/lectures/{id}/materials 정확 형태만.
-# 상한은 영상(500MB)과 분리한 MAX_MATERIAL_UPLOAD_BYTES(50MB): 자료는 문서류라 50MB면
-# 충분하고, 500MB를 그대로 열면 자료 경로가 대용량 업로드 표면(디스크 소모)이 된다.
+# 상한은 영상(5GB)과 분리한 MAX_MATERIAL_UPLOAD_BYTES(50MB): 자료는 문서류라 50MB면
+# 충분하고, 영상 상한을 그대로 열면 자료 경로가 대용량 업로드 표면(디스크 소모)이 된다.
 # multipart일 때만 예외 — 같은 경로의 link 생성(JSON 본문)은 1MB로 충분하며,
 # JSON 파서는 본문 전체를 메모리에 올리므로 예외를 주면 안 된다.
 _MATERIAL_UPLOAD_RE = re.compile(r"^/api/v1/ops/lectures/[^/]+/materials$")
