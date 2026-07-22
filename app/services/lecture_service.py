@@ -11,17 +11,21 @@ commit은 호출자(엔드포인트) 책임 — audit()와 같은 규약.
 
 from collections.abc import Sequence
 from datetime import timedelta
+from pathlib import Path
 
 from fastapi import HTTPException, status
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.core.config import get_settings
 from app.db.base import _now
 from app.models import (
     Lecture,
     LectureCheckpointEvent,
+    LectureMaterial,
     LectureQuestion,
     LectureQuestionGenJob,
+    LectureTranscript,
     LectureWatchProgress,
 )
 
@@ -436,3 +440,91 @@ def sweep_stuck_gen_jobs(db: Session, stale_minutes: int = STUCK_GEN_JOB_MINUTES
     if stuck:
         db.commit()
     return len(stuck)
+
+
+# ==================================================================== 휴지통·완전삭제
+# 강의 삭제는 2단계다. 소프트 삭제(=휴지통, status='deleted'+deleted_at)는 파일·문항·전사를
+# 전부 보존해 복구할 수 있게 하고, 완전 삭제(hard_delete_lecture)만이 되돌릴 수 없이 행·파일을
+# 물리 제거한다. 30일 지난 휴지통 강의는 purge_expired_trash가 자동으로 완전 삭제한다.
+TRASH_RETENTION_DAYS = 30
+
+
+def _question_image_paths(media_dir: Path, payload: dict) -> list[Path]:
+    """문항 payload의 이미지 참조(prompt_image + option_images) → 파일 경로 목록.
+    엔드포인트의 _question_image_refs/_question_image_path와 같은 규약(id+ext로만 유도)."""
+    refs: list[dict] = []
+    pi = (payload or {}).get("prompt_image")
+    if isinstance(pi, dict) and pi.get("id"):
+        refs.append(pi)
+    for ref in ((payload or {}).get("option_images") or {}).values():
+        if isinstance(ref, dict) and ref.get("id"):
+            refs.append(ref)
+    return [media_dir / "questions" / f"{r['id']}{r.get('ext') or ''}" for r in refs]
+
+
+def hard_delete_lecture(db: Session, lec: Lecture) -> dict:
+    """강의를 영구 완전 삭제 — 문항·전사·시청이력·확인이벤트·생성잡·자료 행과 모든 파일을
+    물리 제거한다. 소프트 삭제(휴지통)와 달리 되돌릴 수 없다.
+
+    파일은 commit '성공 후'에 unlink한다(commit 실패 시 파일은 없는데 행은 남는 최악 방지 —
+    기존 소프트삭제와 같은 순서 규약). unlink는 멱등(missing_ok)이라 이미 없어도 무해하다.
+    반환: 지운 행 수(테이블별)·파일 수(감사·로그용). commit은 이 함수가 직접 한다."""
+    media_dir = Path(get_settings().LECTURE_MEDIA_DIR)
+    lec_id = lec.id
+    video_ext = lec.video_ext
+
+    # 파일 경로를 commit 전에 모아 둔다(commit 후 행이 사라지면 payload를 못 읽는다).
+    paths: list[Path] = [media_dir / f"{lec_id}{video_ext}"]
+    for m in db.query(LectureMaterial).filter(LectureMaterial.lecture_id == lec_id).all():
+        if m.kind == "file" and m.file_ext:
+            paths.append(media_dir / "materials" / f"{m.id}{m.file_ext}")
+    for qr in db.query(LectureQuestion).filter(LectureQuestion.lecture_id == lec_id).all():
+        paths.extend(_question_image_paths(media_dir, qr.payload or {}))
+
+    # 자식 행부터 물리 삭제(소프트 참조라 DB 캐스케이드가 없다 — 코드가 직접 지운다).
+    counts: dict[str, int] = {}
+    for model in (
+        LectureQuestion,
+        LectureTranscript,
+        LectureWatchProgress,
+        LectureCheckpointEvent,
+        LectureQuestionGenJob,
+        LectureMaterial,
+    ):
+        counts[model.__tablename__] = (
+            db.query(model)
+            .filter(model.lecture_id == lec_id)
+            .delete(synchronize_session=False)
+        )
+    db.delete(lec)
+    db.commit()
+
+    files_removed = 0
+    for p in paths:
+        try:
+            if p.exists():
+                files_removed += 1
+            p.unlink(missing_ok=True)
+        except OSError:
+            pass  # 파일 삭제 실패는 치명적이지 않다(행은 이미 삭제됨) — 조용히 넘어간다
+    return {"lecture_id": lec_id, "rows": counts, "files_removed": files_removed}
+
+
+def purge_expired_trash(db: Session, retention_days: int = TRASH_RETENTION_DAYS) -> int:
+    """휴지통에 retention_days 넘게 있은 강의를 자동 완전 삭제하고, 정리한 개수를 반환한다.
+
+    스케줄러가 없는 구조라(워커 2개·주기잡 없음) 콘솔 조회·기동 시 기회적으로 호출된다.
+    멱등: 대상이 없으면 0. deleted_at이 NULL인 구데이터는 만료 판단서 제외(영구 보존)한다."""
+    cutoff = _now() - timedelta(days=retention_days)
+    expired = (
+        db.query(Lecture)
+        .filter(
+            Lecture.status == "deleted",
+            Lecture.deleted_at.isnot(None),
+            Lecture.deleted_at < cutoff,
+        )
+        .all()
+    )
+    for lec in expired:
+        hard_delete_lecture(db, lec)  # 각자 commit(부분 실패해도 나머지는 정리됨)
+    return len(expired)

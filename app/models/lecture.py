@@ -67,6 +67,9 @@ class Lecture(Base, UUIDPk, Timestamps):
     # (제거됨 0717) check_min_sec/check_max_sec — 무작위 확인 간격. 출제 시점이 전부
     # 핀(문항의 position_sec)이 되면서 간격 개념 자체가 사라졌다(lecture_pin_02).
     status: Mapped[str] = mapped_column(String(20), default="active")  # active|hidden|deleted
+    # 휴지통 진입 시각 — 삭제(=휴지통 이동) 시 기록, 복구 시 NULL. 30일 지나면 자동 완전삭제
+    # (파일·문항·전사까지) 기준. status='deleted'인데 NULL이면 (구데이터) 만료 판단서 제외한다.
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     # 과목 내 목차 순서(1강·2강…) — 목록·목차는 (subject, order_no, created_at) 오름차순.
     # 생성 시 미지정이면 그 과목의 max+1로 맨 뒤 배정(운영자가 PUT으로 재배열).
     order_no: Mapped[int] = mapped_column(default=0)

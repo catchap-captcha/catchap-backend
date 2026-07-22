@@ -24,7 +24,7 @@ async def lifespan(app: FastAPI):
     여기서 오래 멈춘 잡만 error로 정직하게 마감한다. DB가 아직 준비 안 됐어도(마이그레이션
     전 등) 기동은 막지 않는다 — 정리는 다음 기동에 다시 시도된다."""
     from app.db.session import SessionLocal
-    from app.services.lecture_service import sweep_stuck_gen_jobs
+    from app.services.lecture_service import purge_expired_trash, sweep_stuck_gen_jobs
 
     try:
         db = SessionLocal()
@@ -32,6 +32,11 @@ async def lifespan(app: FastAPI):
             swept = sweep_stuck_gen_jobs(db)
             if swept:
                 _log.warning("기동 정리: 고아 문항생성 잡 %d개를 error로 마감", swept)
+            # 휴지통 30일 만료 강의 자동 완전삭제 — 스케줄러가 없어 기동(배포)마다 정리한다.
+            # 콘솔의 휴지통 조회 시에도 기회적으로 돌아, 둘이 겹쳐 30일 정책을 실현한다.
+            purged = purge_expired_trash(db)
+            if purged:
+                _log.warning("기동 정리: 30일 지난 휴지통 강의 %d개 완전삭제", purged)
         finally:
             db.close()
     except SQLAlchemyError as exc:

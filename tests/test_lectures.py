@@ -1334,23 +1334,26 @@ def test_lecture_update_delete_and_student_visibility(client, db, seed_org, medi
     assert client.get("/api/v1/lectures", headers=auth(tok)).json() == []
     assert client.get(f"/api/v1/lectures/{lec['id']}", headers=auth(tok)).status_code == 404
 
-    # 소프트 삭제 → ops 목록에서도 제외, 행은 보존, '영상 파일은 물리 삭제'
-    assert (media_dir / f"{lec['id']}.mp4").is_file()  # 삭제 전엔 존재
+    # 삭제 = 휴지통 이동(소프트·복구 가능) → ops 목록에서 제외, 행·'파일 모두 보존'(0722 정책)
+    assert (media_dir / f"{lec['id']}.mp4").is_file()  # 삭제 전 존재
     rm = client.delete(f"/api/v1/ops/lectures/{lec['id']}", headers=auth(ops_tok))
     assert rm.status_code == 200
     assert client.get("/api/v1/ops/lectures", headers=auth(ops_tok)).json() == []
     row = db.get(Lecture, lec["id"])
     db.refresh(row)
-    assert row.status == "deleted"  # 레코드·이력은 보존
-    assert int(row.video_bytes or 0) == 0  # 파일 부재 표기
-    assert not (media_dir / f"{lec['id']}.mp4").exists(), "영상 파일이 물리 삭제되지 않았다"
+    assert row.status == "deleted"  # 레코드·이력 보존
+    assert row.deleted_at is not None  # 휴지통 진입 시각 기록(30일 자동삭제 기준)
+    assert (media_dir / f"{lec['id']}.mp4").is_file(), "휴지통은 파일을 보존해야 복구가 완전하다"
 
-    # 파일이 이미 없는 강의도 삭제는 예외 없이 통과(unlink missing_ok 멱등)
-    lec3 = _upload_lecture(client, ops_tok, title="셋").json()
-    (media_dir / f"{lec3['id']}.mp4").unlink()  # 파일을 먼저 지워 부재 상황 재현
-    rm3 = client.delete(f"/api/v1/ops/lectures/{lec3['id']}", headers=auth(ops_tok))
-    assert rm3.status_code == 200, rm3.text
-    assert db.get(Lecture, lec3["id"]).status == "deleted"
+    # 휴지통 목록에 노출되고, 복구하면 다시 활성·재생 가능
+    trash = client.get("/api/v1/ops/lectures/trash", headers=auth(ops_tok)).json()
+    assert [t["id"] for t in trash] == [lec["id"]]
+    assert trash[0]["days_left"] == 30
+    restored = client.post(f"/api/v1/ops/lectures/{lec['id']}/restore", headers=auth(ops_tok))
+    assert restored.status_code == 200
+    db.refresh(row)
+    assert row.status == "active" and row.deleted_at is None
+    assert len(client.get("/api/v1/ops/lectures", headers=auth(ops_tok)).json()) == 1
 
     # 학생 진행 행은 학생·강의당 1개(upsert) — 상세 재진입해도 중복 생성 없음
     lec2 = _upload_lecture(client, ops_tok, title="둘").json()
@@ -2063,11 +2066,9 @@ def test_material_update_soft_delete_and_order(client, db, seed_org, media_dir):
         assert db.query(AuditLog).filter(AuditLog.action == action).count() >= 1
 
 
-def test_lecture_delete_cascades_materials(client, db, seed_org, media_dir):
-    """강의 소프트 삭제 시 그 강의의 자료도 함께 소프트 삭제 + file 파일 물리 삭제.
-
-    (skeptic REFUTED 회귀 방지: 이걸 안 하면 부모 강의 삭제 후 자료 CRUD가 전부 404가
-    되어 자료 파일이 영구 고아로 남는다.)"""
+def test_lecture_trash_preserves_then_permanent_purges_materials(client, db, seed_org, media_dir):
+    """휴지통(소프트 삭제)은 자료·파일을 보존하고, 완전 삭제(permanent)만 자료 행·파일을
+    물리 제거한다(0722 2단계 모델). 복구가 완전하려면 소프트삭제가 아무것도 안 지워야 한다."""
     ops_tok = _instructor(client, db)
     lec = _upload_lecture(client, ops_tok).json()
     mf = _upload_material(client, ops_tok, lec["id"], title="파일 자료").json()
@@ -2075,24 +2076,28 @@ def test_lecture_delete_cascades_materials(client, db, seed_org, media_dir):
     fpath = media_dir / "materials" / f"{mf['id']}.pdf"
     assert fpath.is_file()
 
-    rm = client.delete(f"/api/v1/ops/lectures/{lec['id']}", headers=auth(ops_tok))
-    assert rm.status_code == 200
-
-    # 자료 행은 보존되되 status=deleted, file 자료 파일은 디스크에서 사라진다
+    # 1) 휴지통 이동 — 자료 행·파일 모두 보존(복구 대비)
+    assert client.delete(f"/api/v1/ops/lectures/{lec['id']}", headers=auth(ops_tok)).status_code == 200
     for mid in (mf["id"], ml["id"]):
-        row = db.get(LectureMaterial, mid)
-        db.refresh(row)
-        assert row.status == "deleted", f"{mid} 자료가 함께 삭제되지 않았다"
-    assert not fpath.exists(), "자료 파일이 고아로 남았다"
+        assert db.get(LectureMaterial, mid) is not None, f"{mid} 자료가 휴지통에서 지워졌다"
+    assert fpath.is_file(), "휴지통이 자료 파일을 지웠다(복구 불가해짐)"
 
-    # 감사 로그에 자료 삭제 개수 기록
+    # 2) 완전 삭제 — 자료 행·파일 물리 제거
+    perm = client.delete(f"/api/v1/ops/lectures/{lec['id']}/permanent", headers=auth(ops_tok))
+    assert perm.status_code == 200, perm.text
+    for mid in (mf["id"], ml["id"]):
+        assert db.get(LectureMaterial, mid) is None, f"{mid} 자료 행이 완전삭제 후에도 남았다"
+    assert not fpath.exists(), "완전삭제 후 자료 파일이 고아로 남았다"
+    assert db.get(Lecture, lec["id"]) is None  # 강의 행도 물리 제거
+
+    # 감사: 완전삭제 로그에 지운 자료 행 수 기록
     log = (
         db.query(AuditLog)
-        .filter(AuditLog.action == "lecture.delete")
+        .filter(AuditLog.action == "lecture.purge")
         .order_by(AuditLog.created_at.desc())
         .first()
     )
-    assert log.after_json["materials_deleted"] == 2
+    assert log.after_json["rows"]["lecture_materials"] == 2
 
 
 def test_material_broken_multipart_is_400_not_500(client, db, seed_org, media_dir):
@@ -2398,8 +2403,9 @@ def test_question_image_delete_and_question_delete_cascade(client, db, seed_org,
     assert client.get(pi["prompt_image_url"]).status_code == 404
 
 
-def test_lecture_delete_cascades_question_images(client, db, seed_org, media_dir):
-    """강의 삭제 — 문항 이미지 파일도 연쇄 물리 삭제(고아 파일 방지), 문항 행은 보존."""
+def test_lecture_trash_preserves_then_permanent_purges_question_images(client, db, seed_org, media_dir):
+    """휴지통(소프트)은 문항·이미지를 보존하고 서빙만 차단, 완전 삭제만 문항 행·이미지 파일을
+    물리 제거한다(0722 2단계). 소프트삭제가 이미지를 지우면 복구해도 이미지가 없어진다."""
     ops_tok = _instructor(client, db)
     lec = _upload_lecture(client, ops_tok).json()
     q = _add_question(client, ops_tok, lec["id"])
@@ -2408,11 +2414,117 @@ def test_lecture_delete_cascades_question_images(client, db, seed_org, media_dir
     qdir = media_dir / "questions"
     assert (qdir / f"{img}.png").is_file()
 
-    rm = client.delete(f"/api/v1/ops/lectures/{lec['id']}", headers=auth(ops_tok))
-    assert rm.status_code == 200
-    assert not (qdir / f"{img}.png").exists(), "강의 삭제가 문항 이미지를 정리하지 않았다"
-    assert db.get(LectureQuestion, q["id"]).status != "deleted"  # 문항 행은 보존(강의만 deleted)
+    # 1) 휴지통 — 이미지 파일·문항 행 보존, 단 deleted 강의라 서빙은 404
+    assert client.delete(f"/api/v1/ops/lectures/{lec['id']}", headers=auth(ops_tok)).status_code == 200
+    assert (qdir / f"{img}.png").is_file(), "휴지통이 문항 이미지를 지웠다(복구 불가해짐)"
+    assert db.get(LectureQuestion, q["id"]) is not None  # 문항 행 보존
     assert client.get(pi["prompt_image_url"]).status_code == 404  # deleted 강의 — 서빙 차단
+
+    # 2) 완전 삭제 — 문항 행·이미지 파일 물리 제거
+    assert client.delete(f"/api/v1/ops/lectures/{lec['id']}/permanent", headers=auth(ops_tok)).status_code == 200
+    assert not (qdir / f"{img}.png").exists(), "완전삭제가 문항 이미지를 정리하지 않았다"
+    assert db.get(LectureQuestion, q["id"]) is None  # 문항 행도 물리 제거
+
+
+def test_lecture_trash_preserves_and_permanent_purges_transcript_and_progress(
+    client, db, seed_org, media_dir
+):
+    """STT 전사·시청이력: 휴지통(소프트)은 보존→복구 완전, 완전삭제만 전사 행·영상파일까지 제거.
+    (사용자 확인 0722: 완전삭제 시 STT·문항 다 삭제, 복구하면 다 복구.)"""
+    from app.models import LectureTranscript
+
+    ops_tok = _instructor(client, db)
+    lec = _upload_lecture(client, ops_tok).json()
+    vpath = media_dir / f"{lec['id']}.mp4"
+    db.add(
+        LectureTranscript(
+            lecture_id=lec["id"],
+            segments=[{"start": 0.0, "end": 1.0, "text": "안녕하세요"}],
+            source="stt",
+            segment_count=1,
+        )
+    )
+    db.commit()
+
+    def _tcount():
+        return (
+            db.query(LectureTranscript)
+            .filter(LectureTranscript.lecture_id == lec["id"])
+            .count()
+        )
+
+    # 1) 휴지통 이동 → 전사·영상 보존
+    assert client.delete(f"/api/v1/ops/lectures/{lec['id']}", headers=auth(ops_tok)).status_code == 200
+    assert _tcount() == 1, "휴지통이 STT 전사를 지웠다"
+    assert vpath.is_file()
+
+    # 2) 복구 → 전사 그대로(완전 복구)
+    assert client.post(f"/api/v1/ops/lectures/{lec['id']}/restore", headers=auth(ops_tok)).status_code == 200
+    assert db.get(Lecture, lec["id"]).status == "active"
+    assert _tcount() == 1
+
+    # 3) 다시 삭제 후 완전삭제 → 전사 행·영상 파일까지 제거
+    client.delete(f"/api/v1/ops/lectures/{lec['id']}", headers=auth(ops_tok))
+    assert client.delete(f"/api/v1/ops/lectures/{lec['id']}/permanent", headers=auth(ops_tok)).status_code == 200
+    assert _tcount() == 0, "완전삭제가 STT 전사를 지우지 않았다"
+    assert not vpath.exists(), "완전삭제가 영상 파일을 지우지 않았다"
+    assert db.get(Lecture, lec["id"]) is None
+
+
+def test_lecture_trash_autopurge_after_retention(client, db, seed_org, media_dir):
+    """휴지통 30일(TRASH_RETENTION_DAYS) 지난 강의는 휴지통 조회 시 자동 완전삭제된다.
+    아직 안 지난 강의는 남는다(경계 확인)."""
+    from datetime import timedelta
+
+    from app.models import LectureTranscript
+    from app.services import lecture_service
+
+    ops_tok = _instructor(client, db)
+    old = _upload_lecture(client, ops_tok, title="오래된 휴지통").json()
+    fresh = _upload_lecture(client, ops_tok, title="최근 휴지통").json()
+    db.add(LectureTranscript(lecture_id=old["id"], segments=[{"start": 0, "end": 1, "text": "x"}], source="stt", segment_count=1))
+    db.commit()
+
+    for lid in (old["id"], fresh["id"]):
+        client.delete(f"/api/v1/ops/lectures/{lid}", headers=auth(ops_tok))
+    # old의 삭제 시각을 보관기간+1일 전으로 되돌려 만료 상황 재현
+    row = db.get(Lecture, old["id"])
+    row.deleted_at = datetime.now() - timedelta(days=lecture_service.TRASH_RETENTION_DAYS + 1)
+    db.commit()
+
+    # 휴지통 조회 → 만료된 old는 자동 완전삭제(전사까지), fresh는 남는다
+    trash = client.get("/api/v1/ops/lectures/trash", headers=auth(ops_tok)).json()
+    ids = [t["id"] for t in trash]
+    assert old["id"] not in ids and fresh["id"] in ids
+    assert db.get(Lecture, old["id"]) is None
+    assert (
+        db.query(LectureTranscript).filter(LectureTranscript.lecture_id == old["id"]).count()
+        == 0
+    )
+    assert not (media_dir / f"{old['id']}.mp4").exists()
+
+
+def test_trash_hides_legacy_deleted_and_blocks_broken_restore(client, db, seed_org, media_dir):
+    """이 기능 이전 '옛 삭제'(파일 제거·deleted_at NULL) 강의는 새 휴지통에 안 뜨고, 직접
+    복구 호출도 400으로 막힌다 — 영상 없는 깨진 강의를 학생 화면으로 되살리는 회귀 방지.
+    (skeptic CONFIRMED 회귀: 프로덕션 레거시 삭제 강의 2건.)"""
+    ops_tok = _instructor(client, db)
+    lec = _upload_lecture(client, ops_tok, title="옛날에 지워진 강의").json()
+    # 레거시 상황 재현: status=deleted + deleted_at NULL + 영상 파일 없음(옛 삭제가 지웠던 상태)
+    client.delete(f"/api/v1/ops/lectures/{lec['id']}", headers=auth(ops_tok))
+    row = db.get(Lecture, lec["id"])
+    row.deleted_at = None
+    db.commit()
+    (media_dir / f"{lec['id']}.mp4").unlink(missing_ok=True)
+
+    # 휴지통에 안 뜬다(레거시 숨김)
+    trash = client.get("/api/v1/ops/lectures/trash", headers=auth(ops_tok)).json()
+    assert lec["id"] not in [t["id"] for t in trash]
+
+    # 직접 복구 호출도 400(영상 없어 복구 불가) — 학생 카탈로그로 못 되살아난다
+    r = client.post(f"/api/v1/ops/lectures/{lec['id']}/restore", headers=auth(ops_tok))
+    assert r.status_code == 400, r.text
+    assert db.get(Lecture, lec["id"]).status == "deleted"  # 여전히 삭제 상태(복구 안 됨)
 
 
 def test_question_image_size_exception_and_other_paths_413(

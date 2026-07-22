@@ -30,6 +30,7 @@
 체크포인트 캡차 발급/채점 자체는 공개 캡차 API(captcha_api.py)의 ?lecture= 분기가 담당한다.
 """
 
+import logging
 import os
 import re
 import time
@@ -53,7 +54,7 @@ from fastapi.responses import FileResponse
 from jwt import PyJWTError
 from pydantic import BaseModel, Field
 from sqlalchemy import case, func, not_
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
@@ -77,6 +78,7 @@ from app.services.captcha_service import EDU_SUBJECTS
 from app.utils.helpers import audit
 
 router = APIRouter(tags=["lectures"])
+_log = logging.getLogger(__name__)
 
 # 확장자·Content-Type 화이트리스트 — 이 둘 밖의 업로드는 거절(경로조작·비디오 위장 차단)
 _MEDIA_TYPES = {".mp4": "video/mp4", ".webm": "video/webm"}
@@ -1689,73 +1691,108 @@ def ops_delete_lecture(
     principal: Principal = Depends(require_content_author),
     db: Session = Depends(get_db),
 ):
-    """소프트 삭제 + 영상·자료 파일 물리 삭제 — 레코드·시청 이력·문항·자료 행은 보존
-    (status=deleted로 노출만 차단)하되, 무거운 영상/자료 파일은 디스크에서 지운다(삭제된
-    강의는 status 필터로 재생·조회가 안 되므로 파일 부재가 무해하다).
+    """삭제 = 휴지통으로 이동(소프트 삭제·복구 가능) — status='deleted' + deleted_at 기록.
 
-    자료(material)도 함께 소프트 삭제한다 — 부모 강의가 deleted면 자료 CRUD 경로가 전부
-    404가 되어(자료는 부모 강의 존재를 요구) 자료를 개별로 지울 방법이 사라지므로, 여기서
-    같이 정리하지 않으면 자료 파일이 영구 고아로 남는다(바로 이 기능이 막으려는 디스크 누수).
-
-    파일 삭제는 commit '성공 후'에 한다 — commit 전에 지우면 commit 실패 시 파일은 없는데
-    레코드는 active로 남는 최악이 된다. 파일 부재는 status=deleted + *_bytes=0으로
-    나타내고, 원래 크기는 감사 로그 before에 남긴다."""
+    영상·자료·문항·전사 등 **행과 파일을 전부 보존**한다. 삭제된 강의는 status 필터로
+    학생·목록에서 안 보이지만, 복구(POST .../restore)하면 원상 재생까지 완전히 돌아온다.
+    디스크는 30일 뒤 자동 완전삭제(purge_expired_trash) 또는 운영자의 '완전 삭제'로 회수한다.
+    (이 방식은 사용자 결정 0722 — 파일 보존 + 30일 자동 완전삭제.)"""
     lec = _get_ops_lecture(db, lecture_id, principal)  # 강사는 자기 강의만(스코프)
-    video_path = _video_path(lec)  # commit 후에는 속성이 만료되므로 경로를 미리 확정
-    file_existed = video_path.is_file()
-
-    # 이 강의의 살아있는 자료 — 함께 소프트 삭제하고 file 종류는 파일 경로를 미리 모은다
-    materials = (
-        db.query(LectureMaterial)
-        .filter(
-            LectureMaterial.lecture_id == lec.id,
-            LectureMaterial.status != "deleted",
-        )
-        .all()
-    )
-    material_paths: list[Path] = []
-    for m in materials:
-        if m.kind == "file" and m.file_ext:
-            material_paths.append(_material_path(m))
-        m.status = "deleted"
-        m.file_bytes = 0
-
-    # 문항 이미지도 함께 물리 삭제 — 부모 강의가 deleted면 문항 CRUD 경로가 전부 404가 되어
-    # 이미지를 개별로 지울 방법이 사라진다(자료실 고아 파일 버그와 동형). 문항 행·payload는
-    # 보존한다. deleted 문항의 파일은 이미 지워졌지만 unlink가 멱등이라 전수 수집이 단순·안전하다.
-    question_rows = (
-        db.query(LectureQuestion).filter(LectureQuestion.lecture_id == lec.id).all()
-    )
-    question_image_paths: list[Path] = [
-        _question_image_path(r)
-        for qr in question_rows
-        for r in _question_image_refs(qr.payload or {})
-    ]
-
-    before = {"status": lec.status, "video_bytes": int(lec.video_bytes or 0)}
+    before = {"status": lec.status}
     lec.status = "deleted"
-    lec.video_bytes = 0
+    lec.deleted_at = datetime.now()  # 30일 자동삭제 기준 시각(로컬 naive·KST 규약)
     audit(
         db,
-        action="lecture.delete",
+        action="lecture.trash",
         actor_user_id=principal.id,
         target_type="lecture",
         target_id=lec.id,
         before=before,
-        after={
-            "status": "deleted",
-            "video_file_removed": file_existed,
-            "materials_deleted": len(materials),
-            "question_images_removed": len(question_image_paths),
-        },
+        after={"status": "deleted", "restorable": True},
     )
     db.commit()
-    video_path.unlink(missing_ok=True)  # 이미 없어도 무해(멱등)
-    for p in material_paths:
-        p.unlink(missing_ok=True)
-    for p in question_image_paths:
-        p.unlink(missing_ok=True)
-    return {"ok": True}
+    return {"ok": True, "status": "deleted"}
+
+
+@router.post("/ops/lectures/{lecture_id}/restore")
+def ops_restore_lecture(
+    lecture_id: str,
+    principal: Principal = Depends(require_content_author),
+    db: Session = Depends(get_db),
+):
+    """휴지통에서 복구 — status를 active로 되돌리고 deleted_at을 지운다. 파일·문항·전사가
+    보존돼 있어 복구 즉시 원상 재생·출제가 가능하다(휴지통 삭제가 파일을 안 지운 이유)."""
+    lec = _get_ops_lecture_trashed(db, lecture_id, principal)
+    # 복구 가드 — 영상 파일이 없으면 복구를 막는다. '옛 삭제'(파일 제거·deleted_at NULL)나
+    # 파일이 유실된 강의를 되살리면 학생 카탈로그에 재생 불가(스트림 404)인 깨진 강의가 노출된다.
+    # (목록은 이미 레거시를 숨기지만, 직접 API 호출까지 여기서 막는다 — 이중 방어.)
+    if lec.deleted_at is None or not _video_path(lec).is_file():
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            detail="이 강의는 영상 파일이 없어 복구할 수 없어요(예전에 완전히 삭제된 강의예요).",
+        )
+    lec.status = "active"
+    lec.deleted_at = None
+    audit(
+        db,
+        action="lecture.restore",
+        actor_user_id=principal.id,
+        target_type="lecture",
+        target_id=lec.id,
+        after={"status": "active"},
+    )
+    db.commit()
+    return {"ok": True, "status": "active"}
+
+
+@router.delete("/ops/lectures/{lecture_id}/permanent")
+def ops_permanent_delete_lecture(
+    lecture_id: str,
+    principal: Principal = Depends(require_content_author),
+    db: Session = Depends(get_db),
+):
+    """완전 삭제 — 되돌릴 수 없이 문항·전사·시청이력·자료 행과 모든 파일을 물리 제거한다.
+
+    ★반드시 휴지통(status=deleted)에 있는 강의만 완전삭제할 수 있다 — 활성 강의를 한 번에
+    영구 삭제하는 실수를 막는다(먼저 삭제→휴지통, 그다음 완전삭제의 2단계 강제)."""
+    lec = _get_ops_lecture_trashed(db, lecture_id, principal)
+    result = lecture_service.hard_delete_lecture(db, lec)  # 행·파일 물리 제거 + commit
+    audit(
+        db,
+        action="lecture.purge",
+        actor_user_id=principal.id,
+        target_type="lecture",
+        target_id=lecture_id,
+        after=result,
+    )
+    db.commit()  # 감사 로그 커밋(hard_delete는 강의 행을 이미 지웠다)
+    return {"ok": True, "purged": result}
+
+
+@router.get("/ops/lectures/trash")
+def ops_list_trash(
+    principal: Principal = Depends(require_lecture_manager), db: Session = Depends(get_db)
+):
+    """휴지통 목록 — 삭제된(복구 가능한) 강의. 조회 시 30일 지난 것은 먼저 자동 완전삭제한다
+    (스케줄러가 없어 기회적 정리). days_left = 자동삭제까지 남은 일수(음수 없음)."""
+    try:
+        purged = lecture_service.purge_expired_trash(db)  # 만료분 자동 완전삭제(멱등)
+        if purged:
+            _log.info("휴지통 자동 정리: 30일 지난 강의 %d개 완전삭제", purged)
+    except SQLAlchemyError as exc:  # 정리 실패가 목록 조회를 막지 않게
+        db.rollback()
+        _log.warning("휴지통 자동 정리 건너뜀: %s", exc)
+
+    # deleted_at IS NOT NULL만 — 이 기능 이전 '옛 삭제'(파일까지 물리 제거·deleted_at 없음)
+    # 강의는 복구해도 영상이 없어 깨진다. 그래서 휴지통에 아예 안 띄운다(예전처럼 조용히 묻힘).
+    # 새 삭제(휴지통)만 복구 대상이다. (복구 경로에도 영상 존재 가드가 이중으로 있다.)
+    q = db.query(Lecture).filter(
+        Lecture.status == "deleted", Lecture.deleted_at.isnot(None)
+    )
+    if principal.role == "instructor":
+        q = q.filter(Lecture.uploaded_by == principal.id)
+    rows = q.order_by(Lecture.deleted_at.desc()).all()
+    return [_trash_row(db, lec) for lec in rows]
 
 
 # ---------------------------------------------------------------- 문항 CRUD
@@ -1770,6 +1807,43 @@ def _get_ops_lecture(db: Session, lecture_id: str, principal: Principal) -> Lect
     if principal.role == "instructor" and lec.uploaded_by != principal.id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="강의를 찾을 수 없습니다.")
     return lec
+
+
+def _get_ops_lecture_trashed(db: Session, lecture_id: str, principal: Principal) -> Lecture:
+    """휴지통(복구/완전삭제)용 로더 — _get_ops_lecture와 달리 status='deleted'인 강의만 받는다.
+    활성 강의로 restore/permanent를 부르면 404(휴지통에 없음), 스코프(강사=자기 것)는 동일."""
+    lec = db.get(Lecture, lecture_id)
+    if lec is None or lec.status != "deleted":
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="휴지통에서 강의를 찾을 수 없습니다.")
+    if principal.role == "instructor" and lec.uploaded_by != principal.id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="휴지통에서 강의를 찾을 수 없습니다.")
+    return lec
+
+
+def _trash_row(db: Session, lec: Lecture) -> dict:
+    """휴지통 항목 — 목록 표시 + 자동삭제까지 남은 일수(days_left). deleted_at NULL(구데이터)이면
+    자동삭제 대상이 아니므로 days_left=None(영구 보존 표시)."""
+    total = (
+        db.query(func.count(LectureQuestion.id))
+        .filter(LectureQuestion.lecture_id == lec.id)
+        .scalar()
+        or 0
+    )
+    days_left: int | None = None
+    if lec.deleted_at is not None:
+        elapsed = (datetime.now() - lec.deleted_at).days
+        days_left = max(0, lecture_service.TRASH_RETENTION_DAYS - elapsed)
+    return {
+        "id": lec.id,
+        "title": lec.title,
+        "subject": lec.subject,
+        "course_id": lec.course_id,
+        "video_bytes": int(lec.video_bytes or 0),
+        "duration_sec": lec.duration_sec,
+        "question_count": int(total),
+        "deleted_at": lec.deleted_at.isoformat() if lec.deleted_at else None,
+        "days_left": days_left,  # 자동 완전삭제까지 남은 일수(None=구데이터·자동삭제 안 함)
+    }
 
 
 def _question_row(q: LectureQuestion) -> dict:
