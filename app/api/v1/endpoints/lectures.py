@@ -511,6 +511,7 @@ def list_student_courses(
                 "id": c.id,
                 "title": c.title,
                 "subject": c.subject,
+                "category": c.category,  # 브라우징 대분류(과목 대체) — 학생 목록이 이걸로 묶는다
                 "description": c.description,
                 "order_no": int(c.order_no or 0),
                 "instructor_name": names.get(c.instructor_id),
