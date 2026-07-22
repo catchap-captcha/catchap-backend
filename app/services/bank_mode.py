@@ -37,6 +37,11 @@ SRS_LADDER_DAYS = [1, 3, 7, 14, 30]
 # 오늘의 Q 일일 목표(1세트) — 퀴즈 통합 결정(0719): 매일 습관의 기준선. 목표 달성일이
 # 연속되면 '연속 학습일'이 쌓인다. 풀이 커져도 목표는 이 값 하나(천장이 아니라 바닥).
 Q_DAILY_GOAL = 10
+# 일일 신규 상한(2026-07-23) — 한 학생이 하루에 '새로(처음) 시작'할 수 있는 문항 수(과목당).
+# Anki new-card-limit 원리: 신규를 무제한 열면 며칠 뒤 만기 복습이 폭증한다. 오늘의 Q(pick_question)와
+# 코스 Q(pick_from)가 같은 _classify의 new를 내므로, 상한을 공유 지점에서 걸어 두 경로가 과목별
+# '하루 새 문항 예산'을 공유하게 한다(한 곳만 막으면 다른 곳으로 우회). 기본 20 — 운영 판단으로 조정.
+DAILY_NEW_CAP = 20
 
 
 def _now() -> datetime:
@@ -206,6 +211,25 @@ def _classify(db: Session, student: StudentProfile, subject: str, ids: list[str]
     return due, wrong, new, resting, by_id
 
 
+def _daily_new_remaining(db: Session, student_id: str, subject: str) -> int:
+    """오늘 이 과목에서 더 시작할 수 있는 새 문항 수 = DAILY_NEW_CAP − 오늘 새로 시작한 수.
+    '오늘 새로 시작' = 오늘 처음 답해 상태 행(StudentQuestionState)이 오늘 생성된 문항 수
+    (record_answer가 new를 첫 채점 시 행을 만든다). 오늘의 Q·코스 Q가 같은 과목이면 이 예산을
+    공유한다(둘 다 이 함수를 거쳐 new를 억제)."""
+    day_start = _now().replace(hour=0, minute=0, second=0, microsecond=0)
+    started = (
+        db.query(func.count(StudentQuestionState.id))
+        .filter(
+            StudentQuestionState.student_id == student_id,
+            StudentQuestionState.subject == subject,
+            StudentQuestionState.created_at >= day_start,
+        )
+        .scalar()
+        or 0
+    )
+    return max(0, DAILY_NEW_CAP - int(started))
+
+
 def split_pool(db: Session, student: StudentProfile | None, subject: str):
     """은행 전체를 (안 푼, 틀린, 맞춘)으로 분할 — 진도 화면(progress)용 하위호환 형태.
     잠긴 강의 문항은 제외해 진도 수치가 '접근 가능한 문항' 기준이 되게 한다."""
@@ -230,6 +254,8 @@ def pick_question(
     if student is None:
         return subject_banks.get_question(subject, random.choice(ids))
     due, wrong, new, resting, by_id = _classify(db, student, subject, ids)
+    if new and _daily_new_remaining(db, student.id, subject) <= 0:
+        new = []  # 오늘 새 문항 상한 도달 — 복습·틀린 것만 낸다(신규 폭증 방지)
     for group in (due, wrong, new):
         if group:
             return subject_banks.get_question(subject, random.choice(group))
@@ -253,6 +279,8 @@ def pick_from(
     if student is None:
         return subject_banks.get_question(subject, random.choice(ids))
     due, wrong, new, resting, _ = _classify(db, student, subject, ids)
+    if new and _daily_new_remaining(db, student.id, subject) <= 0:
+        new = []  # 코스 Q도 하루 새 문항 예산을 공유(우회 방지) — 복습·틀린·휴면만 낸다
     for group in (due, wrong, new, resting):
         if group:
             return subject_banks.get_question(subject, random.choice(group))
@@ -263,13 +291,15 @@ def queue_status(db: Session, student: StudentProfile, subject: str) -> dict:
     """오늘의 큐 현황 — '오늘 완료' 안내(다음 복습일)와 진도 카드의 원천."""
     ids = _unlocked_ids(db, student, subject, [q["id"] for q in subject_banks.playable_pool(subject)])
     due, wrong, new, resting, by_id = _classify(db, student, subject, ids)
+    # 새 문항 수는 '오늘 더 시작 가능한 만큼'으로 보여 서빙(pick)과 일치시킨다(일일 상한 반영).
+    new_today = min(_daily_new_remaining(db, student.id, subject), len(new))
     next_at = min(
         (by_id[i].next_review_at for i in resting if by_id[i].next_review_at), default=None
     )
     return {
         "due": len(due),
         "wrong": len(wrong),
-        "new": len(new),
+        "new": new_today,
         "resting": len(resting),
         "next_review_at": next_at.isoformat() if next_at else None,
     }
