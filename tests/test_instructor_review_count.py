@@ -33,3 +33,23 @@ def test_bank_placed_draft_excluded_from_review_count(client, db, media_dir):
     assert d["draft_lecture_questions"] == 1, d
     by_lec = {r["lecture_id"]: r["draft_count"] for r in d["draft_by_lecture"]}
     assert by_lec.get(lec["id"]) == 1, d
+
+
+def test_review_sample_includes_drafts_excludes_bank_placed(client, db, media_dir):
+    """표본 검수 — 검수 대기(draft) 무작위 표본을 대시보드에 얹되 bank_placed는 제외."""
+    itok = _instructor(client, db)
+    lec = _upload_lecture(client, itok).json()
+    for i in range(3):
+        _add_question(client, itok, lec["id"], position=i + 1, status="draft", prompt=f"검수 표본 문항 {i}")
+    _add_question(client, itok, lec["id"], position=9, status="draft", prompt="은행 보낸 문항")
+    rows = db.query(LectureQuestion).filter(LectureQuestion.lecture_id == lec["id"]).all()
+    placed = next(r for r in rows if "은행 보낸" in (r.payload or {}).get("prompt", ""))
+    placed.payload = {**(placed.payload or {}), "bank_placed": {"bank_id": "x", "at": "t"}}
+    db.commit()
+
+    d = client.get("/api/v1/ops/instructor/dashboard", headers=auth(itok)).json()
+    sample = d["review_sample"]
+    prompts = {s["prompt"] for s in sample}
+    assert len(sample) == 3, sample  # bank_placed 제외 → draft 3개 전부(≤6)
+    assert "은행 보낸 문항" not in prompts
+    assert all("lecture_title" in s and "suggested_placement" in s for s in sample)

@@ -1184,24 +1184,41 @@ def ops_instructor_dashboard(
     draft_by_lecture: list[dict] = []
     draft_lecture_q = 0
     lectures_without_checkpoint = 0
+    review_sample: list[dict] = []  # 표본 검수(문제은행 2단계) — 검수 대기 문항 무작위 표본
     if lec_ids:
-        # 검수 대기(draft) 집계 — 단, '문제은행으로 보낸(payload.bank_placed)' 문항은 이미
-        # 처리된 것이라 제외한다. to-bank가 active 문항을 draft로 강등시키므로(은행행=봇이 푸는
-        # 문항이라 캡차 부적합), 제외하지 않으면 은행에 보낸 문항이 검수 대기로 영영 남는다(버그).
-        # JSON 필드(bank_placed) 조건은 DB 방언차가 있어, draft 행을 받아 파이썬에서 센다
-        # (강사당 draft 수는 작아 부담 없음).
-        draft_counts: dict[str, int] = {}
-        for lid, payload in (
-            db.query(LectureQuestion.lecture_id, LectureQuestion.payload)
+        # 검수 대기(draft) 행을 한 번 받아 카운트 + 표본 검수 후보로 함께 쓴다. '문제은행으로
+        # 보낸(payload.bank_placed)' 문항은 이미 처리된 것이라 제외한다(to-bank가 active를 draft로
+        # 강등시키므로, 제외 안 하면 은행 보낸 문항이 검수 대기로 영영 남는 버그). JSON 필드
+        # 조건은 DB 방언차가 있어 파이썬에서 판정(강사당 draft 수는 작아 부담 없음).
+        draft_rows = (
+            db.query(LectureQuestion)
             .filter(
                 LectureQuestion.lecture_id.in_(lec_ids),
                 LectureQuestion.status == "draft",
             )
             .all()
-        ):
-            if (payload or {}).get("bank_placed"):
+        )
+        draft_counts: dict[str, int] = {}
+        review_cands: list[LectureQuestion] = []
+        for r in draft_rows:
+            if (r.payload or {}).get("bank_placed"):
                 continue
-            draft_counts[lid] = draft_counts.get(lid, 0) + 1
+            draft_counts[r.lecture_id] = draft_counts.get(r.lecture_id, 0) + 1
+            review_cands.append(r)
+        # 표본 검수 — 강의별로 일일이 안 들어가도 생성 품질을 빠르게 점검하도록 무작위 최대 6개.
+        import random
+
+        title_by = {lec.id: lec.title for lec in my_lectures}
+        for r in random.sample(review_cands, min(6, len(review_cands))):
+            p = r.payload or {}
+            review_sample.append({
+                "question_id": r.id,
+                "lecture_id": r.lecture_id,
+                "lecture_title": title_by.get(r.lecture_id, ""),
+                "prompt": p.get("prompt", ""),
+                "suggested_placement": p.get("suggested_placement"),  # bank|captcha|discard|None
+                "solver_passed": p.get("solver_passed"),
+            })
         active_counts = dict(
             db.query(LectureQuestion.lecture_id, func.count(LectureQuestion.id))
             .filter(
@@ -1421,6 +1438,7 @@ def ops_instructor_dashboard(
         "draft_lecture_questions": draft_lecture_q,
         "draft_exam_questions": draft_exam_q,
         "draft_by_lecture": draft_by_lecture,
+        "review_sample": review_sample,  # 표본 검수 — 검수 대기 문항 무작위 표본(품질 점검)
         "lectures_without_checkpoint": lectures_without_checkpoint,
         "active_learners": active_learners,
         "completed_watches": completed_watches,
