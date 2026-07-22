@@ -118,6 +118,71 @@ def test_runner_records_error_on_failure(client, db, monkeypatch, tmp_path):
         s.close()
 
 
+def test_runner_notifies_instructor_on_done(client, db, monkeypatch, tmp_path):
+    """생성 완료 시 요청 강사에게 인앱 알림 + 이메일(dev=dry-run·EmailLog 기록)이 간다.
+    (사용자 요청 0722: 강사가 생성 걸어두고 떠나도 완료를 알림·메일로 받게.)"""
+    from app.models import EmailLog, Notification, User
+
+    _mock_ai(monkeypatch, tmp_path)
+    tok = _instructor(client, db, email="notify-done@t.dev")
+    inst = db.query(User).filter(User.email == "notify-done@t.dev").first()
+    lec_id = _lec_with_transcript(client, db, tok)
+    job = LectureQuestionGenJob(lecture_id=lec_id, requested_by=inst.id, n=1, status="pending")
+    db.add(job)
+    db.commit()
+    job_id = job.id
+
+    lec_ep._run_question_gen_job(job_id, session_factory=TestSession)
+
+    s = TestSession()
+    try:
+        notes = (
+            s.query(Notification)
+            .filter(Notification.user_id == inst.id, Notification.type == "lecture_gen")
+            .all()
+        )
+        assert len(notes) == 1
+        assert "완료" in notes[0].title and notes[0].read_at is None
+        # 이메일도 시도됨(개발=dry-run) → EmailLog 기록
+        assert s.query(EmailLog).filter(EmailLog.to_email == "notify-done@t.dev").count() >= 1
+    finally:
+        s.close()
+
+
+def test_runner_notifies_instructor_on_error(client, db, monkeypatch, tmp_path):
+    """생성 실패 시에도 요청 강사에게 실패 알림이 간다(조용한 실패 금지)."""
+    from app.models import Notification, User
+
+    _mock_ai(monkeypatch, tmp_path)
+
+    def boom(**k):
+        from app.clients.ai_client import AiGenerationError
+
+        raise AiGenerationError("LLM 파싱 실패")
+
+    monkeypatch.setattr(ai_client, "generate_lecture_questions", boom)
+    tok = _instructor(client, db, email="notify-fail@t.dev")
+    inst = db.query(User).filter(User.email == "notify-fail@t.dev").first()
+    lec_id = _lec_with_transcript(client, db, tok)
+    job = LectureQuestionGenJob(lecture_id=lec_id, requested_by=inst.id, n=1, status="pending")
+    db.add(job)
+    db.commit()
+    job_id = job.id
+
+    lec_ep._run_question_gen_job(job_id, session_factory=TestSession)
+
+    s = TestSession()
+    try:
+        note = (
+            s.query(Notification)
+            .filter(Notification.user_id == inst.id, Notification.type == "lecture_gen")
+            .first()
+        )
+        assert note is not None and "실패" in note.title
+    finally:
+        s.close()
+
+
 def test_gen_job_status_scoped_to_owner(client, db, monkeypatch, tmp_path):
     """생성 잡 상태 폴링은 소유 강사만 — 남의 강의 잡은 404(존재 미노출)."""
     _mock_ai(monkeypatch, tmp_path)

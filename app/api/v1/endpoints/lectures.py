@@ -3091,8 +3091,38 @@ def ops_question_gen_job(
     return _gen_job_row(job)
 
 
+def _notify_gen_result(db: Session, job: LectureQuestionGenJob, lec_title: str, *, ok: bool) -> None:
+    """문항 생성 잡 완료/실패를 요청 강사에게 알린다(인앱 + 이메일). 알림 실패가 잡을
+    오염시키지 않도록 호출부에서 예외를 삼킨다 — 알림은 부가 기능이지 잡 결과가 아니다."""
+    from app.services import notify_service
+
+    if ok:
+        n = int(job.created_count or 0)
+        title = f"‘{lec_title}’ 문항 생성이 완료됐어요"
+        message = (
+            f"AI 문항 {n}개가 생성되어 검수 대기 중이에요. 강의 콘솔에서 확인·공개해 주세요."
+            if n > 0
+            else "문항 생성이 끝났지만 새로 만들어진 문항이 없어요. 자막·강의 내용을 확인해 주세요."
+        )
+    else:
+        title = f"‘{lec_title}’ 문항 생성이 실패했어요"
+        message = (
+            f"자동 생성 중 문제가 생겼어요: {(job.error_detail or '알 수 없는 오류')[:200]} "
+            "설정(LLM 키·자막)을 확인한 뒤 다시 시도해 주세요."
+        )
+    notify_service.notify_user(
+        db,
+        job.requested_by,
+        type="lecture_gen",
+        category="문항 생성",
+        title=title,
+        message=message,
+        email_html=f"<p>{message}</p>",
+    )
+
+
 def _fail_gen_job(db: Session, job_id: str, detail: str) -> None:
-    """잡을 error로 표기 — 실패 원인을 정직하게 남긴다(성공 위장 금지)."""
+    """잡을 error로 표기 — 실패 원인을 정직하게 남긴다(성공 위장 금지). 실패 시에도 강사에게 알린다."""
     try:
         db.rollback()
         job = db.get(LectureQuestionGenJob, job_id)
@@ -3101,6 +3131,11 @@ def _fail_gen_job(db: Session, job_id: str, detail: str) -> None:
             job.error_detail = (detail or "생성 실패")[:2000]
             job.finished_at = datetime.now()
             db.commit()
+            lec = db.get(Lecture, job.lecture_id)
+            try:
+                _notify_gen_result(db, job, lec.title if lec else "강의", ok=False)
+            except Exception as exc:  # 알림 실패가 잡 실패 처리를 막지 않게
+                _log.warning("생성 실패 알림 전송 실패 job=%s: %s", job_id, exc)
     except Exception:
         db.rollback()
 
@@ -3143,6 +3178,10 @@ def _run_question_gen_job(job_id: str, *, session_factory=SessionLocal) -> None:
         job.verify_error = summary.get("verify_error")
         job.finished_at = datetime.now()
         db.commit()
+        try:  # 완료 알림(인앱+이메일) — 실패해도 잡 성공은 그대로(알림은 부가)
+            _notify_gen_result(db, job, lec.title, ok=True)
+        except Exception as exc:
+            _log.warning("생성 완료 알림 전송 실패 job=%s: %s", job_id, exc)
     except HTTPException as e:  # 헬퍼의 503/502(키없음·STT실패) — 잡 error로 정직 노출
         _fail_gen_job(db, job_id, str(e.detail))
     except Exception as e:  # 예기치 못한 실패도 잡에 남긴다(조용한 실패 금지)
