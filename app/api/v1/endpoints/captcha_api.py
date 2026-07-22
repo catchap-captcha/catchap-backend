@@ -337,13 +337,23 @@ def _lecture_challenge(db: Session, request: Request, api: ApiKey, lecture_id: s
     # URL은 무인증 서빙 엔드포인트 경로뿐 — 어떤 보기 이미지도 정오 신호를 담지 않는다
     # (answer는 지금처럼 서명 토큰에만 들어간다).
     opt_imgs = payload.get("option_images") or {}
+    # ★보기 셔플(2026-07-22) — 정답이 항상 같은 위치(원래 answer_index)에 나오면 위치를
+    #  외우거나 특정 id만 찍는 봇이 시청 없이 통과한다. 매 출제마다 보기 순서를 무작위로
+    #  재배치하고 id도 '표시 위치'로 새로 부여한 뒤, 정답 id를 새 위치로 다시 매핑한다.
+    raw_opts = payload.get("options", [])
+    answer_orig = {int(i) for i in (q.answer_indexes or [q.answer_index])}
+    perm = list(range(len(raw_opts)))
+    random.shuffle(perm)  # new_pos → 원래 인덱스
     options = []
-    for i, t in enumerate(payload.get("options", [])):
-        opt = {"id": str(i), "text": str(t)}
-        ref = opt_imgs.get(str(i))
+    new_answer_ids: list[int] = []
+    for new_i, orig_i in enumerate(perm):
+        opt = {"id": str(new_i), "text": str(raw_opts[orig_i])}
+        ref = opt_imgs.get(str(orig_i))  # 이미지 참조는 '원래' 인덱스 키로 저장돼 있다
         if isinstance(ref, dict) and ref.get("id"):
             opt["image"] = _question_image_url(lec.id, q.id, ref)
         options.append(opt)
+        if orig_i in answer_orig:
+            new_answer_ids.append(new_i)
     # multi(끌어 담기) 렌더러 — boxLabel이 있으면 위젯이 보기를 상자로 드래그해 담는 모드로
     # 그린다(탭 토글 폴백 공존 — 접근성 유지). 단일 정답 문항도 multi로 낸다: 클릭 한 점과
     # 달리 드래그는 속도·경로 궤적이 남아 이상행동 판별 모델의 학습 데이터가 된다.
@@ -367,10 +377,9 @@ def _lecture_challenge(db: Session, request: Request, api: ApiKey, lecture_id: s
     # 위해 어떤 문항이 출제됐는지 서명 토큰에 봉인한다(cp 역조회는 레거시 중복 핀 때문에
     # 모호하고, 클라이언트 신고는 신뢰하지 않는다).
     meta = {"subj": lec.subject, "lec": lec.id, "cp": cp, "qid": q.id, "bank": True}
-    # NULL이면 [answer_index] — 하위호환 규약(기존 행 무변경). select_all은 집합 정확 일치
-    # 채점이라 부분 선택·초과 선택은 오답, 단일 정답이면 1개만 담아 제출하면 통과한다.
-    ids = q.answer_indexes or [q.answer_index]
-    ch = cs._wrap("select_all", sorted(str(int(i)) for i in ids), public, meta)
+    # 셔플된 '표시 위치' 기준 정답 id로 서명한다(원래 answer_index가 아니라 new_answer_ids).
+    # select_all은 집합 정확 일치 채점이라 부분 선택·초과 선택은 오답, 단일 정답이면 1개만 담아 통과.
+    ch = cs._wrap("select_all", sorted(str(i) for i in new_answer_ids), public, meta)
     return _emit_challenge(db, api, lec.subject, ch)
 
 

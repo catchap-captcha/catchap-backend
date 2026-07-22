@@ -29,6 +29,13 @@ from app.models import (
 from tests.test_captcha_api import _instructor, _ops, auth
 
 
+@pytest.fixture(autouse=True)
+def _stable_option_order(monkeypatch):
+    """게이트 테스트는 정답 위치를 '원래 인덱스'로 안다고 가정한다 — 보기 셔플(2026-07-22)을
+    이 모듈에서만 끈다(no-op). 보기 셔플 자체 동작은 tests/test_captcha_shuffle.py가 검증한다."""
+    monkeypatch.setattr("random.shuffle", lambda seq: None)
+
+
 def _student_token(client, seed_org):
     return client.post(
         "/api/v1/auth/student-login",
