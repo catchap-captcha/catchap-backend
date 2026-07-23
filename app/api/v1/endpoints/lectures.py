@@ -75,7 +75,7 @@ from app.models import (
     StudentProfile,
     User,
 )
-from app.services import auth_service, lecture_service
+from app.services import auth_service, lecture_service, notify_service
 from app.services.captcha_service import EDU_SUBJECTS
 from app.utils.helpers import audit
 
@@ -492,6 +492,17 @@ def list_student_courses(
         )
         .all()
     }
+    # 코스별 총 수강 인원(active) — 소셜 증거('N명 수강'). 벌크 group_by 1쿼리로 N+1 회피.
+    enroll_counts = {
+        r[0]: int(r[1])
+        for r in db.query(CourseEnrollment.course_id, func.count(CourseEnrollment.id))
+        .filter(
+            CourseEnrollment.course_id.in_(course_ids or [""]),
+            CourseEnrollment.status == "active",
+        )
+        .group_by(CourseEnrollment.course_id)
+        .all()
+    }
     out = []
     for c in courses:
         lec_ids = [
@@ -520,6 +531,8 @@ def list_student_courses(
                 "lecture_count": len(lec_ids),
                 # 수강신청 여부 — true면 '내 코스'(신청함), false면 카탈로그(수강신청 버튼)
                 "enrolled": c.id in enrolled_ids,
+                # 총 수강 인원(소셜 증거) — 카드에 'N명 수강' 표기
+                "enrolled_count": enroll_counts.get(c.id, 0),
                 # 코스 Q — 이 코스 강의에서 은행으로 배치된 문항 수. 화면 규칙:
                 # unlocked>0 → '이 코스 문제 풀기(N)' 버튼 / total>0 & unlocked=0 →
                 # "완주하면 열려요" 잠금 안내 / total=0 → 아무것도 안 보임(아직 없음).
@@ -555,14 +568,43 @@ def list_student_courses(
     return out
 
 
+def _notify_enroll(student_id: str, course_id: str, *, session_factory=SessionLocal) -> None:
+    """수강신청 완료 알림(인앱 + 이메일) — 백그라운드로 보낸다.
+
+    왜 백그라운드인가: 이메일 SMTP는 1~2초 걸려 신청 클릭 응답을 느리게 한다. 신청은 즉시
+    커밋·반환하고, 알림은 응답 후 이 러너가 자기 세션으로 보낸다. 알림 실패가 신청을 되돌리지
+    않도록 예외는 삼킨다(신청은 이미 성공·커밋됨). 세션 팩토리는 테스트 교체용."""
+    db = session_factory()
+    try:
+        student = db.get(StudentProfile, student_id)
+        course = db.get(Course, course_id)
+        if student is None or course is None:
+            return
+        notify_service.notify_student(
+            db, student,
+            type="course_enrolled",
+            category="학습",
+            title="수강신청 완료",
+            message=f"‘{course.title}’ 코스 수강신청이 완료됐어요. 지금 바로 학습을 시작할 수 있어요.",
+        )
+    except Exception:  # noqa: BLE001 — 알림 실패가 요청/신청을 오염시키지 않게 삼킨다
+        _log.warning("수강신청 알림 실패 student=%s course=%s", student_id, course_id, exc_info=True)
+    finally:
+        db.close()
+
+
 @router.post("/courses/{course_id}/enroll")
 def enroll_course(
     course_id: str,
+    background_tasks: BackgroundTasks,
     principal: Principal = Depends(require_student),
     db: Session = Depends(get_db),
 ):
     """코스 수강신청 — 무료 자유 신청(Coursera 무료 모델). 재신청(취소했던 코스)이면 같은 행을
-    active로 되살려 이전 진도를 이어간다((student_id, course_id) 1행 upsert). 활성 코스만 가능."""
+    active로 되살려 이전 진도를 이어간다((student_id, course_id) 1행 upsert). 활성 코스만 가능.
+
+    신청이 '새로 active가 되는 전환'일 때만 완료 알림을 보낸다(이미 수강 중인데 다시 눌러도
+    중복 알림 안 보냄). 알림은 응답 후 백그라운드(인앱+이메일)."""
     c = db.get(Course, course_id)
     if c is None or c.status != "active":
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="코스를 찾을 수 없어요.")
@@ -574,6 +616,8 @@ def enroll_course(
         )
         .first()
     )
+    # 알림은 '미신청/취소 → active' 전환에만. 이미 active면 재클릭이라 안 보낸다.
+    was_active = e is not None and e.status == "active"
     if e is None:
         e = CourseEnrollment(
             student_id=principal.id,
@@ -601,6 +645,8 @@ def enroll_course(
         if e is not None and e.status != "active":
             e.status = "active"
             db.commit()
+    if not was_active:
+        background_tasks.add_task(_notify_enroll, principal.id, course_id)
     return {"ok": True, "enrolled": True}
 
 

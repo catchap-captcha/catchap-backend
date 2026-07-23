@@ -13,7 +13,7 @@ import logging
 from sqlalchemy.orm import Session
 
 from app.email.smtp import send_email
-from app.models import Notification, User
+from app.models import Notification, StudentProfile, User
 
 _log = logging.getLogger(__name__)
 
@@ -47,4 +47,37 @@ def notify_user(
             ok = send_email(db, user.email, title, body, user_id=user_id)
             if not ok:
                 _log.warning("알림 이메일 미발송(SMTP 실패/미설정) user=%s", user_id)
+    return n
+
+
+def notify_student(
+    db: Session,
+    student: StudentProfile,
+    *,
+    type: str,
+    title: str,
+    message: str,
+    category: str = "일반",
+    email_html: str | None = None,
+    send_mail: bool = True,
+) -> Notification:
+    """학생에게 인앱 알림 + (이메일 가입 학생이면) 이메일.
+
+    왜 notify_user와 별개인가: 학생은 User 행이 없다(StudentProfile로 직접 인증·로그인).
+    그래서 인앱 알림 수신자는 Notification.student_id(user_id 아님 — 학생 알림 조회가 이걸로
+    필터한다), 이메일 주소는 student_login_id다(이메일 가입 학생은 아이디가 곧 이메일).
+    기관 경유 학생은 아이디가 이메일이 아닐 수 있으므로 '@' 포함일 때만 메일을 보낸다(오발송 방지).
+    commit은 이 함수가 한다(백그라운드 잡이 자기 세션으로 호출)."""
+    n = Notification(
+        student_id=student.id, type=type, category=category, title=title, message=message
+    )
+    db.add(n)
+    db.commit()
+
+    login_id = student.student_login_id or ""
+    if send_mail and "@" in login_id:
+        body = email_html or f"<p>{message}</p>"
+        ok = send_email(db, login_id, title, body, user_id=None)  # 학생은 User id가 없다
+        if not ok:
+            _log.warning("학생 알림 이메일 미발송(SMTP 실패/미설정) student=%s", student.id)
     return n
