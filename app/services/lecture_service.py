@@ -38,6 +38,13 @@ HEARTBEAT_HEADROOM_SEC = 5
 # 체크포인트 유예(초) — next_checkpoint_sec + GRACE 이상으로는 캡차를 풀기 전까지
 # watched_max가 전진하지 않는다(건너뛰기 차단의 핵심).
 GRACE_SEC = 15
+# 완주 허용치(초) — 영상 실제 끝(클라가 보내는 floor(position)의 최대)이 저장된 duration_sec보다
+# 몇 초 작을 수 있다(컨테이너 메타데이터·반올림·인코딩 여분). 그러면 watched_max가 duration에
+# '영영 못 닿아' 완주(done) 판정이 안 되고 문제은행이 영구 잠긴다(라이브 버그: duration_sec=1007
+# vs 실제 끝 1006 → 1초 차로 미완주). 끝에서 이 여유만큼은 '다 봤다'로 본다. 건너뛰기는 seek
+# 차단(watched_max는 실시청으로만 전진)이 이미 막으므로, 이 여유가 스킵을 열어주지 않는다.
+# 짧은 영상엔 duration의 10%로 상한(min)을 둬 조기 완주(0초에 done)를 막는다.
+COMPLETE_TOLERANCE_SEC = 5
 
 # ---- 동시접속 차단 ----
 # 마지막 하트비트 후 이 시간(초)이 지나면 죽은 세션으로 간주한다. 하트비트 주기(수 초)의
@@ -253,6 +260,16 @@ def ensure_progress(db: Session, student_id: str, lecture: Lecture) -> LectureWa
         return row
 
 
+def _watched_to_end(watched_max: int, duration: int) -> bool:
+    """영상을 끝까지 봤는가 — 저장된 duration에 몇 초 못 미쳐도(컨테이너 메타/반올림) 완주로 본다.
+    허용치는 COMPLETE_TOLERANCE_SEC이되 duration의 10%로 상한을 둔다(짧은 영상 조기 완주 방지).
+    건너뛰기는 seek 차단이 막으므로(watched_max는 실시청으로만 전진) 이 여유가 스킵을 열지 않는다."""
+    if duration <= 0:
+        return False
+    tol = min(COMPLETE_TOLERANCE_SEC, duration // 10)
+    return watched_max >= duration - tol
+
+
 def advance(
     db: Session,
     progress: LectureWatchProgress,
@@ -313,9 +330,8 @@ def advance(
     checkpoint_due = cp is not None and progress.watched_max_sec >= cp
 
     if (
-        progress.watched_max_sec >= duration
+        _watched_to_end(int(progress.watched_max_sec or 0), duration)
         and progress.next_checkpoint_sec is None
-        and duration > 0
     ):
         progress.status = "done"
 
@@ -385,7 +401,7 @@ def record_checkpoint(
         if (
             lec is not None
             and progress.next_checkpoint_sec is None
-            and int(progress.watched_max_sec or 0) >= int(lec.duration_sec or 0)
+            and _watched_to_end(int(progress.watched_max_sec or 0), int(lec.duration_sec or 0))
         ):
             progress.status = "done"
     else:
