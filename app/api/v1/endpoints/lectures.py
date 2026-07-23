@@ -3002,6 +3002,29 @@ def ops_upload_lecture_thumbnail(
     return _lecture_row(db, lec)
 
 
+@router.delete("/ops/lectures/{lecture_id}/thumbnail")
+def ops_delete_lecture_thumbnail(
+    lecture_id: str,
+    principal: Principal = Depends(require_content_author),
+    db: Session = Depends(get_db),
+):
+    """썸네일만 제거 — 강의는 유지하고 대표 이미지만 없앤다(다시 자동 생성 커버로 복귀).
+    파일도 물리 제거(멱등). 강의 완전삭제와 달리 영상·문항·자료는 그대로 둔다."""
+    lec = _get_ops_lecture(db, lecture_id, principal)  # 소유권 검증(강사=자기 강의만·404)
+    if lec.thumbnail_ext:
+        _thumbnail_path(lec).unlink(missing_ok=True)  # 파일 물리 제거(이미 없어도 무해)
+        lec.thumbnail_ext = None
+        audit(
+            db,
+            action="lecture.thumbnail_delete",
+            actor_user_id=principal.id,
+            target_type="lecture",
+            target_id=lec.id,
+        )
+        db.commit()
+    return _lecture_row(db, lec)
+
+
 @router.delete("/ops/lectures/{lecture_id}/questions/{question_id}/images")
 def ops_delete_question_image(
     lecture_id: str,
