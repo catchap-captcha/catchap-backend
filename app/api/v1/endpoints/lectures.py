@@ -69,8 +69,10 @@ from app.models import (
     LectureMaterial,
     LectureQuestion,
     LectureQuestionGenJob,
+    LectureReview,
     LectureTranscript,
     LectureWatchProgress,
+    StudentProfile,
     User,
 )
 from app.services import auth_service, lecture_service
@@ -766,6 +768,161 @@ def lecture_takeover(
     lecture_service.claim_session(db, progress, session_id, force=True)
     db.commit()
     return _session_response(progress, lec, session_id)
+
+
+# ===== 수강 후기 (리뷰) — 플레이어 '수강 후기' 탭 =====
+class _ReviewReq(BaseModel):
+    rating: int = Field(ge=1, le=5)  # 별 1~5
+    text: str | None = Field(default=None, max_length=1000)
+
+
+def _review_summary(rows: list[LectureReview]) -> dict:
+    """활성 후기 목록 → 요약(평균·개수·별점 분포). 평균은 소수 1자리."""
+    n = len(rows)
+    dist = {str(s): 0 for s in range(1, 6)}
+    total = 0
+    for r in rows:
+        total += int(r.rating or 0)
+        dist[str(int(r.rating))] = dist.get(str(int(r.rating)), 0) + 1
+    return {
+        "count": n,
+        "avg": round(total / n, 1) if n else 0.0,
+        "dist": dist,
+    }
+
+
+def _nickname_map(db: Session, student_ids: list[str]) -> dict[str, str]:
+    """student_id → 가명(nickname). 학생 화면 규약(실명 미노출)."""
+    if not student_ids:
+        return {}
+    rows = (
+        db.query(StudentProfile.id, StudentProfile.nickname)
+        .filter(StudentProfile.id.in_(set(student_ids)))
+        .all()
+    )
+    return {sid: nick for sid, nick in rows}
+
+
+@router.get("/lectures/{lecture_id}/reviews")
+def lecture_reviews(
+    lecture_id: str,
+    principal: Principal = Depends(require_student),
+    db: Session = Depends(get_db),
+):
+    """이 강의의 수강 후기 목록 + 요약(평균·개수·별점 분포) + 내 후기.
+
+    조회는 수강 여부와 무관(둘러보는 학생도 평판을 본다). 작성은 POST에서 수강생만 허용한다.
+    표시 이름은 가명(nickname)만 — 실명은 어디에도 싣지 않는다."""
+    lec = _get_active_lecture(db, lecture_id)
+    rows = (
+        db.query(LectureReview)
+        .filter(LectureReview.lecture_id == lec.id, LectureReview.status == "active")
+        .order_by(LectureReview.created_at.desc())
+        .all()
+    )
+    names = _nickname_map(db, [r.student_id for r in rows])
+    mine = None
+    reviews = []
+    for r in rows:
+        is_mine = r.student_id == principal.id
+        item = {
+            "id": r.id,
+            "rating": int(r.rating),
+            "text": r.text or "",
+            "author": names.get(r.student_id, "학습자"),
+            "created_at": r.created_at.isoformat() if r.created_at else None,
+            "mine": is_mine,
+        }
+        reviews.append(item)
+        if is_mine:
+            mine = {"rating": int(r.rating), "text": r.text or ""}
+    return {"summary": _review_summary(rows), "mine": mine, "reviews": reviews}
+
+
+@router.post("/lectures/{lecture_id}/reviews")
+def lecture_review_upsert(
+    lecture_id: str,
+    body: _ReviewReq,
+    principal: Principal = Depends(require_student),
+    db: Session = Depends(get_db),
+):
+    """내 후기 작성/수정(upsert) — 수강생만. (student_id, lecture_id) 유니크라 재작성=수정.
+
+    삭제됐던 내 후기(status='deleted')를 다시 쓰면 되살린다(active). 안 들은 사람의 평점
+    오염을 막으려 _require_enrolled로 게이트한다(재생·상세와 동일 규약)."""
+    lec = _get_active_lecture(db, lecture_id)
+    _require_enrolled(db, lec, principal)  # 수강생만 후기 작성
+    text = (body.text or "").strip() or None
+    existing = (
+        db.query(LectureReview)
+        .filter(
+            LectureReview.student_id == principal.id,
+            LectureReview.lecture_id == lec.id,
+        )
+        .first()
+    )
+    if existing:
+        existing.rating = body.rating
+        existing.text = text
+        existing.status = "active"  # 삭제했던 후기 재작성이면 되살림
+    else:
+        db.add(
+            LectureReview(
+                student_id=principal.id,
+                lecture_id=lec.id,
+                rating=body.rating,
+                text=text,
+                status="active",
+            )
+        )
+    try:
+        db.commit()
+    except IntegrityError:
+        # 동시 첫 작성 경합(유니크) — 이미 있는 행을 수정으로 흡수(course_enroll과 같은 규약)
+        db.rollback()
+        row = (
+            db.query(LectureReview)
+            .filter(
+                LectureReview.student_id == principal.id,
+                LectureReview.lecture_id == lec.id,
+            )
+            .first()
+        )
+        if row:
+            row.rating = body.rating
+            row.text = text
+            row.status = "active"
+            db.commit()
+    audit(
+        db, action="lecture.review.upsert", actor_user_id=principal.id,
+        target_type="lecture", target_id=lec.id,
+        after={"rating": body.rating},
+    )
+    db.commit()
+    return {"ok": True}
+
+
+@router.delete("/lectures/{lecture_id}/reviews/mine")
+def lecture_review_delete(
+    lecture_id: str,
+    principal: Principal = Depends(require_student),
+    db: Session = Depends(get_db),
+):
+    """내 후기 삭제 — status='deleted'(감사 보존, 나중에 재작성하면 되살아난다)."""
+    lec = _get_active_lecture(db, lecture_id)
+    row = (
+        db.query(LectureReview)
+        .filter(
+            LectureReview.student_id == principal.id,
+            LectureReview.lecture_id == lec.id,
+            LectureReview.status == "active",
+        )
+        .first()
+    )
+    if row:
+        row.status = "deleted"
+        db.commit()
+    return {"ok": True}
 
 
 @router.get("/lectures/{lecture_id}/stream")

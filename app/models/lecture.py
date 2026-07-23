@@ -211,6 +211,29 @@ class LectureTranscript(Base, UUIDPk, Timestamps):
     segment_count: Mapped[int] = mapped_column(default=0)  # 목록 배지용 비정규화(JSON 미로드)
 
 
+class LectureReview(Base, UUIDPk, Timestamps):
+    """강의 수강 후기 — 별점(1~5) + 선택 텍스트. 학생당 강의당 1개(upsert).
+
+    왜: 플레이어의 '수강 후기' 탭이 '준비 중' 껍데기였다. 실서비스(인프런·Udemy)의 리뷰를
+    실제로 담는다. 후기는 '수강신청한 학생'만 남길 수 있다(_require_enrolled) — 안 들은 사람의
+    평점 오염을 막는다. 표시 이름은 학생 규약대로 가명(StudentProfile.nickname)만 쓴다.
+
+    소프트 참조(FK 없음 — 신규 모델 규약·collation 회피, Course.instructor_id 주석 참조).
+    UniqueConstraint(student_id, lecture_id)로 재작성=upsert. 삭제는 status='deleted'(감사 보존)."""
+
+    __tablename__ = "lecture_reviews"
+    __table_args__ = (
+        UniqueConstraint("student_id", "lecture_id", name="uq_lecture_review"),
+        Index("ix_review_lecture_status", "lecture_id", "status"),
+    )
+
+    student_id: Mapped[str] = mapped_column(CHAR(36), index=True)
+    lecture_id: Mapped[str] = mapped_column(CHAR(36), index=True)
+    rating: Mapped[int] = mapped_column()  # 1~5 (엔드포인트에서 검증)
+    text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(String(20), default="active")  # active|deleted
+
+
 class LectureQuestionGenJob(Base, UUIDPk, Timestamps):
     """AI 확인문항 자동 생성 '잡' — 동기 대기 대신 백그라운드로 돌리려 상태를 남긴다(2026-07-20).
 
