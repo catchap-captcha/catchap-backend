@@ -737,18 +737,20 @@ RECORDS_WEEKS = [
 ]
 RECORDS_CAL_LEARNED = [1, 2, 3, 5, 6, 8, 9, 10, 12, 13, 15, 16, 17, 19, 20, 22, 23, 24, 26, 27, 29, 30]
 RECORDS_CAL = {"month": 7, "year": 2026, "today": 2, "blanks": 2, "days": 31}
+# 성인 이수검증형으로 중립화(0723) — 아동 게임 잔재(그림찾기·숫자놀이터 등) 제거. 자격증·강의
+# 예시로 교체. ★프론트는 실집계 없으면(demo) 이 값 대신 빈 상태를 보여주므로 실사용자엔 안 뜬다.
 RECORDS_MASTERY = [
-    {"name": "끌어놓기 놀이", "icon": "ph-fill ph-hand-grabbing", "color": "#17B08C", "bg": "#DFF6ED", "pct": 95, "solved": 40, "delta": 3},
-    {"name": "한글 낱말 찾기", "icon": "ph-fill ph-text-aa", "color": "#FF5A6E", "bg": "#FFE3E9", "pct": 88, "solved": 50, "delta": 2},
-    {"name": "숫자 놀이터", "icon": "ph-fill ph-plus-minus", "color": "#FF922E", "bg": "#FFEDE0", "pct": 76, "solved": 45, "delta": -4},
-    {"name": "그림 찾기 퀴즈", "icon": "ph-fill ph-image", "color": "#2E7BFF", "bg": "#E6F0FF", "pct": 64, "solved": 38, "delta": 6},
-    {"name": "안전 지킴이", "icon": "ph-fill ph-shield-check", "color": "#8B6BFF", "bg": "#EDE6FF", "pct": 32, "solved": 25, "delta": 12},
+    {"name": "정보처리기사", "icon": "ph-fill ph-cpu", "color": "#17B08C", "bg": "#DFF6ED", "pct": 92, "solved": 40, "delta": 3},
+    {"name": "컴퓨터활용능력", "icon": "ph-fill ph-desktop", "color": "#2E7BFF", "bg": "#E6F0FF", "pct": 85, "solved": 50, "delta": 2},
+    {"name": "TOEIC", "icon": "ph-fill ph-translate", "color": "#FF922E", "bg": "#FFEDE0", "pct": 78, "solved": 45, "delta": -4},
+    {"name": "한국사능력검정", "icon": "ph-fill ph-scroll", "color": "#2E7BFF", "bg": "#E6F0FF", "pct": 70, "solved": 38, "delta": 6},
+    {"name": "산업안전기사", "icon": "ph-fill ph-shield-check", "color": "#8B6BFF", "bg": "#EDE6FF", "pct": 64, "solved": 25, "delta": 5},
 ]
 RECORDS_ACTIVITIES = [
-    {"title": "그림 찾기 퀴즈", "sub": "고양이만 골라요 · 8문제", "icon": "ph-fill ph-image", "color": "#2E7BFF", "bg": "#E6F0FF", "result": "정답률 86%", "time": "방금 전"},
-    {"title": "끌어놓기 놀이", "sub": "카드 옮기기 · 6문제", "icon": "ph-fill ph-hand-grabbing", "color": "#17B08C", "bg": "#DFF6ED", "result": "정답률 100%", "time": "오늘 오후 3:10"},
-    {"title": "숫자 놀이터", "sub": "더하기·빼기 · 10문제", "icon": "ph-fill ph-plus-minus", "color": "#FF922E", "bg": "#FFEDE0", "result": "정답률 72%", "time": "어제"},
-    {"title": "한글 낱말 찾기", "sub": "받침 완성 · 10문제", "icon": "ph-fill ph-text-aa", "color": "#FF5A6E", "bg": "#FFE3E9", "result": "정답률 90%", "time": "2일 전"},
+    {"title": "정보처리기사 실기", "sub": "데이터베이스 · 확인 문제 8문제", "icon": "ph-fill ph-cpu", "color": "#17B08C", "bg": "#DFF6ED", "result": "정답률 86%", "time": "방금 전"},
+    {"title": "컴퓨터활용능력 1급", "sub": "스프레드시트 · 확인 문제 6문제", "icon": "ph-fill ph-desktop", "color": "#2E7BFF", "bg": "#E6F0FF", "result": "정답률 100%", "time": "오늘 오후 3:10"},
+    {"title": "네트워크 기초", "sub": "IP·라우팅 · 확인 문제 10문제", "icon": "ph-fill ph-share-network", "color": "#FF922E", "bg": "#FFEDE0", "result": "정답률 72%", "time": "어제"},
+    {"title": "한국사능력검정", "sub": "근현대사 · 확인 문제 10문제", "icon": "ph-fill ph-scroll", "color": "#8B6BFF", "bg": "#EDE6FF", "result": "정답률 90%", "time": "2일 전"},
 ]
 
 # 학습 홈 (학습 홈.dc.html)
