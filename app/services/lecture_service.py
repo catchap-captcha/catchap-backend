@@ -497,6 +497,8 @@ def hard_delete_lecture(db: Session, lec: Lecture) -> dict:
 
     # 파일 경로를 commit 전에 모아 둔다(commit 후 행이 사라지면 payload를 못 읽는다).
     paths: list[Path] = [media_dir / f"{lec_id}{video_ext}"]
+    if lec.thumbnail_ext:  # 영상 썸네일도 함께 물리 제거(고아 파일 방지 — 영상·자료·문항이미지와 동일)
+        paths.append(media_dir / "thumbnails" / f"{lec_id}{lec.thumbnail_ext}")
     for m in db.query(LectureMaterial).filter(LectureMaterial.lecture_id == lec_id).all():
         if m.kind == "file" and m.file_ext:
             paths.append(media_dir / "materials" / f"{m.id}{m.file_ext}")
