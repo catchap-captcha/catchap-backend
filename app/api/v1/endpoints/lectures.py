@@ -492,17 +492,6 @@ def list_student_courses(
         )
         .all()
     }
-    # 코스별 총 수강 인원(active) — 소셜 증거('N명 수강'). 벌크 group_by 1쿼리로 N+1 회피.
-    enroll_counts = {
-        r[0]: int(r[1])
-        for r in db.query(CourseEnrollment.course_id, func.count(CourseEnrollment.id))
-        .filter(
-            CourseEnrollment.course_id.in_(course_ids or [""]),
-            CourseEnrollment.status == "active",
-        )
-        .group_by(CourseEnrollment.course_id)
-        .all()
-    }
     out = []
     for c in courses:
         lec_ids = [
@@ -531,8 +520,6 @@ def list_student_courses(
                 "lecture_count": len(lec_ids),
                 # 수강신청 여부 — true면 '내 코스'(신청함), false면 카탈로그(수강신청 버튼)
                 "enrolled": c.id in enrolled_ids,
-                # 총 수강 인원(소셜 증거) — 카드에 'N명 수강' 표기
-                "enrolled_count": enroll_counts.get(c.id, 0),
                 # 코스 Q — 이 코스 강의에서 은행으로 배치된 문항 수. 화면 규칙:
                 # unlocked>0 → '이 코스 문제 풀기(N)' 버튼 / total>0 & unlocked=0 →
                 # "완주하면 열려요" 잠금 안내 / total=0 → 아무것도 안 보임(아직 없음).
@@ -1200,6 +1187,14 @@ def _course_row(db: Session, c: Course) -> dict:
         .scalar()
         or 0
     )
+    # 수강 인원(active) — 강사/운영자 운영 지표. 학생 화면엔 노출하지 않는다(작은 수는 오히려
+    # 역효과 social proof·이수검증형은 인기 신호가 약함 — 사용자 결정 0723). 여기 강사 뷰에만.
+    enrolled_count = (
+        db.query(func.count(CourseEnrollment.id))
+        .filter(CourseEnrollment.course_id == c.id, CourseEnrollment.status == "active")
+        .scalar()
+        or 0
+    )
     return {
         "id": c.id,
         "title": c.title,
@@ -1210,6 +1205,7 @@ def _course_row(db: Session, c: Course) -> dict:
         "status": c.status,
         "instructor_id": c.instructor_id,
         "lecture_count": int(lecture_count),
+        "enrolled_count": int(enrolled_count),
         "created_at": c.created_at.isoformat() if c.created_at else None,
     }
 
