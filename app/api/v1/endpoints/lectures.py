@@ -137,6 +137,49 @@ def _video_path(lec: Lecture) -> Path:
     return _media_dir() / f"{lec.id}{lec.video_ext}"
 
 
+# 강의 썸네일 확장자·Content-Type 화이트리스트 — 래스터 이미지만(SVG 금지: <img> 인라인
+# 서빙이라 스크립트 삽입 위험). 영상·문항 이미지와 동일 원칙: 경로는 id+확장자로만 유도.
+_THUMB_MEDIA_TYPES = {
+    ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp",
+}
+
+
+def _thumbnails_dir() -> Path:
+    return _media_dir() / "thumbnails"
+
+
+def _thumbnail_path(lec: Lecture) -> Path:
+    # 영상·자료와 동일 원칙 — 썸네일 경로도 id(UUID)+화이트리스트 확장자로만 유도
+    return _thumbnails_dir() / f"{lec.id}{lec.thumbnail_ext or ''}"
+
+
+def _thumbnail_url(lec: Lecture) -> str | None:
+    """학생·콘솔 <img>가 로드할 서빙 경로 — 없으면 None. updated_at 기반 캐시버스터(v=)로
+    같은 강의 썸네일 교체 시 브라우저 캐시가 옛 이미지를 물지 않게 한다."""
+    if not lec.thumbnail_ext:
+        return None
+    v = int(lec.updated_at.timestamp()) if getattr(lec, "updated_at", None) else 0
+    return f"/api/v1/lectures/{lec.id}/thumbnail?v={v}"
+
+
+def _course_thumbnail_url(db: Session, course_id: str | None) -> str | None:
+    """코스 대표 썸네일 — 그 코스에서 썸네일이 있는 첫 강의(목차순)의 것을 쓴다. 코스 자체
+    썸네일 컬럼은 없다(강의 목차 첫 화면을 대표로 삼는 인강 표준). 없으면 None."""
+    if not course_id:
+        return None
+    lec = (
+        db.query(Lecture)
+        .filter(
+            Lecture.course_id == course_id,
+            Lecture.status != "deleted",
+            Lecture.thumbnail_ext.isnot(None),
+        )
+        .order_by(Lecture.order_no.asc(), Lecture.created_at.asc())
+        .first()
+    )
+    return _thumbnail_url(lec) if lec else None
+
+
 def _materials_dir() -> Path:
     return _media_dir() / "materials"
 
@@ -364,6 +407,7 @@ def _student_lecture_item(db: Session, lec: Lecture, progress: LectureWatchProgr
         "order_no": int(lec.order_no or 0),
         "duration_sec": lec.duration_sec,
         "question_count": _active_question_count(db, lec.id),
+        "thumbnail_url": _thumbnail_url(lec),
         "progress": _progress_dict(progress),
     }
 
@@ -518,6 +562,7 @@ def list_student_courses(
                 "order_no": int(c.order_no or 0),
                 "instructor_name": names.get(c.instructor_id),
                 "lecture_count": len(lec_ids),
+                "thumbnail_url": _course_thumbnail_url(db, c.id),
                 # 수강신청 여부 — true면 '내 코스'(신청함), false면 카탈로그(수강신청 버튼)
                 "enrolled": c.id in enrolled_ids,
                 # 코스 Q — 이 코스 강의에서 은행으로 배치된 문항 수. 화면 규칙:
@@ -1118,6 +1163,26 @@ def lecture_question_image(
     )
 
 
+@router.get("/lectures/{lecture_id}/thumbnail")
+def lecture_thumbnail(lecture_id: str, db: Session = Depends(get_db)):
+    """강의 썸네일 서빙(인라인) — 목록·카드의 <img src>가 로드한다.
+
+    인증 의존성이 없다: <img> 태그는 Authorization 헤더를 싣지 못한다(문항 이미지 서빙과
+    동일 원칙). 썸네일은 정답·PII를 담지 않는 대표 이미지라 공개 서빙이 안전하다. 경로는
+    id(UUID)+화이트리스트 확장자로만 유도(경로조작 원천 차단). deleted 강의도 파일이 있으면
+    서빙한다 — thumbnail_ext가 살아 있으면 대표 이미지일 뿐이고, 정보 유출이 없다."""
+    lec = db.get(Lecture, lecture_id)
+    if not lec or not lec.thumbnail_ext:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="썸네일이 없습니다.")
+    path = _thumbnail_path(lec)
+    if not path.exists():
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="썸네일 파일이 없습니다.")
+    return FileResponse(
+        str(path),
+        media_type=_THUMB_MEDIA_TYPES.get(lec.thumbnail_ext, "application/octet-stream"),
+    )
+
+
 # ================================================================ 운영자
 def _lecture_row(db: Session, lec: Lecture) -> dict:
     total = (
@@ -1143,6 +1208,7 @@ def _lecture_row(db: Session, lec: Lecture) -> dict:
         "question_count": int(total),
         # 0이면 확인(캡차)이 아예 안 떠서 시청 검증이 없는 강의 — 콘솔 경고의 근거
         "active_question_count": _active_question_count(db, lec.id),
+        "thumbnail_url": _thumbnail_url(lec),
         "created_at": lec.created_at.isoformat() if lec.created_at else None,
     }
 
@@ -1206,6 +1272,7 @@ def _course_row(db: Session, c: Course) -> dict:
         "instructor_id": c.instructor_id,
         "lecture_count": int(lecture_count),
         "enrolled_count": int(enrolled_count),
+        "thumbnail_url": _course_thumbnail_url(db, c.id),
         "created_at": c.created_at.isoformat() if c.created_at else None,
     }
 
@@ -2883,6 +2950,56 @@ def ops_attach_question_image(
     if isinstance(old_ref, dict) and old_ref.get("id"):
         _question_image_path(old_ref).unlink(missing_ok=True)  # 교체된 옛 파일 정리(멱등)
     return _question_row(q)
+
+
+@router.post("/ops/lectures/{lecture_id}/thumbnail")
+def ops_upload_lecture_thumbnail(
+    lecture_id: str,
+    file: UploadFile = File(...),
+    principal: Principal = Depends(require_content_author),
+    db: Session = Depends(get_db),
+):
+    """강의 썸네일 업로드(multipart) — 영상·문항 이미지와 동일 패턴: 임시파일 청크 복사
+    (누적 바이트 재검사) → 원자적 이동 → DB commit. 실패 시 파일을 남기지 않는다.
+
+    파일명은 항상 {lecture_id}{ext}라 강의당 썸네일 1장(교체는 덮어쓰기). 확장자가 바뀌면
+    (jpg→png 등) 옛 파일을 commit 후 정리한다. 5MB 상한(썸네일은 작은 대표 이미지)."""
+    lec = _get_ops_lecture(db, lecture_id, principal)  # 소유권 검증(강사=자기 강의만·404)
+    ext = os.path.splitext(file.filename or "")[1].lower()
+    if ext not in _THUMB_MEDIA_TYPES:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST, detail="jpg/png/webp 이미지만 업로드할 수 있습니다."
+        )
+    ct = (file.content_type or "").lower()
+    if ct and not ct.startswith("image/"):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="이미지 파일을 올려주세요.")
+    d = _thumbnails_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    old = _thumbnail_path(lec) if lec.thumbnail_ext else None
+    tmp = d / f".thumb-{lec.id}.tmp"
+    final = d / f"{lec.id}{ext}"
+    try:
+        total = _copy_upload_to_tmp(file, tmp, 5 * 1024 * 1024)  # 5MB 상한
+        if total == 0:
+            tmp.unlink(missing_ok=True)
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="빈 파일은 업로드할 수 없습니다.")
+        os.replace(tmp, final)  # 같은 디렉터리 내 원자적 이동
+    except BaseException:
+        tmp.unlink(missing_ok=True)  # replace 실패 포함 — 임시파일을 남기지 않는다
+        raise
+    if old and old != final:
+        old.unlink(missing_ok=True)  # 확장자가 바뀌면 옛 파일 제거(같은 경로면 이미 덮어씀)
+    lec.thumbnail_ext = ext
+    audit(
+        db,
+        action="lecture.thumbnail",
+        actor_user_id=principal.id,
+        target_type="lecture",
+        target_id=lec.id,
+        after={"ext": ext, "bytes": total},
+    )
+    db.commit()
+    return _lecture_row(db, lec)
 
 
 @router.delete("/ops/lectures/{lecture_id}/questions/{question_id}/images")

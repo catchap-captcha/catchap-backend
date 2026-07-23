@@ -63,6 +63,10 @@ class Lecture(Base, UUIDPk, Timestamps):
     course_id: Mapped[str | None] = mapped_column(CHAR(36), nullable=True, index=True)
     video_ext: Mapped[str] = mapped_column(String(10))  # .mp4|.webm
     video_bytes: Mapped[int] = mapped_column(BigInteger, default=0)
+    # 강의 썸네일(목록·카드 대표 이미지) — 영상과 동일 원칙으로 경로는 저장하지 않고
+    # LECTURE_MEDIA_DIR/thumbnails/{id}{thumbnail_ext}로 유도(경로조작 원천 차단).
+    # 없으면 None(썸네일 미설정 — 서빙/직렬화에서 None으로 흐른다). .jpg|.jpeg|.png|.webp.
+    thumbnail_ext: Mapped[str | None] = mapped_column(String(10), nullable=True, default=None)
     duration_sec: Mapped[int] = mapped_column(default=0)
     # (제거됨 0717) check_min_sec/check_max_sec — 무작위 확인 간격. 출제 시점이 전부
     # 핀(문항의 position_sec)이 되면서 간격 개념 자체가 사라졌다(lecture_pin_02).
