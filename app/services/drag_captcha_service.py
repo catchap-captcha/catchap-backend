@@ -73,15 +73,21 @@ def _cursor() -> Iterator[Any]:
 
 # ── DB 접근(ms db.py 이식) ──
 def active_question() -> dict[str, Any] | None:
+    # 챌린지 구성에 실제로 쓰는 컬럼만 선택(SELECT * 대신) — 안 쓰는 reviewer/source 등 전송 제거.
+    # image_path는 발급 시점엔 불필요(에셋 서빙에서만 조회)하므로 여기서 안 가져온다.
     with _cursor() as (_, cur):
         cur.execute(
-            "SELECT * FROM captcha_questions WHERE status='active' AND review_status='approved' "
-            "ORDER BY RAND() LIMIT 1"
+            "SELECT id, instruction_ko, image_width, image_height FROM captcha_questions "
+            "WHERE status='active' AND review_status='approved' ORDER BY RAND() LIMIT 1"
         )
         question = cur.fetchone()
         if not question:
             return None
-        cur.execute("SELECT * FROM captcha_objects WHERE question_id=%s ORDER BY id", (question["id"],))
+        cur.execute(
+            "SELECT id, role, bbox_x, bbox_y, bbox_width, bbox_height FROM captcha_objects "
+            "WHERE question_id=%s ORDER BY id",
+            (question["id"],),
+        )
         question["objects"] = cur.fetchall()
         return question
 
@@ -120,17 +126,6 @@ def _challenge_for_verify(cur: Any, challenge_id: str) -> dict[str, Any] | None:
     )
     challenge["objects"] = cur.fetchall()
     return challenge
-
-
-def get_question(question_id: str) -> dict[str, Any] | None:
-    with _cursor() as (_, cur):
-        cur.execute("SELECT * FROM captcha_questions WHERE id=%s", (question_id,))
-        question = cur.fetchone()
-        if not question:
-            return None
-        cur.execute("SELECT * FROM captcha_objects WHERE question_id=%s ORDER BY id", (question_id,))
-        question["objects"] = cur.fetchall()
-        return question
 
 
 # ── 행동 위험 점수(ms main.py summarize 이식) ──
@@ -268,19 +263,28 @@ def create_challenge(purpose: str, session_id: str, ip: str) -> dict[str, Any]:
 
 
 def asset_path(challenge_id: str, asset_id: str) -> Path:
+    # 핫패스(챌린지당 이미지 1 + 조각 N회 호출) — 필요한 경로 한 개만 단일 쿼리로 조회.
+    # 종전엔 챌린지+객체맵+질문+질문객체까지 4쿼리·2커넥션을 읽었으나 실제로 필요한 건 경로뿐.
     with _cursor() as (_, cur):
-        challenge = _challenge_for_verify(cur, challenge_id)
-    if not challenge:
-        raise FileNotFoundError("challenge")
-    question = get_question(challenge["question_id"])
-    if question is None:
-        raise FileNotFoundError("question")
-    if asset_id == "image":
-        return safe_asset(question["image_path"])
-    mapping = next((m for m in challenge["objects"] if m["temporary_object_id"] == asset_id), None)
-    if not mapping or not mapping.get("piece_path"):
-        raise FileNotFoundError("piece")
-    return safe_asset(mapping["piece_path"])
+        if asset_id == "image":
+            cur.execute(
+                "SELECT q.image_path FROM captcha_challenges_v2 c JOIN captcha_questions q ON q.id=c.question_id "
+                "WHERE c.id=%s",
+                (challenge_id,),
+            )
+            row = cur.fetchone()
+            if not row:
+                raise FileNotFoundError("challenge")
+            return safe_asset(row["image_path"])
+        cur.execute(
+            "SELECT o.piece_path FROM captcha_challenge_objects m JOIN captcha_objects o ON o.id=m.object_id "
+            "WHERE m.challenge_id=%s AND m.temporary_object_id=%s",
+            (challenge_id, asset_id),
+        )
+        row = cur.fetchone()
+        if not row or not row["piece_path"]:
+            raise FileNotFoundError("piece")
+        return safe_asset(row["piece_path"])
 
 
 def verify(challenge_id: str, selected_ids: list[str], session_id: str, duration_ms: int,
