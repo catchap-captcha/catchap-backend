@@ -25,6 +25,13 @@ def _require_enabled() -> None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Not found")
 
 
+@router.get("/config")
+def drag_config():
+    # 게이트하지 않음 — 프론트가 이 플래그를 보고 드래그 캡차 vs 기존 forest 위젯을 고른다.
+    # OFF면 프론트는 기존 forest를 렌더해 스텝업 캡차가 안 깨진다.
+    return {"enabled": get_settings().DRAG_CAPTCHA_ENABLED}
+
+
 class ChallengeCreate(BaseModel):
     purpose: Literal["signup", "login", "recovery"] = "login"
     session_id: str = Field(min_length=8, max_length=128)
