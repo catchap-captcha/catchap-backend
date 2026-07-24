@@ -335,6 +335,23 @@ def _active_question_count(db: Session, lecture_id: str) -> int:
     )
 
 
+def _active_question_count_map(db: Session, lecture_ids: list[str]) -> dict[str, int]:
+    """여러 강의의 활성 문항 수를 한 번에(강의당 COUNT N+1 제거). 목록·목차 직렬화에서
+    `_active_question_count`를 강의마다 부르던 것을 grouped count 한 쿼리로 대체한다."""
+    if not lecture_ids:
+        return {}
+    rows = (
+        db.query(LectureQuestion.lecture_id, func.count(LectureQuestion.id))
+        .filter(
+            LectureQuestion.lecture_id.in_(lecture_ids),
+            LectureQuestion.status == "active",
+        )
+        .group_by(LectureQuestion.lecture_id)
+        .all()
+    )
+    return {lecture_id: int(count) for lecture_id, count in rows}
+
+
 def _progress_dict(p: LectureWatchProgress | None) -> dict | None:
     if p is None:
         return None
@@ -395,7 +412,14 @@ def _progress_map(db: Session, student_id: str, lecture_ids: list[str]) -> dict:
     }
 
 
-def _student_lecture_item(db: Session, lec: Lecture, progress: LectureWatchProgress | None) -> dict:
+def _student_lecture_item(
+    db: Session,
+    lec: Lecture,
+    progress: LectureWatchProgress | None,
+    question_count: int | None = None,
+) -> dict:
+    # question_count를 미리 벌크로 구해 넘기면 강의당 COUNT를 안 친다(목록·목차 N+1 제거).
+    # 안 넘기면(단건 호출) 종전대로 개별 조회로 폴백해 하위호환.
     return {
         "id": lec.id,
         "title": lec.title,
@@ -406,7 +430,7 @@ def _student_lecture_item(db: Session, lec: Lecture, progress: LectureWatchProgr
         "course_id": lec.course_id,
         "order_no": int(lec.order_no or 0),
         "duration_sec": lec.duration_sec,
-        "question_count": _active_question_count(db, lec.id),
+        "question_count": question_count if question_count is not None else _active_question_count(db, lec.id),
         "thumbnail_url": _thumbnail_url(lec),
         "progress": _progress_dict(progress),
     }
@@ -454,8 +478,13 @@ def list_lectures(
         q = q.filter(Lecture.subject == subject)
     rows = q.order_by(Lecture.subject, Lecture.order_no, Lecture.created_at).all()
 
-    progress = _progress_map(db, principal.id, [r.id for r in rows])
-    return [_student_lecture_item(db, lec, progress.get(lec.id)) for lec in rows]
+    lec_ids = [r.id for r in rows]
+    progress = _progress_map(db, principal.id, lec_ids)
+    qcounts = _active_question_count_map(db, lec_ids)
+    return [
+        _student_lecture_item(db, lec, progress.get(lec.id), qcounts.get(lec.id, 0))
+        for lec in rows
+    ]
 
 
 @router.get("/courses")
@@ -536,14 +565,32 @@ def list_student_courses(
         )
         .all()
     }
+    # 코스당 활성 강의 id — 벌크(종전 코스당 SELECT N+1 제거). 순서는 sum/set/len에만 쓰여 무관.
+    lecs_by_course: dict[str, list[str]] = {}
+    for cid, lid in (
+        db.query(Lecture.course_id, Lecture.id)
+        .filter(Lecture.course_id.in_(course_ids or [""]), Lecture.status == "active")
+        .all()
+    ):
+        lecs_by_course.setdefault(cid, []).append(lid)
+    # 코스 대표 썸네일 — '썸네일 있는 첫 강의(목차순)'를 벌크로(종전 코스당 _course_thumbnail_url
+    # N+1 제거). 목차순 정렬 후 코스별 첫 행만 취해 _course_thumbnail_url과 동일 결과.
+    course_thumb_url: dict[str, str | None] = {}
+    for lec in (
+        db.query(Lecture)
+        .filter(
+            Lecture.course_id.in_(course_ids or [""]),
+            Lecture.status != "deleted",
+            Lecture.thumbnail_ext.isnot(None),
+        )
+        .order_by(Lecture.course_id, Lecture.order_no.asc(), Lecture.created_at.asc())
+        .all()
+    ):
+        if lec.course_id not in course_thumb_url:
+            course_thumb_url[lec.course_id] = _thumbnail_url(lec)
     out = []
     for c in courses:
-        lec_ids = [
-            r[0]
-            for r in db.query(Lecture.id)
-            .filter(Lecture.course_id == c.id, Lecture.status == "active")
-            .all()
-        ]
+        lec_ids = lecs_by_course.get(c.id, [])
         if not lec_ids:
             continue
         if c.subject not in qcounts_by_subject:
@@ -562,7 +609,7 @@ def list_student_courses(
                 "order_no": int(c.order_no or 0),
                 "instructor_name": names.get(c.instructor_id),
                 "lecture_count": len(lec_ids),
-                "thumbnail_url": _course_thumbnail_url(db, c.id),
+                "thumbnail_url": course_thumb_url.get(c.id),
                 # 수강신청 여부 — true면 '내 코스'(신청함), false면 카탈로그(수강신청 버튼)
                 "enrolled": c.id in enrolled_ids,
                 # 코스 Q — 이 코스 강의에서 은행으로 배치된 문항 수. 화면 규칙:
@@ -724,6 +771,8 @@ def lecture_detail(
         toc_q = toc_q.filter(Lecture.subject == lec.subject, Lecture.course_id.is_(None))
     toc_rows = toc_q.order_by(Lecture.order_no, Lecture.created_at).all()
     toc_progress = _progress_map(db, principal.id, [r.id for r in toc_rows])
+    # 본문 + 목차 강의들의 활성 문항 수를 한 번에(강의당 COUNT N+1 제거)
+    qcounts = _active_question_count_map(db, list({lec.id, *(r.id for r in toc_rows)}))
     # 순수 조회 — 세션·stream_url을 주지 않는다. 상세만 열어 본 사용자가 다른 기기의
     # 시청을 차단(오탐)하지 않게, 재생 시작은 POST /session으로 명시적으로 분리했다.
     return {
@@ -734,14 +783,15 @@ def lecture_detail(
         "course_id": lec.course_id,
         "order_no": int(lec.order_no or 0),
         "duration_sec": lec.duration_sec,
-        "question_count": _active_question_count(db, lec.id),
+        "question_count": qcounts.get(lec.id, 0),
         "progress": _progress_dict(progress),
         "next_checkpoint_sec": progress.next_checkpoint_sec,
         # 자료실 — file 자료는 내부 경로가 아니라 다운로드 엔드포인트 경로만 노출
         "materials": [_student_material_item(m) for m in _active_materials(db, lec.id)],
         # 과목 목차 — 강의실 사이드바가 바로 그릴 수 있는 형태(내 진행 포함)
         "toc": [
-            _student_lecture_item(db, r, toc_progress.get(r.id)) for r in toc_rows
+            _student_lecture_item(db, r, toc_progress.get(r.id), qcounts.get(r.id, 0))
+            for r in toc_rows
         ],
     }
 
