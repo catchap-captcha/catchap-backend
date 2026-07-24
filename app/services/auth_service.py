@@ -96,11 +96,21 @@ def _require_captcha_if_needed(db: Session, identifier: str, captcha_token: str 
     """
     if not captcha_required(db, identifier):
         return
+    from app.core.config import get_settings
     from app.models import LoginThrottle
-    from app.services import forest_captcha as fc
 
-    if fc.service.consume_token(captcha_token):
-        return  # 유효 토큰 소비 — 이 시도를 자격 검증으로 진행 허용
+    # 메인 캡차 교체: 플래그가 켜지면 forest 대신 우리 드래그 캡차 토큰을 소비한다(자체 완결).
+    # 로그인 요청엔 session_id가 없어 토큰 유효성만으로 소비(발급된 토큰만 존재하므로 안전).
+    if get_settings().DRAG_CAPTCHA_ENABLED:
+        from app.services import drag_captcha_service as dc
+
+        if dc.verify_and_consume_token(captcha_token):
+            return
+    else:
+        from app.services import forest_captcha as fc
+
+        if fc.service.consume_token(captcha_token):
+            return  # 유효 토큰 소비 — 이 시도를 자격 검증으로 진행 허용
     row = db.query(LoginThrottle).filter(LoginThrottle.identifier == identifier).first()
     raise HTTPException(
         status.HTTP_401_UNAUTHORIZED,
