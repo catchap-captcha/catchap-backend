@@ -137,5 +137,28 @@ def password_reset_confirm(req: s.PasswordResetConfirm, db: Session = Depends(ge
     return {"ok": True}
 
 
+@router.post("/student-password-reset/request")
+def student_password_reset_request(
+    req: s.StudentPasswordResetRequest, request: Request, db: Session = Depends(get_db)
+):
+    """학생 비밀번호 재설정 코드 발송.
+
+    학생은 users에 없어서 위의 /password-reset 흐름을 탈 수 없다(별도 경로가 필요한 이유).
+    계정 존재 여부를 흘리지 않도록 서비스가 조용히 반환하고 여기서는 항상 200을 준다 —
+    응답으로 가입 여부를 알아내는 열거 공격을 막기 위함이다.
+    """
+    auth_service.rate_limit(db, f"sturesetip:{_client_ip(request)}", limit=40)
+    auth_service.student_password_reset_request(db, req.student_login_id)
+    return {"ok": True}
+
+
+@router.post("/student-password-reset/confirm")
+def student_password_reset_confirm(
+    req: s.StudentPasswordResetConfirm, db: Session = Depends(get_db)
+):
+    auth_service.student_password_reset_confirm(db, req)
+    return {"ok": True}
+
+
 # (verify-join-code · verify-org-code · verify-teacher-code · invite/{token} 는
 #  학교/교사 은퇴(0717~18)로 제거 — 소비 화면이 없다. 종전 코드는 git 이력 참고.)
