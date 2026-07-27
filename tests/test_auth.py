@@ -180,19 +180,26 @@ def _add_instructor(db, email="inst@test.dev"):
     return u
 
 
-def test_public_ops_login_excludes_ops(client, db, seed_org):
-    """운영자 분리(0720) — 공개 로그인 폼(public=true)에서는 운영자를 인증하지 않는다.
+def test_public_ops_login_allows_ops_and_instructor(client, db, seed_org):
+    """공개 로그인 폼(public=true)에서 운영자·강사 둘 다 로그인된다.
 
-    운영자는 전용 /ops/login(public 미지정)에서만 로그인. 강사는 공개 폼에서도 로그인된다."""
+    종전 0720 정책은 공개 폼에서 운영자를 분리(401)했으나, 2026-07-26 결정으로 두 role 모두
+    어느 진입구로든 이메일+비밀번호가 맞으면 로그인된다(auth_service.ops_login 주석 참고).
+    프론트 통합 로그인 폼(/login → /auth/public-login)이 이 동작에 의존한다."""
     _add_ops(db)
     _add_instructor(db)
-    # 공개 폼(public=true): 운영자는 정답 비번이어도 401(분리) — 존재/정답 오라클도 없음
+    # 공개 폼(public=true)에서도 운영자 로그인 성공 — 전용 포털 전용이 아니다
     res = client.post(
         "/api/v1/auth/ops-login",
         json={"email": "ops@test.dev", "password": "Password123!", "public": True},
     )
-    assert res.status_code == 401
-    # 같은 공개 폼에서 강사는 성공
+    assert res.status_code == 200
+    me_ops = client.get(
+        "/api/v1/auth/me",
+        headers={"Authorization": f"Bearer {res.json()['access_token']}"},
+    )
+    assert me_ops.json()["role"] == "ops"
+    # 같은 공개 폼에서 강사도 성공
     ok = client.post(
         "/api/v1/auth/ops-login",
         json={"email": "inst@test.dev", "password": "Password123!", "public": True},
@@ -244,10 +251,17 @@ def test_public_login_falls_back_to_instructor(client, db, seed_org):
     assert me.json()["role"] == "instructor"
 
 
-def test_public_login_excludes_ops(client, db, seed_org):
-    """공개 단일 진입에서는 운영자를 인증하지 않는다 — 전용 /ops/login만."""
+def test_public_login_includes_ops(client, db, seed_org):
+    """공개 단일 진입(/auth/public-login)도 운영자를 인증한다 (2026-07-26 결정).
+
+    학생이 아닌 이메일이면 ops_login으로 폴백하고, 거기서 ops·instructor 두 role을 모두 허용한다."""
     _add_ops(db)
-    assert _public_login(client, "ops@test.dev", "Password123!").status_code == 401
+    res = _public_login(client, "ops@test.dev", "Password123!")
+    assert res.status_code == 200
+    me = client.get(
+        "/api/v1/auth/me", headers={"Authorization": f"Bearer {res.json()['access_token']}"}
+    )
+    assert me.json()["role"] == "ops"
 
 
 def test_public_login_wrong_password_is_401(client, db, seed_org):
