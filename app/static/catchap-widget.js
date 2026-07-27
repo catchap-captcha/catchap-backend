@@ -205,15 +205,14 @@
     box.setAttribute('data-catchap-root', '1'); // 포커스 링·스켈레톤 CSS 스코프
     box.setAttribute('role', 'group');
     box.setAttribute('aria-label', lectureMode ? '강의 확인 문제' : 'CatChap 문제');
+    box.style.cursor = 'pointer'; // 심플한 손 모양 포인터(고양이 발자국 트레일 대체 — 사용자 요청 2026-07-27)
 
-    var head = h('div'); css(head, { display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '12px' });
-    if (lectureMode) head.style.display = 'none'; // 강의실 안 — 브랜드 헤더 중복 제거
-    var logo = h('span'); logo.textContent = '🐱'; css(logo, { fontSize: '20px' });
-    var brand = h('span'); brand.textContent = 'CatChap'; css(brand, { fontWeight: '800', color: C, fontSize: '15px' });
-    var spacer = h('span'); css(spacer, { flex: '1' });
+    // 헤더 — CatChap 로고/브랜드 제거(사용자 요청 2026-07-27, 심플화). 상태 표시만 오른쪽에 둔다.
+    var head = h('div'); css(head, { display: 'flex', alignItems: 'center', justifyContent: 'flex-end', minHeight: '16px', marginBottom: '12px' });
+    if (lectureMode) head.style.display = 'none'; // 강의실 안 — 헤더 중복 제거
     var status = h('span'); css(status, { fontSize: '12px', fontWeight: '700', color: '#B0A79B' });
     status.setAttribute('aria-live', 'polite'); // 확인 중/불러오는 중 상태를 스크린리더에 안내
-    head.appendChild(logo); head.appendChild(brand); head.appendChild(spacer); head.appendChild(status);
+    head.appendChild(status);
 
     var body = h('div');
     // 풀 사이즈: 문항은 세로 중앙, 액션 풋터는 카드 하단에 붙도록 본문이 남는 높이를 차지
@@ -256,8 +255,9 @@
     var PAW_JUMP = 120;   // 이보다 큰 이동은 걸음이 아니라 점프 — 자국 없이 기준점만 갱신
     var PAW_MAX = 24;     // 동시 표시 상한
     var PAW_LIFE = 1100;  // 수명(ms) — ccPawFade 길이와 일치
-    var pawsOn = box.getAttribute('data-paws') !== '0'
-      && !(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+    // 고양이 발자국 트레일 은퇴(사용자 요청 2026-07-27) — 커서는 심플한 손 모양(위 box.cursor)으로.
+    // pawStep이 즉시 반환하도록 항상 off. (아래 트레일 코드는 재도입 대비 남겨 두되 실행되지 않는다.)
+    var pawsOn = false;
     var pawLayer = null, pawLast = null, pawSide = 0, pawAlive = [];
     // 고양이 발자국 SVG("toe beans"/젤리 스타일) — 발끝이 위(-y)라 진행 방향으로 회전시킨다.
     // 젤리 콘셉트: (1) 발가락 젤리 4개 = 통통한 둥근 젤리, 부채꼴 아치로(안쪽 2개가 조금 앞으로)
@@ -351,12 +351,12 @@
       css(idleGate, { position: 'absolute', top: '0', left: '0', right: '0', bottom: '0',
         display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
         gap: '12px', textAlign: 'center', padding: '20px', zIndex: '30',
-        background: 'rgba(255,250,244,0.97)', borderRadius: '16px' });
-      var t = h('div'); t.textContent = '🐱 냥? 잠깐 쉬고 있었어?';
+        background: 'rgba(243,243,243,0.97)', borderRadius: '16px' }); // 연한 회색 바탕
+      var t = h('div'); t.textContent = '아직 보고 있나요?';
       css(t, { fontWeight: '800', fontSize: '18px', color: '#3A3226' });
-      var s = h('div'); s.textContent = '괜찮아! 다시 할 준비되면 아래 버튼을 콕 눌러줘 🐾';
+      var s = h('div'); s.textContent = '다시 시작하려면 아래 버튼을 눌러 주세요.';
       css(s, { fontSize: '13px', color: '#8A8070' });
-      var b = h('button'); b.textContent = '좋아, 계속할래! ✏️'; css(b, btnStyle(C, '#fff'));
+      var b = h('button'); b.textContent = '계속하기'; css(b, btnStyle('#1A1A1A', '#fff')); // 검은색 버튼
       b.onclick = hideIdleGate;
       idleGate.appendChild(t); idleGate.appendChild(s); idleGate.appendChild(b);
       if (getComputedStyle(box).position === 'static') box.style.position = 'relative';
@@ -388,6 +388,35 @@
       wrap.appendChild(ic); wrap.appendChild(p);
       body.appendChild(wrap);
       refreshBtn(); if (footerOn) footerReset();
+    }
+    // 빈 상태 — '지금 낼 문항이 없음'은 오류가 아니라 정상 상태다. 오류(fail)의 붉은 톤·우는
+    // 고양이 대신, 페이지(웜 크림)와 어울리는 차분한 안내 + 부드러운 새로고침으로 보여 준다.
+    // 강의 확인문항처럼 서버가 구체적 안내(운영자 문의 등)를 준 경우엔 그 문구를 그대로 살린다.
+    function empty(msg) {
+      body.innerHTML = '';
+      var GENERIC = '플레이할 문항이 없어요.';
+      var specific = msg && msg !== GENERIC && msg !== '요청 실패' ? msg : '';
+      var wrap = h('div');
+      css(wrap, { textAlign: 'center', padding: '40px 16px 6px', maxWidth: '360px', margin: '0 auto' });
+      var p = h('div'); p.textContent = specific || '지금은 풀 수 있는 문제가 없어요';
+      p.setAttribute('role', 'status');
+      css(p, { color: T.color.inkSoft, fontSize: T.font.md, fontWeight: '700', lineHeight: '1.6' });
+      wrap.appendChild(p);
+      if (!specific) {
+        var sub = h('div'); sub.textContent = '잠시 후 다시 확인해 주세요.';
+        css(sub, { color: T.color.inkMute, fontSize: T.font.sm, fontWeight: '600', marginTop: '4px' });
+        wrap.appendChild(sub);
+      }
+      body.appendChild(wrap);
+      // 부드러운 아웃라인 새로고침 — 에러 톤(회색 채움) 대신 카드와 같은 결의 라인 버튼.
+      var b = h('button'); b.textContent = '새로고침';
+      css(b, { marginTop: '18px', width: '100%', border: '1.5px solid ' + T.color.line,
+        borderRadius: T.radius.md, padding: '11px', minHeight: T.tap, fontWeight: '800',
+        fontSize: '14px', fontFamily: 'inherit', cursor: 'pointer',
+        background: T.color.card, color: T.color.inkSoft });
+      b.onclick = load;
+      body.appendChild(b);
+      status.textContent = '준비 중'; status.style.color = T.color.inkMute;
     }
     // 로딩 스켈레톤 — '불러오는 중…' 텍스트만으로는 빈 화면처럼 보인다. 문항 골격을 미리
     // 그려 로딩을 체감시킨다(순수 표시용, aria-hidden — 상태는 status aria-live가 안내).
@@ -578,7 +607,7 @@
         var exp = h('div');
         css(exp, { marginTop: '10px', padding: '12px 14px', borderRadius: '12px', fontSize: '13px',
           lineHeight: '1.6', background: '#FFF8EE', border: '1px solid #F3E4CC', color: '#6B5E48' });
-        exp.textContent = '🐾 이렇게 풀어요! ' + res.explain;
+        exp.textContent = '이렇게 풀어요! ' + res.explain;
         body.appendChild(exp);
       }
       if (dkBtn) setBtnOn(dkBtn, false); // 답한 뒤엔 '잘 모르겠어요' 비활성
@@ -2310,7 +2339,7 @@
             border: '1.5px solid ' + T.color.brandLine, borderRadius: T.radius.pill,
             padding: '2px 9px', lineHeight: '1.4' });
           mGhost = h('div');
-          mGhost.textContent = '🐾 ' + d.boxLabel;
+          mGhost.textContent = d.boxLabel;
           css(mGhost, { fontSize: '14px', fontWeight: '700', color: T.color.inkFaint,
             padding: '15px 6px', lineHeight: '1.5' });
           mBoxChips = h('div');
@@ -2941,6 +2970,12 @@
               bubbles: true,
               detail: { next_review_at: d.next_review_at || null, message: d.message || '' },
             }));
+            return;
+          }
+          // '낼 문항 없음'은 404로 온다 — 오류가 아니라 정상 빈 상태로 차분히 안내한다.
+          // (진짜 오류: 401·403·5xx 등은 아래 fail의 붉은 톤 그대로 유지)
+          if (r.status === 404) {
+            empty(typeof d === 'string' ? d : '');
             return;
           }
           fail(typeof d === 'string' && d ? d : '요청 실패');

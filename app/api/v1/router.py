@@ -14,6 +14,7 @@ from app.api.v1.endpoints import (
     monitoring,
     notifications,
     ops,
+    payments,
     settings as settings_ep,
     students,
     widget,
@@ -37,5 +38,6 @@ for _mod in (
     lectures,
     course_exam,
     monitoring,
+    payments,
 ):
     api_router.include_router(_mod.router)

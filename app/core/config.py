@@ -71,6 +71,18 @@ class Settings(BaseSettings):
     METRICS_INGEST_TOKEN: str = ""
     LLM_MODEL: str = "claude-opus-4-8"
 
+    # 코스 수강 결제(토스페이먼츠) — 두 키가 모두 있으면 실제 PG 결제 경로가 켜지고, 하나라도
+    # 비면 mock 결제(카드 입력 없이 승인)로 폴백한다(로컬·데모에서 결제 UX를 그대로 볼 수 있게).
+    # 프런트는 checkout 응답의 pg_provider("toss"|"mock")로 실제 결제창/모의 승인을 분기한다.
+    # 시크릿 키는 서버 confirm(/payments/confirm)에서 결제 승인 검증에만 쓰고 프런트로 내보내지 않는다.
+    TOSS_CLIENT_KEY: str = ""  # 프런트 결제창 초기화용 공개 키(응답으로 프런트에 전달 가능)
+    TOSS_SECRET_KEY: str = ""  # 서버 결제 승인 검증용 비밀 키 — 절대 프런트로 노출하지 않는다
+
+    @property
+    def toss_enabled(self) -> bool:
+        """실제 토스 결제 경로 활성 여부 — 두 키가 모두 있어야 승인 검증이 가능하다."""
+        return bool(self.TOSS_CLIENT_KEY.strip()) and bool(self.TOSS_SECRET_KEY.strip())
+
     ENV: str = "dev"
 
     @property

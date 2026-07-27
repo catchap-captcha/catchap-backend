@@ -34,7 +34,7 @@ import logging
 import os
 import re
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import jwt
@@ -625,34 +625,25 @@ def _notify_enroll(student_id: str, course_id: str, *, session_factory=SessionLo
         db.close()
 
 
-@router.post("/courses/{course_id}/enroll")
-def enroll_course(
-    course_id: str,
-    background_tasks: BackgroundTasks,
-    principal: Principal = Depends(require_student),
-    db: Session = Depends(get_db),
-):
-    """코스 수강신청 — 무료 자유 신청(Coursera 무료 모델). 재신청(취소했던 코스)이면 같은 행을
-    active로 되살려 이전 진도를 이어간다((student_id, course_id) 1행 upsert). 활성 코스만 가능.
+def activate_enrollment(db: Session, student_id: str, course_id: str) -> bool:
+    """(student_id, course_id) 수강신청을 active로 upsert 하고, '새로 active가 됐는지'를 돌려준다.
 
-    신청이 '새로 active가 되는 전환'일 때만 완료 알림을 보낸다(이미 수강 중인데 다시 눌러도
-    중복 알림 안 보냄). 알림은 응답 후 백그라운드(인앱+이메일)."""
-    c = db.get(Course, course_id)
-    if c is None or c.status != "active":
-        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="코스를 찾을 수 없어요.")
+    무료 자유 신청과 결제 확정(payments.confirm) 두 경로가 공유하는 단일 진실원 — 재신청(취소했던
+    코스)이면 같은 행을 되살려 이전 진도를 이어가고(진도는 별도 테이블), 동시 신청 경합은 유니크
+    인덱스가 막으므로 IntegrityError를 롤백 후 멱등 처리한다. 커밋까지 여기서 한다.
+    반환값(newly_active)이 True일 때만 호출부가 완료 알림을 보낸다(중복 알림 방지)."""
     e = (
         db.query(CourseEnrollment)
         .filter(
-            CourseEnrollment.student_id == principal.id,
+            CourseEnrollment.student_id == student_id,
             CourseEnrollment.course_id == course_id,
         )
         .first()
     )
-    # 알림은 '미신청/취소 → active' 전환에만. 이미 active면 재클릭이라 안 보낸다.
     was_active = e is not None and e.status == "active"
     if e is None:
         e = CourseEnrollment(
-            student_id=principal.id,
+            student_id=student_id,
             course_id=course_id,
             status="active",
             enrolled_at=datetime.now(),
@@ -669,7 +660,7 @@ def enroll_course(
         e = (
             db.query(CourseEnrollment)
             .filter(
-                CourseEnrollment.student_id == principal.id,
+                CourseEnrollment.student_id == student_id,
                 CourseEnrollment.course_id == course_id,
             )
             .first()
@@ -677,7 +668,27 @@ def enroll_course(
         if e is not None and e.status != "active":
             e.status = "active"
             db.commit()
-    if not was_active:
+    return not was_active
+
+
+@router.post("/courses/{course_id}/enroll")
+def enroll_course(
+    course_id: str,
+    background_tasks: BackgroundTasks,
+    principal: Principal = Depends(require_student),
+    db: Session = Depends(get_db),
+):
+    """코스 수강신청 — 무료 자유 신청(Coursera 무료 모델). 재신청(취소했던 코스)이면 같은 행을
+    active로 되살려 이전 진도를 이어간다((student_id, course_id) 1행 upsert). 활성 코스만 가능.
+
+    신청이 '새로 active가 되는 전환'일 때만 완료 알림을 보낸다(이미 수강 중인데 다시 눌러도
+    중복 알림 안 보냄). 알림은 응답 후 백그라운드(인앱+이메일). 유료 코스 결제 경로는
+    payments.py가 결제 확정 후 같은 activate_enrollment를 부른다."""
+    c = db.get(Course, course_id)
+    if c is None or c.status != "active":
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="코스를 찾을 수 없어요.")
+    newly_active = activate_enrollment(db, principal.id, course_id)
+    if newly_active:
         background_tasks.add_task(_notify_enroll, principal.id, course_id)
     return {"ok": True, "enrolled": True}
 
@@ -1712,6 +1723,356 @@ def ops_instructor_dashboard(
         "weak_questions": weak_questions,
         "weak_lectures": weak_lectures,
         "weak_checkpoint_questions": weak_checkpoint_qs,
+    }
+
+
+@router.get("/ops/courses/{course_id}/detail")
+def ops_course_detail(
+    course_id: str,
+    principal: Principal = Depends(require_lecture_manager),
+    db: Session = Depends(get_db),
+):
+    """코스 상세 — 코스 관리 화면이 한 번에 그릴 수 있게 코스 메타 + 소속 강의 목록을 묶는다.
+    강의 행은 기존 _lecture_row 그대로(신규 집계 아님) — 코스 관리 화면의 '이 코스의 강의'
+    패널과 강의 재배정(강의 수정 PUT의 course_id)의 조회 근거로 쓴다."""
+    c = _get_ops_course(db, course_id, principal)
+    lec_rows = (
+        db.query(Lecture)
+        .filter(Lecture.course_id == c.id, Lecture.status != "deleted")
+        .order_by(Lecture.order_no, Lecture.created_at)
+        .all()
+    )
+    return {
+        **_course_row(db, c),
+        "lectures": [_lecture_row(db, lec) for lec in lec_rows],
+    }
+
+
+@router.get("/ops/questions/review-queue")
+def ops_question_review_queue(
+    tab: str = "pending",  # pending(검수 대기) | review(검토 권장) | published(공개됨)
+    page: int = 1,
+    page_size: int = 20,
+    lecture_id: str | None = None,
+    principal: Principal = Depends(require_content_author),  # 문항 검수 — 저작자(강사) 전용
+    db: Session = Depends(get_db),
+):
+    """확인문항 검수 큐 — 강사 홈의 '표본 검수'(무작위 최대 6개 미리보기)와 달리, 검수 화면
+    전용으로 전량을 탭(검수 대기/검토 권장/공개됨)별 페이지네이션으로 훑는다.
+
+    '검토 권장'은 자기검증(2번째 LLM) 판정이 discard(불량 의심)인 검수 대기 문항 — 새 상태
+    컬럼을 만들지 않고 기존 payload.suggested_placement로만 가른다. '문제은행으로 보낸'
+    (payload.bank_placed) 문항은 검수 대기에서 제외(강사 홈 집계와 동일 규약). 승인/반려는
+    이 엔드포인트가 하지 않는다 — 기존 PUT(.../questions/{id}, status=active)과 DELETE를
+    그대로 쓴다(신규 상태·컬럼 없이 기존 draft/active/deleted 전이만으로 충분하기 때문)."""
+    if tab not in ("pending", "review", "published"):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="tab은 pending|review|published만 가능합니다.")
+    my_lecture_ids = [
+        r[0]
+        for r in db.query(Lecture.id)
+        .filter(Lecture.uploaded_by == principal.id, Lecture.status == "active")
+        .all()
+    ]
+    if lecture_id:
+        if lecture_id not in my_lecture_ids:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, detail="강의를 찾을 수 없습니다.")
+        my_lecture_ids = [lecture_id]
+    empty = {
+        "items": [], "total": 0, "page": page, "page_size": page_size,
+        "counts": {"pending": 0, "review": 0, "published": 0},
+    }
+    if not my_lecture_ids:
+        return empty
+
+    draft_rows = (
+        db.query(LectureQuestion)
+        .filter(LectureQuestion.lecture_id.in_(my_lecture_ids), LectureQuestion.status == "draft")
+        .order_by(LectureQuestion.created_at.asc())
+        .all()
+    )
+    # bank_placed 제외는 JSON 필드라 파이썬에서 판정(강사당 draft 수는 작아 부담 없음 —
+    # 강사 홈 대시보드의 표본 검수와 동일 판정 로직).
+    pending_rows = [r for r in draft_rows if not (r.payload or {}).get("bank_placed")]
+    review_rows = [r for r in pending_rows if (r.payload or {}).get("suggested_placement") == "discard"]
+    published_count = int(
+        db.query(func.count(LectureQuestion.id))
+        .filter(LectureQuestion.lecture_id.in_(my_lecture_ids), LectureQuestion.status == "active")
+        .scalar()
+        or 0
+    )
+    counts = {"pending": len(pending_rows), "review": len(review_rows), "published": published_count}
+
+    if tab == "pending":
+        source = pending_rows
+    elif tab == "review":
+        source = review_rows
+    else:
+        source = (
+            db.query(LectureQuestion)
+            .filter(LectureQuestion.lecture_id.in_(my_lecture_ids), LectureQuestion.status == "active")
+            .order_by(LectureQuestion.created_at.desc())
+            .all()
+        )
+
+    total = len(source)
+    start = max(0, (page - 1) * page_size)
+    page_rows = source[start : start + page_size]
+    title_by = {
+        lid: title
+        for lid, title in db.query(Lecture.id, Lecture.title)
+        .filter(Lecture.id.in_(my_lecture_ids))
+        .all()
+    }
+    items = []
+    for r in page_rows:
+        row = _question_row(r)
+        row["lecture_title"] = title_by.get(r.lecture_id, "")
+        items.append(row)
+    return {"items": items, "total": total, "page": page, "page_size": page_size, "counts": counts}
+
+
+@router.get("/ops/instructor/analytics")
+def ops_instructor_analytics(
+    principal: Principal = Depends(require_content_author),  # 학습 분석 — 강사 전용
+    db: Session = Depends(get_db),
+):
+    """학습 분석 — 강사 홈(할 일·약한 문항 중심)과 달리 코스·강의별 완주 추이를 본다.
+
+    완주 '시각'을 담는 전용 컬럼(completed_at)은 두지 않는다(스키마 변경 금지 결정) —
+    대신 LectureWatchProgress.updated_at을 완주 시각의 근사치로 쓴다: status가 'done'으로
+    바뀌는 순간 갱신되고 그 뒤로는 watched_max_sec가 늘지 않는 한 다시 안 바뀌므로, 주간
+    추이를 보는 용도로는 충분한 근사다(엄밀한 '최초 완주 시각'과는 다를 수 있음 — 예: 완주
+    후 재생을 다시 열어보면 갱신될 수 있는 방향의 근사 오차). 코스 수료는 이미 정확한
+    시각 컬럼(CourseCompletion.passed_at)이 있어 그대로 쓴다(근사 아님).
+    """
+    from app.models import CourseCompletion, CourseExamAttempt, CourseExamQuestion
+
+    uid = principal.id
+    my_lectures = (
+        db.query(Lecture)
+        .filter(Lecture.uploaded_by == uid, Lecture.status == "active")
+        .all()
+    )
+    lec_ids = [lec.id for lec in my_lectures]
+    my_courses = (
+        db.query(Course)
+        .filter(Course.instructor_id == uid, Course.status == "active")
+        .all()
+    )
+    course_ids = [c.id for c in my_courses]
+
+    # --- 주간 추이(최근 8주, 월요일 시작) — 강의 완주(근사) + 코스 수료(정본)
+    today = datetime.now().date()
+    this_monday = today - timedelta(days=today.weekday())
+    week_starts = [this_monday - timedelta(weeks=w) for w in range(7, -1, -1)]
+    idx_by_week = {w: i for i, w in enumerate(week_starts)}
+    weekly = [
+        {"week_start": w.isoformat(), "lecture_completions": 0, "course_completions": 0}
+        for w in week_starts
+    ]
+
+    def _bucket(d) -> int | None:
+        monday = d - timedelta(days=d.weekday())
+        return idx_by_week.get(monday)  # 9주 이상 전 데이터는 집계 밖(그래프 범위 밖)
+
+    if lec_ids:
+        for (ts,) in (
+            db.query(LectureWatchProgress.updated_at)
+            .filter(
+                LectureWatchProgress.lecture_id.in_(lec_ids),
+                LectureWatchProgress.status == "done",
+            )
+            .all()
+        ):
+            if not ts:
+                continue
+            i = _bucket(ts.date())
+            if i is not None:
+                weekly[i]["lecture_completions"] += 1
+
+    if course_ids:
+        for (ts,) in (
+            db.query(CourseCompletion.passed_at)
+            .filter(CourseCompletion.course_id.in_(course_ids))
+            .all()
+        ):
+            if not ts:
+                continue
+            i = _bucket(ts.date())
+            if i is not None:
+                weekly[i]["course_completions"] += 1
+
+    # --- 코스별 요약 — 수강 인원 대비 수료율 + 활성 시험문항 평균 통과율
+    per_course: list[dict] = []
+    if course_ids:
+        enrolled_counts = dict(
+            db.query(CourseEnrollment.course_id, func.count(CourseEnrollment.id))
+            .filter(
+                CourseEnrollment.course_id.in_(course_ids),
+                CourseEnrollment.status == "active",
+            )
+            .group_by(CourseEnrollment.course_id)
+            .all()
+        )
+        completion_counts = dict(
+            db.query(CourseCompletion.course_id, func.count(CourseCompletion.id))
+            .filter(CourseCompletion.course_id.in_(course_ids))
+            .group_by(CourseCompletion.course_id)
+            .all()
+        )
+        exam_qids_by_course: dict[str, list[str]] = {}
+        for cid, qid in (
+            db.query(CourseExamQuestion.course_id, CourseExamQuestion.id)
+            .filter(
+                CourseExamQuestion.course_id.in_(course_ids),
+                CourseExamQuestion.status == "active",
+            )
+            .all()
+        ):
+            exam_qids_by_course.setdefault(cid, []).append(qid)
+        all_qids = [qid for qids in exam_qids_by_course.values() for qid in qids]
+        attempted_by_q: dict[str, int] = {}
+        mastered_by_q: dict[str, int] = {}
+        if all_qids:
+            attempted_by_q = dict(
+                db.query(
+                    CourseExamAttempt.question_id,
+                    func.count(func.distinct(CourseExamAttempt.student_id)),
+                )
+                .filter(CourseExamAttempt.question_id.in_(all_qids))
+                .group_by(CourseExamAttempt.question_id)
+                .all()
+            )
+            mastered_by_q = dict(
+                db.query(
+                    CourseExamAttempt.question_id,
+                    func.count(func.distinct(CourseExamAttempt.student_id)),
+                )
+                .filter(
+                    CourseExamAttempt.question_id.in_(all_qids),
+                    CourseExamAttempt.result == "correct",
+                )
+                .group_by(CourseExamAttempt.question_id)
+                .all()
+            )
+        for c in my_courses:
+            enrolled = int(enrolled_counts.get(c.id, 0))
+            completed = int(completion_counts.get(c.id, 0))
+            qids = exam_qids_by_course.get(c.id, [])
+            att_total = sum(attempted_by_q.get(q, 0) for q in qids)
+            mas_total = sum(mastered_by_q.get(q, 0) for q in qids)
+            per_course.append(
+                {
+                    "course_id": c.id,
+                    "title": c.title,
+                    "enrolled_count": enrolled,
+                    "completed_count": completed,
+                    "completion_rate": round(completed / enrolled, 3) if enrolled else None,
+                    "exam_pass_rate": round(mas_total / att_total, 3) if att_total else None,
+                }
+            )
+        per_course.sort(key=lambda r: r["enrolled_count"], reverse=True)
+
+    # --- 강의별 시청 퍼널 — 시작(진행 행 존재) 대비 완주율 + 평균 진도율(근사)
+    per_lecture: list[dict] = []
+    active_learners = 0
+    if lec_ids:
+        active_learners = int(
+            db.query(func.count(func.distinct(LectureWatchProgress.student_id)))
+            .filter(LectureWatchProgress.lecture_id.in_(lec_ids))
+            .scalar()
+            or 0
+        )
+        prog_rows = (
+            db.query(
+                LectureWatchProgress.lecture_id,
+                func.count(LectureWatchProgress.id),
+                func.sum(case((LectureWatchProgress.status == "done", 1), else_=0)),
+                func.avg(LectureWatchProgress.watched_max_sec),
+            )
+            .filter(LectureWatchProgress.lecture_id.in_(lec_ids))
+            .group_by(LectureWatchProgress.lecture_id)
+            .all()
+        )
+        # 강의별 확인문항(체크포인트) 통과율 — '학습 분석' 하단 '강의별 확인문항 통과율' 섹션의
+        # 원천. 강사 홈의 weak_lectures와 같은 집계이나(passed/failed 시도 비율), 거긴 상위 6개만
+        # 추리는 반면 여기는 전량(started_count가 있는 강의 전부)을 준다 — 화면 목적이 다르다.
+        cp_rows = (
+            db.query(
+                LectureCheckpointEvent.lecture_id,
+                func.sum(case((LectureCheckpointEvent.result == "passed", 1), else_=0)),
+                func.sum(case((LectureCheckpointEvent.result == "failed", 1), else_=0)),
+                func.count(func.distinct(LectureCheckpointEvent.student_id)),
+            )
+            .filter(
+                LectureCheckpointEvent.lecture_id.in_(lec_ids),
+                LectureCheckpointEvent.result.in_(("passed", "failed")),
+            )
+            .group_by(LectureCheckpointEvent.lecture_id)
+            .all()
+        )
+        cp_by_lecture = {
+            lid: (int(p or 0), int(f or 0), int(learners or 0)) for lid, p, f, learners in cp_rows
+        }
+        dur_by = {lec.id: int(lec.duration_sec or 0) for lec in my_lectures}
+        title_by = {lec.id: lec.title for lec in my_lectures}
+        subject_by = {lec.id: lec.subject for lec in my_lectures}
+        cp_passed_total = 0
+        cp_attempt_total = 0
+        for lid, started, done, avg_watched in prog_rows:
+            started = int(started or 0)
+            if started == 0:
+                continue
+            done = int(done or 0)
+            dur = dur_by.get(lid, 0)
+            # 평균 시청 진도율(근사) — 완주해도 watched_max_sec는 줄지 않아 done 포함 평균이
+            # 실제 '중도 이탈 지점'보다 높게 보일 수 있는 방향의 근사(과대추정 쪽 오차).
+            avg_pct = min(1.0, float(avg_watched or 0) / dur) if dur else None
+            cp_p, cp_f, cp_learners = cp_by_lecture.get(lid, (0, 0, 0))
+            cp_total = cp_p + cp_f
+            cp_passed_total += cp_p
+            cp_attempt_total += cp_total
+            per_lecture.append(
+                {
+                    "lecture_id": lid,
+                    "title": title_by.get(lid, ""),
+                    "subject": subject_by.get(lid, ""),
+                    "started_count": started,
+                    "completed_count": done,
+                    "completion_rate": round(done / started, 3),
+                    "avg_watch_pct": round(avg_pct, 3) if avg_pct is not None else None,
+                    # 확인문항 통과율 — 시도(passed+failed) 0이면 아직 판단 근거가 없어 None
+                    "checkpoint_pass_rate": round(cp_p / cp_total, 3) if cp_total else None,
+                    "checkpoint_learners": cp_learners,
+                }
+            )
+        per_lecture.sort(key=lambda r: r["started_count"], reverse=True)
+
+    # --- 시청 검증 퍼널(전체 근사) — 강의 시작(=100% 기준) → 시청 완주 → 확인문항 통과 → 코스 수료.
+    # 각 단계는 서로 다른 모수(학생×강의 vs 학생×코스)의 독립 비율이라 엄밀한 깔때기는 아니지만,
+    # per_lecture/per_course에서 이미 계산한 합계를 재사용하는 근사 지표로 충분하다.
+    total_started = sum(r["started_count"] for r in per_lecture)
+    total_completed = sum(r["completed_count"] for r in per_lecture)
+    watch_completion_rate = round(total_completed / total_started, 3) if total_started else None
+    checkpoint_pass_rate = (
+        round(cp_passed_total / cp_attempt_total, 3) if lec_ids and cp_attempt_total else None
+    )
+    total_enrolled = sum(r["enrolled_count"] for r in per_course)
+    total_course_completed = sum(r["completed_count"] for r in per_course)
+    course_completion_rate = (
+        round(total_course_completed / total_enrolled, 3) if total_enrolled else None
+    )
+
+    return {
+        "lecture_count": len(my_lectures),
+        "course_count": len(my_courses),
+        "active_learners": active_learners,
+        "checkpoint_pass_rate": checkpoint_pass_rate,
+        "watch_completion_rate": watch_completion_rate,
+        "course_completion_rate": course_completion_rate,
+        "weekly": weekly,
+        "per_course": per_course,
+        "per_lecture": per_lecture,
     }
 
 

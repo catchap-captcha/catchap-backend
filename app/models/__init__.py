@@ -37,6 +37,7 @@ from app.models.course_exam import (
     CourseExamSitting,
 )
 from app.models.course_enrollment import CourseEnrollment
+from app.models.course_order import CourseOrder
 from app.models.lecture import (
     Course,
     Lecture,
@@ -116,6 +117,7 @@ __all__ = [
     "LearningSummary",
     "Course",
     "CourseEnrollment",
+    "CourseOrder",
     "CourseCompletion",
     "CourseExamAttempt",
     "CourseExamQuestion",

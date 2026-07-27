@@ -6,6 +6,7 @@
 import logging
 import re
 import smtplib
+import sys
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from html import unescape
@@ -97,7 +98,13 @@ def send_email(db: Session, to_email: str, subject: str, html: str, user_id: str
         # 개발용: 인증코드/재설정코드가 HTML 하단(약 1000번째 글자)에 있어
         # 잘라내면 코드가 안 보인다 → 본문 전체를 콘솔에 출력한다.
         logger.warning("[EMAIL DRY-RUN] to=%s subject=%s", to_email, subject)
-        print(f"\n===== EMAIL DRY-RUN =====\nTO: {to_email}\nSUBJECT: {subject}\n{html}\n=========================\n")
+        # Windows 콘솔(cp949 등)은 이모지 같은 4바이트 유니코드를 못 찍어 print()가
+        # UnicodeEncodeError로 요청 전체를 죽인다 — 콘솔 인코딩으로 안전하게 변환해서 찍는다.
+        dry_run_text = (
+            f"\n===== EMAIL DRY-RUN =====\nTO: {to_email}\nSUBJECT: {subject}\n{html}\n=========================\n"
+        )
+        enc = sys.stdout.encoding or "utf-8"
+        print(dry_run_text.encode(enc, errors="replace").decode(enc, errors="replace"))
         log.status = "dry_run"
         db.add(log)
         db.commit()

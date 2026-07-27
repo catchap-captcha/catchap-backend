@@ -11,6 +11,9 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 
+# 로컬 개발용 SQLite (dev_cat.db 등) — 실제 사용자 레코드·비밀번호 해시가 들어 있어 커밋 금지
+*.db
+
 # 로그
 *.log
 

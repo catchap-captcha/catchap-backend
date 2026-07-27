@@ -405,23 +405,30 @@ def challenge(
     if lecture is not None:
         return _lecture_challenge(db, request, api, lecture)
     # 교육형 키는 발급 시 과목이 박혀 있지만, 우리 앱(과목별 게임화면)이 붙을 땐
-    # 화면 과목에 맞춰 요청별로 과목을 바꿀 수 있게 허용한다. (EDU_SUBJECTS 안에서만)
+    # 화면 과목에 맞춰 요청별로 과목을 바꿀 수 있게 허용한다. (EDU_SUBJECTS 6개 + 코스가
+    # declare한 동적 과목 — 과목 하드코딩 폐지 방침과 맞춰, 레거시 6과목만 허용하면 새
+    # 코스(자격증·어학 등)의 문제은행 연습이 위젯에서 영영 안 열린다.)
+    from app.services import subject_banks
+
+    def _subject_ok(s: str | None) -> bool:
+        return bool(s) and (s in cs.EDU_SUBJECTS or subject_banks.is_live(s))
+
     eff_subject = api.subject
     learning = False
     if api.product == "edu":
         # 과목 스코프 강제: 외부 판매 키(first_party=False)는 발급 과목에 고정한다 —
         # ?subject=로 다른 과목을 받아 구매 안 한 과목에 접근하는 것을 막는다.
-        # 1st-party(우리 인앱) 키만 요청별 과목 전환을 허용한다(한 키로 6과목 게임화면).
-        if api.first_party and subject and subject in cs.EDU_SUBJECTS:
+        # 1st-party(우리 인앱) 키만 요청별 과목 전환을 허용한다(한 키로 여러 과목 게임화면).
+        if api.first_party and _subject_ok(subject):
             eff_subject = subject
         # 교육형 키는 자기 과목의 실제 문제를 낸다(구매 고객 = 그 과목 학습 API).
-        if eff_subject in cs.EDU_SUBJECTS:
+        if _subject_ok(eff_subject):
             learning = True
     if day is not None:
         learning = True  # 커리큘럼 일차(생활 인앱)도 학습 세션
     if chapter is not None:
         learning = True  # 전체학습 주간 챕터도 학습 세션(조작형 대신 실문항)
-    if bank and api.product == "edu" and eff_subject in cs.EDU_SUBJECTS:
+    if bank and api.product == "edu" and _subject_ok(eff_subject):
         # 전체학습 문제은행 모드 — SRS 큐 출제(만기 복습>틀린>새, 설계:
         # question-bank-scale-design.md). 큐가 비면 '오늘 완료'를 정직하게 알린다(무한
         # 재순환 폐지). 인증 학생이 없으면(외부 임베드) 잠금 적용된 풀에서 랜덤.
