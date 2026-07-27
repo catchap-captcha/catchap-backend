@@ -134,6 +134,18 @@ class PasswordResetConfirm(BaseModel):
     new_password: str = Field(min_length=8)
 
 
+# 학생 비밀번호 재설정 — 학생은 users 테이블에 없어서 위의 재설정 흐름을 탈 수 없었다.
+# 학생 식별자는 이메일이 아니라 student_login_id 이므로 별도 스키마를 둔다.
+class StudentPasswordResetRequest(BaseModel):
+    student_login_id: str = Field(min_length=1, max_length=255)
+
+
+class StudentPasswordResetConfirm(BaseModel):
+    student_login_id: str = Field(min_length=1, max_length=255)
+    code: str = Field(min_length=6, max_length=6)
+    new_password: str = Field(min_length=8)
+
+
 class OrgCodeVerifyRequest(BaseModel):
     organization_id: str
     code: str

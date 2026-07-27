@@ -1254,12 +1254,19 @@ def exam_submit(
 
     picks_by_q = {a.question_id: a.picks for a in req.answers}
     per_ms = max(0, int(req.solve_time_ms)) // max(1, len(sitting.questions))
+    # 채점 대상 문항을 한 번에 로드(문항별 db.get N+1 제거). 완벽 회차는 활성 전 문항이
+    # 한 회차에 담겨 코스가 크면 N이 무제한 — 벌크 1쿼리로 축소. 채점 로직·객체는 불변.
+    _q_ids = [item["question_id"] for item in sitting.questions]
+    _qmap = {
+        q.id: q
+        for q in db.query(CourseExamQuestion).filter(CourseExamQuestion.id.in_(_q_ids or [""])).all()
+    }
     results = []
     correct_n = 0
     stale = 0  # 발급 후 강사가 편집·삭제해 채점 불가한 문항 수(학생에게 정직히 안내)
     graded_ids: set[str] = set()  # 이번 회차에서 실제 채점된 문항(완벽 회차 판정용)
     for item in sitting.questions:
-        q = db.get(CourseExamQuestion, item["question_id"])
+        q = _qmap.get(item["question_id"])
         order: list[int] = item.get("order", [])
         # 발급 후 문항 소실·보기 수 변경 → 저장된 순열이 어긋난다. 채점하면 order 매핑이
         # 터지므로(skeptic CONFIRMED) 이 문항은 채점에서 제외한다. 응답을 기록하지 않아

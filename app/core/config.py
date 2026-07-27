@@ -83,6 +83,21 @@ class Settings(BaseSettings):
         """실제 토스 결제 경로 활성 여부 — 두 키가 모두 있어야 승인 검증이 가능하다."""
         return bool(self.TOSS_CLIENT_KEY.strip()) and bool(self.TOSS_SECRET_KEY.strip())
 
+    # 메인 캡차(사람 확인) — ms의 '다중 객체 드래그' 캡차를 우리 백엔드로 자체 이식.
+    # 플래그가 켜지면 로그인/회원가입 5회 실패 스텝업이 forest 대신 드래그 캡차를 쓴다.
+    # 기본 OFF — 승인 문제 데이터(captcha_questions/objects 행 + media/captcha 이미지)와
+    # 프론트 위젯이 배치된 뒤 켠다. 자체 완결이라 외부 ms 서비스·GPU 도달 필요 없음.
+    DRAG_CAPTCHA_ENABLED: bool = False
+    # 승인 문제 이미지 루트 — 하위에 final/images, final/pieces (ms data/final 구조 그대로).
+    CAPTCHA_MEDIA_DIR: str = "./media/captcha"
+    CAPTCHA_CHALLENGE_TTL_SECONDS: int = 180
+    CAPTCHA_VERIFICATION_TTL_SECONDS: int = 300
+    CAPTCHA_MAX_ATTEMPTS: int = 3
+    CAPTCHA_MAX_CHALLENGES_PER_MINUTE: int = 30
+    # 행동 위험 점수 임계 — 이상이면 통과 대신 재확인/차단(사람도 가끔 걸릴 수 있어 보수적).
+    CAPTCHA_STEP_UP_SCORE: int = 30
+    CAPTCHA_BLOCK_SCORE: int = 80
+
     ENV: str = "dev"
 
     @property

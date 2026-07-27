@@ -35,6 +35,7 @@ from app.models import (
     InquiryReply,
     Invitation,
     Invoice,
+    LoginThrottle,
     Membership,
     ModelVersion,
     Organization,
@@ -2698,3 +2699,164 @@ def update_instructor(
     )
     db.commit()
     return _instructor_row(inst)
+
+
+# ---------------------------------------------------------------------------
+# 계정 잠금 해제 · 학생 임시 비밀번호 발급
+#
+# 왜 필요한가: 로그인 5회(현 8회) 실패하면 캡차를 요구하는데, 캡차를 풀 수 없는 사용자
+# (키보드·스크린리더)나 비밀번호를 잊은 학생은 자력으로 빠져나올 방법이 없었다. 특히 학생은
+# users 테이블에 없어 비밀번호 재설정 흐름 자체가 없었고, 로그인 아이디가 이메일이 아닌
+# 학생(실측 56명 중 47명)은 메일 재설정도 불가능하다. 그 최후 수단을 운영자에게 준다.
+# ---------------------------------------------------------------------------
+class ThrottleUnlockRequest(BaseModel):
+    identifier: str = Field(min_length=1, max_length=255)
+
+
+@router.get("/login-throttles")
+def list_login_throttles(
+    only_blocked: bool = True,
+    principal: Principal = Depends(require_ops),
+    db: Session = Depends(get_db),
+):
+    """로그인 실패 카운터 목록. 실제 계정이 있는 식별자인지도 함께 표시한다.
+
+    실측상 임계를 넘은 식별자 대부분은 '가입도 안 된 아이디'(오타·탐색 흔적)라, 계정 유무를
+    같이 보여주지 않으면 운영자가 실제 피해자를 가려낼 수 없다.
+    """
+    from app.services.auth_service import CAPTCHA_FAIL_THRESHOLD
+
+    query = db.query(LoginThrottle)
+    if only_blocked:
+        query = query.filter(LoginThrottle.fail_count >= CAPTCHA_FAIL_THRESHOLD)
+    rows = query.order_by(LoginThrottle.updated_at.desc()).limit(200).all()
+
+    student_ids = [r.identifier[8:] for r in rows if r.identifier.startswith("student:")]
+    user_emails = [r.identifier[5:] for r in rows if r.identifier.startswith("user:")]
+    live_students = {
+        sp.student_login_id: sp
+        for sp in db.query(StudentProfile).filter(
+            StudentProfile.student_login_id.in_(student_ids or [""])
+        )
+    }
+    live_users = {
+        u.email: u for u in db.query(User).filter(User.email.in_(user_emails or [""]))
+    }
+
+    items = []
+    for r in rows:
+        kind, _, rest = r.identifier.partition(":")
+        account = None
+        if kind == "student" and rest in live_students:
+            sp = live_students[rest]
+            account = {"type": "student", "id": sp.id, "status": sp.status,
+                       "name": sp.real_name or sp.nickname, "can_email": "@" in rest}
+        elif kind == "user" and rest in live_users:
+            u = live_users[rest]
+            account = {"type": "user", "id": u.id, "status": u.status,
+                       "name": u.name, "role": u.role, "can_email": True}
+        items.append({
+            "identifier": r.identifier,
+            "kind": kind,
+            "subject": rest,
+            "fail_count": r.fail_count,
+            "updated_at": r.updated_at,
+            "account": account,  # None이면 가입되지 않은 아이디 = 풀어줄 사람이 없음
+        })
+    return {"items": items, "threshold": CAPTCHA_FAIL_THRESHOLD}
+
+
+@router.post("/login-throttles/unlock")
+def unlock_login_throttle(
+    req: ThrottleUnlockRequest,
+    principal: Principal = Depends(require_ops),
+    db: Session = Depends(get_db),
+):
+    """로그인 실패 카운터를 0으로 — 캡차 요구·하드락을 즉시 해제한다."""
+    row = (
+        db.query(LoginThrottle)
+        .filter(LoginThrottle.identifier == req.identifier.strip())
+        .first()
+    )
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="해당 식별자의 기록이 없습니다.")
+    before = row.fail_count
+    row.fail_count = 0
+    audit(
+        db,
+        action="ops.login_throttle_unlock",
+        actor_user_id=principal.id,
+        target_type="login_throttle",
+        target_id=row.identifier,
+        before={"fail_count": before},
+        after={"fail_count": 0},
+    )
+    db.commit()
+    return {"ok": True, "identifier": row.identifier, "before": before}
+
+
+@router.post("/students/{student_id}/reset-password")
+def reset_student_password(
+    student_id: str,
+    principal: Principal = Depends(require_ops),
+    db: Session = Depends(get_db),
+):
+    """학생 임시 비밀번호 발급 — 로그인 아이디가 이메일이면 메일로도 보낸다.
+
+    이메일이 아닌 학생은 메일을 보낼 수 없으므로 임시 비밀번호를 응답으로 1회만 노출해
+    운영자가 다른 경로(전화·대면)로 전달하게 한다. 이 경우 응답에 비밀번호가 담기므로
+    감사 로그에는 남기지 않는다(로그에 평문 비번을 남기지 않는다).
+    """
+    from app.services import auth_service
+
+    student = db.get(StudentProfile, student_id)
+    if student is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="학생을 찾을 수 없습니다.")
+    if student.status == "disabled":
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail="탈퇴한 계정이에요. 먼저 계정을 재개한 뒤 재설정해 주세요.",
+        )
+    temp_password = secrets.token_urlsafe(9)
+    student.password_hash = hash_password(temp_password)
+    student.must_change_password = True  # 첫 로그인 시 새 비번 강제
+    auth_service.logout(db, student.id)  # 기존 세션 폐기
+    # 임시 비번을 받았는데 캡차에 막혀 못 들어가면 의미가 없다 — 로그인 카운터도 같이 푼다.
+    auth_service._reset_fails(db, f"student:{student.student_login_id}")
+    db.flush()
+
+    login_id = student.student_login_id
+    email_status = "no_email"
+    if "@" in login_id:
+        pw = escape(temp_password)
+        html = (
+            "<div style='font-family:sans-serif;line-height:1.7;color:#333'>"
+            f"<p>{escape(student.real_name or student.nickname or '학습자')}님, 안녕하세요. CatChap입니다.</p>"
+            "<p>요청하신 <b>임시 비밀번호</b>를 안내드립니다.</p>"
+            "<div style='margin:16px 0;padding:14px 16px;background:#eef4ff;border-radius:10px'>"
+            f"<b>로그인 아이디</b><br>{escape(login_id)}<br><br><b>임시 비밀번호</b><br>"
+            f"<span style='font-size:18px;font-weight:700;color:#2563eb;letter-spacing:1px'>{pw}</span></div>"
+            "<p>로그인 후 <b>새 비밀번호로 변경</b>해 주세요.</p><p>감사합니다. 🐾</p></div>"
+        )
+        sent = send_email(
+            db, to_email=login_id, subject="[CatChap] 임시 비밀번호 안내", html=html
+        )
+        email_status = (
+            "dry_run" if not get_settings().smtp_enabled else ("sent" if sent else "failed")
+        )
+    audit(
+        db,
+        action="ops.student_password_reset",
+        actor_user_id=principal.id,
+        target_type="student",
+        target_id=student.id,
+        after={"email_status": email_status},  # ★평문 비밀번호는 남기지 않는다
+    )
+    db.commit()
+    return {
+        "ok": True,
+        "student_login_id": login_id,
+        "email_status": email_status,
+        # 메일을 보낼 수 없는 학생에게만 노출 — 운영자가 다른 경로로 전달해야 한다.
+        "temp_password": None if email_status in ("sent", "dry_run") else temp_password,
+    }

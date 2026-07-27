@@ -13,7 +13,10 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "course_order_01"
-down_revision: Union[str, None] = "lecture_thumbnail_01"
+# th-after의 drag_captcha_01/02도 lecture_thumbnail_01에서 분기해 head가 둘로 갈라졌다
+# (jy 머지 2026-07-27). 관례대로 하나로 체이닝 — 이 리비전을 drag_captcha_02 뒤로 옮긴다.
+# 아직 어떤 DB에도 적용된 적이 없어 down_revision 변경이 안전하다.
+down_revision: Union[str, None] = "drag_captcha_02"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

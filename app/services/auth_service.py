@@ -30,7 +30,12 @@ from app.models import (
 from app.schemas import auth as s
 
 EMAIL_CODE_TTL_MINUTES = 5
-CAPTCHA_FAIL_THRESHOLD = 5  # 이 횟수 이상 연속 실패하면 캡차 요구
+# 이 횟수 이상 연속 실패하면 캡차 요구. 5회는 비밀번호를 아는 사용자가 오타 몇 번으로도
+# 걸릴 만큼 빡빡했다(실측: 캡차 임계를 넘은 식별자 18개 중 17개가 아예 가입도 안 된 오타·탐색
+# 흔적이었다). 하드락(10회)까지 여유를 남기면서 정상 사용자를 덜 벌하도록 8회로 올린다.
+CAPTCHA_FAIL_THRESHOLD = 8
+# 마지막 실패 후 이 시간이 지나면 캡차 요구를 자동 해제한다(카운터 리셋). captcha_required 참고.
+CAPTCHA_DECAY_SECONDS = 1800  # 30분
 
 
 def _now() -> datetime:
@@ -68,10 +73,28 @@ def _reset_fails(db: Session, identifier: str) -> None:
 
 
 def captcha_required(db: Session, identifier: str) -> bool:
+    """캡차를 요구할지 판단한다. 창(window)이 지났으면 카운터를 리셋해 자동 해제한다.
+
+    ★왜 창이 필요한가: 종전엔 fail_count가 '성공 로그인' 외에는 절대 줄지 않아서, 5회 실패한
+    사용자는 영원히 캡차를 요구받았다. 반면 하드락(10회)은 15분이면 자동 해제된다 —
+    **더 많이 틀린 사람이 더 빨리 풀리는 역전**이었다. 게다가 캡차를 풀 수 없는 사용자
+    (키보드·스크린리더)에게는 영구 차단이 된다. 무차별 대입은 초 단위로 오므로 30분 창이
+    실질 방어를 낮추지 않는다(하드락 10회/15분은 그대로 유지된다).
+
+    같은 '창 지나면 리셋' 패턴이 _check_locked·rate_limit 에 이미 있어 그 관례를 따른다.
+    """
     from app.models import LoginThrottle
 
     row = db.query(LoginThrottle).filter(LoginThrottle.identifier == identifier).first()
-    return bool(row and row.fail_count >= CAPTCHA_FAIL_THRESHOLD)
+    if row is None or row.fail_count < CAPTCHA_FAIL_THRESHOLD:
+        return False
+    # updated_at은 로컬 시각(Timestamps)으로 저장되므로 창 비교도 로컬(datetime.now)로 맞춘다
+    last = row.updated_at or row.created_at
+    if last and (datetime.now() - last).total_seconds() >= CAPTCHA_DECAY_SECONDS:
+        row.fail_count = 0
+        db.commit()
+        return False
+    return True
 
 
 def _login_failed(db: Session, identifier: str, message: str) -> HTTPException:
@@ -96,11 +119,21 @@ def _require_captcha_if_needed(db: Session, identifier: str, captcha_token: str 
     """
     if not captcha_required(db, identifier):
         return
+    from app.core.config import get_settings
     from app.models import LoginThrottle
-    from app.services import forest_captcha as fc
 
-    if fc.service.consume_token(captcha_token):
-        return  # 유효 토큰 소비 — 이 시도를 자격 검증으로 진행 허용
+    # 메인 캡차 교체: 플래그가 켜지면 forest 대신 우리 드래그 캡차 토큰을 소비한다(자체 완결).
+    # 로그인 요청엔 session_id가 없어 토큰 유효성만으로 소비(발급된 토큰만 존재하므로 안전).
+    if get_settings().DRAG_CAPTCHA_ENABLED:
+        from app.services import drag_captcha_service as dc
+
+        if dc.verify_and_consume_token(captcha_token):
+            return
+    else:
+        from app.services import forest_captcha as fc
+
+        if fc.service.consume_token(captcha_token):
+            return  # 유효 토큰 소비 — 이 시도를 자격 검증으로 진행 허용
     row = db.query(LoginThrottle).filter(LoginThrottle.identifier == identifier).first()
     raise HTTPException(
         status.HTTP_401_UNAUTHORIZED,
@@ -706,12 +739,45 @@ def register_org(db: Session, req: s.RegisterOrgRequest) -> Organization:
 
 
 
+def password_reset_request(db: Session, email: str) -> None:
+    """비밀번호 재설정 코드를 발송한다.
+
+    ★이 함수는 없었다 — 엔드포인트(/auth/password-reset/request)가 부르고 있었는데 정의가
+    빠져 있어서 **프로덕션에서 모든 재설정 요청이 AttributeError로 500**이었다(2026-07-27 확인).
+    즉 "비밀번호를 잊으셨나요?"가 아무에게도 동작하지 않았다.
+
+    학생도 여기서 함께 처리한다: 학생은 users에 없지만 2026-07-16 이후 가입자는 로그인
+    아이디가 곧 이메일이라 같은 주소로 코드를 보낼 수 있다. 사용자가 '나는 학생인가 강사인가'를
+    스스로 구분해 다른 화면을 찾아갈 필요가 없도록 한 입구에서 받는다.
+
+    계정 존재 여부를 응답으로 흘리지 않기 위해 어떤 경우에도 조용히 반환한다(호출부는 항상 200).
+    """
+    email = email.strip().lower()
+    # 존재 확인 전에 걸어 계정 열거·발송 폭주를 함께 막는다.
+    rate_limit(db, f"pwresetreq:{email}", limit=5, window_seconds=3600)
+    known = db.query(User).filter(User.email == email).first() is not None
+    if not known:
+        known = _student_for_reset(db, email) is not None
+    if not known:
+        return
+    send_email_code(db, email, "reset")
+
+
 def password_reset_confirm(db: Session, req: s.PasswordResetConfirm) -> None:
     email = req.email.strip().lower()
     # B2: 6자리 재설정 코드 무제한 대입 → 계정 탈취 차단 (이메일 기준 잠금)
     ident = f"reset:{email}"
     _check_locked(db, ident)
     user = db.query(User).filter(User.email == email).first()
+    # 학생은 users에 없다 — 같은 이메일의 학생이 있으면 학생 재설정으로 넘긴다(위 발송과 대칭).
+    if user is None and _student_for_reset(db, email) is not None:
+        student_password_reset_confirm(
+            db,
+            s.StudentPasswordResetConfirm(
+                student_login_id=email, code=req.code, new_password=req.new_password
+            ),
+        )
+        return
     if user is None:
         _record_fail(db, ident)
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="인증 코드가 올바르지 않습니다.")
@@ -722,8 +788,68 @@ def password_reset_confirm(db: Session, req: s.PasswordResetConfirm) -> None:
         raise
     _reset_fails(db, ident)
     user.password_hash = hash_password(req.new_password)
+    # ★로그인 실패 카운터도 함께 푼다 — 비밀번호를 새로 정했는데 캡차 게이트에 막혀 못 들어가면
+    # 재설정이 무의미하다. 이메일 코드 소지는 캡차보다 강한 본인 증명이므로 보안 하향이 아니다.
+    _reset_fails(db, f"user:{email}")
     db.commit()
     logout(db, user.id)  # 모든 기기 로그아웃
+
+
+# --- 학생 비밀번호 재설정 ---
+# 왜 별도 흐름인가: 학생은 users 테이블이 아니라 student_profiles에 있고 식별자도 이메일이
+# 아니라 student_login_id다. 그래서 위의 password_reset_* 을 탈 수 없었고, 결과적으로
+# **학생은 비밀번호를 잊으면 복구 수단이 전혀 없었다**(교사·운영자 대행 기능도 없었음).
+#
+# ★한계(반드시 인지할 것): 학생에게는 이메일 컬럼이 없다. 2026-07-16 이후 가입자는
+# 로그인 아이디가 곧 이메일이라 그 주소로 보낼 수 있지만, 그 이전 가입자(실측 56명 중 47명)는
+# 보낼 주소가 없다. 그들의 복구 경로는 운영자 임시 비밀번호 발급(ops)뿐이다.
+def _student_for_reset(db: Session, login_id: str) -> StudentProfile | None:
+    return (
+        db.query(StudentProfile)
+        .filter(
+            StudentProfile.student_login_id == login_id,
+            StudentProfile.status != "disabled",
+        )
+        .first()
+    )
+
+
+def student_password_reset_request(db: Session, login_id: str) -> None:
+    """재설정 코드를 학생 이메일(=로그인 아이디)로 발송한다.
+
+    계정 존재 여부를 흘리지 않기 위해 어떤 경우에도 조용히 반환한다(호출부는 항상 200).
+    """
+    login_id = login_id.strip()
+    # 존재 확인 전에 걸어 계정 열거·발송 폭주를 함께 막는다.
+    rate_limit(db, f"sturesetreq:{login_id.lower()}", limit=5, window_seconds=3600)
+    if "@" not in login_id:  # 이메일 형태가 아니면 보낼 주소가 없다
+        return
+    if _student_for_reset(db, login_id) is None:
+        return
+    send_email_code(db, login_id, "reset")
+
+
+def student_password_reset_confirm(db: Session, req: s.StudentPasswordResetConfirm) -> None:
+    login_id = req.student_login_id.strip()
+    # 6자리 코드 무제한 대입 차단(아이디 기준 잠금) — User 재설정과 같은 방식.
+    ident = f"streset:{login_id.lower()}"
+    _check_locked(db, ident)
+    student = _student_for_reset(db, login_id) if "@" in login_id else None
+    if student is None:
+        _record_fail(db, ident)
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="인증 코드가 올바르지 않습니다.")
+    try:
+        _consume_verified_code(db, login_id, req.code, "reset")
+    except HTTPException:
+        _record_fail(db, ident)
+        raise
+    _reset_fails(db, ident)
+    student.password_hash = hash_password(req.new_password)
+    student.must_change_password = False
+    # 로그인 실패 카운터도 함께 초기화(위 User 흐름과 같은 이유).
+    _reset_fails(db, f"student:{login_id}")
+    db.commit()
+    logout(db, student.id)  # 모든 기기 로그아웃
 
 
 # --- 코드 확인 ---

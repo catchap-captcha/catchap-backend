@@ -1,3 +1,4 @@
+from app.services.auth_service import CAPTCHA_DECAY_SECONDS, CAPTCHA_FAIL_THRESHOLD
 from tests.conftest import get_email_code
 
 
@@ -33,9 +34,13 @@ def test_login_wrong_password(client, seed_org):
     assert login(client, "teacher", "t1@test.dev", "wrong").status_code == 401
 
 
-def test_captcha_required_after_five_fails(client, seed_org):
-    """5회 이상 연속 실패 → captcha_required, 성공하면 리셋"""
-    for i in range(1, 5):
+def test_captcha_required_after_threshold_fails(client, seed_org):
+    """임계 횟수 이상 연속 실패 → captcha_required, 성공하면 리셋.
+
+    임계값을 하드코딩하지 않고 상수를 따른다 — 5회는 오타 몇 번에도 걸릴 만큼 빡빡해
+    8회로 올렸는데(CAPTCHA_FAIL_THRESHOLD), 그때 이 테스트가 상수와 어긋나 깨졌다.
+    """
+    for i in range(1, CAPTCHA_FAIL_THRESHOLD):
         res = login(client, "teacher", "t1@test.dev", "wrong")
         assert res.status_code == 401
         assert res.json()["detail"]["captcha_required"] is False, f"{i}번째 실패에서 캡차 요구"
@@ -62,7 +67,7 @@ def test_captcha_required_after_five_fails(client, seed_org):
 
 def test_student_captcha_counter(client, seed_org):
     """학생 로그인도 실패 카운트/리셋 동작"""
-    for _ in range(5):
+    for _ in range(CAPTCHA_FAIL_THRESHOLD):
         res = client.post(
             "/api/v1/auth/student-login",
             json={"student_login_id": "stu01", "password": "wrong"},
@@ -509,3 +514,240 @@ def test_email_verification_expiry(client, db):
         json={"email": "expired@test.dev", "code": "999999", "purpose": "signup"},
     )
     assert res.status_code == 400
+
+
+# --- 캡차 요구 자동 해제(시간 창) ---
+def test_captcha_requirement_decays_after_window(client, db, seed_org):
+    """★임계를 넘겨도 창(30분)이 지나면 캡차 요구가 자동 해제된다.
+
+    종전엔 fail_count가 성공 로그인 외에는 절대 줄지 않아, 캡차를 풀 수 없는 사용자
+    (키보드·스크린리더)에게는 영구 차단이었다. 반대로 하드락(10회)은 15분이면 풀려서
+    '더 많이 틀린 사람이 더 빨리 풀리는' 역전까지 있었다.
+    """
+    from datetime import datetime, timedelta
+
+    from app.models import LoginThrottle
+
+    for _ in range(CAPTCHA_FAIL_THRESHOLD):
+        res = login(client, "teacher", "t1@test.dev", "wrong")
+    assert res.json()["detail"]["captcha_required"] is True
+
+    # 마지막 실패 시각을 창 밖으로 밀어 놓는다(시간을 기다리지 않고 조건만 재현).
+    row = db.query(LoginThrottle).filter(LoginThrottle.identifier == "user:t1@test.dev").one()
+    row.updated_at = datetime.now() - timedelta(seconds=CAPTCHA_DECAY_SECONDS + 60)
+    db.commit()
+
+    after = login(client, "teacher", "t1@test.dev", "wrong")
+    assert after.json()["detail"]["captcha_required"] is False, "창이 지났는데 캡차를 계속 요구"
+
+
+def test_captcha_requirement_stays_within_window(client, db, seed_org):
+    """창 안에서는 그대로 요구한다 — 감쇠가 방어를 통째로 없애면 안 된다."""
+    from datetime import datetime, timedelta
+
+    from app.models import LoginThrottle
+
+    for _ in range(CAPTCHA_FAIL_THRESHOLD):
+        login(client, "teacher", "t1@test.dev", "wrong")
+    row = db.query(LoginThrottle).filter(LoginThrottle.identifier == "user:t1@test.dev").one()
+    row.updated_at = datetime.now() - timedelta(seconds=CAPTCHA_DECAY_SECONDS - 120)
+    db.commit()
+
+    still = login(client, "teacher", "t1@test.dev", "wrong")
+    assert still.json()["detail"]["captcha_required"] is True
+
+
+# --- 학생 비밀번호 재설정 ---
+def _student_reset_code(db, login_id: str) -> str:
+    """재설정용 이메일 코드를 직접 심는다(dry-run 발송이라 원문을 꺼낼 수 없다)."""
+    from datetime import datetime, timedelta
+
+    from app.core.security import sha256_hash
+    from app.models import EmailVerificationCode
+
+    code = "654321"
+    db.add(
+        EmailVerificationCode(
+            email=login_id.lower(),
+            purpose="reset",
+            code_hash=sha256_hash(code),
+            expires_at=datetime.now() + timedelta(minutes=10),
+        )
+    )
+    db.commit()
+    return code
+
+
+def test_student_password_reset_end_to_end(client, db, seed_org):
+    """학생은 users에 없어 기존 재설정 흐름을 탈 수 없었다 — 전용 경로로 실제 비번이 바뀌는지."""
+    from app.core.security import hash_password
+    from app.models import StudentProfile
+
+    # 로그인 아이디가 이메일인 학생(2026-07-16 이후 가입 형태)
+    st = StudentProfile(
+        student_login_id="kid@test.dev",
+        student_code="CAT-7777",
+        password_hash=hash_password("OldPass123!"),
+        nickname="이메일학생",
+    )
+    db.add(st)
+    db.commit()
+
+    assert client.post(
+        "/api/v1/auth/student-password-reset/request", json={"student_login_id": "kid@test.dev"}
+    ).status_code == 200
+
+    code = _student_reset_code(db, "kid@test.dev")
+    res = client.post(
+        "/api/v1/auth/student-password-reset/confirm",
+        json={"student_login_id": "kid@test.dev", "code": code, "new_password": "NewPass123!"},
+    )
+    assert res.status_code == 200, res.text
+
+    # 새 비번으로 로그인되고 옛 비번은 막힌다
+    ok = client.post(
+        "/api/v1/auth/student-login",
+        json={"student_login_id": "kid@test.dev", "password": "NewPass123!"},
+    )
+    assert ok.status_code == 200, ok.text
+    old = client.post(
+        "/api/v1/auth/student-login",
+        json={"student_login_id": "kid@test.dev", "password": "OldPass123!"},
+    )
+    assert old.status_code == 401
+
+
+def test_student_password_reset_clears_login_lock(client, db, seed_org):
+    """★재설정을 마쳤는데 캡차 게이트에 막히면 의미가 없다 — 로그인 카운터도 함께 풀려야 한다."""
+    from app.core.security import hash_password
+    from app.models import LoginThrottle, StudentProfile
+
+    st = StudentProfile(
+        student_login_id="locked@test.dev",
+        student_code="CAT-7778",
+        password_hash=hash_password("OldPass123!"),
+        nickname="잠긴학생",
+    )
+    db.add(st)
+    db.commit()
+
+    for _ in range(CAPTCHA_FAIL_THRESHOLD):
+        res = client.post(
+            "/api/v1/auth/student-login",
+            json={"student_login_id": "locked@test.dev", "password": "wrong"},
+        )
+    assert res.json()["detail"]["captcha_required"] is True
+
+    code = _student_reset_code(db, "locked@test.dev")
+    assert client.post(
+        "/api/v1/auth/student-password-reset/confirm",
+        json={"student_login_id": "locked@test.dev", "code": code, "new_password": "NewPass123!"},
+    ).status_code == 200
+
+    row = (
+        db.query(LoginThrottle)
+        .filter(LoginThrottle.identifier == "student:locked@test.dev")
+        .first()
+    )
+    assert row is None or row.fail_count == 0, "재설정 후에도 로그인 카운터가 남아 캡차에 막힌다"
+    ok = client.post(
+        "/api/v1/auth/student-login",
+        json={"student_login_id": "locked@test.dev", "password": "NewPass123!"},
+    )
+    assert ok.status_code == 200, ok.text
+
+
+def test_student_password_reset_does_not_leak_existence(client, db, seed_org):
+    """없는 아이디·이메일 아닌 아이디로 요청해도 200 — 응답으로 가입 여부를 알 수 없어야 한다."""
+    for login_id in ("nobody@test.dev", "stu01"):
+        res = client.post(
+            "/api/v1/auth/student-password-reset/request", json={"student_login_id": login_id}
+        )
+        assert res.status_code == 200, f"{login_id} 응답이 200이 아님 → 존재 여부 노출"
+
+
+def test_student_password_reset_rejects_wrong_code(client, db, seed_org):
+    from app.core.security import hash_password
+    from app.models import StudentProfile
+
+    db.add(
+        StudentProfile(
+            student_login_id="wrongcode@test.dev",
+            student_code="CAT-7779",
+            password_hash=hash_password("OldPass123!"),
+            nickname="코드틀림",
+        )
+    )
+    db.commit()
+    _student_reset_code(db, "wrongcode@test.dev")
+    res = client.post(
+        "/api/v1/auth/student-password-reset/confirm",
+        json={"student_login_id": "wrongcode@test.dev", "code": "000000", "new_password": "NewPass123!"},
+    )
+    assert res.status_code == 400
+
+
+# --- 비밀번호 재설정(전원) ---
+def test_password_reset_request_does_not_500(client, db, seed_org):
+    """★회귀: password_reset_request 정의가 빠져 있어 프로덕션에서 모든 요청이 500이었다.
+
+    존재하는 계정·없는 계정 모두 200이어야 한다(계정 열거 방지 + 500 재발 방지).
+    """
+    for email in ("t1@test.dev", "nobody@test.dev"):
+        res = client.post("/api/v1/auth/password-reset/request", json={"email": email})
+        assert res.status_code == 200, f"{email} → {res.status_code} {res.text}"
+
+
+def test_password_reset_request_covers_student(client, db, seed_org):
+    """학생(users에 없음)도 같은 입구에서 코드를 받는다 — 사용자가 역할을 구분할 필요가 없다."""
+    from app.core.security import hash_password
+    from app.models import EmailVerificationCode, StudentProfile
+
+    db.add(
+        StudentProfile(
+            student_login_id="unified@test.dev",
+            student_code="CAT-7780",
+            password_hash=hash_password("OldPass123!"),
+            nickname="통합입구",
+        )
+    )
+    db.commit()
+    assert client.post(
+        "/api/v1/auth/password-reset/request", json={"email": "unified@test.dev"}
+    ).status_code == 200
+    issued = (
+        db.query(EmailVerificationCode)
+        .filter(
+            EmailVerificationCode.email == "unified@test.dev",
+            EmailVerificationCode.purpose == "reset",
+        )
+        .count()
+    )
+    assert issued == 1, "학생인데 재설정 코드가 발급되지 않았다"
+
+
+def test_password_reset_confirm_falls_through_to_student(client, db, seed_org):
+    """같은 입구에서 확정도 되어야 한다 — 학생이면 학생 비번이 바뀐다."""
+    from app.core.security import hash_password
+    from app.models import StudentProfile
+
+    db.add(
+        StudentProfile(
+            student_login_id="unified2@test.dev",
+            student_code="CAT-7781",
+            password_hash=hash_password("OldPass123!"),
+            nickname="통합확정",
+        )
+    )
+    db.commit()
+    code = _student_reset_code(db, "unified2@test.dev")
+    res = client.post(
+        "/api/v1/auth/password-reset/confirm",
+        json={"email": "unified2@test.dev", "code": code, "new_password": "NewPass123!"},
+    )
+    assert res.status_code == 200, res.text
+    ok = client.post(
+        "/api/v1/auth/student-login",
+        json={"student_login_id": "unified2@test.dev", "password": "NewPass123!"},
+    )
+    assert ok.status_code == 200, ok.text
