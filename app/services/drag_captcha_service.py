@@ -14,7 +14,9 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import logging
 import math
+import random
 import secrets
 import uuid
 from contextlib import contextmanager
@@ -29,6 +31,15 @@ from app.core.config import get_settings
 from app.db.session import engine
 
 CANVAS_TYPE = "object_drag"
+
+_log = logging.getLogger(__name__)
+
+# 만료 행 청소 — 레거시 forest 캡차(forest_captcha._sweep)와 같은 '확률적 청소' 관례를 따른다.
+# 발급 요청마다 DELETE를 돌리면 핫패스가 무거워지므로 2%만 수행하고, 한 번에 지우는 양도 묶는다.
+_PURGE_PROBABILITY = 0.02
+_PURGE_BATCH = 500
+# 만료 후 이만큼 더 지난 것만 지운다. 토큰 수명이 챌린지 수명보다 길기 때문에 필요한 유예다(아래 참조).
+_PURGE_GRACE_SECONDS = 60
 
 
 def utcnow() -> datetime:
@@ -220,10 +231,43 @@ def summarize(events: list[Any], selected: set[str], targets: set[str], duration
 
 
 # ── 고수준 API(ms main.py 엔드포인트 로직 이식) ──
+def _maybe_purge_expired() -> None:
+    """만료된 챌린지를 확률적으로 청소한다(자식 행은 FK CASCADE로 함께 삭제).
+
+    왜 필요한가: 이식 원본에는 이 루틴이 없어 captcha_challenges_v2 / challenge_objects /
+    attempts / tokens 가 영구히 쌓였다. 레거시 forest 캡차는 같은 문제를 `_sweep`(확률 2%)로
+    해결하고 있었으므로 그 관례를 그대로 따른다.
+
+    ★유예(_PURGE_GRACE_SECONDS)가 반드시 필요한 이유: 토큰 수명
+    (CAPTCHA_VERIFICATION_TTL_SECONDS=300초)이 챌린지 수명(CAPTCHA_CHALLENGE_TTL_SECONDS=180초)
+    보다 길다. captcha_tokens 는 challenge_id 에 ON DELETE CASCADE 로 묶여 있어서, 만료 즉시
+    챌린지를 지우면 방금 캡차를 푼 사용자가 로그인 요청을 보내는 사이에 토큰이 증발해
+    **정상 로그인이 막힌다**. 그래서 '토큰이 아직 살아 있을 수 있는 최대 시간'만큼 지난
+    것만 지운다.
+
+    청소는 부가 작업이라 발급과 트랜잭션을 분리하고, 실패해도 캡차 발급을 막지 않는다.
+    """
+    if random.random() >= _PURGE_PROBABILITY:
+        return
+    s = get_settings()
+    cutoff = utcnow() - timedelta(seconds=s.CAPTCHA_VERIFICATION_TTL_SECONDS + _PURGE_GRACE_SECONDS)
+    try:
+        with _cursor() as (raw, cur):
+            # ORDER BY + LIMIT 으로 idx_challenge_expiry 를 타면서 한 번에 지우는 양을 묶는다.
+            cur.execute(
+                "DELETE FROM captcha_challenges_v2 WHERE expires_at < %s ORDER BY expires_at LIMIT %s",
+                (cutoff, _PURGE_BATCH),
+            )
+            raw.commit()
+    except Exception:  # noqa: BLE001 — 유지보수 작업이 사용자 요청을 깨뜨리면 안 된다
+        _log.warning("drag captcha 만료 챌린지 청소 실패(무시하고 진행)", exc_info=True)
+
+
 def create_challenge(purpose: str, session_id: str, ip: str) -> dict[str, Any]:
     """새 챌린지 발급. 실패 시 예외 코드는 라우터가 HTTP로 매핑."""
     s = get_settings()
     ip_hash = hash_value(ip)
+    _maybe_purge_expired()
     with _cursor() as (raw, cur):
         pattern = _request_pattern(cur, session_id, ip_hash)
         if pattern["ip_challenges_1m"] >= s.CAPTCHA_MAX_CHALLENGES_PER_MINUTE:
