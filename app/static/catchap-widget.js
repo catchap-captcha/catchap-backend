@@ -14,7 +14,7 @@
   'use strict';
   // ── 디자인 토큰 (1단계 도입) — 코드 전체에 흩어져 있던 하드코딩 스타일의 단일 근거.
   // 기존 브랜드 톤을 유지하며 체계화: 코랄(#FF5A4D)=주 액션, 잉크 브라운(#3A3226)=본문.
-  // 대비(크림 #FFFAF4 배경 기준): ink 11.9:1 · inkSoft 6.6:1 · inkFaint 4.6:1 — 본문/보조 AA 이상.
+  // 대비(배경 #F7F9FC 기준): ink 12.9:1 · inkSoft 6.7:1 · inkFaint 4.6:1 — 본문/보조 AA 이상.
   var T = {
     color: {
       brand: '#FF5A4D',        // 브랜드 코랄 — 주 버튼·선택 강조
@@ -22,13 +22,16 @@
       brandLine: '#FFB8A8',    // 코랄 보조 라인(드롭 링 등)
       ok: '#17B08C', okSoft: '#E1F5EC',        // 정답
       err: '#D14559', errSoft: '#FFEDEF',      // 오답(아동용 — 채도 낮춘 로즈)
-      ink: '#3A3226',          // 본문 잉크(웜 브라운)
-      inkSoft: '#6B6157',      // 보조 텍스트(뜻·라벨)
-      inkFaint: '#8A8070',     // 힌트·자리표시
-      inkMute: '#B0A79B',      // 상태 표시·비활성
-      line: '#F0E4D8',         // 카드 테두리(웜 샌드)
-      lineSoft: '#E3D6C6',     // 점선 존 테두리
-      cream: '#FFFAF4',        // 놀이 영역 배경
+      // 중립색은 쿨 그레이 계열(2026-07-28). 종전 웜 브라운/샌드/크림은 아동용 톤이라
+      // 자격증·직무교육으로 전환된 제품과 어긋났다. 명도는 그대로 두고 색상만 쿨로 옮겨
+      // 대비비는 유지한다(아래 주석 참고). 브랜드 코랄·정답/오답 의미색은 그대로.
+      ink: '#2B2F36',          // 본문 잉크(쿨 차콜)
+      inkSoft: '#5A6270',      // 보조 텍스트(뜻·라벨)
+      inkFaint: '#767F8E',     // 힌트·자리표시
+      inkMute: '#A6AEBB',      // 상태 표시·비활성
+      line: '#E4E8EF',         // 카드 테두리(쿨 그레이)
+      lineSoft: '#D3D9E3',     // 점선 존 테두리
+      cream: '#F7F9FC',        // 놀이 영역 배경(쿨 오프화이트)
       card: '#fff',
       // 발자국 트레일 젤리 — 브랜드 코랄에 로즈 살짝 섞은 투톤(위 밝은 하이라이트/아래 진한 그늘).
       // 반투명(≈0.5~0.62)이라 글자 위를 덮어도 읽히되 1단계(0.30)보다 또렷하다.
@@ -38,10 +41,48 @@
     },
     font: { xl: '21px', lg: '17px', md: '15px', sm: '13px', xs: '12px' },
     radius: { lg: '16px', md: '12px', sm: '10px', pill: '30px' },
-    shadow: { card: '0 10px 30px -20px rgba(120,90,70,.4)', pop: '0 10px 24px -14px rgba(120,90,70,0.35)' },
+    // 그림자도 쿨로 — 종전 rgba(120,90,70)은 갈색이라 쿨 중립색 위에서 누렇게 비쳤다.
+    shadow: { card: '0 10px 30px -20px rgba(60,72,92,.4)', pop: '0 10px 24px -14px rgba(60,72,92,0.35)' },
     tap: '44px', // 아동 손가락 최소 터치타깃(WCAG 2.5.5 · 플랫폼 HIG 44pt)
   };
   var C = T.color.brand, OK = T.color.ok; // 기존 사용처(전 렌더러) 호환 별칭
+
+  /* ── 다크 모드 ────────────────────────────────────────────────────────────
+     위젯은 색을 인라인 스타일로 박으므로 CSS 미디어쿼리로는 못 바꾼다. 렌더 직전에
+     팔레트(T.color)를 통째로 갈아끼워 다크에 대응한다.
+     판정 순서: 호스트가 <html data-theme>를 쓰면 그 값이 우선(우리 앱의 테마 토글),
+     없으면 OS 설정(prefers-color-scheme) — 외부 사이트 임베드는 data-theme이 없다.
+     브랜드 코랄·정답 초록 같은 의미색은 두 테마 공통이라 여기서 다루지 않는다. */
+  var PALETTE = {
+    light: {
+      ink: '#2B2F36', inkSoft: '#5A6270', inkFaint: '#767F8E', inkMute: '#A6AEBB',
+      line: '#E4E8EF', lineSoft: '#D3D9E3', cream: '#F7F9FC', card: '#ffffff',
+      brandSoft: '#FFF0EE', okSoft: '#E1F5EC', errSoft: '#FFEDEF',
+    },
+    dark: {
+      ink: '#E6E9EE', inkSoft: '#AAB3C0', inkFaint: '#8B94A3', inkMute: '#6E7789',
+      line: '#2A2F37', lineSoft: '#39404A', cream: '#14171C', card: '#1B1F25',
+      brandSoft: '#3A2320', okSoft: '#12291F', errSoft: '#331B20',
+    },
+  };
+  function isDark() {
+    try {
+      var attr = document.documentElement.getAttribute('data-theme');
+      if (attr === 'dark') return true;
+      if (attr === 'light') return false;
+      return !!(window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches);
+    } catch (e) { return false; }
+  }
+  var themeApplied = null;
+  function applyTheme() {
+    var mode = isDark() ? 'dark' : 'light';
+    if (mode === themeApplied) return false;
+    var p = PALETTE[mode];
+    for (var k in p) T.color[k] = p[k];
+    themeApplied = mode;
+    return true; // 바뀜 — 호출자가 다시 그릴지 판단
+  }
+  applyTheme();
 
   function css(el, o) { for (var k in o) el.style[k] = o[k]; }
   function h(tag, cls) { var e = document.createElement(tag); if (cls) e.className = cls; return e; }
@@ -134,6 +175,7 @@
   }
 
   function mount(box) {
+    applyTheme(); // 박스·머리 스타일도 팔레트를 쓰므로 만들기 전에 테마를 확정한다
     ensureKeyframes();
     var key = box.getAttribute('data-site-key');
     var base = box.getAttribute('data-api') || '/api/v1';
@@ -220,6 +262,9 @@
     var hidden = h('input'); hidden.type = 'hidden'; hidden.name = 'catchap-token';
     box.innerHTML = ''; box.appendChild(head); box.appendChild(body); box.appendChild(hidden);
     var product = 'captcha', renderedAt = 0, retries = 0, solvedCount = 0;
+    // 현재 문항의 문제 텍스트 — catchap:answer 이벤트에 실어 소비자(게임 화면)가 오답을
+    // 목록으로 되짚을 수 있게 한다. 종전엔 정답 여부만 넘겨서 '무엇을 틀렸는지'를 알 수 없었다.
+    var curPrompt = '';
     var redoCount = 0; // 문항당 '다시 고르기/그리기' 횟수 — 행동데이터(retry_count)에 합산
     var answeredCount = 0, sessionDone = false; // 교육형 세션 진행 — 서버 session 응답 우선
     var grading = false;  // verify in-flight — 이 동안 다음 문제/제출 클릭을 무시(데드락 방지)
@@ -397,25 +442,45 @@
       var GENERIC = '플레이할 문항이 없어요.';
       var specific = msg && msg !== GENERIC && msg !== '요청 실패' ? msg : '';
       var wrap = h('div');
-      css(wrap, { textAlign: 'center', padding: '40px 16px 6px', maxWidth: '360px', margin: '0 auto' });
+      // 위아래 여백을 줄였다 — 종전 40px에 전폭 버튼까지 더해 안내 두 줄이 400px 넘는 빈
+      // 상자에 떠 있었다(화면 절반이 공백).
+      css(wrap, { textAlign: 'center', padding: '0 16px 6px', maxWidth: '360px', margin: '0 auto' });
+
+      // 상태 아이콘 — 이모지·마스코트 대신 얇은 선 시계. '잠시 후 다시 확인'이라는 안내와
+      // 뜻이 맞고, 성인 학습자(자격증·직무교육) 화면 톤에 어긋나지 않는다. 색은 브랜드
+      // 코랄 한 점만 남겨 무채색으로 가라앉지 않게 한다.
+      var ic = h('div'); ic.setAttribute('aria-hidden', 'true');
+      ic.innerHTML = '<svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="'
+        + T.color.brand + '" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">'
+        + '<circle cx="12" cy="12" r="9"/><path d="M12 7.4V12l3 1.8"/></svg>';
+      css(ic, { marginBottom: '10px', lineHeight: '0' });
+      wrap.appendChild(ic);
+
       var p = h('div'); p.textContent = specific || '지금은 풀 수 있는 문제가 없어요';
       p.setAttribute('role', 'status');
-      css(p, { color: T.color.inkSoft, fontSize: T.font.md, fontWeight: '700', lineHeight: '1.6' });
+      // 제목은 본문 잉크(ink)로 — 종전 inkSoft라 아이콘·버튼보다 약해 위계가 뒤집혀 있었다.
+      // 글자 크기 19 / 16px — 종전 15px은 580px 폭 카드에서 너무 작았고, 토큰 xl(21)/lg(17)은
+      // 반대로 과했다. 그 사이 값이라 토큰이 없어 여기서만 직접 지정한다.
+      css(p, { color: T.color.ink, fontSize: '19px', fontWeight: '700', lineHeight: '1.5' });
       wrap.appendChild(p);
       if (!specific) {
         var sub = h('div'); sub.textContent = '잠시 후 다시 확인해 주세요.';
-        css(sub, { color: T.color.inkMute, fontSize: T.font.sm, fontWeight: '600', marginTop: '4px' });
+        css(sub, { color: T.color.inkFaint, fontSize: '16px', fontWeight: '600', marginTop: '7px' });
         wrap.appendChild(sub);
       }
-      body.appendChild(wrap);
-      // 부드러운 아웃라인 새로고침 — 에러 톤(회색 채움) 대신 카드와 같은 결의 라인 버튼.
-      var b = h('button'); b.textContent = '새로고침';
-      css(b, { marginTop: '18px', width: '100%', border: '1.5px solid ' + T.color.line,
-        borderRadius: T.radius.md, padding: '11px', minHeight: T.tap, fontWeight: '800',
-        fontSize: '14px', fontFamily: 'inherit', cursor: 'pointer',
-        background: T.color.card, color: T.color.inkSoft });
+
+      // 새로고침 — 내용 폭에 맞춘 아웃라인 버튼. 종전엔 카드색 전폭 사각이라 회색으로
+      // 가라앉고 카드를 가로질러 무거웠다. 채운 알약은 반대로 과해서, 얇은 코랄 테두리 +
+      // 코랄 글자로만 강조하고 모서리는 각진 12px(알약 30px은 톤이 물러 보인다).
+      var b = h('button'); b.textContent = '다시 확인';
+      css(b, { marginTop: '16px', border: '1px solid ' + T.color.brandLine,
+        borderRadius: T.radius.md, padding: '0 20px', minHeight: T.tap, fontWeight: '700',
+        fontSize: T.font.md, fontFamily: 'inherit', cursor: 'pointer',
+        background: T.color.card, color: T.color.brand });
       b.onclick = load;
-      body.appendChild(b);
+      wrap.appendChild(b);
+
+      body.appendChild(wrap);
       status.textContent = '준비 중'; status.style.color = T.color.inkMute;
     }
     // 로딩 스켈레톤 — '불러오는 중…' 텍스트만으로는 빈 화면처럼 보인다. 문항 골격을 미리
@@ -2925,6 +2990,7 @@
               correct: !!(r.data && r.data.success),
               session: sess || null,
               lecture: (r.data && r.data.lecture) || null,
+              prompt: curPrompt, // 방금 푼 문제의 문제 텍스트(오답 되짚기용)
             },
           }));
         } else if (r.ok && r.data.success) {
@@ -2936,7 +3002,8 @@
     }
 
     function load() {
-      status.textContent = '불러오는 중…'; status.style.color = '#B0A79B';
+      applyTheme(); // 새 문항을 그리기 직전에 현재 테마를 반영(인라인 스타일이라 렌더 시점이 곧 적용 시점)
+      status.textContent = '불러오는 중…'; status.style.color = T.color.inkMute;
       stopSounds();
       body.innerHTML = '';
       showSkeleton();
@@ -2982,6 +3049,7 @@
           return;
         }
         product = r.data.product;
+        curPrompt = typeof r.data.prompt === 'string' ? r.data.prompt : '';
         status.textContent = product === 'edu' ? ('교육 · ' + (r.data.subject || '')) : '캡차';
         render(r.data);
       }).catch(function () { fail('네트워크 오류'); });
