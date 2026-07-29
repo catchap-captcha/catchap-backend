@@ -48,6 +48,7 @@ from app.models import (
     User,
 )
 from app.services import ai_models_service
+from app.services import auth_service
 from app.services import captcha_service as _cs
 from app.services import question_metrics as question_metrics_service
 
@@ -221,7 +222,7 @@ def ops_create_org(
     바로 사용 가능(active) 상태로 만든다.
     """
     admin_email = req.admin_email.strip().lower()
-    if db.query(User).filter(User.email == admin_email).first():
+    if auth_service.login_identifier_taken(db, admin_email):  # 학생 아이디와도 겹치면 안 됨
         raise HTTPException(status.HTTP_409_CONFLICT, detail="이미 가입된 관리자 이메일입니다.")
     if req.business_number and (
         db.query(Organization)
@@ -478,7 +479,7 @@ def create_operator(
     임시 비번은 응답에서도 1회 노출한다(이메일 dry-run/실패 시 수동 전달용).
     """
     email = req.email.strip().lower()
-    if db.query(User).filter(User.email == email).first():
+    if auth_service.login_identifier_taken(db, email):  # 학생 아이디와도 겹치면 안 됨
         raise HTTPException(status.HTTP_409_CONFLICT, detail="이미 가입된 이메일입니다.")
     temp_password = secrets.token_urlsafe(9)
     op = User(
@@ -2558,7 +2559,9 @@ def create_instructor(
     임시 비번은 응답에서도 1회 노출한다(이메일 dry-run/실패 시 수동 전달용 — 운영자 발급과
     동일 규약). 강사는 강의 제작 콘솔(자기 강의만)에 접근하고 운영 메뉴에는 접근 불가."""
     email = req.email.strip().lower()
-    if db.query(User).filter(User.email == email).first():
+    # 학생 아이디(=이메일)와도 겹치면 안 된다 — 겹치면 public_login이 학생으로 판별해
+    # 강사가 자기 계정으로 로그인하지 못한다(auth_service.login_identifier_taken 참고).
+    if auth_service.login_identifier_taken(db, email):
         raise HTTPException(status.HTTP_409_CONFLICT, detail="이미 가입된 이메일입니다.")
     temp_password = secrets.token_urlsafe(9)
     inst = User(

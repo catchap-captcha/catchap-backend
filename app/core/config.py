@@ -71,17 +71,51 @@ class Settings(BaseSettings):
     METRICS_INGEST_TOKEN: str = ""
     LLM_MODEL: str = "claude-opus-4-8"
 
-    # 코스 수강 결제(토스페이먼츠) — 두 키가 모두 있으면 실제 PG 결제 경로가 켜지고, 하나라도
-    # 비면 mock 결제(카드 입력 없이 승인)로 폴백한다(로컬·데모에서 결제 UX를 그대로 볼 수 있게).
-    # 프런트는 checkout 응답의 pg_provider("toss"|"mock")로 실제 결제창/모의 승인을 분기한다.
-    # 시크릿 키는 서버 confirm(/payments/confirm)에서 결제 승인 검증에만 쓰고 프런트로 내보내지 않는다.
+    # 코스 수강 결제. PG 비밀 키는 서버에서만 사용하고 프런트로 내보내지 않는다.
+    # mock은 개발 환경에서만 허용한다. ENV=production이면 PAYMENT_MOCK_ENABLED=true여도
+    # 자동으로 비활성화되어, 키 누락이 실제 결제 성공으로 둔갑하지 않는다.
+    PAYMENT_MOCK_ENABLED: bool = True
     TOSS_CLIENT_KEY: str = ""  # 프런트 결제창 초기화용 공개 키(응답으로 프런트에 전달 가능)
     TOSS_SECRET_KEY: str = ""  # 서버 결제 승인 검증용 비밀 키 — 절대 프런트로 노출하지 않는다
+    KAKAOPAY_CID: str = ""  # 가맹점 코드(CID)
+    KAKAOPAY_SECRET_KEY: str = ""  # 온라인 결제 Secret key — 절대 프런트로 노출하지 않는다
+    KAKAOPAY_CID_SECRET: str = ""  # 계약에 따라 발급되는 CID 인증키(선택)
+    # 비우면 FRONTEND_URL 아래 /student/payment/{success|fail|cancel}을 사용한다.
+    PAYMENT_SUCCESS_URL: str = ""
+    PAYMENT_FAIL_URL: str = ""
+    PAYMENT_CANCEL_URL: str = ""
 
     @property
     def toss_enabled(self) -> bool:
         """실제 토스 결제 경로 활성 여부 — 두 키가 모두 있어야 승인 검증이 가능하다."""
         return bool(self.TOSS_CLIENT_KEY.strip()) and bool(self.TOSS_SECRET_KEY.strip())
+
+    @property
+    def kakaopay_enabled(self) -> bool:
+        """카카오페이 ready/approve 호출에 필요한 CID와 Secret key가 모두 있는지."""
+        return bool(self.KAKAOPAY_CID.strip()) and bool(self.KAKAOPAY_SECRET_KEY.strip())
+
+    @property
+    def payment_mock_enabled(self) -> bool:
+        return bool(self.PAYMENT_MOCK_ENABLED) and not self.is_production
+
+    @property
+    def payment_success_url(self) -> str:
+        return self.PAYMENT_SUCCESS_URL.strip() or (
+            f"{self.FRONTEND_URL.rstrip('/')}/student/payment/success"
+        )
+
+    @property
+    def payment_fail_url(self) -> str:
+        return self.PAYMENT_FAIL_URL.strip() or (
+            f"{self.FRONTEND_URL.rstrip('/')}/student/payment/fail"
+        )
+
+    @property
+    def payment_cancel_url(self) -> str:
+        return self.PAYMENT_CANCEL_URL.strip() or (
+            f"{self.FRONTEND_URL.rstrip('/')}/student/payment/cancel"
+        )
 
     # 메인 캡차(사람 확인) — ms의 '다중 객체 드래그' 캡차를 우리 백엔드로 자체 이식.
     # 플래그가 켜지면 로그인/회원가입 5회 실패 스텝업이 forest 대신 드래그 캡차를 쓴다.

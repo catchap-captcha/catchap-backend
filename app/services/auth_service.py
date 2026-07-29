@@ -3,6 +3,8 @@ import secrets
 from datetime import datetime, timedelta
 
 from fastapi import HTTPException, status
+from sqlalchemy import func
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.security import (
@@ -466,9 +468,10 @@ def logout(db: Session, subject_id: str) -> None:
 
 # --- 이메일 인증 (6자리 코드) ---
 def send_email_code(db: Session, email: str, purpose: str, for_account: bool = False) -> None:
-    # 계정용 이메일(학부모/교사/기관 가입)은 발송 전에 중복을 먼저 알려준다
+    # 계정용 이메일(학부모/교사/기관 가입)은 발송 전에 중복을 먼저 알려준다.
+    # 학생 아이디까지 한 네임스페이스로 본다 — 코드를 보내봐야 가입 단계에서 막힌다.
     if purpose == "signup" and for_account:
-        if db.query(User).filter(User.email == email.strip().lower()).first():
+        if login_identifier_taken(db, email):
             raise HTTPException(status.HTTP_409_CONFLICT, detail="이미 가입된 이메일입니다.")
     # 발송 폭주/스팸 방지: 이메일 기준 시간당 발송 상한 (IP 기준 상한은 엔드포인트에서)
     rate_limit(db, f"emailsend:{email.strip().lower()}", limit=8, window_seconds=3600)
@@ -555,22 +558,45 @@ def register_teacher(db: Session, req: s.RegisterTeacherRequest) -> User:
     )
 
 
-def student_id_available(db: Session, login_id: str) -> bool:
-    """학생 아이디 전역 중복 확인 (전 기관 대상).
+def normalize_login_id(login_id: str) -> str:
+    """로그인 식별자 정규화 — 저장·비교 모두 이 값을 쓴다.
 
-    이미 가입한 학생(student_profiles)뿐 아니라 아직 미사용인 가입 코드에 예약된
-    아이디(student_join_codes.login_id)와도 겹치면 안 된다 — 활성화 시점 충돌 방지.
+    이메일 가입에서 아이디 = 이메일이므로 대소문자는 의미가 없다. 소문자로 통일하지
+    않으면 `STUDENT@cat.dev` 가 `student@cat.dev` 와 다른 계정으로 새로 만들어진다
+    (SQLite는 비교·UNIQUE 인덱스가 대소문자를 구분한다).
     """
-    login_id = login_id.strip()
-    if len(login_id) < 3:
+    return login_id.strip().lower()
+
+
+def login_identifier_taken(db: Session, login_id: str) -> bool:
+    """로그인 식별자가 이미 쓰이고 있는지 — 학생·성인 계정을 한 네임스페이스로 본다.
+
+    학생(student_profiles.student_login_id)과 성인 계정(users.email)은 테이블이 다르지만
+    로그인 입력창은 하나다. 각자 자기 테이블만 검사하면 같은 이메일로 학생과 강사가
+    동시에 존재할 수 있고, 그러면 public_login이 '학생이 있으면 학생 경로'로 판별하므로
+    강사·운영자가 자기 계정으로 로그인하지 못한다(실측 재현). 미사용 가입 코드에 예약된
+    아이디도 활성화 시점에 충돌하므로 함께 본다.
+
+    비교는 대소문자 무시(func.lower) — MySQL은 기본 collation(_ci)이 이미 그렇게 동작하고,
+    SQLite는 구분하므로 여기서 명시적으로 맞춘다.
+    """
+    key = normalize_login_id(login_id)
+    return (
+        db.query(StudentProfile.id)
+        .filter(func.lower(StudentProfile.student_login_id) == key)
+        .first()
+        is not None
+        or db.query(StudentJoinCode.id).filter(func.lower(StudentJoinCode.login_id) == key).first()
+        is not None
+        or db.query(User.id).filter(func.lower(User.email) == key).first() is not None
+    )
+
+
+def student_id_available(db: Session, login_id: str) -> bool:
+    """학생 아이디 전역 중복 확인 (전 기관 + 성인 계정 이메일까지)."""
+    if len(login_id.strip()) < 3:
         return False
-    used_by_student = (
-        db.query(StudentProfile).filter(StudentProfile.student_login_id == login_id).first()
-    )
-    reserved_by_code = (
-        db.query(StudentJoinCode).filter(StudentJoinCode.login_id == login_id).first()
-    )
-    return used_by_student is None and reserved_by_code is None
+    return not login_identifier_taken(db, login_id)
 
 
 def suggest_student_ids(db: Session, requested: str, n: int = 4) -> list[str]:
@@ -600,6 +626,11 @@ def suggest_student_ids(db: Session, requested: str, n: int = 4) -> list[str]:
     ):
         if lid:
             taken.add(lid.strip().lower())
+    # 성인 계정 이메일과도 겹치면 안 된다(login_identifier_taken과 같은 네임스페이스) —
+    # 여기서 빼지 않으면 추천대로 골랐는데 가입에서 409로 막히는 모순이 생긴다.
+    for (mail,) in db.query(User.email).filter(User.email.like(like)).all():
+        if mail:
+            taken.add(mail.strip().lower())
     out: list[str] = []
     i = 1
     while len(out) < n and i <= 200:
@@ -659,8 +690,9 @@ def register_student(db: Session, req: s.RegisterStudentRequest) -> StudentProfi
             raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="기관 코드가 올바르지 않습니다.")
         _assert_org_code_not_expired(org)  # 만료된 코드로는 가입 불가
 
-    # 학생 아이디는 전역 유일 (기관 무관) — 이메일 가입이면 이메일 자체가 아이디
-    login_id = (req.student_login_id or email).strip()
+    # 학생 아이디는 전역 유일 (기관 무관, 성인 계정 이메일과도 겹치면 안 됨)
+    # — 이메일 가입이면 이메일 자체가 아이디. 저장 전 소문자로 정규화한다.
+    login_id = normalize_login_id(req.student_login_id or email)
     if not student_id_available(db, login_id):
         raise HTTPException(
             status.HTTP_409_CONFLICT,
@@ -700,7 +732,17 @@ def register_student(db: Session, req: s.RegisterStudentRequest) -> StudentProfi
                 granted_at=datetime.now(),
             )
         )
-    db.commit()
+    # 위의 중복 검사와 INSERT 사이에 다른 요청이 같은 아이디를 선점할 수 있다
+    # (가입 버튼 더블클릭 등). student_login_id UNIQUE 인덱스가 최종 방어선이므로,
+    # 그 위반은 500이 아니라 위와 같은 409로 사용자에게 돌려준다.
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail="이미 가입된 이메일이에요. 로그인하거나 다른 이메일을 사용해 주세요.",
+        ) from None
     return student
 
 

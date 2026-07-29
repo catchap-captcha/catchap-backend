@@ -64,6 +64,7 @@ from app.db.session import SessionLocal, get_db
 from app.models import (
     Course,
     CourseEnrollment,
+    CourseOrder,
     Lecture,
     LectureCheckpointEvent,
     LectureMaterial,
@@ -77,6 +78,7 @@ from app.models import (
 )
 from app.services import auth_service, lecture_service, notify_service
 from app.services.captcha_service import EDU_SUBJECTS
+from app.services.course_pricing import effective_course_price
 from app.utils.helpers import audit
 
 router = APIRouter(tags=["lectures"])
@@ -370,6 +372,18 @@ def _get_active_lecture(db: Session, lecture_id: str) -> Lecture:
     return lec
 
 
+def _course_pricing_row(c: Course) -> dict:
+    """코스 가격 스냅샷 — 학생 목록·강사 콘솔·체크아웃이 공유하는 표시용 형태.
+    effective_price가 실제 청구 금액이며(할인 기간이면 sale_price), 0이면 무료다."""
+    return {
+        "price": int(c.price or 0),
+        "sale_price": c.sale_price,
+        "sale_ends_at": c.sale_ends_at.isoformat() if c.sale_ends_at else None,
+        "effective_price": effective_course_price(c),
+        "is_free": effective_course_price(c) == 0,
+    }
+
+
 def _require_enrolled(db: Session, lec: Lecture, principal: Principal) -> None:
     """수강신청 게이트 — 코스에 담긴 강의는 그 코스에 수강신청(active)해야 시청·풀이할 수 있다.
 
@@ -389,6 +403,21 @@ def _require_enrolled(db: Session, lec: Lecture, principal: Principal) -> None:
         .first()
     )
     if enrolled is None:
+        # 유료 코스는 '신청하세요'가 아니라 '결제하세요'로 안내한다 — 결제 확정(payments.confirm)이
+        # activate_enrollment를 부르므로, 유료 코스에 active 수강권이 있다는 건 결제됐다는 뜻이다.
+        # 즉 이 한 곳에서 무료 수강신청 게이트와 유료 결제 게이트가 함께 닫힌다.
+        course = db.get(Course, lec.course_id)
+        amount = effective_course_price(course) if course else 0
+        if amount > 0:
+            raise HTTPException(
+                status.HTTP_402_PAYMENT_REQUIRED,
+                detail={
+                    "message": "결제를 완료한 뒤 강의를 이용할 수 있어요.",
+                    "reason": "payment_required",
+                    "course_id": lec.course_id,
+                    "amount": amount,
+                },
+            )
         raise HTTPException(
             status.HTTP_403_FORBIDDEN,
             detail={
@@ -610,7 +639,9 @@ def list_student_courses(
                 "instructor_name": names.get(c.instructor_id),
                 "lecture_count": len(lec_ids),
                 "thumbnail_url": course_thumb_url.get(c.id),
-                # 수강신청 여부 — true면 '내 코스'(신청함), false면 카탈로그(수강신청 버튼)
+                # 가격 — 서버 정본. 프런트는 표시에만 쓰고, 결제 금액은 주문 생성 때 서버가 다시 정한다.
+                "pricing": _course_pricing_row(c),
+                # 수강신청 여부 — true면 '내 코스'(신청함), false면 카탈로그(수강신청/결제 버튼)
                 "enrolled": c.id in enrolled_ids,
                 # 코스 Q — 이 코스 강의에서 은행으로 배치된 문항 수. 화면 규칙:
                 # unlocked>0 → '이 코스 문제 풀기(N)' 버튼 / total>0 & unlocked=0 →
@@ -734,6 +765,17 @@ def enroll_course(
     c = db.get(Course, course_id)
     if c is None or c.status != "active":
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="코스를 찾을 수 없어요.")
+    # 유료 코스는 이 무료 경로로 수강권을 얻을 수 없다 — 결제(payments)만이 수강권을 준다.
+    if effective_course_price(c) > 0:
+        raise HTTPException(
+            status.HTTP_402_PAYMENT_REQUIRED,
+            detail={
+                "reason": "payment_required",
+                "message": "유료 코스는 결제를 완료한 뒤 수강할 수 있어요.",
+                "course_id": c.id,
+                "amount": effective_course_price(c),
+            },
+        )
     newly_active = activate_enrollment(db, principal.id, course_id)
     if newly_active:
         background_tasks.add_task(_notify_enroll, principal.id, course_id)
@@ -747,7 +789,7 @@ def unenroll_course(
     db: Session = Depends(get_db),
 ):
     """수강 취소 — 내 코스에서 빠진다(status='withdrawn'). 진행 이력(시청·수료·시험)은 지우지
-    않아 재신청하면 이어갈 수 있다. 무료 서비스라 환불 개념 없음(Coursera 무료 모델)."""
+    않아 재신청하면 이어갈 수 있다. 결제한 코스는 이 경로로 못 빼고 결제 취소(환불)로 보낸다."""
     e = (
         db.query(CourseEnrollment)
         .filter(
@@ -758,6 +800,25 @@ def unenroll_course(
         .first()
     )
     if e is not None:
+        # paid 주문이 있는 유료 수강권을 단순 취소로 회수하면 결제는 남고 접근만 끊긴다.
+        # 결제 취소 API가 PG 환불과 수강권 회수를 한 흐름으로 처리하도록 유도한다.
+        paid_order = (
+            db.query(CourseOrder.id)
+            .filter(
+                CourseOrder.student_id == principal.id,
+                CourseOrder.course_id == course_id,
+                CourseOrder.status == "paid",
+            )
+            .first()
+        )
+        if paid_order is not None:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                detail={
+                    "reason": "paid_enrollment",
+                    "message": "결제한 코스는 결제 취소 메뉴에서 환불해 주세요.",
+                },
+            )
         e.status = "withdrawn"
         db.commit()
     return {"ok": True, "enrolled": False}
@@ -1296,6 +1357,12 @@ class _CourseUpdate(BaseModel):
     status: str | None = None  # active|hidden
 
 
+class _CoursePricingUpdate(BaseModel):
+    price: int = Field(ge=0, le=100_000_000)
+    sale_price: int | None = Field(default=None, ge=0, le=100_000_000)
+    sale_ends_at: datetime | None = None
+
+
 def _get_ops_course(db: Session, course_id: str, principal: Principal) -> Course:
     """코스 로더 — 운영자는 전체, 강사는 자기 코스(instructor_id)만. 남의 코스는 403이
     아니라 404(강의 스코프 _get_ops_lecture와 동일 — 존재 여부를 흘리지 않는다)."""
@@ -1333,6 +1400,7 @@ def _course_row(db: Session, c: Course) -> dict:
         "instructor_id": c.instructor_id,
         "lecture_count": int(lecture_count),
         "enrolled_count": int(enrolled_count),
+        "pricing": _course_pricing_row(c),
         "thumbnail_url": _course_thumbnail_url(db, c.id),
         "created_at": c.created_at.isoformat() if c.created_at else None,
     }
@@ -1435,6 +1503,43 @@ def ops_update_course(
     )
     db.commit()
     return _course_row(db, c)
+
+
+@router.put("/ops/courses/{course_id}/pricing")
+def ops_update_course_pricing(
+    course_id: str,
+    req: _CoursePricingUpdate,
+    principal: Principal = Depends(require_content_author),
+    db: Session = Depends(get_db),
+):
+    """강사가 자기 코스의 서버 정본 가격을 설정한다.
+
+    결제 주문은 이 값을 원 단위 정수로 스냅샷하므로 프런트가 다른 금액을 보내도 승인되지 않는다.
+    """
+    c = _get_ops_course(db, course_id, principal)
+    if req.sale_price is not None and req.sale_price > req.price:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST, detail="할인가는 정상가보다 클 수 없습니다."
+        )
+    sale_ends_at = req.sale_ends_at
+    if sale_ends_at is not None and sale_ends_at.tzinfo is not None:
+        # 이 코드베이스의 DB 시각 규약은 KST local naive다.
+        sale_ends_at = sale_ends_at.astimezone().replace(tzinfo=None)
+    before = _course_pricing_row(c)
+    c.price = req.price
+    c.sale_price = req.sale_price
+    c.sale_ends_at = sale_ends_at if req.sale_price is not None else None
+    audit(
+        db,
+        action="course.pricing.update",
+        actor_user_id=principal.id,
+        target_type="course",
+        target_id=c.id,
+        before=before,
+        after=_course_pricing_row(c),
+    )
+    db.commit()
+    return _course_pricing_row(c)
 
 
 @router.delete("/ops/courses/{course_id}")

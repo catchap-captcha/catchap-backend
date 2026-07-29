@@ -40,6 +40,11 @@ class Course(Base, UUIDPk, Timestamps):
     category: Mapped[str | None] = mapped_column(String(40), nullable=True, index=True)
     title: Mapped[str] = mapped_column(String(200))
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # 결제 가격의 서버 정본(원 단위 정수). 0이면 무료 코스다. sale_price는 선택 할인가이며
+    # sale_ends_at 전까지만 적용한다. PG 요청 금액은 반드시 이 값으로 계산해 주문에 스냅샷한다.
+    price: Mapped[int] = mapped_column(default=0)
+    sale_price: Mapped[int | None] = mapped_column(nullable=True)
+    sale_ends_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     # 과목 안에서의 코스 정렬(학생 화면: 같은 과목의 코스들 순서). 미지정 시 max+1로 맨 뒤.
     order_no: Mapped[int] = mapped_column(default=0)
     status: Mapped[str] = mapped_column(String(20), default="active")  # active|hidden|deleted

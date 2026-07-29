@@ -33,6 +33,7 @@ for _mod in (
     settings_ep,
     misc,
     ops,
+    payments,
     captcha_api,
     forest_captcha,
     drag_captcha,
@@ -40,6 +41,5 @@ for _mod in (
     lectures,
     course_exam,
     monitoring,
-    payments,
 ):
     api_router.include_router(_mod.router)
