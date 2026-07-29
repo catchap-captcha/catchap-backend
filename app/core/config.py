@@ -46,6 +46,20 @@ class Settings(BaseSettings):
     BACKEND_URL: str = "http://localhost:8000"
     CORS_ORIGINS: str = "http://localhost:5173"
 
+    # 봇 판별 캡차 승급 — 시청 중 이상행동이 누적되면 메인 캡차(드래그)를 띄운다.
+    # 인강 체크포인트 캡차('이 대목 봤는가')와는 별개 장치다: 뜨는 이유가 다르다.
+    #   off     기존과 동일. 누적도 판정도 하지 않는다
+    #   record  누적·판정은 하되 화면에는 아무것도 띄우지 않는다(응답에 플래그 미포함).
+    #           임계값을 실트래픽으로 교정하는 단계 — 사용자 영향 0
+    #   enforce 임계 초과 시 응답에 captcha_required 를 실어 보낸다
+    BOT_ESCALATION_MODE: str = "off"
+    # 임계값. record 모드로 관측한 뒤 정하는 값 — 아래 기본값은 근거 없는 출발점이다.
+    BOT_SUSPICION_THRESHOLD: int = 10
+    # 메인 캡차 호스트. 비우면 승급이 동작하지 않는다(빈 값이면 off 로 강등).
+    MAIN_CAPTCHA_URL: str = ""
+    # /api/verify-token 서버검증용. 절대 프런트로 노출하지 않는다.
+    MAIN_CAPTCHA_SITE_SECRET: str = ""
+
     # 강의 시청 검증 — 영상 저장 디렉터리(경로는 DB에 저장하지 않고 {id}{ext}로 유도)와
     # 업로드 상한. 전역 1MB 본문 제한의 예외 처리는 main.py 미들웨어가 담당한다.
     LECTURE_MEDIA_DIR: str = "./media/lectures"

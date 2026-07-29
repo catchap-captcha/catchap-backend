@@ -77,6 +77,7 @@ from app.models import (
     User,
 )
 from app.services import auth_service, lecture_service, notify_service
+from app.clients import main_captcha_client
 from app.services.captcha_service import EDU_SUBJECTS
 from app.services.course_pricing import effective_course_price
 from app.utils.helpers import audit
@@ -121,6 +122,8 @@ RATE_QUESTION_IMAGE_UPLOAD_PER_HOUR = 120
 # 세션 발급 상한 — 정상 사용(재생 시작·새로고침)은 시간당 수 회. 발급 스팸으로 자기
 # session_id를 회전시키며 진행 행을 흔드는 것을 억제한다.
 RATE_SESSION_PER_HOUR = 60
+# 봇 판별 캡차 통과 토큰 제출 — 정상 학생은 승급 시에만 부른다. 브루트포스 여지를 좁힌다.
+RATE_BOT_CHECK_PER_HOUR = 30
 # takeover 상한 — 두 세션이 하트비트마다 번갈아 takeover하면 동시 재생 차단이 무력화되므로
 # 별도의 낮은 상한을 둔다. 정상 사용(새로고침·기기 이동)은 시간당 수 회를 넘지 않는다.
 RATE_TAKEOVER_PER_HOUR = 30
@@ -944,6 +947,62 @@ def lecture_progress(
     state = lecture_service.advance(db, progress, lec, req.position_sec)
     db.commit()
     return state
+
+
+class _BotCheckReq(BaseModel):
+    """메인 캡차가 발급한 통과 토큰. 캡차 위젯의 postMessage 콜백으로 프런트가 받은 값."""
+
+    captcha_token: str
+
+
+@router.post("/lectures/{lecture_id}/bot-check")
+def lecture_bot_check(
+    lecture_id: str,
+    req: _BotCheckReq,
+    x_lecture_session: str | None = Header(default=None),
+    principal: Principal = Depends(require_student),
+    db: Session = Depends(get_db),
+):
+    """봇 판별 캡차 통과 처리 — 의심 누적을 리셋해 시청을 계속하게 한다.
+
+    프런트가 "통과했다"고 말하는 것은 믿지 않는다. 토큰을 캡차 서버에 서버-투-서버로
+    검증하고(사이트 시크릿 필요), 캡차가 확인해준 것만 인정한다. 토큰은 1회용이며
+    발급 시 강의ID에 바인딩되므로 다른 강의에서 받은 토큰은 여기서 거부된다.
+
+    fail-closed: 검증 실패·설정 누락은 통과가 아니다. 통과를 확인하지 못했으면 통과가 아니다.
+    """
+    auth_service.rate_limit(
+        db, f"lect-botchk:{principal.id}", limit=RATE_BOT_CHECK_PER_HOUR, window_seconds=3600
+    )
+    session_id = _verify_session_token(x_lecture_session, lecture_id, principal.id)
+    lec = _get_active_lecture(db, lecture_id)
+    progress = lecture_service.ensure_progress(db, principal.id, lec)
+
+    try:
+        ok = main_captcha_client.verify_token(
+            token=req.captcha_token, session_id=session_id, lecture_id=lecture_id
+        )
+    except main_captcha_client.MainCaptchaNotConfiguredError:
+        # 승급을 켜두고 캡차 설정을 빼먹은 상태. 학생 탓이 아니므로 500 이 맞다.
+        _log.error("메인 캡차 설정 누락 — 승급이 켜져 있는데 검증할 수 없습니다")
+        raise HTTPException(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={"message": "인증 서버 설정이 준비되지 않았습니다."},
+        ) from None
+
+    if not ok:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            detail={"message": "인증을 완료하지 못했습니다. 다시 시도해 주세요.", "captcha_required": True},
+        )
+
+    lecture_service.clear_suspicion(progress)
+    db.commit()
+    audit(
+        db, action="lecture.bot_check.passed", actor_user_id=principal.id,
+        target_type="lecture", target_id=lecture_id,
+    )
+    return {"ok": True}
 
 
 @router.post("/lectures/{lecture_id}/takeover")

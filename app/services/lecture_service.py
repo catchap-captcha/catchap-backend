@@ -9,6 +9,7 @@
 commit은 호출자(엔드포인트) 책임 — audit()와 같은 규약.
 """
 
+import logging
 from collections.abc import Sequence
 from datetime import timedelta
 from pathlib import Path
@@ -29,9 +30,74 @@ from app.models import (
     LectureWatchProgress,
 )
 
+log = logging.getLogger(__name__)
+
 # 하트비트 간 position 전진 상한 = wall-clock 경과 × SPEED_FACTOR.
 # 2배속 시청까지는 정상 사용이므로 2.5배로 여유를 둔다(전송 지연·반올림 포함).
 SPEED_FACTOR = 2.5
+
+# ---- 봇 의심 누적(캡차 승급) ----
+# 시청 중 이상행동을 하트비트마다 가산하고, 정상 비트에서 감쇠시킨다. 임계를 넘으면
+# 메인 캡차(드래그·행동 AI)를 띄운다. 체크포인트 캡차와는 별개 장치 — 뜨는 이유가 다르다.
+#
+# 신호를 새로 만들지 않았다: 아래 셋은 이미 계산되고 버려지던 값들이다.
+#   ① position 자기신고가 wall-clock 허용치를 초과 (advance 의 min() 이 조용히 클램프)
+#   ② 동시접속 충돌 (claim_session 이 409 만 던지고 끝)
+#   ③ 한 체크포인트에서 연속 오답 상한 도달 (되감기만 하고 끝)
+#
+# 셋 다 "실제로 앉아서 보고 있지 않다"를 가리킨다.
+SUSPICION_SPEED_VIOLATION = 3
+SUSPICION_SESSION_CONFLICT = 5
+SUSPICION_CHECKPOINT_EXHAUSTED = 4
+# 정상 하트비트에서의 감쇠. 이게 없으면 장시간 시청에서 누적만 되어 결국 전원이
+# 캡차를 본다 — 오탐이 시간의 함수가 되어버린다.
+SUSPICION_DECAY_PER_CLEAN_BEAT = 1
+# 상한 — 오래 의심스러웠던 학생이 캡차 하나로 못 벗어나는 상태를 막는다.
+SUSPICION_MAX = 30
+
+
+def _escalation_mode() -> str:
+    """off | record | enforce. 캡차 호스트나 시크릿이 비면 off 로 강등한다.
+
+    설정만으로 완전히 되돌릴 수 있어야 한다 — 잘못 켰을 때 코드 롤백이 필요하면
+    켜는 것 자체가 위험해진다.
+    """
+    settings = get_settings()
+    mode = (getattr(settings, "BOT_ESCALATION_MODE", "off") or "off").strip().lower()
+    if mode not in {"off", "record", "enforce"}:
+        return "off"
+    if mode != "off" and not (
+        getattr(settings, "MAIN_CAPTCHA_URL", "").strip()
+        and getattr(settings, "MAIN_CAPTCHA_SITE_SECRET", "").strip()
+    ):
+        return "off"
+    return mode
+
+
+def bump_suspicion(progress: LectureWatchProgress, amount: int, reason: str) -> int:
+    """의심도 가산. commit 은 호출자 책임(기존 advance/claim_session 규약과 동일)."""
+    if _escalation_mode() == "off" or amount <= 0:
+        return int(progress.bot_suspicion or 0)
+    value = min(SUSPICION_MAX, int(progress.bot_suspicion or 0) + amount)
+    progress.bot_suspicion = value
+    log.info(
+        "bot_suspicion +%d (%s) student=%s lecture=%s -> %d",
+        amount, reason, progress.student_id, progress.lecture_id, value,
+    )
+    return value
+
+
+def clear_suspicion(progress: LectureWatchProgress) -> None:
+    """메인 캡차를 통과했을 때 리셋. 토큰을 서버검증한 뒤에만 부른다."""
+    progress.bot_suspicion = 0
+
+
+def captcha_required(progress: LectureWatchProgress) -> bool:
+    """승급 대상인지. record 모드에서는 True 여도 응답에 싣지 않는다(호출부 책임)."""
+    if _escalation_mode() == "off":
+        return False
+    threshold = int(getattr(get_settings(), "BOT_SUSPICION_THRESHOLD", 10) or 10)
+    return int(progress.bot_suspicion or 0) >= threshold
 # 첫 하트비트·짧은 간격의 반올림/네트워크 지연 여유(초) — 이게 없으면 경과 0초 시점의
 # 정상 하트비트(재생 1~2초)까지 전부 0으로 클램프된다.
 HEARTBEAT_HEADROOM_SEC = 5
@@ -200,6 +266,11 @@ def claim_session(
     ]
     if others:
         if not force:
+            # 동시접속 충돌을 의심도에 남긴다. 이 경로는 409로 빠져나가 호출자가 commit
+            # 하지 않으므로 여기서 직접 커밋한다 — 안 하면 신호가 롤백되어 사라진다.
+            # takeover(force=True)는 정상 이어보기이므로 가산하지 않는다.
+            if bump_suspicion(progress, SUSPICION_SESSION_CONFLICT, "session_conflict"):
+                db.commit()
             raise HTTPException(
                 status.HTTP_409_CONFLICT,
                 detail={
@@ -300,6 +371,16 @@ def advance(
     allowed = elapsed * SPEED_FACTOR + headroom
     new_max = min(position, int(watched + allowed))
 
+    # 위반 기록 — 위 min() 이 초과분을 조용히 잘라내므로, 잘리기 전에 센다.
+    # 클라이언트가 wall-clock 으로 불가능한 진도를 주장했다는 뜻이다.
+    if position > watched + allowed:
+        bump_suspicion(progress, SUSPICION_SPEED_VIOLATION, "speed_violation")
+    elif position > watched:
+        # 정상 전진 비트에서만 감쇠한다 — 일시정지·버퍼링(전진 없음)까지 감쇠에 넣으면
+        # 재생을 멈춰두고 의심도를 씻어낼 수 있다.
+        decayed = int(progress.bot_suspicion or 0) - SUSPICION_DECAY_PER_CLEAN_BEAT
+        progress.bot_suspicion = max(0, decayed)
+
     # 예약이 비어 있으면 여기서 다시 잡는다 — next_checkpoint_sec=None은 '검증 끝'이 아니라
     # '아직 안 잡힘'일 수도 있다. 운영자가 강의 길이를 바꾸거나 문항을 새로 등록하면
     # 낡은 예약을 None으로 지우는데(lectures.py), 재예약 경로가 없으면 그 학생은 남은 강의
@@ -335,7 +416,17 @@ def advance(
     ):
         progress.status = "done"
 
-    return {
+    # record 모드에서는 판정하되 화면에 아무것도 띄우지 않는다 — 임계값을 실트래픽으로
+    # 교정하는 단계다. 플래그를 응답에 실으면 프런트가 캡차를 띄우므로 enforce 에서만 싣는다.
+    escalate = captcha_required(progress)
+    mode = _escalation_mode()
+    if escalate and mode == "record":
+        log.info(
+            "bot_escalation would fire (record) student=%s lecture=%s suspicion=%d",
+            progress.student_id, progress.lecture_id, int(progress.bot_suspicion or 0),
+        )
+
+    state = {
         "watched_max_sec": int(progress.watched_max_sec),
         "next_checkpoint_sec": progress.next_checkpoint_sec,
         "checkpoint_due": bool(checkpoint_due),
@@ -343,6 +434,12 @@ def advance(
         "status": progress.status,
         "duration_sec": duration,
     }
+    if escalate and mode == "enforce":
+        # 프런트는 이 플래그를 보고 메인 캡차 위젯을 띄운다. lecture_id 를 함께 주는 이유는
+        # 캡차가 발급하는 토큰이 강의에 바인딩되기 때문 — 다른 강의 토큰을 재사용할 수 없다.
+        state["captcha_required"] = True
+        state["captcha_lecture_id"] = progress.lecture_id
+    return state
 
 
 def record_checkpoint(
@@ -418,6 +515,9 @@ def record_checkpoint(
             else:
                 progress.watched_max_sec = max(0, cp - REWIND_SEC)
             progress.checkpoint_fails = 0
+            # 되감기만으로 끝내지 않고 의심도에도 반영한다 — 한 대목에서 상한까지
+            # 연속 오답한 것은 내용을 보지 않고 보기를 대입하는 패턴과 구분되지 않는다.
+            bump_suspicion(progress, SUSPICION_CHECKPOINT_EXHAUSTED, "checkpoint_exhausted")
             # 앵커 갱신 필수 — 없으면 게이트가 열려 있던 동안 늘어난 elapsed로 allowed가
             # 부풀어, 되감긴 watched_max가 다음 하트비트 한 번에 cp로 다시 튀어 오른다
             # (되감기 무력화 — 특히 프론트 없이 position=cp를 반복 신고하는 봇).
