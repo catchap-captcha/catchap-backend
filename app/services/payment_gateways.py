@@ -333,3 +333,110 @@ class KakaoPayGateway:
             status="CANCELED",
             method="카카오페이",
         )
+
+
+class PortOneGateway:
+    """포트원(PortOne) V2 — 여러 PG를 한 연동으로 묶는 중개 레이어.
+
+    토스·카카오 직접 연동과 다른 점: 결제창 호출은 브라우저 SDK가 하고, 서버는 결제가 끝난 뒤
+    **paymentId로 조회해서 검증만** 한다(승인 요청을 서버가 보내지 않는다). 그래서 이 클래스에는
+    approve가 없고 verify/cancel만 있다.
+
+    포트원 문서가 명시하는 원칙 그대로 — SDK 콜백이나 웹훅 본문을 신뢰하지 않고 항상
+    GET /payments/{paymentId} 로 다시 조회한 결과만 믿는다.
+    """
+
+    API_BASE = "https://api.portone.io"
+    # 조회 응답의 status. PAID 만 결제 완료로 인정한다(가상계좌 발급·대기 상태와 구분).
+    PAID = "PAID"
+    CANCELLED = {"CANCELLED", "PARTIAL_CANCELLED"}
+
+    def __init__(
+        self,
+        api_secret: str,
+        *,
+        store_id: str = "",
+        client: httpx.Client | None = None,
+        timeout: float = 10.0,
+    ):
+        if not api_secret.strip():
+            raise ValueError("포트원 API Secret이 필요합니다.")
+        self.store_id = store_id.strip()
+        self._headers = {
+            "Authorization": f"PortOne {api_secret.strip()}",
+            "Content-Type": "application/json",
+        }
+        self._client = client
+        self._timeout = timeout
+
+    def _request(
+        self, method: str, path: str, *, json: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        url = f"{self.API_BASE}{path}"
+        try:
+            if self._client is not None:
+                response = self._client.request(method, url, headers=self._headers, json=json)
+            else:
+                response = httpx.request(
+                    method, url, headers=self._headers, json=json, timeout=self._timeout
+                )
+        except httpx.HTTPError as exc:
+            raise PaymentGatewayError(
+                "포트원 결제 결과를 확인하지 못했어요. 잠시 후 상태를 확인해 주세요.",
+                uncertain=True,
+            ) from exc
+        body = _safe_json(response)
+        if response.status_code < 200 or response.status_code >= 300:
+            message, code = _error_message(body, "포트원 요청이 거절됐어요.")
+            raise PaymentGatewayError(
+                message, provider_code=code, uncertain=response.status_code >= 500
+            )
+        return body
+
+    @staticmethod
+    def _payment(body: dict[str, Any]) -> ApprovedPayment:
+        payment_id = str(body.get("id") or "")
+        if not payment_id:
+            raise PaymentGatewayError("포트원 결제 식별값이 없어요.")
+        amount_obj = body.get("amount") if isinstance(body.get("amount"), dict) else {}
+        try:
+            amount = int(amount_obj.get("total"))
+        except (TypeError, ValueError) as exc:
+            raise PaymentGatewayError("포트원 결제 금액을 확인할 수 없어요.") from exc
+        # 결제수단 표기 — payMethod 는 {type: "PaymentMethodCard", ...} 형태다.
+        method_obj = body.get("method") if isinstance(body.get("method"), dict) else {}
+        method = method_obj.get("type") or body.get("payMethod")
+        channel = body.get("channel") if isinstance(body.get("channel"), dict) else {}
+        return ApprovedPayment(
+            provider_payment_id=payment_id,
+            # 포트원은 고객사가 채번한 paymentId 가 곧 주문번호다(우리 order_uid).
+            order_id=payment_id,
+            amount=amount,
+            status=str(body.get("status") or ""),
+            method=str(channel.get("pgProvider") or method or "")[:30] or None,
+            receipt_url=str(body.get("receiptUrl")) if body.get("receiptUrl") else None,
+        )
+
+    def verify(self, payment_id: str) -> ApprovedPayment:
+        """결제 건 조회 — SDK 응답을 믿지 않고 서버가 직접 확인한다."""
+        body = self._request("GET", f"/payments/{quote(payment_id, safe='')}")
+        return self._payment(body)
+
+    def cancel(self, payment_id: str, amount: int, reason: str) -> ApprovedPayment:
+        """전액 취소. 취소 후 상태를 다시 조회해 CANCELLED 인지 확인한다."""
+        payload: dict[str, Any] = {"reason": reason[:200]}
+        if self.store_id:
+            payload["storeId"] = self.store_id
+        if amount > 0:
+            payload["amount"] = amount
+        self._request(
+            "POST", f"/payments/{quote(payment_id, safe='')}/cancel", json=payload
+        )
+        # 취소 응답 본문만 믿지 않고 재조회 — 부분취소로 끝났는지도 여기서 걸러진다.
+        after = self.verify(payment_id)
+        if after.status not in self.CANCELLED:
+            raise PaymentGatewayError(
+                f"포트원 취소가 반영되지 않았어요(상태: {after.status}).",
+                uncertain=True,
+            )
+        return after

@@ -26,6 +26,9 @@ def payment_context(db, monkeypatch):
         "KAKAOPAY_CID": "TC0ONETIME",
         "KAKAOPAY_SECRET_KEY": "kakao_test_secret",
         "KAKAOPAY_CID_SECRET": "",
+        "PORTONE_STORE_ID": "store-test",
+        "PORTONE_CHANNEL_KEY": "channel-key-test",
+        "PORTONE_API_SECRET": "portone_test_secret",
         "BACKEND_URL": "http://api.test",
         "FRONTEND_URL": "http://frontend.test",
         "PAYMENT_SUCCESS_URL": "http://frontend.test/payment/success",
@@ -92,7 +95,8 @@ def test_checkout_and_order_use_server_price(payment_context):
     checkout = ctx["client"].get(f"/api/v1/courses/{ctx['course'].id}/checkout")
     assert checkout.status_code == 200
     assert checkout.json()["amount"] == 49_000
-    assert checkout.json()["available_providers"] == ["toss", "kakaopay", "mock"]
+    # 설정된 PG가 모두 노출된다(포트원 추가). 순서는 _available_providers 정의 순서.
+    assert checkout.json()["available_providers"] == ["toss", "kakaopay", "portone", "mock"]
 
     order_data = _create_order(ctx, "toss")
     assert order_data["amount"] == 49_000
@@ -428,3 +432,199 @@ def test_course_pricing_endpoint_sets_server_price(payment_context):
     assert response.json()["effective_price"] == 39_000
     ctx["db"].expire_all()
     assert ctx["db"].get(Course, ctx["course"].id).price == 60_000
+
+
+# ===================== 포트원(PortOne) =====================
+
+
+def test_portone_appears_in_available_providers(payment_context):
+    """콘솔 키가 설정되면 결제수단 목록에 포트원이 나오고 SDK 공개값이 함께 내려온다."""
+    ctx = payment_context
+    res = ctx["client"].get(f"/api/v1/courses/{ctx['course'].id}/checkout")
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert "portone" in body["available_providers"]
+    assert body["portone_store_id"] == "store-test"
+    assert body["portone_channel_key"] == "channel-key-test"
+    # API Secret 은 어떤 필드로도 프런트에 내려가면 안 된다
+    assert "portone_test_secret" not in res.text
+
+
+def test_portone_confirm_verifies_by_order_uid_and_activates(payment_context, monkeypatch):
+    """포트원은 서버가 order_uid(=paymentId)로 조회해 검증한다 — 프런트 입력을 쓰지 않는다."""
+    ctx = payment_context
+    order = _create_order(ctx, "portone")
+    seen = {}
+
+    def fake_verify(_self, payment_id):
+        seen["payment_id"] = payment_id
+        return ApprovedPayment(
+            provider_payment_id=payment_id,
+            order_id=payment_id,
+            amount=order["amount"],
+            status="PAID",
+            method="TOSSPAYMENTS",
+            receipt_url="https://receipt.test/portone",
+        )
+
+    monkeypatch.setattr(payments.PortOneGateway, "verify", fake_verify)
+    res = ctx["client"].post(
+        "/api/v1/payments/confirm",
+        json={"order_uid": order["order_uid"], "amount": order["amount"]},
+    )
+    assert res.status_code == 200, res.text
+    # 프런트가 아무 값도 안 보내도 서버 주문번호로 조회한다
+    assert seen["payment_id"] == order["order_uid"]
+    assert res.json()["receipt_url"] == "https://receipt.test/portone"
+    ctx["db"].expire_all()
+    saved = (
+        ctx["db"].query(CourseOrder)
+        .filter(CourseOrder.order_uid == order["order_uid"]).one()
+    )
+    assert saved.status == "paid"
+    enrollment = (
+        ctx["db"].query(CourseEnrollment)
+        .filter(
+            CourseEnrollment.student_id == ctx["student"].id,
+            CourseEnrollment.course_id == ctx["course"].id,
+        )
+        .one()
+    )
+    assert enrollment.status == "active"
+
+
+def test_portone_confirm_rejects_unpaid_status(payment_context, monkeypatch):
+    """조회 상태가 PAID 가 아니면 수강권을 주지 않는다(가상계좌 발급·대기 포함)."""
+    ctx = payment_context
+    order = _create_order(ctx, "portone")
+
+    def fake_verify(_self, payment_id):
+        return ApprovedPayment(
+            provider_payment_id=payment_id,
+            order_id=payment_id,
+            amount=order["amount"],
+            status="VIRTUAL_ACCOUNT_ISSUED",
+        )
+
+    monkeypatch.setattr(payments.PortOneGateway, "verify", fake_verify)
+    res = ctx["client"].post(
+        "/api/v1/payments/confirm",
+        json={"order_uid": order["order_uid"], "amount": order["amount"]},
+    )
+    assert res.status_code == 502, res.text
+    ctx["db"].expire_all()
+    saved = (
+        ctx["db"].query(CourseOrder)
+        .filter(CourseOrder.order_uid == order["order_uid"]).one()
+    )
+    # 아직 진행 중일 수 있는 상태라 주문을 failed 로 끊지 않는다(uncertain)
+    assert saved.status == "pending"
+    assert (
+        ctx["db"].query(CourseEnrollment)
+        .filter(CourseEnrollment.student_id == ctx["student"].id)
+        .count()
+        == 0
+    )
+
+
+def test_portone_confirm_rejects_amount_mismatch(payment_context, monkeypatch):
+    """PG 조회 금액이 주문 금액과 다르면 승인하지 않는다(금액 위변조 방어)."""
+    ctx = payment_context
+    order = _create_order(ctx, "portone")
+
+    def fake_verify(_self, payment_id):
+        return ApprovedPayment(
+            provider_payment_id=payment_id,
+            order_id=payment_id,
+            amount=100,  # 서버 주문은 49,000원
+            status="PAID",
+        )
+
+    monkeypatch.setattr(payments.PortOneGateway, "verify", fake_verify)
+    res = ctx["client"].post(
+        "/api/v1/payments/confirm",
+        json={"order_uid": order["order_uid"], "amount": order["amount"]},
+    )
+    assert res.status_code == 502, res.text
+    assert (
+        ctx["db"].query(CourseEnrollment)
+        .filter(CourseEnrollment.student_id == ctx["student"].id)
+        .count()
+        == 0
+    )
+
+
+def test_portone_webhook_refetches_and_ignores_body_amount(payment_context, monkeypatch):
+    """웹훅 본문을 믿지 않고 API 재조회 결과로만 반영한다(포트원 문서 권고)."""
+    ctx = payment_context
+    order = _create_order(ctx, "portone")
+
+    def fake_verify(_self, payment_id):
+        return ApprovedPayment(
+            provider_payment_id=payment_id,
+            order_id=payment_id,
+            amount=order["amount"],
+            status="PAID",
+            method="KAKAOPAY",
+        )
+
+    monkeypatch.setattr(payments.PortOneGateway, "verify", fake_verify)
+    res = ctx["client"].post(
+        "/api/v1/payments/webhooks/portone",
+        json={
+            "type": "Transaction.Paid",
+            # 본문에 엉뚱한 금액이 실려 와도 재조회 값이 정본이다
+            "data": {"paymentId": order["order_uid"], "totalAmount": 1},
+        },
+    )
+    assert res.status_code == 200, res.text
+    ctx["db"].expire_all()
+    saved = (
+        ctx["db"].query(CourseOrder)
+        .filter(CourseOrder.order_uid == order["order_uid"]).one()
+    )
+    assert saved.status == "paid"
+
+
+def test_portone_cancel_refunds_and_revokes_enrollment(payment_context, monkeypatch):
+    ctx = payment_context
+    order = _create_order(ctx, "portone")
+
+    monkeypatch.setattr(
+        payments.PortOneGateway,
+        "verify",
+        lambda _s, pid: ApprovedPayment(
+            provider_payment_id=pid, order_id=pid, amount=order["amount"], status="PAID"
+        ),
+    )
+    ctx["client"].post(
+        "/api/v1/payments/confirm",
+        json={"order_uid": order["order_uid"], "amount": order["amount"]},
+    )
+
+    cancelled = {}
+
+    def fake_cancel(_self, payment_id, amount, reason):
+        cancelled.update({"id": payment_id, "amount": amount, "reason": reason})
+        return ApprovedPayment(
+            provider_payment_id=payment_id, order_id=payment_id, amount=amount, status="CANCELLED"
+        )
+
+    monkeypatch.setattr(payments.PortOneGateway, "cancel", fake_cancel)
+    res = ctx["client"].post(
+        f"/api/v1/payments/{order['order_uid']}/cancel", json={"reason": "학습자 요청"}
+    )
+    assert res.status_code == 200, res.text
+    assert cancelled["id"] == order["order_uid"]
+    assert cancelled["amount"] == order["amount"]
+    ctx["db"].expire_all()
+    saved = (
+        ctx["db"].query(CourseOrder)
+        .filter(CourseOrder.order_uid == order["order_uid"]).one()
+    )
+    assert saved.status == "refunded"
+    enrollment = (
+        ctx["db"].query(CourseEnrollment)
+        .filter(CourseEnrollment.student_id == ctx["student"].id).one()
+    )
+    assert enrollment.status == "withdrawn"

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hmac
 import logging
+from dataclasses import replace
 from datetime import datetime
 from typing import Literal
 from urllib.parse import urlencode
@@ -37,13 +38,14 @@ from app.services.payment_gateways import (
     ApprovedPayment,
     KakaoPayGateway,
     PaymentGatewayError,
+    PortOneGateway,
     TossPaymentsGateway,
 )
 
 _log = logging.getLogger("catchap.payments")
 router = APIRouter(tags=["payments"])
 
-PaymentProvider = Literal["toss", "kakaopay", "mock"]
+PaymentProvider = Literal["toss", "kakaopay", "portone", "mock"]
 
 
 def _available_providers() -> list[str]:
@@ -53,6 +55,8 @@ def _available_providers() -> list[str]:
         providers.append("toss")
     if settings.kakaopay_enabled:
         providers.append("kakaopay")
+    if settings.portone_enabled:
+        providers.append("portone")
     if settings.payment_mock_enabled:
         providers.append("mock")
     return providers
@@ -235,6 +239,9 @@ class CheckoutOut(BaseModel):
     provider: str
     available_providers: list[str]
     toss_client_key: str
+    # 포트원 브라우저 SDK 초기화용 공개값. 미설정이면 빈 문자열.
+    portone_store_id: str
+    portone_channel_key: str
     customer_key: str
 
 
@@ -263,6 +270,8 @@ def checkout_info(
         provider=providers[0] if providers else "unavailable",
         available_providers=providers,
         toss_client_key=settings.TOSS_CLIENT_KEY if settings.toss_enabled else "",
+        portone_store_id=settings.PORTONE_STORE_ID if settings.portone_enabled else "",
+        portone_channel_key=settings.PORTONE_CHANNEL_KEY if settings.portone_enabled else "",
         # 학생 PK는 서버가 만든 UUID라 이메일·전화번호 같은 PII가 아니며 추측하기 어렵다.
         customer_key=f"catchap_{principal.id}",
     )
@@ -280,6 +289,8 @@ class CreateOrderOut(BaseModel):
     available_providers: list[str]
     course_title: str
     toss_client_key: str
+    portone_store_id: str
+    portone_channel_key: str
     customer_key: str
 
 
@@ -358,6 +369,8 @@ def create_order(
         available_providers=_available_providers(),
         course_title=course.title,
         toss_client_key=settings.TOSS_CLIENT_KEY if provider == "toss" else "",
+        portone_store_id=settings.PORTONE_STORE_ID if provider == "portone" else "",
+        portone_channel_key=settings.PORTONE_CHANNEL_KEY if provider == "portone" else "",
         customer_key=f"catchap_{principal.id}",
     )
 
@@ -592,7 +605,7 @@ def confirm_payment(
     principal: Principal = Depends(require_student),
     db: Session = Depends(get_db),
 ):
-    """토스 승인 또는 개발용 mock 승인. 카카오페이는 approve 리다이렉트가 승인한다."""
+    """토스 승인 / 포트원 조회 검증 / 개발용 mock 승인. 카카오페이는 approve 리다이렉트가 승인한다."""
     order = (
         db.query(CourseOrder)
         .filter(
@@ -637,6 +650,29 @@ def confirm_payment(
             payment = TossPaymentsGateway(settings.TOSS_SECRET_KEY).confirm(
                 body.payment_key, order.order_uid, order.amount
             )
+        elif order.provider == "portone":
+            if not settings.portone_enabled:
+                raise HTTPException(
+                    status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="포트원 설정이 완료되지 않았어요.",
+                )
+            # 포트원은 SDK가 결제창을 띄우고 서버는 조회로 검증한다(승인 요청 없음).
+            # paymentId = 우리 order_uid 이므로 프런트가 보낸 값을 쓰지 않는다 — 위조 차단.
+            payment = PortOneGateway(
+                settings.PORTONE_API_SECRET, store_id=settings.PORTONE_STORE_ID
+            ).verify(order.order_uid)
+            if payment.status != PortOneGateway.PAID:
+                raise PaymentGatewayError(
+                    f"결제가 완료되지 않았어요(상태: {payment.status}).",
+                    provider_code=payment.status,
+                    # READY/PENDING 은 아직 진행 중일 수 있어 주문을 실패로 끊지 않는다.
+                    uncertain=payment.status in ("READY", "PENDING", "VIRTUAL_ACCOUNT_ISSUED"),
+                )
+            if payment.amount != order.amount:
+                raise PaymentGatewayError("결제 금액이 주문과 일치하지 않아요.")
+            # _mark_paid 는 PG 무관하게 status=="DONE" 을 성공 규약으로 쓴다(카카오도 동일).
+            # 포트원의 PAID 를 그 규약으로 정규화한다.
+            payment = replace(payment, status="DONE")
         elif order.provider == "mock":
             if not settings.payment_mock_enabled:
                 raise HTTPException(
@@ -756,6 +792,15 @@ def cancel_payment(
                 settings.KAKAOPAY_SECRET_KEY,
                 cid_secret=settings.KAKAOPAY_CID_SECRET,
             ).cancel(order.payment_key, amount=order.amount)
+        elif order.provider == "portone":
+            if not settings.portone_enabled:
+                raise HTTPException(
+                    status.HTTP_503_SERVICE_UNAVAILABLE, detail="포트원 설정이 없어요."
+                )
+            # 취소 대상은 우리 order_uid(= 포트원 paymentId). 취소 후 재조회로 반영을 확인한다.
+            PortOneGateway(
+                settings.PORTONE_API_SECRET, store_id=settings.PORTONE_STORE_ID
+            ).cancel(order.order_uid, amount=order.amount, reason=body.reason)
         elif order.provider == "mock" and settings.payment_mock_enabled:
             pass
         else:
@@ -851,3 +896,75 @@ def toss_webhook(
         order.fail_reason = f"토스 상태: {payment.status}"
         db.commit()
     return {"ok": True, "status": order.status}
+
+
+class PortOneWebhookIn(BaseModel):
+    type: str
+    data: dict
+
+
+@router.post("/payments/webhooks/portone")
+def portone_webhook(
+    payload: PortOneWebhookIn,
+    request: Request,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+):
+    """포트원 결제 상태 웹훅.
+
+    포트원 문서가 명시하는 원칙 그대로 — 웹훅 본문을 신뢰하지 않고 paymentId 로 결제 건을
+    다시 조회해 그 응답만 반영한다(위조 요청 방어). 서명 검증은 시크릿이 설정된 경우에만
+    추가 방어로 쓰고, 검증을 통과했더라도 재조회 결과가 정본이다.
+    """
+    client_ip = request.client.host if request.client else "unknown"
+    auth_service.rate_limit(
+        db, f"payment-webhook:portone:{client_ip}", limit=120, window_seconds=60
+    )
+    payment_id = str(payload.data.get("paymentId") or "")
+    if not payment_id or len(payment_id) > 200:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="paymentId가 없어요.")
+    settings = get_settings()
+    if not settings.portone_enabled:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, detail="포트원 설정이 없어요.")
+    try:
+        payment = PortOneGateway(
+            settings.PORTONE_API_SECRET, store_id=settings.PORTONE_STORE_ID
+        ).verify(payment_id)
+    except PaymentGatewayError as exc:
+        raise _provider_failure(exc)
+
+    order = (
+        db.query(CourseOrder)
+        .filter(CourseOrder.order_uid == payment_id, CourseOrder.provider == "portone")
+        .with_for_update()
+        .first()
+    )
+    if order is None:
+        # 우리 주문이 아닌 결제는 성공 응답으로 버린다(재전송해도 복구할 수 없다).
+        _log.warning("알 수 없는 포트원 웹훅 payment=%s", payment_id)
+        return {"ok": True, "ignored": True}
+    if payment.amount != order.amount:
+        _log.error(
+            "포트원 웹훅 금액 불일치 order=%s expected=%s actual=%s",
+            order.order_uid,
+            order.amount,
+            payment.amount,
+        )
+        raise HTTPException(status.HTTP_409_CONFLICT, detail="결제 금액이 주문과 일치하지 않아요.")
+
+    if payment.status == PortOneGateway.PAID and order.status == "pending":
+        # confirm 경로와 같은 규약 — _mark_paid 는 status=="DONE" 만 성공으로 본다.
+        newly_active = _mark_paid(db, order, replace(payment, status="DONE"))
+        if newly_active:
+            background_tasks.add_task(_notify_enroll, order.student_id, order.course_id)
+    elif payment.status in PortOneGateway.CANCELLED and order.status == "paid":
+        order.status = "refunded"
+        order.cancelled_at = datetime.now()
+        order.cancel_reason = order.cancel_reason or "포트원 취소 웹훅"
+        _revoke_enrollment_if_unpaid_elsewhere(db, order)
+        db.commit()
+    elif payment.status == "FAILED" and order.status == "pending":
+        order.status = "failed"
+        order.fail_reason = "포트원 결제 실패"
+        db.commit()
+    return {"ok": True}

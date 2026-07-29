@@ -80,6 +80,13 @@ class Settings(BaseSettings):
     KAKAOPAY_CID: str = ""  # 가맹점 코드(CID)
     KAKAOPAY_SECRET_KEY: str = ""  # 온라인 결제 Secret key — 절대 프런트로 노출하지 않는다
     KAKAOPAY_CID_SECRET: str = ""  # 계약에 따라 발급되는 CID 인증키(선택)
+    # 포트원(PortOne) V2 — 여러 PG를 한 연동으로 묶는 중개 레이어.
+    # store id·channel key는 브라우저 SDK 초기화에 쓰이므로 프런트로 내려도 되는 공개값이고,
+    # API Secret과 웹훅 시크릿은 서버 전용이다.
+    PORTONE_STORE_ID: str = ""  # store-xxxxxxxx (공개)
+    PORTONE_CHANNEL_KEY: str = ""  # channel-key-xxxxxxxx (공개) — 콘솔 결제연동>채널관리에서 발급
+    PORTONE_API_SECRET: str = ""  # V2 API Secret — 절대 프런트로 노출하지 않는다
+    PORTONE_WEBHOOK_SECRET: str = ""  # 웹훅 서명 검증용(선택)
     # 비우면 FRONTEND_URL 아래 /student/payment/{success|fail|cancel}을 사용한다.
     PAYMENT_SUCCESS_URL: str = ""
     PAYMENT_FAIL_URL: str = ""
@@ -94,6 +101,18 @@ class Settings(BaseSettings):
     def kakaopay_enabled(self) -> bool:
         """카카오페이 ready/approve 호출에 필요한 CID와 Secret key가 모두 있는지."""
         return bool(self.KAKAOPAY_CID.strip()) and bool(self.KAKAOPAY_SECRET_KEY.strip())
+
+    @property
+    def portone_enabled(self) -> bool:
+        """포트원 결제 경로 활성 여부.
+
+        SDK 호출에 store id·channel key가, 서버 검증에 API Secret이 모두 필요하다.
+        하나라도 비면 결제창을 띄워도 승인 검증을 못 하므로 아예 켜지 않는다."""
+        return (
+            bool(self.PORTONE_STORE_ID.strip())
+            and bool(self.PORTONE_CHANNEL_KEY.strip())
+            and bool(self.PORTONE_API_SECRET.strip())
+        )
 
     @property
     def payment_mock_enabled(self) -> bool:
