@@ -171,6 +171,11 @@ class LectureWatchProgress(Base, UUIDPk, Timestamps):
     # 컬럼은 남긴다: 드롭은 되돌릴 수 없고 마이그레이션만 하나 늘 뿐, 남겨도 무해하다.
     # 제거 이유는 lecture_service의 '상호작용 면제: 제거됨' 주석 참조.
     exempt_streak: Mapped[int] = mapped_column(default=0)
+    # 봇 의심 누적 — 하트비트마다 이상행동 신호를 가산하고 정상 비트에서 감쇠한다.
+    # BOT_SUSPICION_THRESHOLD 를 넘으면 메인 캡차(봇 판별)를 승급해 띄운다.
+    # 0717에 드롭된 suspicion 과 이름을 달리했다: 그건 체크포인트 '간격을 좁히는'
+    # 감시 장치였고, 이건 별개 캡차를 띄우는 트리거다. 고정 핀 예약은 건드리지 않는다.
+    bot_suspicion: Mapped[int] = mapped_column(default=0)
     # (제거됨 0717) suspicion — 의심 누적으로 무작위 확인 간격을 좁히던 값. 간격 자체가
     # 사라져(전부 핀) 컬럼도 함께 드롭했다(lecture_pin_02). 값이 일시 카운터라 잃는 정보가 없다.
     # 한 체크포인트에서 연속 오답 횟수 — MAX_CHECKPOINT_FAILS에 닿으면 그 대목을 다시
