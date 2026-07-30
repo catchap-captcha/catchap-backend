@@ -1,5 +1,6 @@
 """카카오페이·토스페이먼츠 코스 결제 API."""
 
+from datetime import datetime, timedelta
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
@@ -678,3 +679,236 @@ def test_portone_cancel_refunds_and_revokes_enrollment(payment_context, monkeypa
         .filter(CourseEnrollment.student_id == ctx["student"].id).one()
     )
     assert enrollment.status == "withdrawn"
+
+
+# ===================== 내 결제 내역 (환불 화면 원천) =====================
+
+
+def test_my_orders_lists_paid_with_context(payment_context, monkeypatch):
+    """결제 내역에 코스명·환불 가능 여부·수강/수료 상태가 함께 온다."""
+    ctx = payment_context
+    order = _create_order(ctx, "toss")
+    monkeypatch.setattr(
+        payments.TossPaymentsGateway, "confirm",
+        lambda _s, payment_key, order_id, amount: ApprovedPayment(
+            provider_payment_id=payment_key, order_id=order_id, amount=amount,
+            status="DONE", method="카드",
+        ),
+    )
+    ctx["client"].post("/api/v1/payments/confirm", json={
+        "order_uid": order["order_uid"], "amount": order["amount"], "payment_key": "pk-1"})
+
+    res = ctx["client"].get("/api/v1/payments/orders")
+    assert res.status_code == 200, res.text
+    rows = res.json()
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["order_uid"] == order["order_uid"]
+    assert row["course_title"] == ctx["course"].title
+    assert row["status"] == "paid"
+    assert row["refundable"] is True      # 결제 완료 + payment_key 보유
+    assert row["enrolled"] is True
+    assert row["completed"] is False
+
+
+def test_my_orders_hides_pending_and_failed(payment_context):
+    """pending/failed 는 학생이 할 수 있는 일이 없어 목록에서 뺀다."""
+    ctx = payment_context
+    _create_order(ctx, "toss")  # pending 상태로 남는다
+    res = ctx["client"].get("/api/v1/payments/orders")
+    assert res.status_code == 200
+    assert res.json() == []
+
+
+def test_my_orders_keeps_refunded_as_record(payment_context, monkeypatch):
+    """환불된 건은 기록으로 남되 다시 환불할 수 없다."""
+    ctx = payment_context
+    order = _create_order(ctx, "toss")
+    monkeypatch.setattr(
+        payments.TossPaymentsGateway, "confirm",
+        lambda _s, payment_key, order_id, amount: ApprovedPayment(
+            provider_payment_id=payment_key, order_id=order_id, amount=amount, status="DONE"),
+    )
+    ctx["client"].post("/api/v1/payments/confirm", json={
+        "order_uid": order["order_uid"], "amount": order["amount"], "payment_key": "pk-2"})
+    monkeypatch.setattr(payments.TossPaymentsGateway, "cancel",
+                        lambda _s, *a, **k: ApprovedPayment(
+                            provider_payment_id="pk-2", order_id=order["order_uid"],
+                            amount=order["amount"], status="CANCELED"))
+    ctx["client"].post(f"/api/v1/payments/{order['order_uid']}/cancel",
+                       json={"reason": "학습자 요청"})
+
+    rows = ctx["client"].get("/api/v1/payments/orders").json()
+    assert len(rows) == 1
+    assert rows[0]["status"] == "refunded"
+    assert rows[0]["refundable"] is False   # 다시 환불 불가
+    assert rows[0]["enrolled"] is False     # 수강권 회수됨
+
+
+def test_my_orders_is_scoped_to_me(payment_context, monkeypatch):
+    """남의 결제는 보이지 않는다."""
+    from app.core.security import hash_password
+    from app.models import StudentProfile
+
+    ctx = payment_context
+    order = _create_order(ctx, "toss")
+    monkeypatch.setattr(
+        payments.TossPaymentsGateway, "confirm",
+        lambda _s, payment_key, order_id, amount: ApprovedPayment(
+            provider_payment_id=payment_key, order_id=order_id, amount=amount, status="DONE"),
+    )
+    ctx["client"].post("/api/v1/payments/confirm", json={
+        "order_uid": order["order_uid"], "amount": order["amount"], "payment_key": "pk-3"})
+
+    other = StudentProfile(
+        organization_id=None, class_id=None,
+        student_login_id="order-other@example.test", student_code="CAT-ORD-01",
+        password_hash=hash_password("Password123!"), nickname="다른학생", grade_band="adult",
+    )
+    ctx["db"].add(other)
+    ctx["db"].commit()
+    app.dependency_overrides[require_student] = lambda: Principal(
+        kind="student", id=other.id, role="student", student=other)
+    assert ctx["client"].get("/api/v1/payments/orders").json() == []
+
+
+def test_my_orders_survives_deleted_course(payment_context, monkeypatch):
+    """코스가 지워져도 결제 기록은 남아야 한다 — 제목 자리가 빈칸이 되지 않게."""
+    ctx = payment_context
+    order = _create_order(ctx, "toss")
+    monkeypatch.setattr(
+        payments.TossPaymentsGateway, "confirm",
+        lambda _s, payment_key, order_id, amount: ApprovedPayment(
+            provider_payment_id=payment_key, order_id=order_id, amount=amount, status="DONE"),
+    )
+    ctx["client"].post("/api/v1/payments/confirm", json={
+        "order_uid": order["order_uid"], "amount": order["amount"], "payment_key": "pk-4"})
+
+    ctx["db"].delete(ctx["db"].get(Course, ctx["course"].id))
+    ctx["db"].commit()
+    rows = ctx["client"].get("/api/v1/payments/orders").json()
+    assert len(rows) == 1
+    assert rows[0]["course_title"] == "(삭제된 코스)"
+
+
+# ===================== 환불 정책 =====================
+# 전자상거래법상 디지털 콘텐츠는 7일 이내 청약철회가 원칙이되 제공이 개시되면 제한할 수 있다.
+# 강의는 '시청 시작'을 제공 개시로 본다. 비율 환불은 토스가 부분취소를 지원하지 않아 못 한다.
+
+
+def _paid_order(ctx, monkeypatch, *, key="pk-policy"):
+    """결제 완료 상태의 주문을 하나 만들고 CourseOrder 를 돌려준다."""
+    order = _create_order(ctx, "toss")
+    monkeypatch.setattr(
+        payments.TossPaymentsGateway, "confirm",
+        lambda _s, payment_key, order_id, amount: ApprovedPayment(
+            provider_payment_id=payment_key, order_id=order_id, amount=amount, status="DONE"),
+    )
+    ctx["client"].post("/api/v1/payments/confirm", json={
+        "order_uid": order["order_uid"], "amount": order["amount"], "payment_key": key})
+    ctx["db"].expire_all()
+    return (ctx["db"].query(CourseOrder)
+            .filter(CourseOrder.order_uid == order["order_uid"]).one())
+
+
+def _watch(ctx, seconds):
+    """이 코스의 강의를 seconds 만큼 시청한 것으로 만든다."""
+    from app.models import Lecture, LectureWatchProgress
+
+    lec = Lecture(
+        course_id=ctx["course"].id, title="1강", subject="일반",
+        video_ext=".mp4", duration_sec=600, status="active",
+    )
+    ctx["db"].add(lec)
+    ctx["db"].flush()
+    ctx["db"].add(LectureWatchProgress(
+        student_id=ctx["student"].id, lecture_id=lec.id,
+        watched_max_sec=seconds, next_checkpoint_sec=None,
+        checkpoints_passed=0, status="watching",
+    ))
+    ctx["db"].commit()
+
+
+def test_refund_allowed_within_window_and_unwatched(payment_context, monkeypatch):
+    """7일 이내 + 시청 시작 전 → 환불 가능."""
+    ctx = payment_context
+    _paid_order(ctx, monkeypatch)
+    row = ctx["client"].get("/api/v1/payments/orders").json()[0]
+    assert row["refundable"] is True
+    assert row["refund_blocked"] is None
+    assert row["refund_deadline"] is not None
+
+
+def test_refund_blocked_after_watching(payment_context, monkeypatch):
+    """시청을 시작하면 기간이 남아 있어도 환불되지 않는다(제공 개시)."""
+    ctx = payment_context
+    order = _paid_order(ctx, monkeypatch)
+    _watch(ctx, payments.REFUND_WATCHED_GRACE_SEC + 30)
+
+    row = ctx["client"].get("/api/v1/payments/orders").json()[0]
+    assert row["refundable"] is False
+    assert row["refund_blocked"] == "already_watched"
+
+    # 화면을 우회해 직접 불러도 서버가 막는다
+    res = ctx["client"].post(f"/api/v1/payments/{order.order_uid}/cancel",
+                             json={"reason": "그냥"})
+    assert res.status_code == 403, res.text
+    assert res.json()["detail"]["reason"] == "already_watched"
+    ctx["db"].expire_all()
+    assert ctx["db"].query(CourseOrder).filter(
+        CourseOrder.order_uid == order.order_uid).one().status == "paid"
+
+
+def test_brief_playback_does_not_block_refund(payment_context, monkeypatch):
+    """1분 미만은 시청으로 보지 않는다 — 실수 클릭·미리보기로 환불이 막히면 안 된다."""
+    ctx = payment_context
+    _paid_order(ctx, monkeypatch)
+    _watch(ctx, payments.REFUND_WATCHED_GRACE_SEC - 1)
+    row = ctx["client"].get("/api/v1/payments/orders").json()[0]
+    assert row["refundable"] is True
+
+
+def test_refund_blocked_after_window(payment_context, monkeypatch):
+    """기간이 지나면 시청하지 않았어도 자동 환불은 안 된다."""
+    ctx = payment_context
+    order = _paid_order(ctx, monkeypatch)
+    order.paid_at = datetime.now() - timedelta(days=payments.REFUND_WINDOW_DAYS + 1)
+    ctx["db"].commit()
+
+    row = ctx["client"].get("/api/v1/payments/orders").json()[0]
+    assert row["refundable"] is False
+    assert row["refund_blocked"] == "window_over"
+
+    res = ctx["client"].post(f"/api/v1/payments/{order.order_uid}/cancel",
+                             json={"reason": "늦었지만"})
+    assert res.status_code == 403
+    assert res.json()["detail"]["reason"] == "window_over"
+
+
+def test_refund_window_boundary_is_inclusive(payment_context, monkeypatch):
+    """기한 직전(7일 -1분)은 아직 가능하다 — 경계에서 하루 일찍 막히면 안 된다."""
+    ctx = payment_context
+    order = _paid_order(ctx, monkeypatch)
+    order.paid_at = (datetime.now()
+                     - timedelta(days=payments.REFUND_WINDOW_DAYS)
+                     + timedelta(minutes=1))
+    ctx["db"].commit()
+    assert ctx["client"].get("/api/v1/payments/orders").json()[0]["refundable"] is True
+
+
+def test_refund_succeeds_when_policy_allows(payment_context, monkeypatch):
+    """정책을 통과하면 실제로 환불되고 수강권이 회수된다."""
+    ctx = payment_context
+    order = _paid_order(ctx, monkeypatch)
+    monkeypatch.setattr(payments.TossPaymentsGateway, "cancel",
+                        lambda _s, *a, **k: ApprovedPayment(
+                            provider_payment_id="pk-policy", order_id=order.order_uid,
+                            amount=order.amount, status="CANCELED"))
+    res = ctx["client"].post(f"/api/v1/payments/{order.order_uid}/cancel",
+                             json={"reason": "내용이 기대와 달라요"})
+    assert res.status_code == 200, res.text
+    ctx["db"].expire_all()
+    assert ctx["db"].query(CourseOrder).filter(
+        CourseOrder.order_uid == order.order_uid).one().status == "refunded"
+    assert ctx["db"].query(CourseEnrollment).filter(
+        CourseEnrollment.student_id == ctx["student"].id).one().status == "withdrawn"
