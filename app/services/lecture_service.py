@@ -66,7 +66,10 @@ def _escalation_mode() -> str:
     mode = (getattr(settings, "BOT_ESCALATION_MODE", "off") or "off").strip().lower()
     if mode not in {"off", "record", "enforce"}:
         return "off"
-    if mode != "off" and not (
+    # enforce 만 캡차 설정을 요구한다. record 는 신호를 누적·기록만 하고 캡차를
+    # 부르지 않으므로, 설정이 없다고 강등하면 관측 자체를 못 켠다 — 임계값을 정하려면
+    # 관측이 먼저다. (처음엔 record 도 함께 강등했는데, 그게 관측을 막고 있었다.)
+    if mode == "enforce" and not (
         getattr(settings, "MAIN_CAPTCHA_URL", "").strip()
         and getattr(settings, "MAIN_CAPTCHA_SITE_SECRET", "").strip()
     ):
@@ -74,17 +77,25 @@ def _escalation_mode() -> str:
     return mode
 
 
-def bump_suspicion(progress: LectureWatchProgress, amount: int, reason: str) -> int:
-    """의심도 가산. commit 은 호출자 책임(기존 advance/claim_session 규약과 동일)."""
+def bump_suspicion(progress: LectureWatchProgress, amount: int, reason: str) -> bool:
+    """의심도 가산. 실제로 값을 바꿨으면 True.
+
+    commit 은 호출자 책임(기존 advance/claim_session 규약과 동일). 반환값이 곧
+    "커밋할 것이 있는가"다 — 처음엔 누적 후 의심도를 돌려줬는데, 호출부가 그걸
+    커밋 조건으로 쓰고 있어서 의미와 사용처가 어긋나 있었다.
+    """
     if _escalation_mode() == "off" or amount <= 0:
-        return int(progress.bot_suspicion or 0)
-    value = min(SUSPICION_MAX, int(progress.bot_suspicion or 0) + amount)
+        return False
+    before = int(progress.bot_suspicion or 0)
+    value = min(SUSPICION_MAX, before + amount)
+    if value == before:          # 이미 상한
+        return False
     progress.bot_suspicion = value
     log.info(
         "bot_suspicion +%d (%s) student=%s lecture=%s -> %d",
         amount, reason, progress.student_id, progress.lecture_id, value,
     )
-    return value
+    return True
 
 
 def clear_suspicion(progress: LectureWatchProgress) -> None:
@@ -378,8 +389,11 @@ def advance(
     elif position > watched:
         # 정상 전진 비트에서만 감쇠한다 — 일시정지·버퍼링(전진 없음)까지 감쇠에 넣으면
         # 재생을 멈춰두고 의심도를 씻어낼 수 있다.
-        decayed = int(progress.bot_suspicion or 0) - SUSPICION_DECAY_PER_CLEAN_BEAT
-        progress.bot_suspicion = max(0, decayed)
+        # 감쇠도 모드 게이팅 안이어야 한다. 밖에 두면 record 로 쌓아둔 관측값이
+        # off 로 내린 뒤에도 계속 빠져서 "off 는 기존과 100% 동일"이 깨진다.
+        if _escalation_mode() != "off":
+            decayed = int(progress.bot_suspicion or 0) - SUSPICION_DECAY_PER_CLEAN_BEAT
+            progress.bot_suspicion = max(0, decayed)
 
     # 예약이 비어 있으면 여기서 다시 잡는다 — next_checkpoint_sec=None은 '검증 끝'이 아니라
     # '아직 안 잡힘'일 수도 있다. 운영자가 강의 길이를 바꾸거나 문항을 새로 등록하면

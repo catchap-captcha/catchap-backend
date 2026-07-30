@@ -8,6 +8,8 @@ import pytest
 
 from app.core.config import get_settings
 from app.services import lecture_service as ls
+# test_lectures 의 지역 픽스처. pytest 는 모듈 네임스페이스에 있으면 인식한다.
+from tests.test_lectures import media_dir  # noqa: F401
 
 
 @pytest.fixture()
@@ -117,3 +119,56 @@ def test_decay_never_goes_negative(prog, mode):
     prog.bot_suspicion = 0
     prog.bot_suspicion = max(0, prog.bot_suspicion - ls.SUSPICION_DECAY_PER_CLEAN_BEAT)
     assert prog.bot_suspicion == 0
+
+
+def test_record_does_not_need_captcha_config(prog, mode):
+    """record 는 캡차를 부르지 않는다 — 설정이 없다고 강등하면 관측을 못 켠다.
+
+    임계값을 정하려면 관측이 먼저인데, 처음엔 record 도 함께 강등하도록 짜서
+    캡차 시크릿을 받기 전까지 아무것도 못 보는 상태였다. enforce 만 요구한다.
+    """
+    mode(BOT_ESCALATION_MODE="record", MAIN_CAPTCHA_URL="", MAIN_CAPTCHA_SITE_SECRET="")
+    assert ls._escalation_mode() == "record"
+    assert ls.bump_suspicion(prog, ls.SUSPICION_SPEED_VIOLATION, "speed") is True
+    assert prog.bot_suspicion == ls.SUSPICION_SPEED_VIOLATION
+
+
+def test_bump_reports_whether_it_changed_anything(prog, mode):
+    """반환값은 '커밋할 것이 있는가'다 — claim_session 이 그 용도로 쓴다."""
+    assert ls.bump_suspicion(prog, ls.SUSPICION_SPEED_VIOLATION, "speed") is True
+    prog.bot_suspicion = ls.SUSPICION_MAX
+    assert ls.bump_suspicion(prog, 5, "speed") is False, "상한이면 바뀐 게 없다"
+    mode(BOT_ESCALATION_MODE="off")
+    prog.bot_suspicion = 0
+    assert ls.bump_suspicion(prog, 5, "speed") is False
+
+
+def test_off_mode_does_not_decay_recorded_values(client, db, seed_org, media_dir, monkeypatch):
+    """off 로 내렸을 때 record 로 쌓아둔 값이 씻기면 안 된다.
+
+    감쇠가 모드 게이팅 밖에 있었다. off 에서는 bump 가 안 되어 값이 0 이라 실질
+    영향이 없었지만, record 로 관측한 뒤 off 로 내리면 정상 전진 하트비트마다
+    값이 빠져서 관측 데이터가 사라진다. 실제 하트비트로 확인한다.
+    """
+    from app.models.lecture import LectureWatchProgress
+    from tests.test_lectures import (
+        _hb, _instructor, _session_token, _student_token, _upload_lecture, auth,
+    )
+
+    ops_tok = _instructor(client, db)
+    lec = _upload_lecture(client, ops_tok).json()
+    tok = _student_token(client, seed_org)
+    assert client.get(f"/api/v1/lectures/{lec['id']}", headers=auth(tok)).status_code == 200
+    st = _session_token(client, tok, lec["id"])
+    assert _hb(client, tok, lec["id"], 4, st=st).status_code == 200
+
+    row = db.query(LectureWatchProgress).filter_by(lecture_id=lec["id"]).one()
+    row.bot_suspicion = 7          # record 로 관측해 쌓인 상태를 흉내
+    db.commit()
+
+    settings = get_settings()
+    monkeypatch.setattr(settings, "BOT_ESCALATION_MODE", "off", raising=False)
+    assert _hb(client, tok, lec["id"], 6, st=st).status_code == 200   # 정상 전진 = 감쇠 대상
+
+    db.refresh(row)
+    assert row.bot_suspicion == 7, "off 인데 감쇠가 돌아 관측값이 빠졌다"
