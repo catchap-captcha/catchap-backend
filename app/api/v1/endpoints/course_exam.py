@@ -18,7 +18,7 @@
 import os
 import random
 import shutil
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile, status
 from fastapi.responses import FileResponse
@@ -40,7 +40,7 @@ from app.models import (
     LectureQuestion,
     LectureTranscript,
 )
-from app.services import bank_mode
+from app.services import auth_service, bank_mode
 from app.utils.helpers import audit
 
 router = APIRouter(tags=["course-exam"])
@@ -53,6 +53,49 @@ ORIGINS = {"manual", "past_exam", "lecture", "llm"}
 # 만들되, 코스에 강의가 많으면 전체 자막이 토큰을 폭발시키므로 총·강의별 상한으로 자른다.
 _COURSE_EXAM_TR_TOTAL_CAP = 30000  # 총 문자 예산(대략 수천 토큰 규모)
 _COURSE_EXAM_TR_PER_LECTURE = 5000  # 강의 하나당 상한(한 강의가 예산을 독식하지 않게)
+
+# ---- 자동화 방어 ----
+# mastery 설계상 '정답 1건 = 영구 정복'이고 회차는 미정복 문항만 낸다. 되돌림이 없는
+# 누적이라, 시도 비용이 0이면 무작위 제출을 반복하는 것만으로 수료가 된다(4지선다 기준
+# 문항당 기대 4회, 50문항이면 HTTP 요청 수십 번 = 수십 초). 아래 셋이 그 비용을 올린다.
+#
+# ① 오답 쿨다운 — 틀린 문항은 이 시간 동안 재출제하지 않는다. 시도 사이에 대기가 끼면
+#    총 소요가 '회차 수'가 아니라 '시계 시간'에 지배된다(50문항 기준 수십 초 → 2~3시간).
+#    정상 학생에게는 해설을 읽고 다시 도전하기까지의 간격이라 학습상으로도 무리가 없다.
+EXAM_WRONG_COOLDOWN_MIN = 10
+# ② 응시 레이트리밋 — 쿨다운은 '미정복이 회차 크기보다 많은' 초반 구간을 못 막는다
+#    (50문항이면 첫 5회차는 대기 없이 돌아간다). 그 구간은 이쪽이 막는다.
+#    정상 학생은 50문항이어도 5회차면 끝나므로 4배 여유다.
+RATE_EXAM_SESSION_PER_HOUR = 20
+RATE_EXAM_SUBMIT_PER_HOUR = 20
+# ③ 문항당 최소 풀이 시간 — 읽지도 않고 제출하는 것을 막는다. 봇이 그냥 기다리면 되므로
+#    이것만으로 방어가 되지는 않지만, 아래 solve_time_ms 서버 계산과 짝이다.
+EXAM_MIN_SEC_PER_QUESTION = 3
+
+
+def _cooling_down_ids(db: Session, student_id: str, course_id: str) -> dict[str, datetime]:
+    """쿨다운 중인 문항 → 해제 시각. 최근 오답의 created_at 기준.
+
+    새 컬럼이 필요 없다 — CourseExamAttempt 가 Timestamps 를 상속해 created_at 을 이미
+    갖고 있고, 인덱스 ix_cea_student_course_q 가 이 조회에 그대로 맞는다.
+    """
+    since = datetime.now() - timedelta(minutes=EXAM_WRONG_COOLDOWN_MIN)
+    rows = (
+        db.query(CourseExamAttempt.question_id, func.max(CourseExamAttempt.created_at))
+        .filter(
+            CourseExamAttempt.student_id == student_id,
+            CourseExamAttempt.course_id == course_id,
+            CourseExamAttempt.result == "incorrect",
+            CourseExamAttempt.created_at >= since,
+        )
+        .group_by(CourseExamAttempt.question_id)
+        .all()
+    )
+    return {
+        qid: last + timedelta(minutes=EXAM_WRONG_COOLDOWN_MIN)
+        for qid, last in rows
+        if last is not None
+    }
 
 
 # ---------------------------------------------------------------- 공통 로더·파생
@@ -1126,6 +1169,9 @@ def exam_session(
     가능 — 한 회차에 다 맞히면 완벽 통과로 승급(0719 정책 재설계·재도전 경로)."""
     from app.models import Course
 
+    auth_service.rate_limit(
+        db, f"exam-sess:{principal.id}", limit=RATE_EXAM_SESSION_PER_HOUR, window_seconds=3600
+    )
     c = db.get(Course, course_id)
     if c is None or c.status != "active":
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="코스를 찾을 수 없습니다.")
@@ -1186,9 +1232,26 @@ def exam_session(
                 db.commit()
                 st2 = _exam_state(db, principal.id, course_id)
                 return {"passed": comp is not None, "perfect": st2["perfect"], "passed_at": st2["passed_at"]}
+            # 방금 틀린 문항은 쿨다운 동안 빼둔다. 완벽 도전(challenge)에는 걸지 않는다 —
+            # 수료 후 재도전 전용이고 전 문항을 한 회차에 다 맞혀야 해 무작위로는 사실상
+            # 불가능하다(구조가 자기제한적). 걸면 정당한 재도전자만 불편해진다.
+            cooling = _cooling_down_ids(db, principal.id, course_id)
+            ready = [q for q in unmastered if q.id not in cooling]
+            if not ready:
+                # 남은 미정복이 전부 쿨다운 중 — 빈 회차를 내주는 대신 언제 다시 열리는지
+                # 정직하게 알려준다. 쿨다운 중인 문항을 그냥 내면 쿨다운이 무의미해진다.
+                soonest = min(cooling[q.id] for q in unmastered if q.id in cooling)
+                wait = max(0, int((soonest - datetime.now()).total_seconds()))
+                return {
+                    "passed": False,
+                    "cooldown": True,
+                    "retry_after_sec": wait,
+                    "cooldown_minutes": EXAM_WRONG_COOLDOWN_MIN,
+                    "progress": {"mastered": st["mastered_count"], "total": st["question_count"]},
+                }
             # 안 푼 것(오답 이력도 없는 것) 먼저, 그다음 틀린 것 — 각 그룹 안에서 섞는다
-            fresh = [q for q in unmastered if q.id not in wrong]
-            retry = [q for q in unmastered if q.id in wrong]
+            fresh = [q for q in ready if q.id not in wrong]
+            retry = [q for q in ready if q.id in wrong]
             random.shuffle(fresh)
             random.shuffle(retry)
             picked = (fresh + retry)[:EXAM_SITTING_SIZE]
@@ -1246,14 +1309,33 @@ def exam_submit(
 
     무응답은 오답으로 채점(운 좋은 정답 없음 — 틀린 것으로 남아 다음 회차에 재출제).
     제출된 회차 재제출은 409(재채점·파밍 방지)."""
+    auth_service.rate_limit(
+        db, f"exam-sub:{principal.id}", limit=RATE_EXAM_SUBMIT_PER_HOUR, window_seconds=3600
+    )
     sitting = db.get(CourseExamSitting, req.sitting_id)
     if sitting is None or sitting.student_id != principal.id or sitting.course_id != course_id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="응시 회차를 찾을 수 없습니다.")
     if sitting.submitted_at is not None:
         raise HTTPException(status.HTTP_409_CONFLICT, detail="이미 제출된 회차입니다.")
 
+    # 풀이 시간은 회차 발급 시각 기준으로 서버가 계산한다. 종전엔 클라이언트가 보낸
+    # solve_time_ms 를 그대로 저장했는데, 그건 위조할 수 있어서 운영 통계의 '평균 풀이
+    # 시간'이 신뢰할 수 없는 값이었고 자동화 탐지에도 쓸 수 없었다. req.solve_time_ms 는
+    # 더 이상 채점·저장에 쓰지 않는다(하위호환을 위해 필드는 남겨 둔다).
+    n_q = max(1, len(sitting.questions))
+    elapsed_sec = max(0.0, (datetime.now() - sitting.created_at).total_seconds())
+    min_sec = EXAM_MIN_SEC_PER_QUESTION * n_q
+    if elapsed_sec < min_sec:
+        raise HTTPException(
+            status.HTTP_429_TOO_MANY_REQUESTS,
+            detail={
+                "message": "문제를 읽을 시간이 필요해요. 잠시 후 다시 제출해 주세요.",
+                "retry_after_sec": int(min_sec - elapsed_sec) + 1,
+            },
+        )
+
     picks_by_q = {a.question_id: a.picks for a in req.answers}
-    per_ms = max(0, int(req.solve_time_ms)) // max(1, len(sitting.questions))
+    per_ms = int(elapsed_sec * 1000) // n_q
     # 채점 대상 문항을 한 번에 로드(문항별 db.get N+1 제거). 완벽 회차는 활성 전 문항이
     # 한 회차에 담겨 코스가 크면 N이 무제한 — 벌크 1쿼리로 축소. 채점 로직·객체는 불변.
     _q_ids = [item["question_id"] for item in sitting.questions]
