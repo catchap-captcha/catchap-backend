@@ -434,6 +434,56 @@ def test_course_pricing_endpoint_sets_server_price(payment_context):
     assert ctx["db"].get(Course, ctx["course"].id).price == 60_000
 
 
+def _set_pricing(ctx, **body):
+    """강사 권한으로 가격 설정 PUT."""
+    app.dependency_overrides[require_content_author] = lambda: Principal(
+        kind="user", id=ctx["course"].instructor_id, role="instructor"
+    )
+    return ctx["client"].put(
+        f"/api/v1/ops/courses/{ctx['course'].id}/pricing", json=body
+    )
+
+
+@pytest.mark.parametrize("price", [1, 10, 99])
+def test_pricing_rejects_below_pg_minimum(payment_context, price):
+    """1~99원은 결제창까지 갔다가 PG가 거절해 수강신청이 막힌다 — 설정 단계에서 끊는다.
+
+    실제로 테스트용 10원 코스가 "신용카드는 결제금액이 100원 이상"으로 막혔다.
+    """
+    ctx = payment_context
+    before = ctx["db"].get(Course, ctx["course"].id).price
+    res = _set_pricing(ctx, price=price, sale_price=None, sale_ends_at=None)
+    assert res.status_code == 400, res.text
+    assert "100원" in res.text
+    ctx["db"].expire_all()
+    # 거절됐으면 값이 바뀌지 않아야 한다
+    assert ctx["db"].get(Course, ctx["course"].id).price == before
+
+
+def test_pricing_allows_zero_because_free_skips_payment(payment_context):
+    """0원은 결제를 거치지 않는 무료 코스라 하한을 적용하지 않는다."""
+    ctx = payment_context
+    res = _set_pricing(ctx, price=0, sale_price=None, sale_ends_at=None)
+    assert res.status_code == 200, res.text
+    ctx["db"].expire_all()
+    assert ctx["db"].get(Course, ctx["course"].id).price == 0
+
+
+def test_pricing_rejects_sale_price_below_minimum(payment_context):
+    """학생이 실제로 내는 금액은 할인가다 — 정상가가 멀쩡해도 할인가가 낮으면 막는다."""
+    ctx = payment_context
+    res = _set_pricing(ctx, price=50_000, sale_price=50, sale_ends_at=None)
+    assert res.status_code == 400, res.text
+    assert "할인가" in res.text
+
+
+def test_pricing_allows_exactly_minimum(payment_context):
+    """경계값 100원은 통과해야 한다."""
+    ctx = payment_context
+    res = _set_pricing(ctx, price=100, sale_price=None, sale_ends_at=None)
+    assert res.status_code == 200, res.text
+
+
 # ===================== 포트원(PortOne) =====================
 
 

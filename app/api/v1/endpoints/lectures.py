@@ -1416,6 +1416,26 @@ class _CourseUpdate(BaseModel):
     status: str | None = None  # active|hidden
 
 
+# PG 최소 결제금액 — 카드는 100원, 계좌이체는 200원 미만을 승인하지 않는다(토스·포트원 공통).
+# 0원은 무료 코스라 결제를 거치지 않으므로 예외다. 1~99원은 결제창까지 갔다가 PG가
+# "신용카드는 결제금액이 100원 이상..." 으로 거절해 학생이 수강신청을 못 한다.
+# 실제로 테스트용 10원 코스가 이 경로로 막혔다.
+MIN_PAID_COURSE_PRICE = 100
+
+
+def _reject_below_pg_minimum(price: int, label: str) -> None:
+    """0원(무료)이 아니면서 PG 최소 결제금액 미만인 가격을 거절한다."""
+    if 0 < price < MIN_PAID_COURSE_PRICE:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"{label}는 0원(무료) 또는 {MIN_PAID_COURSE_PRICE}원 이상이어야 합니다. "
+                f"결제대행사가 {MIN_PAID_COURSE_PRICE}원 미만은 승인하지 않아 "
+                "수강신청이 막힙니다."
+            ),
+        )
+
+
 class _CoursePricingUpdate(BaseModel):
     price: int = Field(ge=0, le=100_000_000)
     sale_price: int | None = Field(default=None, ge=0, le=100_000_000)
@@ -1580,6 +1600,10 @@ def ops_update_course_pricing(
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST, detail="할인가는 정상가보다 클 수 없습니다."
         )
+    # 학생이 실제로 결제하는 금액은 할인가(있으면)다 — 둘 다 막아야 한다.
+    _reject_below_pg_minimum(req.price, "정상가")
+    if req.sale_price is not None:
+        _reject_below_pg_minimum(req.sale_price, "할인가")
     sale_ends_at = req.sale_ends_at
     if sale_ends_at is not None and sale_ends_at.tzinfo is not None:
         # 이 코드베이스의 DB 시각 규약은 KST local naive다.
