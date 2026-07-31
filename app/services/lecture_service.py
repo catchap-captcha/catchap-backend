@@ -48,7 +48,9 @@ SPEED_FACTOR = 2.5
 #
 # 셋 다 "실제로 앉아서 보고 있지 않다"를 가리킨다.
 SUSPICION_SPEED_VIOLATION = 3
-SUSPICION_SESSION_CONFLICT = 5
+# 5→2 (감사 #9, 2026-07-31): 노트북↔폰 정상 전환 왕복(충돌 2회)만으로 임계(10)에 닿아 정상
+# 사용자가 캡차를 보던 오탐을 줄인다. 봇 시나리오 실측 전에 가중치를 먼저 낮춰 둔다.
+SUSPICION_SESSION_CONFLICT = 2
 SUSPICION_CHECKPOINT_EXHAUSTED = 4
 # 정상 하트비트에서의 감쇠. 이게 없으면 장시간 시청에서 누적만 되어 결국 전원이
 # 캡차를 본다 — 오탐이 시간의 함수가 되어버린다.

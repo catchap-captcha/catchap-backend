@@ -158,7 +158,11 @@ def _challenge_for_verify(cur: Any, challenge_id: str) -> dict[str, Any] | None:
 
 # ── 행동 위험 점수(ms main.py summarize 이식) ──
 def summarize(events: list[Any], selected: set[str], targets: set[str], duration_ms: int,
-              correct: bool, pattern: dict[str, int], ip_changed: bool) -> dict:
+              correct: bool, pattern: dict[str, int], ip_changed: bool,
+              client_duration_ms: int = 0) -> dict:
+    # duration_ms = 서버가 잰 풀이 시간(now - challenge.created_at, 조작 불가). client_duration_ms =
+    # 클라이언트 자기신고(참고용, 점수엔 안 쓴다). 종전엔 client 값을 duration_ms 로 받았는데,
+    # 봇이 임의 값을 보내 무의미했다 — 서버 측정으로 바꾼다(감사: solve_time 서버 계산).
     segments: list[list[Any]] = []
     current: list[Any] = []
     for e in events:
@@ -198,7 +202,13 @@ def summarize(events: list[Any], selected: set[str], targets: set[str], duration
     move_count = sum(e.type == "pointer_move" for e in events)
     removal_order = [e.object_id for e in events if e.type == "object_removed" and e.object_id]
     components = {"answer_accuracy": 0, "drag_behavior": 0, "reaction_exploration": 0,
-                 "selection_correction": 0, "session_behavior": 0, "api_pattern": 0}
+                 "selection_correction": 0, "session_behavior": 0, "api_pattern": 0,
+                 "min_solve_time": 0}
+    # 서버 측정 최소 풀이 시간 — 챌린지 발급~제출을 서버가 재므로 봇이 못 속인다. 설정 임계보다
+    # 빠르면(사람+네트워크로는 불가능한 속도) 위험 가산. 0=비활성(실측 보정 후 켠다).
+    _min_solve = get_settings().CAPTCHA_MIN_SOLVE_MS
+    if _min_solve > 0 and duration_ms < _min_solve:
+        components["min_solve_time"] = 15
     if not correct:
         components["answer_accuracy"] = 30
     if move_count < 3:
@@ -242,7 +252,10 @@ def summarize(events: list[Any], selected: set[str], targets: set[str], duration
         "reaction_time_ms": reaction, "drag_count": sum(e.type == "drag_start" for e in events),
         "wrong_object_count": len(selected - targets), "average_speed": average,
         "speed_variance": variance, "path_length": sum(distances), "path_curvature": turns,
-        "pause_count": pause_count, "total_duration_ms": duration_ms,
+        "pause_count": pause_count,
+        "total_duration_ms": duration_ms,  # 서버 측정(now-created_at, 조작 불가)
+        "client_duration_ms": client_duration_ms,  # 참고: 클라이언트 자기신고(점수 미사용)
+        "duration_source": "server",
         "risk_components": components, "risk_score": risk_score, "risk_level": risk_level,
     }
 
@@ -372,13 +385,16 @@ def verify(challenge_id: str, selected_ids: list[str], session_id: str, duration
         correct = submitted == targets and submitted <= valid
         reason = None if correct else ("unknown_object" if not submitted <= valid else "incorrect_selection")
         pattern = _request_pattern(cur, session_id, ip_hash)
-        summary = summarize(events, submitted, targets, duration_ms, correct, pattern,
-                            ip_hash != challenge["client_ip_hash"])
+        # 서버가 잰 풀이 시간 — 챌린지 발급(created_at)~지금. 클라이언트 자기신고(duration_ms)와 달리
+        # 봇이 못 속인다(감사: solve_time 서버 계산). 서버 시계 역행 등 이상은 0으로 클램프.
+        server_solve_ms = max(0, int((utcnow() - challenge["created_at"]).total_seconds() * 1000))
+        summary = summarize(events, submitted, targets, server_solve_ms, correct, pattern,
+                            ip_hash != challenge["client_ip_hash"], client_duration_ms=duration_ms)
         # attempt + behavior 기록, 챌린지 상태 갱신 (ms record_attempt 이식)
         cur.execute(
             "INSERT INTO captcha_attempts(challenge_id,selected_object_ids,is_correct,failure_reason,"
             "duration_ms,behavior_summary,raw_event_path,created_at) VALUES(%s,%s,%s,%s,%s,%s,%s,%s)",
-            (challenge_id, json.dumps(list(submitted)), correct, reason, duration_ms,
+            (challenge_id, json.dumps(list(submitted)), correct, reason, server_solve_ms,
              json.dumps(summary), None, utcnow()),
         )
         # 행동 요약은 captcha_attempts.behavior_summary(JSON)에 이미 저장했다. ms의 별도

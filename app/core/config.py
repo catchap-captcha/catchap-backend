@@ -175,6 +175,11 @@ class Settings(BaseSettings):
     CAPTCHA_VERIFICATION_TTL_SECONDS: int = 300
     CAPTCHA_MAX_ATTEMPTS: int = 3
     CAPTCHA_MAX_CHALLENGES_PER_MINUTE: int = 30
+    # 서버가 잰 최소 풀이 시간(ms) — 챌린지 발급~제출을 서버가 재고(now-created_at), 이보다 빠르면
+    # 위험 점수를 더한다. 클라이언트가 보내는 solve_time과 달리 봇이 못 속인다(감사: solve_time 서버
+    # 계산). 0=비활성(기본) — 서버 측정값은 네트워크·이미지 로드를 포함해 실측으로 임계를 보정한 뒤
+    # 켠다(예: 800). 켜기 전에도 서버 측정값은 항상 기록·요약에 남는다.
+    CAPTCHA_MIN_SOLVE_MS: int = 0
     # 행동 위험 점수 임계 — 이상이면 통과 대신 재확인/차단(사람도 가끔 걸릴 수 있어 보수적).
     CAPTCHA_STEP_UP_SCORE: int = 30
     CAPTCHA_BLOCK_SCORE: int = 80
