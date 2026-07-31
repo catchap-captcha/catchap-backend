@@ -259,8 +259,12 @@ def get_media_storage() -> MediaStorage:
 
 
 def reset_media_storage_cache() -> None:
-    """테스트에서 설정을 바꾼 뒤 저장소를 다시 만들게 한다."""
+    """테스트에서 설정을 바꾼 뒤 저장소를 다시 만들게 한다.
+
+    ★자산 캐시도 같이 비운다 — 저장소가 바뀌었는데 옛 백엔드에서 읽은 바이트가 남아 있으면
+    "바꿨는데 옛 파일이 나온다"는 재현 어려운 혼선이 생긴다."""
     get_media_storage.cache_clear()
+    _cached_asset_bytes.cache_clear()
 
 
 # ────────────────────────────────────────────────────────────────
@@ -295,6 +299,47 @@ def parse_range(header: str | None, size: int) -> tuple[int, int] | None:
     if start > end or start >= size:
         return None
     return start, min(end, size - 1)
+
+
+# ────────────────────────────────────────────────────────────────
+# 작고 불변인 자산 전용 — 메모리 캐시
+# ────────────────────────────────────────────────────────────────
+# 왜 필요한가(실측): 버킷에서 작은 객체 하나를 읽는 데 **약 0.27초**가 걸린다(VPC 안, 11KB~119KB
+# 모두 비슷 — 크기가 아니라 왕복 지연이 지배한다). 드래그 캡차는 챌린지당 배경 1 + 조각 N개를
+# 매번 읽는 핫패스라, 그냥 버킷으로 바꾸면 **한 번 푸는 데 2초쯤 그대로 느려진다**
+# (지금은 로컬 디스크라 1ms도 안 걸린다).
+#
+# 캡차 자산은 캐시하기에 딱 맞다 — **유한하고(배경 766 + 조각 2,676) 내용이 변하지 않는다**
+# (뱅크를 새로 만들면 새 파일이 생길 뿐 기존 파일은 그대로). 그래서 한 번 읽으면 계속 쓴다.
+#
+# ★영상에는 절대 쓰지 말 것. 수백 MB 를 메모리에 올리게 되고 Range 도 못 준다.
+#   영상은 media_response() 로 조각 단위 중계한다.
+_ASSET_CACHE_MAX = 512  # 평균 56KB × 512 ≈ 29MB
+
+
+@lru_cache(maxsize=_ASSET_CACHE_MAX)
+def _cached_asset_bytes(key: str) -> bytes:
+    storage = get_media_storage()
+    st = storage.stat(key)
+    if st is None:
+        raise MediaNotFound(key)
+    return b"".join(storage.open_range(key, 0, st.size - 1))
+
+
+def cached_asset_response(key: str, *, media_type: str, cache_control: str | None = None):
+    """작고 불변인 자산을 메모리 캐시로 서빙한다 — 첫 요청만 저장소를 읽는다.
+
+    ★`media_response()` 와 달리 Range 를 처리하지 않는다. 캡차 이미지처럼 통째로 받는
+    자산 전용이다(브라우저도 <img> 로는 Range 를 안 쓴다)."""
+    from fastapi import HTTPException, status
+    from fastapi.responses import Response
+
+    try:
+        data = _cached_asset_bytes(key)
+    except MediaNotFound:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="파일을 찾을 수 없습니다.")
+    headers = {"Cache-Control": cache_control} if cache_control else {}
+    return Response(content=data, media_type=media_type, headers=headers)
 
 
 @contextmanager
