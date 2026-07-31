@@ -32,6 +32,7 @@
 
 import logging
 import os
+import tempfile
 import re
 import time
 from datetime import datetime, timedelta
@@ -77,6 +78,7 @@ from app.models import (
     User,
 )
 from app.services import auth_service, lecture_service, notify_service
+from app.services.media_storage import get_media_storage, local_file, media_response
 from app.clients import main_captcha_client
 from app.services.captcha_service import EDU_SUBJECTS
 from app.services.course_pricing import effective_course_price
@@ -133,13 +135,35 @@ def _client_ip(request: Request) -> str:
     return request.client.host if request.client else "unknown"
 
 
-def _media_dir() -> Path:
-    return Path(get_settings().LECTURE_MEDIA_DIR)
+# ────────────────────────────────────────────────────────────────
+# 미디어 키(key) — 저장소가 로컬 디스크든 오브젝트 스토리지든 같은 문자열을 쓴다.
+#
+# 왜 Path 가 아니라 문자열 키인가(팀 학습용): 파일이 백엔드 서버 디스크에 있으면 파드를
+# 2개로 늘렸을 때 파드마다 디스크가 달라 업로드한 영상을 다른 파드가 못 찾는다. 그래서
+# 저장 위치를 버킷으로 뺄 수 있게 `app/services/media_storage.py` 로 추상화했고, 여기서는
+# **"어디에 있는가"가 아니라 "무엇인가"** 만 정한다. 실제 위치는 저장소 구현이 안다.
+#
+# ★함수 이름을 _*_path → _*_key 로 바꾼 것은 의도적이다. 이름을 그대로 두고 반환형만
+#   바꾸면 고치지 않은 호출부가 문자열을 Path 처럼 다뤄 **조용히 잘못 동작**한다.
+#   이름을 바꾸면 놓친 자리가 NameError 로 즉시 드러난다.
+# ★키는 항상 서버가 만든 id(UUID)+화이트리스트 확장자로만 조립한다 — 클라이언트 입력이
+#   끼어들 자리가 없다(경로 조작 원천 차단). 저장소 계층에서 한 번 더 검증한다.
+# ────────────────────────────────────────────────────────────────
+def _staging_path(name: str) -> Path:
+    """업로드를 잠깐 받아 둘 임시파일 경로 — 저장소로 옮기기 전 단계.
+
+    왜 임시파일을 거치나: 전역 미들웨어는 `Content-Length` 헤더만 보고 본문을 버퍼링하지
+    않는다. 헤더를 속인 초과 업로드는 **실제로 쓴 바이트**로 잘라내야 하는데, 그러려면 한 번
+    받아 봐야 한다(`_copy_upload_to_tmp`). 그 뒤 저장소로 옮긴다.
+    ★미디어 디렉터리가 아니라 OS 임시 디렉터리를 쓴다 — object 백엔드에서는 미디어
+      디렉터리가 존재하지 않을 수 있고, 임시파일이 버킷에 올라갈 이유도 없다."""
+    d = Path(tempfile.gettempdir()) / "catchap-upload"
+    d.mkdir(parents=True, exist_ok=True)
+    return d / f".{name}.tmp"
 
 
-def _video_path(lec: Lecture) -> Path:
-    # 경로는 DB에 저장하지 않는다 — id(UUID)+화이트리스트 확장자로만 유도(경로조작 원천 차단)
-    return _media_dir() / f"{lec.id}{lec.video_ext}"
+def _video_key(lec: Lecture) -> str:
+    return f"lectures/{lec.id}{lec.video_ext}"
 
 
 # 강의 썸네일 확장자·Content-Type 화이트리스트 — 래스터 이미지만(SVG 금지: <img> 인라인
@@ -149,13 +173,8 @@ _THUMB_MEDIA_TYPES = {
 }
 
 
-def _thumbnails_dir() -> Path:
-    return _media_dir() / "thumbnails"
-
-
-def _thumbnail_path(lec: Lecture) -> Path:
-    # 영상·자료와 동일 원칙 — 썸네일 경로도 id(UUID)+화이트리스트 확장자로만 유도
-    return _thumbnails_dir() / f"{lec.id}{lec.thumbnail_ext or ''}"
+def _thumbnail_key(lec: Lecture) -> str:
+    return f"lectures/thumbnails/{lec.id}{lec.thumbnail_ext or ''}"
 
 
 def _thumbnail_url(lec: Lecture) -> str | None:
@@ -185,24 +204,13 @@ def _course_thumbnail_url(db: Session, course_id: str | None) -> str | None:
     return _thumbnail_url(lec) if lec else None
 
 
-def _materials_dir() -> Path:
-    return _media_dir() / "materials"
+def _material_key(mat: LectureMaterial) -> str:
+    return f"lectures/materials/{mat.id}{mat.file_ext}"
 
 
-def _material_path(mat: LectureMaterial) -> Path:
-    # 영상과 동일 원칙 — 자료 파일 경로도 id(UUID)+화이트리스트 확장자로만 유도
-    return _materials_dir() / f"{mat.id}{mat.file_ext}"
-
-
-def _question_images_dir() -> Path:
-    return _media_dir() / "questions"
-
-
-def _question_image_path(ref: dict) -> Path:
-    # 영상·자료와 동일 원칙 — 문항 이미지 경로도 payload에 기록된 id(UUID·서버 발급)와
-    # 화이트리스트 확장자로만 유도. 클라이언트 입력이 경로에 끼어들 자리가 없다.
-    # ext는 .get — 손상된 참조(ext 누락)여도 삭제 연쇄(unlink missing_ok)가 500 없이 지나간다.
-    return _question_images_dir() / f"{ref['id']}{ref.get('ext') or ''}"
+def _question_image_key(ref: dict) -> str:
+    # ext는 .get — 손상된 참조(ext 누락)여도 삭제 연쇄가 500 없이 지나간다.
+    return f"lectures/questions/{ref['id']}{ref.get('ext') or ''}"
 
 
 def _question_image_url(lecture_id: str, question_id: str, ref: dict) -> str:
@@ -1200,6 +1208,7 @@ def lecture_review_delete(
 
 @router.get("/lectures/{lecture_id}/stream")
 def lecture_stream(
+    request: Request,
     lecture_id: str,
     t: str | None = None,
     db: Session = Depends(get_db),
@@ -1233,10 +1242,12 @@ def lecture_stream(
     media_type = _MEDIA_TYPES.get(lec.video_ext or "")
     if media_type is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="영상 형식이 올바르지 않습니다.")
-    path = _video_path(lec)
-    if not path.is_file():
-        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="영상 파일을 찾을 수 없습니다.")
-    return FileResponse(str(path), media_type=media_type)
+    # 저장소(로컬 디스크 또는 버킷)에서 Range 구간만 읽어 흘려보낸다. 세션 검사는 위에서
+    # 이미 했고, 매 Range 요청마다 이 함수를 다시 타므로 takeover 시 즉시 끊기는 성질이
+    # 그대로 유지된다(서명 URL로 바꾸면 이 성질이 사라진다 — media_storage.py 주석 참조).
+    return media_response(
+        _video_key(lec), media_type=media_type, range_header=request.headers.get("range")
+    )
 
 
 @router.post("/ops/lectures/{lecture_id}/preview")
@@ -1261,6 +1272,7 @@ def ops_lecture_preview(
 
 @router.get("/ops/lectures/{lecture_id}/stream")
 def ops_lecture_stream(
+    request: Request,
     lecture_id: str,
     t: str | None = None,
     db: Session = Depends(get_db),
@@ -1278,14 +1290,14 @@ def ops_lecture_stream(
     media_type = _MEDIA_TYPES.get(lec.video_ext or "")
     if media_type is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="영상 형식이 올바르지 않습니다.")
-    path = _video_path(lec)
-    if not path.is_file():
-        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="영상 파일을 찾을 수 없습니다.")
-    return FileResponse(str(path), media_type=media_type)
+    return media_response(
+        _video_key(lec), media_type=media_type, range_header=request.headers.get("range")
+    )
 
 
 @router.get("/lectures/{lecture_id}/materials/{material_id}/download")
 def lecture_material_download(
+    request: Request,
     lecture_id: str,
     material_id: str,
     principal: Principal = Depends(require_student),
@@ -1303,14 +1315,12 @@ def lecture_material_download(
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST, detail="링크 자료는 다운로드가 아니라 URL로 이동합니다."
         )
-    path = _material_path(mat)
-    if not path.is_file():
-        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="자료 파일을 찾을 수 없습니다.")
     # 파일명은 제목+확장자 — 헤더를 깨는 문자(경로 구분자·따옴표·개행)만 치환
     safe_title = re.sub(r'[\\/\r\n"]', "_", mat.title).strip() or "material"
-    return FileResponse(
-        str(path),
+    return media_response(
+        _material_key(mat),
         media_type="application/octet-stream",
+        range_header=request.headers.get("range"),
         filename=f"{safe_title}{mat.file_ext}",
     )
 
@@ -1348,13 +1358,10 @@ def lecture_question_image(
     media_type = _QUESTION_IMAGE_MEDIA.get(str(ref.get("ext") or "").lower())
     if media_type is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="이미지를 찾을 수 없습니다.")
-    path = _question_image_path(ref)
-    if not path.is_file():
-        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="이미지 파일을 찾을 수 없습니다.")
-    return FileResponse(
-        str(path),
+    return media_response(
+        _question_image_key(ref),
         media_type=media_type,
-        headers={"Cache-Control": "public, max-age=86400"},
+        cache_control="public, max-age=86400",
     )
 
 
@@ -1369,11 +1376,8 @@ def lecture_thumbnail(lecture_id: str, db: Session = Depends(get_db)):
     lec = db.get(Lecture, lecture_id)
     if not lec or not lec.thumbnail_ext:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="썸네일이 없습니다.")
-    path = _thumbnail_path(lec)
-    if not path.exists():
-        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="썸네일 파일이 없습니다.")
-    return FileResponse(
-        str(path),
+    return media_response(
+        _thumbnail_key(lec),
         media_type=_THUMB_MEDIA_TYPES.get(lec.thumbnail_ext, "application/octet-stream"),
     )
 
@@ -2521,16 +2525,17 @@ def ops_create_lecture(
     db.add(lec)
     db.flush()  # id 확정 — 파일명은 {id}{ext}
 
-    media_dir = _media_dir()
-    media_dir.mkdir(parents=True, exist_ok=True)
-    tmp_path = media_dir / f".upload-{lec.id}.tmp"
-    final_path = media_dir / f"{lec.id}{ext}"
+    # 업로드는 항상 임시파일을 거친다 — 전역 미들웨어는 Content-Length 헤더만 보므로,
+    # 헤더를 속인 초과 업로드는 여기서 '실제로 쓴 바이트' 기준으로 잘라내야 한다.
+    # 그다음 저장소(로컬 디스크 또는 버킷)로 옮긴다.
+    video_key = f"lectures/{lec.id}{ext}"
+    tmp_path = _staging_path(f"upload-{lec.id}")
     try:
         total = _copy_upload_to_tmp(file, tmp_path, get_settings().MAX_UPLOAD_BYTES)
         if total == 0:
             tmp_path.unlink(missing_ok=True)
             raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="빈 파일은 업로드할 수 없습니다.")
-        os.replace(tmp_path, final_path)  # 같은 디렉터리 내 원자적 이동
+        get_media_storage().save_path(video_key, tmp_path)
     except BaseException:
         db.rollback()  # 강의 행도 함께 폐기 — 파일 없는 유령 강의를 만들지 않는다
         tmp_path.unlink(missing_ok=True)
@@ -2555,7 +2560,7 @@ def ops_create_lecture(
         )
         db.commit()
     except BaseException:
-        final_path.unlink(missing_ok=True)  # DB 확정 실패 — 고아 파일 제거
+        get_media_storage().delete(video_key)  # DB 확정 실패 — 고아 파일 제거
         raise
     return _lecture_row(db, lec)
 
@@ -2723,7 +2728,7 @@ def ops_restore_lecture(
     # 복구 가드 — 영상 파일이 없으면 복구를 막는다. '옛 삭제'(파일 제거·deleted_at NULL)나
     # 파일이 유실된 강의를 되살리면 학생 카탈로그에 재생 불가(스트림 404)인 깨진 강의가 노출된다.
     # (목록은 이미 레거시를 숨기지만, 직접 API 호출까지 여기서 막는다 — 이중 방어.)
-    if lec.deleted_at is None or not _video_path(lec).is_file():
+    if lec.deleted_at is None or get_media_storage().stat(_video_key(lec)) is None:
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
             detail="이 강의는 영상 파일이 없어 복구할 수 없어요(예전에 완전히 삭제된 강의예요).",
@@ -3204,12 +3209,12 @@ def ops_update_question(
 
     # 보기 축소 시 범위 밖 보기의 이미지 참조를 함께 정리한다 — 참조만 지우고 파일을 두면
     # 고아 파일(자료실에서 겪은 디스크 누수)이 되므로 commit '성공 후' 물리 삭제한다.
-    removed_image_paths: list[Path] = []
+    removed_image_keys: list[str] = []
     opt_imgs = dict(payload.get("option_images") or {})
     if req.options is not None and opt_imgs:
         for k in list(opt_imgs):
             if not str(k).isdigit() or int(k) >= len(new_options):
-                removed_image_paths.append(_question_image_path(opt_imgs.pop(k)))
+                removed_image_keys.append(_question_image_key(opt_imgs.pop(k)))
         if opt_imgs:
             payload["option_images"] = opt_imgs
         else:
@@ -3273,8 +3278,8 @@ def ops_update_question(
         },
     )
     db.commit()
-    for p in removed_image_paths:
-        p.unlink(missing_ok=True)  # commit 성공 후 — 실패 시 참조·파일 정합 유지(멱등)
+    for k in removed_image_keys:
+        get_media_storage().delete(k)  # commit 성공 후 — 실패 시 참조·파일 정합 유지(멱등)
     return _question_row(q)
 
 
@@ -3290,7 +3295,7 @@ def ops_delete_question(
     q = _get_ops_question(db, lecture_id, question_id, principal)
     # 문항 이미지는 물리 삭제(강의·자료와 동일 원칙) — 레코드·payload(참조 포함)는 이력으로
     # 보존한다. deleted 문항은 서빙·출제 경로가 전부 status 필터로 닫혀 파일 부재가 무해하다.
-    image_paths = [_question_image_path(r) for r in _question_image_refs(q.payload or {})]
+    image_keys = [_question_image_key(r) for r in _question_image_refs(q.payload or {})]
     q.status = "deleted"
     # 지운 문항에 기대고 있던 예약을 걷는다 — 마지막 문항을 지우면 학생이 게이트에 닿아도
     # 낼 문제가 없어 4xx만 나고 진행은 클램프에 갇힌다(문항 0개 = 검증 없음이 정직한 상태).
@@ -3302,11 +3307,11 @@ def ops_delete_question(
         actor_user_id=principal.id,
         target_type="lecture_question",
         target_id=q.id,
-        after={"status": "deleted", "image_files_removed": len(image_paths)},
+        after={"status": "deleted", "image_files_removed": len(image_keys)},
     )
     db.commit()
-    for p in image_paths:
-        p.unlink(missing_ok=True)  # commit 성공 후 — 이미 없어도 무해(멱등)
+    for k in image_keys:
+        get_media_storage().delete(k)  # commit 성공 후 — 이미 없어도 무해(멱등)
     return {"ok": True}
 
 
@@ -3573,17 +3578,16 @@ def ops_attach_question_image(
         )
 
     ref = {"id": new_uuid(), "ext": ext}  # 서버 발급 id — 교체 시에도 항상 새 id(URL 불변성)
-    qdir = _question_images_dir()
-    qdir.mkdir(parents=True, exist_ok=True)
-    tmp_path = qdir / f".upload-{ref['id']}.tmp"
-    final_path = _question_image_path(ref)
+    image_key = _question_image_key(ref)
+    tmp_path = _staging_path(f"qimg-{ref['id']}")
+
     try:
         total = _copy_upload_to_tmp(file, tmp_path, get_settings().MAX_QUESTION_IMAGE_BYTES)
         if total == 0:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="빈 파일은 업로드할 수 없습니다.")
-        os.replace(tmp_path, final_path)  # 같은 디렉터리 내 원자적 이동
+        get_media_storage().save_path(image_key, tmp_path)
     except BaseException:
-        tmp_path.unlink(missing_ok=True)  # replace 실패 포함 — 임시파일을 남기지 않는다(영상·자료와 동일)
+        tmp_path.unlink(missing_ok=True)  # 저장 실패 포함 — 임시파일을 남기지 않는다(영상·자료와 동일)
         raise
 
     old_ref = None
@@ -3616,10 +3620,10 @@ def ops_attach_question_image(
         db.commit()
     except BaseException:
         db.rollback()  # 참조도 함께 폐기 — 파일 없는 유령 참조를 만들지 않는다
-        final_path.unlink(missing_ok=True)
+        get_media_storage().delete(image_key)
         raise
     if isinstance(old_ref, dict) and old_ref.get("id"):
-        _question_image_path(old_ref).unlink(missing_ok=True)  # 교체된 옛 파일 정리(멱등)
+        get_media_storage().delete(_question_image_key(old_ref))  # 교체된 옛 파일 정리(멱등)
     return _question_row(q)
 
 
@@ -3644,22 +3648,20 @@ def ops_upload_lecture_thumbnail(
     ct = (file.content_type or "").lower()
     if ct and not ct.startswith("image/"):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="이미지 파일을 올려주세요.")
-    d = _thumbnails_dir()
-    d.mkdir(parents=True, exist_ok=True)
-    old = _thumbnail_path(lec) if lec.thumbnail_ext else None
-    tmp = d / f".thumb-{lec.id}.tmp"
-    final = d / f"{lec.id}{ext}"
+    old_key = _thumbnail_key(lec) if lec.thumbnail_ext else None
+    new_key = f"lectures/thumbnails/{lec.id}{ext}"
+    tmp = _staging_path(f"thumb-{lec.id}")
     try:
         total = _copy_upload_to_tmp(file, tmp, 5 * 1024 * 1024)  # 5MB 상한
         if total == 0:
             tmp.unlink(missing_ok=True)
             raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="빈 파일은 업로드할 수 없습니다.")
-        os.replace(tmp, final)  # 같은 디렉터리 내 원자적 이동
+        get_media_storage().save_path(new_key, tmp)
     except BaseException:
-        tmp.unlink(missing_ok=True)  # replace 실패 포함 — 임시파일을 남기지 않는다
+        tmp.unlink(missing_ok=True)  # 저장 실패 포함 — 임시파일을 남기지 않는다
         raise
-    if old and old != final:
-        old.unlink(missing_ok=True)  # 확장자가 바뀌면 옛 파일 제거(같은 경로면 이미 덮어씀)
+    if old_key and old_key != new_key:
+        get_media_storage().delete(old_key)  # 확장자가 바뀌면 옛 파일 제거(같은 키면 이미 덮어씀)
     lec.thumbnail_ext = ext
     audit(
         db,
@@ -3683,7 +3685,7 @@ def ops_delete_lecture_thumbnail(
     파일도 물리 제거(멱등). 강의 완전삭제와 달리 영상·문항·자료는 그대로 둔다."""
     lec = _get_ops_lecture(db, lecture_id, principal)  # 소유권 검증(강사=자기 강의만·404)
     if lec.thumbnail_ext:
-        _thumbnail_path(lec).unlink(missing_ok=True)  # 파일 물리 제거(이미 없어도 무해)
+        get_media_storage().delete(_thumbnail_key(lec))  # 파일 물리 제거(이미 없어도 무해)
         lec.thumbnail_ext = None
         audit(
             db,
@@ -3747,7 +3749,7 @@ def ops_delete_question_image(
         },
     )
     db.commit()
-    _question_image_path(old_ref).unlink(missing_ok=True)  # commit 성공 후(멱등)
+    get_media_storage().delete(_question_image_key(old_ref))  # commit 성공 후(멱등)
     return _question_row(q)
 
 
@@ -3997,12 +3999,15 @@ def _generate_questions_now(db: Session, lec: Lecture, n: int, actor_id: str, on
         if on_phase:
             on_phase("transcribing")  # 단계 표시: 자막 변환 중(가장 오래 걸리는 구간)
         try:
-            transcript = transcribe_lecture(
-                _video_path(lec),
-                worker_url=stt_worker_url,
-                worker_token=get_settings().STT_WORKER_TOKEN,
-                api_key=openai_key,
-            )
+            # 저장소가 버킷이면 임시로 내려받아 경로를 만든다(STT 워커가 파일 경로를 받는다).
+            # 로컬 백엔드면 원본 경로를 그대로 쓰므로 복사가 일어나지 않는다.
+            with local_file(_video_key(lec), suffix=lec.video_ext or ".mp4") as vpath:
+                transcript = transcribe_lecture(
+                    vpath,
+                    worker_url=stt_worker_url,
+                    worker_token=get_settings().STT_WORKER_TOKEN,
+                    api_key=openai_key,
+                )
         except SttError as e:
             raise HTTPException(
                 status.HTTP_502_BAD_GATEWAY, detail=f"강의 음성 전사(STT)에 실패했습니다: {e}"
@@ -4469,16 +4474,14 @@ async def _create_file_material(
     db.flush()  # id 확정 — 파일명은 materials/{id}{ext}
     mat.url = f"/api/v1/lectures/{lec.id}/materials/{mat.id}/download"
 
-    mdir = _materials_dir()
-    mdir.mkdir(parents=True, exist_ok=True)
-    tmp_path = mdir / f".upload-{mat.id}.tmp"
-    final_path = mdir / f"{mat.id}{ext}"
+    material_key = f"lectures/materials/{mat.id}{ext}"
+    tmp_path = _staging_path(f"mat-{mat.id}")
     try:
         total = _copy_upload_to_tmp(upload, tmp_path, get_settings().MAX_MATERIAL_UPLOAD_BYTES)
         if total == 0:
             tmp_path.unlink(missing_ok=True)
             raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="빈 파일은 업로드할 수 없습니다.")
-        os.replace(tmp_path, final_path)  # 같은 디렉터리 내 원자적 이동
+        get_media_storage().save_path(material_key, tmp_path)
     except BaseException:
         db.rollback()  # 자료 행도 함께 폐기 — 파일 없는 유령 자료를 만들지 않는다
         tmp_path.unlink(missing_ok=True)
@@ -4502,7 +4505,7 @@ async def _create_file_material(
         )
         db.commit()
     except BaseException:
-        final_path.unlink(missing_ok=True)  # DB 확정 실패 — 고아 파일 제거
+        get_media_storage().delete(material_key)  # DB 확정 실패 — 고아 파일 제거
         raise
     return _material_row(mat)
 
@@ -4583,8 +4586,8 @@ def ops_delete_material(
     mat = db.get(LectureMaterial, material_id)
     if mat is None or mat.lecture_id != lecture_id or mat.status == "deleted":
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="자료를 찾을 수 없습니다.")
-    file_path = _material_path(mat) if (mat.kind == "file" and mat.file_ext) else None
-    file_existed = file_path.is_file() if file_path is not None else False
+    file_key = _material_key(mat) if (mat.kind == "file" and mat.file_ext) else None
+    file_existed = get_media_storage().stat(file_key) is not None if file_key else False
     before = {"status": mat.status, "file_bytes": int(mat.file_bytes or 0)}
     mat.status = "deleted"
     if mat.kind == "file":
@@ -4599,6 +4602,6 @@ def ops_delete_material(
         after={"status": "deleted", "file_removed": file_existed},
     )
     db.commit()
-    if file_path is not None:
-        file_path.unlink(missing_ok=True)  # 이미 없어도 무해(멱등)
+    if file_key:
+        get_media_storage().delete(file_key)  # 이미 없어도 무해(멱등)
     return {"ok": True}

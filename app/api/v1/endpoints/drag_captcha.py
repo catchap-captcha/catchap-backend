@@ -9,7 +9,7 @@ from __future__ import annotations
 from typing import Literal
 
 from fastapi import APIRouter, HTTPException, Request, status
-from fastapi.responses import FileResponse
+from app.services.media_storage import cached_asset_response
 from pydantic import BaseModel, Field
 
 from app.core.config import get_settings
@@ -70,11 +70,19 @@ def create_challenge(payload: ChallengeCreate, request: Request):
 
 @router.get("/assets/{challenge_id}/{asset_id}")
 def challenge_asset(challenge_id: str, asset_id: str):
+    """캡차 배경·조각 서빙 — 메모리 캐시를 거친다.
+
+    ★캐시가 필요한 이유(실측): 버킷에서 작은 객체 하나를 읽는 데 약 0.27초가 걸린다.
+    이 엔드포인트는 챌린지당 배경 1 + 조각 N 번 호출되는 핫패스라, 캐시 없이 버킷으로
+    바꾸면 캡차 한 번 푸는 데 2초쯤 그대로 느려진다. 자산은 유한하고(배경 766 + 조각 2,676)
+    내용이 변하지 않아 캐시하기에 맞다."""
     _require_enabled()
     try:
-        return FileResponse(svc.asset_path(challenge_id, asset_id))
+        key, media_type = svc.asset_key(challenge_id, asset_id)
     except FileNotFoundError:
         raise HTTPException(404, "Asset not found")
+    return cached_asset_response(key, media_type=media_type,
+                                 cache_control="public, max-age=86400")
 
 
 @router.post("/challenges/{challenge_id}/verify")

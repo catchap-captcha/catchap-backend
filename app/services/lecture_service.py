@@ -19,6 +19,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
+from app.services.media_storage import get_media_storage
 from app.db.base import _now
 from app.models import (
     Lecture,
@@ -585,9 +586,9 @@ def sweep_stuck_gen_jobs(db: Session, stale_minutes: int = STUCK_GEN_JOB_MINUTES
 TRASH_RETENTION_DAYS = 30
 
 
-def _question_image_paths(media_dir: Path, payload: dict) -> list[Path]:
-    """문항 payload의 이미지 참조(prompt_image + option_images) → 파일 경로 목록.
-    엔드포인트의 _question_image_refs/_question_image_path와 같은 규약(id+ext로만 유도)."""
+def _question_image_keys(payload: dict) -> list[str]:
+    """문항 payload의 이미지 참조(prompt_image + option_images) → 저장소 키 목록.
+    엔드포인트의 _question_image_refs/_question_image_key와 같은 규약(id+ext로만 유도)."""
     refs: list[dict] = []
     pi = (payload or {}).get("prompt_image")
     if isinstance(pi, dict) and pi.get("id"):
@@ -595,7 +596,7 @@ def _question_image_paths(media_dir: Path, payload: dict) -> list[Path]:
     for ref in ((payload or {}).get("option_images") or {}).values():
         if isinstance(ref, dict) and ref.get("id"):
             refs.append(ref)
-    return [media_dir / "questions" / f"{r['id']}{r.get('ext') or ''}" for r in refs]
+    return [f"lectures/questions/{r['id']}{r.get('ext') or ''}" for r in refs]
 
 
 def hard_delete_lecture(db: Session, lec: Lecture) -> dict:
@@ -605,19 +606,18 @@ def hard_delete_lecture(db: Session, lec: Lecture) -> dict:
     파일은 commit '성공 후'에 unlink한다(commit 실패 시 파일은 없는데 행은 남는 최악 방지 —
     기존 소프트삭제와 같은 순서 규약). unlink는 멱등(missing_ok)이라 이미 없어도 무해하다.
     반환: 지운 행 수(테이블별)·파일 수(감사·로그용). commit은 이 함수가 직접 한다."""
-    media_dir = Path(get_settings().LECTURE_MEDIA_DIR)
     lec_id = lec.id
     video_ext = lec.video_ext
 
-    # 파일 경로를 commit 전에 모아 둔다(commit 후 행이 사라지면 payload를 못 읽는다).
-    paths: list[Path] = [media_dir / f"{lec_id}{video_ext}"]
+    # 키를 commit 전에 모아 둔다(commit 후 행이 사라지면 payload를 못 읽는다).
+    keys: list[str] = [f"lectures/{lec_id}{video_ext}"]
     if lec.thumbnail_ext:  # 영상 썸네일도 함께 물리 제거(고아 파일 방지 — 영상·자료·문항이미지와 동일)
-        paths.append(media_dir / "thumbnails" / f"{lec_id}{lec.thumbnail_ext}")
+        keys.append(f"lectures/thumbnails/{lec_id}{lec.thumbnail_ext}")
     for m in db.query(LectureMaterial).filter(LectureMaterial.lecture_id == lec_id).all():
         if m.kind == "file" and m.file_ext:
-            paths.append(media_dir / "materials" / f"{m.id}{m.file_ext}")
+            keys.append(f"lectures/materials/{m.id}{m.file_ext}")
     for qr in db.query(LectureQuestion).filter(LectureQuestion.lecture_id == lec_id).all():
-        paths.extend(_question_image_paths(media_dir, qr.payload or {}))
+        keys.extend(_question_image_keys(qr.payload or {}))
 
     # 자식 행부터 물리 삭제(소프트 참조라 DB 캐스케이드가 없다 — 코드가 직접 지운다).
     counts: dict[str, int] = {}
@@ -638,12 +638,13 @@ def hard_delete_lecture(db: Session, lec: Lecture) -> dict:
     db.commit()
 
     files_removed = 0
-    for p in paths:
+    storage = get_media_storage()
+    for k in keys:
         try:
-            if p.exists():
+            if storage.stat(k) is not None:
                 files_removed += 1
-            p.unlink(missing_ok=True)
-        except OSError:
+            storage.delete(k)
+        except Exception:
             pass  # 파일 삭제 실패는 치명적이지 않다(행은 이미 삭제됨) — 조용히 넘어간다
     return {"lecture_id": lec_id, "rows": counts, "files_removed": files_removed}
 

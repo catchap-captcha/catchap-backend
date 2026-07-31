@@ -14,3 +14,7 @@ httpx>=0.27
 pytest>=8.3
 sentry-sdk>=2.0
 psutil>=5.9  # 서버 모니터링 self-collect(CPU/메모리/디스크) — host_metrics가 사용
+# 미디어 오브젝트 스토리지(카카오클라우드 Object Storage · S3 호환 API). 왜 필요한가:
+# 파드를 2개 이상 띄우면 로컬 디스크가 파드마다 달라 업로드한 영상을 다른 파드가 못 찾는다.
+# ★MEDIA_STORAGE_BACKEND=local 이면 이 패키지를 import 조차 하지 않는다(지연 임포트).
+boto3>=1.35

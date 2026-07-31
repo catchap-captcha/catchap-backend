@@ -2338,25 +2338,34 @@ def test_question_image_rejects_executable_svg_and_bad_slot(client, db, seed_org
 
 
 def test_question_image_replace_failure_leaves_no_tmp(client, db, seed_org, media_dir, monkeypatch):
-    """os.replace 실패(디스크 풀·잠금) — 임시파일을 남기지 않고 payload도 오염되지 않는다."""
-    import app.api.v1.endpoints.lectures as lectures_mod
+    """저장 실패(디스크 풀·버킷 오류) — 임시파일을 남기지 않고 payload도 오염되지 않는다.
+
+    ★가로채는 지점이 `os.replace` → `MediaStorage.save_path` 로 바뀌었다. 미디어 저장이
+    저장소 계층(로컬 디스크/버킷)으로 추상화되면서 최종 이동을 저장소가 맡기 때문이다.
+    검사하는 성질은 그대로다 — 저장이 실패하면 ① 임시파일이 남지 않고 ② 참조가 안 붙는다."""
+    from app.services import media_storage as ms
 
     ops_tok = _instructor(client, db)
     lec = _upload_lecture(client, ops_tok).json()
     q = _add_question(client, ops_tok, lec["id"])
 
-    real_replace = lectures_mod.os.replace
-
-    def boom(src, dst):
+    def boom(self, key, src_path):
         raise OSError("disk error")
 
-    monkeypatch.setattr(lectures_mod.os, "replace", boom)
+    monkeypatch.setattr(ms.LocalMediaStorage, "save_path", boom)
     with pytest.raises(OSError):
         _attach_image(client, ops_tok, lec["id"], q["id"], slot="prompt")
-    monkeypatch.setattr(lectures_mod.os, "replace", real_replace)
+    monkeypatch.undo()
 
     qdir = media_dir / "questions"
-    assert not qdir.exists() or not list(qdir.iterdir()), "replace 실패 후 임시파일이 남았다"
+    assert not qdir.exists() or not list(qdir.iterdir()), "저장 실패 후 임시파일이 남았다"
+    # 업로드 스테이징 디렉터리에도 임시파일이 남지 않아야 한다(저장소 밖 경로).
+    import tempfile
+    from pathlib import Path as _P
+
+    staging = _P(tempfile.gettempdir()) / "catchap-upload"
+    leftovers = [p for p in staging.glob(".qimg-*.tmp")] if staging.exists() else []
+    assert not leftovers, f"스테이징 임시파일이 남았다: {leftovers}"
     row = db.get(LectureQuestion, q["id"])
     assert "prompt_image" not in (row.payload or {})
 

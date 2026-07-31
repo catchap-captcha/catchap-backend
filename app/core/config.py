@@ -71,6 +71,20 @@ class Settings(BaseSettings):
     # 자료 상한(50MB)을 그대로 열면 문항 경로가 또 하나의 대용량 업로드 표면이 된다.
     MAX_QUESTION_IMAGE_BYTES: int = 5_000_000
 
+    # 미디어 저장 위치 — local(서버 디스크) | object(Object Storage 버킷)
+    # 왜 필요한가: 쿠버네티스에서 파드를 2개 이상 띄우면 파드마다 로컬 디스크가 달라
+    # A 파드로 올린 영상을 B 파드가 못 찾는다(요청이 어디로 가느냐에 따라 404).
+    # 버킷은 파드 밖에 있으므로 파드가 몇 개든 같은 파일을 본다.
+    # ★기본값을 local 로 둬서 개발·테스트와 기존 배포는 동작이 전혀 바뀌지 않는다.
+    #   문제가 생기면 이 값 하나만 되돌리면 된다(이미지 재빌드 불필요).
+    MEDIA_STORAGE_BACKEND: str = "local"
+    MEDIA_BUCKET: str = ""
+    MEDIA_KEY_PREFIX: str = "media"  # 버킷 안 최상위 접두사. ★stt-temp/ 와 겹치지 않게 할 것
+    MEDIA_S3_ENDPOINT: str = "https://objectstorage.kr-central-2.kakaocloud.com"
+    MEDIA_S3_REGION: str = "kr-central-2"
+    MEDIA_S3_ACCESS_KEY: str = ""
+    MEDIA_S3_SECRET_KEY: str = ""
+
     # LLM 문항 자동 생성(Anthropic Messages API). 키가 비면 생성 기능은 503으로 정직하게
     # 거절한다 — stub 문제를 만들어 성공처럼 반환하지 않는다(가짜 성공 금지).
     ANTHROPIC_API_KEY: str = ""

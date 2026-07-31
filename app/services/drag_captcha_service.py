@@ -28,6 +28,7 @@ import pymysql
 from pymysql.cursors import DictCursor
 
 from app.core.config import get_settings
+from app.services import media_storage
 from app.db.session import engine
 
 CANVAS_TYPE = "object_drag"
@@ -55,18 +56,34 @@ def hash_value(value: str) -> str:
     return hmac.new(_secret_bytes(), value.encode(), hashlib.sha256).hexdigest()
 
 
-def _final_dir() -> Path:
-    # media/captcha 아래 final(images/, pieces/) 구조. image_path/piece_path는 이 루트 상대경로.
-    root = Path(get_settings().CAPTCHA_MEDIA_DIR)
-    return root if root.is_absolute() else (Path.cwd() / root)
+# 캡차 자산 확장자 화이트리스트 — 래스터 이미지만(SVG 금지: <img> 인라인 서빙이라 스크립트
+# 삽입 위험). 강의 문항 이미지와 같은 원칙.
+_ASSET_MEDIA_TYPES = {
+    ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp",
+}
 
 
-def safe_asset(relative: str) -> Path:
-    root = _final_dir().resolve()
-    candidate = (root / relative).resolve()
-    if root not in candidate.parents or not candidate.is_file():
+def safe_asset_key(relative: str) -> tuple[str, str]:
+    """DB에 저장된 상대경로(`images/x.jpg`) → (저장소 키, Content-Type).
+
+    왜 경로가 아니라 키인가: 파일이 서버 디스크가 아니라 Object Storage 에 있을 수 있다.
+    K8s 에서 파드를 늘리면 파드마다 로컬 디스크가 달라 자산을 못 찾기 때문이다.
+    실제 위치는 저장소 구현(media_storage.py)이 안다.
+
+    ★경로 조작 차단은 그대로다 — 종전에는 resolve() 후 루트 하위인지 봤고, 지금은
+    저장소 계층의 _validate_key 가 `..`·절대경로·비허용문자를 막는다(ValueError).
+    ★확장자 화이트리스트를 여기서 한 번 더 본다 — DB 값이 오염돼도 임의 파일이 못 나간다."""
+    rel = (relative or "").strip().replace("\\", "/").lstrip("/")
+    ext = Path(rel).suffix.lower()
+    media_type = _ASSET_MEDIA_TYPES.get(ext)
+    if not rel or media_type is None:
         raise FileNotFoundError(relative)
-    return candidate
+    key = f"captcha/{rel}"
+    try:
+        media_storage._validate_key(key)
+    except ValueError as e:
+        raise FileNotFoundError(relative) from e
+    return key, media_type
 
 
 @contextmanager
@@ -306,7 +323,11 @@ def create_challenge(purpose: str, session_id: str, ip: str) -> dict[str, Any]:
     }
 
 
-def asset_path(challenge_id: str, asset_id: str) -> Path:
+def asset_key(challenge_id: str, asset_id: str) -> tuple[str, str]:
+    """챌린지의 자산 → (저장소 키, Content-Type).
+
+    ★이름을 asset_path → asset_key 로 바꿨다. 반환형이 Path 에서 (키, 타입) 튜플로 바뀌는데
+    이름을 그대로 두면 안 고친 호출부가 튜플을 Path 처럼 다뤄 조용히 잘못 동작한다."""
     # 핫패스(챌린지당 이미지 1 + 조각 N회 호출) — 필요한 경로 한 개만 단일 쿼리로 조회.
     # 종전엔 챌린지+객체맵+질문+질문객체까지 4쿼리·2커넥션을 읽었으나 실제로 필요한 건 경로뿐.
     with _cursor() as (_, cur):
@@ -319,7 +340,7 @@ def asset_path(challenge_id: str, asset_id: str) -> Path:
             row = cur.fetchone()
             if not row:
                 raise FileNotFoundError("challenge")
-            return safe_asset(row["image_path"])
+            return safe_asset_key(row["image_path"])
         cur.execute(
             "SELECT o.piece_path FROM captcha_challenge_objects m JOIN captcha_objects o ON o.id=m.object_id "
             "WHERE m.challenge_id=%s AND m.temporary_object_id=%s",
@@ -328,7 +349,7 @@ def asset_path(challenge_id: str, asset_id: str) -> Path:
         row = cur.fetchone()
         if not row or not row["piece_path"]:
             raise FileNotFoundError("piece")
-        return safe_asset(row["piece_path"])
+        return safe_asset_key(row["piece_path"])
 
 
 def verify(challenge_id: str, selected_ids: list[str], session_id: str, duration_ms: int,

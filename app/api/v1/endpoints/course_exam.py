@@ -21,7 +21,6 @@ import shutil
 from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile, status
-from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import case, func
 from sqlalchemy.exc import IntegrityError
@@ -41,6 +40,7 @@ from app.models import (
     LectureTranscript,
 )
 from app.services import auth_service, bank_mode
+from app.services.media_storage import get_media_storage, local_file, media_response
 from app.utils.helpers import audit
 
 router = APIRouter(tags=["course-exam"])
@@ -426,23 +426,23 @@ def ops_update_exam_question(
         q.order_no = req.order_no
     # 보기가 줄면 범위 밖 보기 이미지 참조를 정리한다 — 안 그러면 없는 보기의 이미지가
     # 유령 참조로 남는다(강의 문항 update의 remap과 같은 취지). 파일은 commit 후 물리 삭제.
-    orphan_paths = []
+    orphan_keys = []
     if isinstance(q.images, dict) and q.images.get("options"):
-        from app.api.v1.endpoints.lectures import _question_image_path
+        from app.api.v1.endpoints.lectures import _question_image_key
 
         images = {"prompt": q.images.get("prompt"), "options": {}}
         for k, ref in (q.images.get("options") or {}).items():
             if str(k).isdigit() and int(k) < len(q.options):
                 images["options"][k] = ref
             elif isinstance(ref, dict) and ref.get("id"):
-                orphan_paths.append(_question_image_path(ref))
+                orphan_keys.append(_question_image_key(ref))
         q.images = images  # JSON 컬럼은 재할당으로만 변경 감지
     audit(db, action="course.exam_question.update", actor_user_id=principal.id,
           target_type="course_exam_question", target_id=q.id,
           after={"status": q.status, "origin": q.origin})
     db.commit()
-    for p in orphan_paths:
-        p.unlink(missing_ok=True)  # commit 성공 후(멱등) — 잘려나간 보기의 이미지 파일 정리
+    for k in orphan_keys:
+        get_media_storage().delete(k)  # commit 성공 후(멱등) — 잘려나간 보기의 이미지 정리
     return _question_row(q)
 
 
@@ -455,7 +455,7 @@ def ops_delete_exam_question(
 ):
     from app.api.v1.endpoints.lectures import _get_ops_course
 
-    from app.api.v1.endpoints.lectures import _question_image_path
+    from app.api.v1.endpoints.lectures import _question_image_key
 
     _get_ops_course(db, course_id, principal)
     q = db.get(CourseExamQuestion, question_id)
@@ -463,13 +463,13 @@ def ops_delete_exam_question(
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="문항을 찾을 수 없습니다.")
     # 소프트 삭제 문항의 이미지는 서빙이 막히므로(status=deleted) 파일을 남길 이유가 없다 —
     # commit 성공 후 물리 삭제해 디스크 누수를 막는다(응답 기록 attempts는 이미지와 무관).
-    image_paths = [_question_image_path(r) for r in _exam_image_refs(q.images)]
+    image_keys = [_question_image_key(r) for r in _exam_image_refs(q.images)]
     q.status = "deleted"  # 소프트 삭제 — 응답 기록(attempts)의 참조 대상을 보존
     audit(db, action="course.exam_question.delete", actor_user_id=principal.id,
           target_type="course_exam_question", target_id=q.id, after=None)
     db.commit()
-    for p in image_paths:
-        p.unlink(missing_ok=True)
+    for k in image_keys:
+        get_media_storage().delete(k)
     return {"ok": True}
 
 
@@ -489,7 +489,7 @@ def ops_import_exam_from_lectures(
     이미지 파일은 새 UUID로 복사해 시험 문항이 강의 문항 생명주기와 독립되게 한다(강의 문항을
     지워도 시험 이미지는 남는다). 형식 불량은 조용히 건너뛰되 개수를 정직하게 반환한다.
     가져온 문항은 draft — 강사 검수 후 active."""
-    from app.api.v1.endpoints.lectures import _get_ops_course, _question_image_path
+    from app.api.v1.endpoints.lectures import _get_ops_course, _question_image_key
 
     _get_ops_course(db, course_id, principal)
     lec_ids = _course_lecture_ids(db, course_id)
@@ -510,20 +510,23 @@ def ops_import_exam_from_lectures(
     )
     imported = 0
     skipped = 0
-    copied_paths: list = []  # commit 실패 시 정리할 새로 복사된 이미지 파일들
+    copied_keys: list[str] = []  # commit 실패 시 정리할 새로 복사된 이미지들
 
     def _copy_ref(ref: dict) -> dict | None:
         """강의 문항 이미지 파일을 새 UUID로 복사 → 새 참조(원본이 없으면 None)."""
         if not (isinstance(ref, dict) and ref.get("id")):
             return None
-        src = _question_image_path(ref)
-        if not src.is_file():
+        st = get_media_storage()
+        src_key = _question_image_key(ref)
+        stat = st.stat(src_key)
+        if stat is None:
             return None
         new_ref = {"id": new_uuid(), "ext": ref.get("ext") or ""}
-        dst = _question_image_path(new_ref)
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(src, dst)
-        copied_paths.append(dst)
+        dst_key = _question_image_key(new_ref)
+        # 저장소가 버킷이어도 동작하도록 조각 단위로 읽어 그대로 쓴다(메모리 상주 없음).
+        with local_file(src_key) as src_path, open(src_path, "rb") as fh:
+            st.save(dst_key, fh)
+        copied_keys.append(dst_key)
         return new_ref
 
     try:
@@ -587,8 +590,8 @@ def ops_import_exam_from_lectures(
         db.commit()
     except BaseException:
         db.rollback()
-        for p in copied_paths:  # DB에 참조가 안 남았으니 복사한 파일도 되돌린다(유령 파일 방지)
-            p.unlink(missing_ok=True)
+        for k in copied_keys:  # DB에 참조가 안 남았으니 복사한 파일도 되돌린다(유령 파일 방지)
+            get_media_storage().delete(k)
         raise
     return {"imported": imported, "skipped": skipped}
 
@@ -735,7 +738,7 @@ def exam_question_image(
     강의 문항 이미지 서빙과 동일 원칙: 인증 의존성 없음(<img>는 Authorization 못 실음·경로가
     코스·문항·이미지 세 UUID 조합이라 추측 불가), 정답 미노출(모든 보기 이미지가 같은 형태 URL),
     경로는 서버 발급 UUID + 화이트리스트 확장자로만 유도(경로조작·SVG 차단). deleted 문항만 차단."""
-    from app.api.v1.endpoints.lectures import _QUESTION_IMAGE_MEDIA, _question_image_path
+    from app.api.v1.endpoints.lectures import _QUESTION_IMAGE_MEDIA, _question_image_key
 
     q = db.get(CourseExamQuestion, question_id)
     if q is None or q.course_id != course_id or q.status == "deleted":
@@ -746,13 +749,10 @@ def exam_question_image(
     media_type = _QUESTION_IMAGE_MEDIA.get(str(ref.get("ext") or "").lower())
     if media_type is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="이미지를 찾을 수 없습니다.")
-    path = _question_image_path(ref)
-    if not path.is_file():
-        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="이미지 파일을 찾을 수 없습니다.")
-    return FileResponse(
-        str(path),
+    return media_response(
+        _question_image_key(ref),
         media_type=media_type,
-        headers={"Cache-Control": "public, max-age=86400"},
+        cache_control="public, max-age=86400",
     )
 
 
@@ -788,8 +788,8 @@ def ops_attach_exam_image(
         _client_ip,
         _copy_upload_to_tmp,
         _get_ops_course,
-        _question_image_path,
-        _question_images_dir,
+        _question_image_key,
+        _staging_path,
     )
     from app.services import auth_service
 
@@ -813,15 +813,13 @@ def ops_attach_exam_image(
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="이미지 Content-Type(image/png 등)이 아닙니다.")
 
     ref = {"id": new_uuid(), "ext": ext}
-    qdir = _question_images_dir()
-    qdir.mkdir(parents=True, exist_ok=True)
-    tmp_path = qdir / f".upload-{ref['id']}.tmp"
-    final_path = _question_image_path(ref)
+    image_key = _question_image_key(ref)
+    tmp_path = _staging_path(f"examimg-{ref['id']}")
     try:
         total = _copy_upload_to_tmp(file, tmp_path, get_settings().MAX_QUESTION_IMAGE_BYTES)
         if total == 0:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="빈 파일은 업로드할 수 없습니다.")
-        os.replace(tmp_path, final_path)
+        get_media_storage().save_path(image_key, tmp_path)
     except BaseException:
         tmp_path.unlink(missing_ok=True)
         raise
@@ -846,10 +844,10 @@ def ops_attach_exam_image(
         db.commit()
     except BaseException:
         db.rollback()
-        final_path.unlink(missing_ok=True)
+        get_media_storage().delete(image_key)
         raise
     if isinstance(old_ref, dict) and old_ref.get("id"):
-        _question_image_path(old_ref).unlink(missing_ok=True)  # 교체된 옛 파일 정리(멱등)
+        get_media_storage().delete(_question_image_key(old_ref))  # 교체된 옛 파일 정리(멱등)
     return _question_row(q)
 
 
@@ -863,7 +861,7 @@ def ops_delete_exam_image(
     db: Session = Depends(get_db),
 ):
     """시험 문항 이미지 제거 — images 참조 삭제 + commit 성공 후 파일 물리 삭제."""
-    from app.api.v1.endpoints.lectures import _get_ops_course, _question_image_path
+    from app.api.v1.endpoints.lectures import _get_ops_course, _question_image_key
 
     _get_ops_course(db, course_id, principal)
     q = db.get(CourseExamQuestion, question_id)
@@ -891,7 +889,7 @@ def ops_delete_exam_image(
                  "option_index": option_index if slot == "option" else None,
                  "image_id": old_ref["id"]})
     db.commit()
-    _question_image_path(old_ref).unlink(missing_ok=True)  # commit 성공 후(멱등)
+    get_media_storage().delete(_question_image_key(old_ref))  # commit 성공 후(멱등)
     return _question_row(q)
 
 
