@@ -1062,6 +1062,20 @@ def _nickname_map(db: Session, student_ids: list[str]) -> dict[str, str]:
     return {sid: nick for sid, nick in rows}
 
 
+def _mask_name(name: str | None) -> str:
+    """후기 표시명 마스킹 — 첫 글자만 남기고 나머지를 가린다(예: 변우석 → 변○○).
+
+    가입 시 nickname이 실명(req.name)으로 초기화되어(auth_service) nickname에 실명이 담길 수 있다.
+    후기는 강사·다른 학생에게 노출되므로, nickname 값이 무엇이든 이 함수를 거쳐 실명이 그대로
+    보이지 않게 한다('표시 이름은 가명' 규약을 표시 단계에서 강제). 빈 값은 '학습자'."""
+    n = (name or "").strip()
+    if not n:
+        return "학습자"
+    if len(n) == 1:
+        return n
+    return n[0] + "○" * (len(n) - 1)
+
+
 @router.get("/lectures/{lecture_id}/reviews")
 def lecture_reviews(
     lecture_id: str,
@@ -1088,7 +1102,7 @@ def lecture_reviews(
             "id": r.id,
             "rating": int(r.rating),
             "text": r.text or "",
-            "author": names.get(r.student_id, "학습자"),
+            "author": _mask_name(names.get(r.student_id)),
             "created_at": r.created_at.isoformat() if r.created_at else None,
             "mine": is_mine,
         }
@@ -2301,6 +2315,63 @@ def ops_instructor_analytics(
         round(total_course_completed / total_enrolled, 3) if total_enrolled else None
     )
 
+    # --- 수강 후기 — 내 강의(lec_ids)에 달린 활성 후기를 코스별로 묶어 코스당 평균 별점·개수·최근
+    # 코멘트를 준다(강사가 코스별 평판을 본다). summary는 전체 평균(전량 기준). 표시 이름은
+    # _mask_name으로 마스킹 — 강사에게도 실명이 안 보이게(가입 시 nickname이 실명이라).
+    review_summary = {"count": 0, "avg": 0.0}
+    review_by_course: list[dict] = []
+    if lec_ids:
+        review_rows = (
+            db.query(LectureReview)
+            .filter(
+                LectureReview.lecture_id.in_(lec_ids),
+                LectureReview.status == "active",
+            )
+            .order_by(LectureReview.created_at.desc())
+            .all()
+        )
+        if review_rows:
+            total_rating = sum(int(r.rating or 0) for r in review_rows)
+            review_summary = {
+                "count": len(review_rows),
+                "avg": round(total_rating / len(review_rows), 1),
+            }
+            names = _nickname_map(db, [r.student_id for r in review_rows])
+            lec_title = {lec.id: lec.title for lec in my_lectures}
+            lec_course = {lec.id: lec.course_id for lec in my_lectures}
+            course_title = {c.id: c.title for c in my_courses}
+            # 코스별 그룹 — course_id 없는(미분류) 강의의 후기는 '코스 미지정'으로 묶는다.
+            groups: dict[str, dict] = {}
+            for r in review_rows:
+                cid = lec_course.get(r.lecture_id) or ""
+                g = groups.setdefault(
+                    cid, {"title": course_title.get(cid, "코스 미지정"), "rows": []}
+                )
+                g["rows"].append(r)
+            for cid, g in groups.items():
+                rows = g["rows"]
+                c_total = sum(int(x.rating or 0) for x in rows)
+                review_by_course.append(
+                    {
+                        "course_id": cid,
+                        "course_title": g["title"],
+                        "count": len(rows),
+                        "avg": round(c_total / len(rows), 1),
+                        "items": [
+                            {
+                                "id": x.id,
+                                "rating": int(x.rating),
+                                "text": x.text or "",
+                                "author": _mask_name(names.get(x.student_id)),
+                                "lecture_title": lec_title.get(x.lecture_id, ""),
+                                "created_at": x.created_at.isoformat() if x.created_at else None,
+                            }
+                            for x in rows[:20]  # 코스당 최근 20개
+                        ],
+                    }
+                )
+            review_by_course.sort(key=lambda c: c["count"], reverse=True)  # 후기 많은 코스 우선
+
     return {
         "lecture_count": len(my_lectures),
         "course_count": len(my_courses),
@@ -2311,6 +2382,7 @@ def ops_instructor_analytics(
         "weekly": weekly,
         "per_course": per_course,
         "per_lecture": per_lecture,
+        "reviews": {"summary": review_summary, "by_course": review_by_course},
     }
 
 
