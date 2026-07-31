@@ -85,6 +85,40 @@ def update_my_profile(
     return {"ok": True, "name": st.nickname, "age": st.age}
 
 
+# ---------------------------------------------------------------- 관심사(온보딩)
+class _InterestsReq(_GBaseModel):
+    interests: list[str] = []
+
+
+@router.get("/students/me/interests")
+def get_my_interests(
+    principal: Principal = Depends(require_student),
+):
+    """관심사 + 온보딩 여부 — 최초 로그인 판별용. interests가 null이면 아직 안 골랐다(온보딩
+    모달 노출). 홈 추천 강의도 프런트가 이 값으로 코스 분류(category)를 거른다."""
+    st = _me(principal)
+    return {"onboarded": st.interests is not None, "interests": st.interests or []}
+
+
+@router.put("/students/me/interests")
+def set_my_interests(
+    req: _InterestsReq,
+    principal: Principal = Depends(require_student),
+    db: Session = Depends(get_db),
+):
+    """관심사 저장(= 온보딩 완료). 빈 목록(스킵)도 저장해 온보딩을 끝낸다(null과 구분되어 모달이
+    다시 안 뜬다). 값은 코스 분류(category) 문자열 — 공백·중복 제거, 최대 20개."""
+    st = _me(principal)
+    seen: list[str] = []
+    for x in req.interests:
+        v = (x or "").strip()
+        if v and v not in seen:
+            seen.append(v)
+    st.interests = seen[:20]
+    db.commit()
+    return {"ok": True, "onboarded": True, "interests": st.interests}
+
+
 # ---------------------------------------------------------------- 학습 홈
 @router.get("/students/me/dashboard")
 def dashboard(

@@ -45,6 +45,9 @@ class StudentProfile(Base, UUIDPk, Timestamps):
     gender: Mapped[str | None] = mapped_column(String(10), nullable=True)
     grade_band: Mapped[str] = mapped_column(String(30), default="kindergarten")
     avatar: Mapped[dict] = mapped_column(JSON, default=dict)  # {hat, background, sticker}
+    # 관심사(온보딩) — 최초 로그인 시 고른 코스 분류(category) 목록. null=아직 안 골랐음(온보딩
+    # 모달 노출 조건), []=골랐으나 스킵, ["IT/개발", ...]=관심사. 홈 추천 강의의 기준(interest_01).
+    interests: Mapped[list | None] = mapped_column(JSON, nullable=True)
     coins: Mapped[int] = mapped_column(default=0)
     level: Mapped[int] = mapped_column(default=1)
     status: Mapped[str] = mapped_column(String(20), default="good")  # good|inactive|needs_help
