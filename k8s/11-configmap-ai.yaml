@@ -1,0 +1,17 @@
+# AI 서비스(행동 위험도) 평문 설정
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: catchap-ai-config
+  namespace: catchap
+data:
+  TZ: "Asia/Seoul"
+  RISK_POLICY_MODE: "shadow"              # shadow = 판정만 기록, 차단 안 함
+  # ★관리형 MySQL Primary. 옛 주소는 10.0.1.168 이었다.
+  #   포트가 역할을 정한다 — 3306 이 Primary, 3307 이 Standby(읽기 전용).
+  MYSQL_HOST: "az-a.mysql-team1.5f428f1b341249c983ab19c6f8f3fdb4.mysql.managed-service.kr-central-2.kakaocloud.com"
+  MYSQL_PORT: "3306"
+  MYSQL_USER: "catchap_backend"
+  MYSQL_DATABASE: "catchap_dev_db"
+  MYSQL_POOL_SIZE: "5"
+  PRODUCTION_MODEL_DIR: "/app/models/candidate/revalidation_two_view_participant_safe_20260722"
