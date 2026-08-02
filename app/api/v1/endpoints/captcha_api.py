@@ -17,6 +17,7 @@ from fastapi.responses import Response
 from jwt import PyJWTError
 from pydantic import BaseModel
 from sqlalchemy import func
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.security import decode_token, sha256_hash
@@ -730,3 +731,105 @@ def validate(
     cs.log_call(db, api, "captcha/validate", 200 if ok else 400)
     db.commit()
     return {"success": ok}
+
+
+# --- 학생 문항 신고 ("문제가 이상해요") --------------------------------------
+# 신고 사유 화이트리스트 — 임의 문자열 차단(스키마 오염·통계 왜곡 방지).
+REPORT_REASONS = {"wrong_answer", "typo", "unclear", "other"}
+RATE_REPORT_PER_HOUR = 10  # 학생당 시간당 신고 상한(남용 방지)
+
+
+class _ReportReq(BaseModel):
+    challenge_token: str
+    reason: str
+    detail: str | None = None
+
+
+@router.post("/report", status_code=status.HTTP_201_CREATED)
+def report_question(
+    req: _ReportReq,
+    request: Request,
+    x_site_key: str | None = Header(default=None),
+    db: Session = Depends(get_db),
+):
+    """강의 확인문항 신고 — 학생이 받은 챌린지 토큰으로 대상 문항을 특정한다.
+
+    발급/채점과 같은 게이트(edu 1st-party 키 + 학생 로그인)를 건다. 신고 대상 문항은
+    학생 화면에 없는 question_id를 서명 토큰에서 복원해 확정하므로, 남의 문항·임의 문항
+    신고가 원천 차단된다(토큰은 소비하지 않아 풀이 흐름은 그대로). 같은 학생·같은 문항
+    재신고는 DB 유니크 제약으로 막고, 신고 시 그 강의 강사에게 in-app 알림 1건을 남긴다.
+    """
+    from app.models import Lecture, LectureQuestionReport, Notification
+    from app.utils.helpers import audit
+
+    _throttle(db, request, "report", RATE_REPORT_PER_HOUR * 60)  # IP 버스트 1차 차단
+    api = _key(db, x_site_key)
+    _origin_guard(db, request, api)
+
+    if api.product != "edu" or not api.first_party:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN, detail="이 키로는 문항 신고를 사용할 수 없어요."
+        )
+    student = _optional_student(db, request)
+    if student is None:
+        raise HTTPException(
+            status.HTTP_401_UNAUTHORIZED, detail="문항 신고는 학생 로그인이 필요해요."
+        )
+    if req.reason not in REPORT_REASONS:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="알 수 없는 신고 사유예요.")
+
+    meta = cs.peek_lecture_meta(req.challenge_token)
+    if meta is None:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST, detail="만료됐거나 잘못된 문항이에요. 새로 받아 주세요."
+        )
+    lecture_id, question_id = meta["lec"], meta["qid"]
+
+    # 학생당 신고 상한(시간당) — LoginThrottle 재사용(IP 상한과 별개로 계정 기준).
+    auth_service.rate_limit(
+        db, f"qreport:{student.id}", limit=RATE_REPORT_PER_HOUR, window_seconds=3600
+    )
+
+    detail = (req.detail or "").strip()[:500] or None
+    report = LectureQuestionReport(
+        lecture_id=lecture_id, question_id=question_id, student_id=student.id,
+        reason=req.reason, detail=detail, status="open",
+    )
+    db.add(report)
+    try:
+        db.flush()  # 유니크 제약(학생·문항) 위반을 여기서 잡는다
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, detail="이미 신고한 문항이에요. 검토 중이니 조금만 기다려 주세요."
+        )
+
+    # 강사 알림 — 같은 문항에 미읽음 동일 알림이 있으면 중복 생성하지 않는다(폭주 방지).
+    lec = db.get(Lecture, lecture_id)
+    if lec is not None and lec.uploaded_by:
+        dup = (
+            db.query(Notification)
+            .filter(
+                Notification.user_id == lec.uploaded_by,
+                Notification.type == "question_report",
+                Notification.read_at.is_(None),
+                Notification.message.like(f"%{question_id}%"),
+            )
+            .first()
+        )
+        if dup is None:
+            db.add(Notification(
+                user_id=lec.uploaded_by,
+                type="question_report",
+                category="강의",
+                title="확인문항 신고가 접수됐어요",
+                message=f"[{lec.title}] 확인문항에 신고가 들어왔어요. (문항 {question_id})",
+            ))
+
+    audit(
+        db, action="lecture.question.report",
+        target_type="lecture_question", target_id=question_id,
+        after={"lecture_id": lecture_id, "reason": req.reason},
+    )
+    db.commit()
+    return {"reported": True, "status": "open"}

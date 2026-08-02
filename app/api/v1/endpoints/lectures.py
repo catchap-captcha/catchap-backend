@@ -71,6 +71,7 @@ from app.models import (
     LectureMaterial,
     LectureQuestion,
     LectureQuestionGenJob,
+    LectureQuestionReport,
     LectureReview,
     LectureTranscript,
     LectureWatchProgress,
@@ -4245,6 +4246,92 @@ def _notify_gen_result(db: Session, job: LectureQuestionGenJob, lec_title: str, 
         message=message,
         email_html=f"<p>{message}</p>",
     )
+
+
+# --- 학생 문항 신고 검토 (강사) ---------------------------------------------
+def _report_row(r: LectureQuestionReport, prompt: str | None) -> dict:
+    """강사 검토용 행 — 학생 신원(student_id)은 의도적으로 노출하지 않는다(PII 원칙)."""
+    return {
+        "id": r.id,
+        "question_id": r.question_id,
+        "question_prompt": prompt,  # 어떤 문항인지 강사가 알아보게(삭제된 문항이면 None)
+        "reason": r.reason,
+        "detail": r.detail,
+        "status": r.status,
+        "created_at": r.created_at.isoformat() if r.created_at else None,
+        "resolved_at": r.resolved_at.isoformat() if r.resolved_at else None,
+    }
+
+
+@router.get("/ops/lectures/{lecture_id}/reports")
+def ops_list_question_reports(
+    lecture_id: str,
+    status_filter: str = "open",  # open|resolved|dismissed|all
+    principal: Principal = Depends(require_content_author),
+    db: Session = Depends(get_db),
+):
+    """이 강의의 문항 신고 목록(강사 스코프) — 기본은 처리 안 된 것(open)만.
+
+    학생 신원은 응답에 넣지 않는다(PII). 같은 문항에 여러 신고가 있으면 문항별로 묶어
+    개수를 함께 준다 — 강사가 '많이 신고된 문항'을 먼저 볼 수 있게."""
+    _get_ops_lecture(db, lecture_id, principal)  # 소유 스코프 — 남의 강의 404
+    q = db.query(LectureQuestionReport).filter(
+        LectureQuestionReport.lecture_id == lecture_id
+    )
+    if status_filter != "all":
+        if status_filter not in ("open", "resolved", "dismissed"):
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="알 수 없는 상태예요.")
+        q = q.filter(LectureQuestionReport.status == status_filter)
+    reports = q.order_by(LectureQuestionReport.created_at.desc()).all()
+
+    # 문항 프롬프트 일괄 로드(삭제된 문항은 None) — N+1 회피.
+    qids = {r.question_id for r in reports}
+    prompts: dict[str, str] = {}
+    if qids:
+        for lq in db.query(LectureQuestion).filter(LectureQuestion.id.in_(qids)).all():
+            prompts[lq.id] = (lq.payload or {}).get("prompt", "")
+
+    # 문항별 신고 수(같은 상태 필터 안에서).
+    counts: dict[str, int] = {}
+    for r in reports:
+        counts[r.question_id] = counts.get(r.question_id, 0) + 1
+
+    return {
+        "reports": [_report_row(r, prompts.get(r.question_id)) for r in reports],
+        "counts_by_question": counts,
+    }
+
+
+class _ReportResolveReq(BaseModel):
+    status: str  # resolved|dismissed
+
+
+@router.patch("/ops/lectures/{lecture_id}/reports/{report_id}")
+def ops_resolve_question_report(
+    lecture_id: str,
+    report_id: str,
+    req: _ReportResolveReq,
+    principal: Principal = Depends(require_content_author),
+    db: Session = Depends(get_db),
+):
+    """신고 처리 표시 — resolved(반영함) 또는 dismissed(문제없음). 강사 스코프."""
+    _get_ops_lecture(db, lecture_id, principal)  # 소유 스코프 — 남의 강의 404
+    if req.status not in ("resolved", "dismissed"):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="resolved 또는 dismissed만 가능해요.")
+    r = db.get(LectureQuestionReport, report_id)
+    if r is None or r.lecture_id != lecture_id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="신고를 찾을 수 없습니다.")
+    r.status = req.status
+    r.resolved_by = principal.id
+    r.resolved_at = datetime.now()
+    audit(
+        db, action="lecture.question.report.resolve",
+        actor_user_id=principal.id,
+        target_type="lecture_question_report", target_id=report_id,
+        after={"status": req.status},
+    )
+    db.commit()
+    return _report_row(r, None)
 
 
 def _fail_gen_job(db: Session, job_id: str, detail: str) -> None:

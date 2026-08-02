@@ -201,6 +201,35 @@ class LectureCheckpointEvent(Base, UUIDPk, Timestamps):
     result: Mapped[str] = mapped_column(String(20))  # passed|failed|exempted
 
 
+class LectureQuestionReport(Base, UUIDPk, Timestamps):
+    """학생이 올린 확인문항 신고 — "문제가 이상해요"(오답·오타·이해 불가 등).
+
+    통계('다시 봐야 할 확인문항')는 통과율이 쌓여야 신호가 잡히지만, 신고는 학생이
+    즉시 이상을 알리는 상호보완 장치다. 신고 대상 문항은 학생 화면에 노출되지 않는
+    question_id 대신 '학생이 실제로 받은 챌린지 토큰'에서 서버가 복원한다(클라이언트
+    자기신고를 신뢰하지 않는다 — captcha_api의 발급/채점과 같은 원칙).
+
+    소프트 참조(FK 없음, 인덱스만): 문항·강의 삭제와 독립적으로 신고 이력을 남기고
+    라이브 덤프 collation 정합을 지킨다(LectureTranscript·gen_job 규약과 동일).
+    student_id는 중복 신고 차단·감사에 쓰되 강사 조회 응답에는 노출하지 않는다(PII).
+    """
+
+    __tablename__ = "lecture_question_reports"
+    __table_args__ = (
+        # 같은 학생이 같은 문항을 여러 번 신고하지 못하게 DB 레벨에서 막는다.
+        UniqueConstraint("student_id", "question_id", name="uq_lqr_student_question"),
+    )
+
+    lecture_id: Mapped[str] = mapped_column(CHAR(36), index=True)  # 강사 스코프 조회용
+    question_id: Mapped[str] = mapped_column(CHAR(36), index=True)  # 토큰에서 복원
+    student_id: Mapped[str] = mapped_column(CHAR(36), index=True)  # 중복 방지·감사(강사 비노출)
+    reason: Mapped[str] = mapped_column(String(30))  # wrong_answer|typo|unclear|other
+    detail: Mapped[str | None] = mapped_column(String(500), nullable=True)  # 자유 서술(선택)
+    status: Mapped[str] = mapped_column(String(20), default="open")  # open|resolved|dismissed
+    resolved_by: Mapped[str | None] = mapped_column(CHAR(36), nullable=True)  # 처리한 강사/운영자
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
 class LectureTranscript(Base, UUIDPk, Timestamps):
     """강의 전사(자막) — LLM 문항 생성의 근거. 강사 제공(SRT/VTT/붙여넣기) 또는 자동 STT 결과.
 

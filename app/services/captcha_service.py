@@ -828,6 +828,20 @@ def peek_is_lecture(challenge_token: str) -> bool:
     return bool(data and data.get("lec"))
 
 
+def peek_lecture_meta(challenge_token: str) -> dict | None:
+    """토큰을 소비하지 않고 강의 체크포인트 메타(lec/qid/cp)만 복원 — 문항 신고용.
+
+    학생 화면에는 question_id가 나가지 않으므로(발급 시 서명 토큰에만 봉인), 신고 대상
+    문항은 '학생이 실제로 받은 챌린지 토큰'에서만 확정할 수 있다. 서명 검증 실패(위조·
+    만료)나 강의 토큰이 아니면 None — 신고 엔드포인트가 400으로 거른다. verify와 달리
+    nonce를 소비하지 않는다(신고가 정상 풀이 흐름을 방해하지 않게).
+    """
+    data = _unsign(challenge_token)
+    if not data or not data.get("lec") or not data.get("qid"):
+        return None
+    return {"lec": str(data["lec"]), "qid": str(data["qid"]), "cp": data.get("cp")}
+
+
 def verify_challenge(db: Session, challenge_token: str, answer) -> dict:
     """제출 답 서버 채점 → 통과 시 verdict 토큰(1회용) 발급.
 
