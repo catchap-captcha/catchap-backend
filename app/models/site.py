@@ -67,10 +67,15 @@ class CaptchaConsumedToken(Base, UUIDPk, Timestamps):
     __tablename__ = "captcha_consumed_tokens"
     __table_args__ = (
         UniqueConstraint("kind", "token_id", name="uq_captcha_consumed"),
+        # 만료 행 청소(purge_expired_consumed_tokens)가 expires_at 범위로 지운다.
+        # 인덱스가 없으면 지울 때마다 풀스캔 + 정렬이라, 이 표가 커질수록 청소가 느려진다.
+        Index("ix_captcha_consumed_expires", "expires_at"),
     )
 
     kind: Mapped[str] = mapped_column(String(20), index=True)  # challenge | verdict
     token_id: Mapped[str] = mapped_column(String(64), index=True)
+    # ★만료 뒤에는 쓸모가 없다 — 토큰 자체가 exp 로 먼저 거절되므로 리플레이 차단에도
+    #   더는 필요 없다. 안 지우면 계속 쌓인다(2026-08-03 실측 29,001행 · 14MB).
     expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 

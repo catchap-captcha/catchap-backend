@@ -14,11 +14,13 @@
 import base64
 import hashlib
 import json
+import logging
 import math
+import random
 import re
 import secrets
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from functools import lru_cache
 from urllib.parse import urlparse
 
@@ -31,6 +33,8 @@ from sqlalchemy.orm import Session
 from app.core.config import get_settings
 from app.core.security import sha256_hash
 from app.models import ApiKey, ApiUsageLog, CaptchaConsumedToken, Plan, Site, Subscription
+
+_log = logging.getLogger("catchap.captcha")
 
 # ── 제품 · 요금제 엔타이틀먼트 ─────────────────────────────────
 PRODUCTS = {"captcha": "메인 캡차 API", "edu": "교육형 API (행동데이터 수집)"}
@@ -76,6 +80,74 @@ def _unsign(token: str) -> dict | None:
     return data
 
 
+_PURGE_PROBABILITY = 0.02  # 소비 기록을 쓸 때 2% 확률로만 청소한다(drag_captcha와 같은 값)
+_PURGE_BATCH = 500  # 한 번에 지우는 최대 행 수 — 긴 락으로 사용자 요청을 막지 않게
+_PURGE_GRACE_SECONDS = 60  # 만료 직후는 남겨 둔다(아래 설명)
+
+
+def purge_expired_consumed_tokens(
+    now: datetime | None = None, session_factory=None
+) -> int:
+    """만료된 1회용 토큰 소비 기록을 지운다. 지운 행 수를 돌려준다.
+
+    왜 지워도 되나 — 이 표는 "이 토큰은 이미 썼다"는 기록이다. 그런데 만료된 토큰은
+    `_unsign()`이 `exp < now`로 **먼저** 거절하므로 `_consume()`까지 오지 못한다.
+    즉 만료 뒤의 행은 리플레이 차단에 아무 역할도 하지 않는다.
+
+    왜 필요한가 — 안 지우면 무한히 쌓인다. 2026-08-03 실측 29,001행·14MB이고
+    그중 28,998행이 이미 만료였다. 수명이 몇 분인 데이터가 3주치 남아 있었다.
+
+    ★유예(_PURGE_GRACE_SECONDS)를 두는 이유: `expires_at`은 발급한 워커의 시계로
+    찍히고 청소는 다른 워커가 돈다. 시계가 조금 어긋나면 **아직 유효한 토큰의 기록을
+    지워** 그 토큰이 한 번 더 통과할 수 있다. 1분이면 충분히 안전하다.
+
+    ★요청 세션이 아니라 **별도 세션**에서 돈다. 청소가 실패해 롤백되더라도
+    진행 중인 캡차 검증 트랜잭션을 되돌리면 안 되기 때문이다.
+    `session_factory`는 시험에서 테스트용 DB를 물리려고 열어 둔 자리다(운영은 기본값).
+
+    ★세션이 둘이면 락 경합이 걱정되는데, 두 세션이 만지는 곳이 겹치지 않는다.
+    소비 기록 INSERT는 `expires_at = 지금 + TTL`(미래 끝)에 들어가고, 청소는
+    `expires_at < 지금 - 60초`(과거 끝)부터 지운다. 같은 인덱스의 반대편이다.
+    그래도 대기가 생기면 아래 except가 삼키고 경고만 남긴다 — 사용자 요청은 진행된다.
+    """
+    if session_factory is None:
+        from app.db.session import SessionLocal as session_factory  # noqa: N813
+
+    cutoff = (now or datetime.now()) - timedelta(seconds=_PURGE_GRACE_SECONDS)
+    db = session_factory()
+    try:
+        # id를 먼저 뽑아 지운다 — MySQL의 DELETE...LIMIT과 달리 어느 DB에서나 같게 동작하고,
+        # ix_captcha_consumed_expires를 타면서 한 번에 지우는 양을 묶을 수 있다.
+        rows = (
+            db.query(CaptchaConsumedToken.id)
+            .filter(
+                # SQL에서 NULL < 값 은 참이 아니라 이 조건이 없어도 결과는 같다.
+                # 의도를 남기려고 적어 둔다 — 만료를 모르는 행(exp 없이 발급된 토큰)은
+                # 언제 지워도 되는지 판단할 수 없으므로 건드리지 않는다.
+                CaptchaConsumedToken.expires_at.isnot(None),
+                CaptchaConsumedToken.expires_at < cutoff,
+            )
+            .order_by(CaptchaConsumedToken.expires_at)
+            .limit(_PURGE_BATCH)
+            .all()
+        )
+        if not rows:
+            return 0
+        deleted = (
+            db.query(CaptchaConsumedToken)
+            .filter(CaptchaConsumedToken.id.in_([r[0] for r in rows]))
+            .delete(synchronize_session=False)
+        )
+        db.commit()
+        return deleted
+    except Exception:  # noqa: BLE001 — 유지보수 작업이 사용자 요청을 깨뜨리면 안 된다
+        db.rollback()
+        _log.warning("만료 캡차 토큰 기록 청소 실패(무시하고 진행)", exc_info=True)
+        return 0
+    finally:
+        db.close()
+
+
 def _consume(db: Session, kind: str, token_id: str, exp: float) -> bool:
     """1회용 토큰 소비 기록 — INSERT 성공=최초 사용, IntegrityError=이미 사용됨(리플레이)."""
     db.add(
@@ -90,10 +162,15 @@ def _consume(db: Session, kind: str, token_id: str, exp: float) -> bool:
     )
     try:
         db.flush()
-        return True
+        ok = True
     except IntegrityError:
         db.rollback()
-        return False
+        ok = False
+    # 스케줄러가 없으므로 쓰기 시점에 곁다리로 청소한다(forest·drag 캡차와 같은 방식).
+    # 트래픽에 비례해 돌아, 많이 쓸수록 자주 지워진다.
+    if random.random() < _PURGE_PROBABILITY:
+        purge_expired_consumed_tokens()
+    return ok
 
 
 # ── 키 발급/인증 ───────────────────────────────────────────────
