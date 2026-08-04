@@ -348,12 +348,12 @@ def bank_progress(
         for p in db.query(StudentProgress).filter(StudentProgress.student_id == me.id).all()
     }
     out = []
-    for subject in D.SUBJECT_ORDER:
-        if subject not in subject_banks.LIVE_SUBJECTS:
-            continue
+    # 하드코딩 6과목이 아니라 은행에 실제로 있는 과목(동적)을 돈다 — 안전/일반/어학 등 실제
+    # 코스 과목이 문제은행 진도에 그대로 나오게. 미지 과목 색·아이콘은 subject_meta 폴백.
+    for subject in subject_banks.live_subjects():
         row = bank_mode.progress(db, me, subject)
         row["accuracy"] = acc_by_subject.get(subject)
-        row["meta"] = D.SUBJECT_META.get(subject, {})
+        row["meta"] = D.subject_meta(subject)
         out.append(row)
     return {"subjects": out}
 @router.get("/students/me/q-today")

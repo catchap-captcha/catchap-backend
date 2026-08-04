@@ -15,6 +15,28 @@ SUBJECT_META = {
     "생활": {"color": "#FF6DA6", "soft": "#FFE3EF", "grad": "linear-gradient(150deg,#FF93BE,#FF6DA6)", "icon": "ph-fill ph-house-line"},
 }
 
+# 6과목 밖(코스 중심 전환 후 안전/일반/어학 등) 과목의 색·아이콘 폴백 — 프론트 categoryTheme와
+# 같은 규칙(이름 해시 → 6팔레트 고정 배정)이라 같은 과목이면 색이 안정적으로 배정된다.
+_META_PALETTE = list(SUBJECT_META.values())
+_DEFAULT_META = {
+    "color": "#6b6b73", "soft": "#eeedf0",
+    "grad": "linear-gradient(150deg,#8a8a93,#6b6b73)", "icon": "ph-fill ph-graduation-cap",
+}
+
+
+def subject_meta(sub: str) -> dict:
+    """과목명 → 색/아이콘 메타. 알려진 6과목이면 고유 메타, 그 밖(안전/일반/어학 등)은 이름
+    해시로 6팔레트에서 고정 색을 배정한다. 빈 값/'기타'는 회색 기본. 하드코딩 6과목에만
+    있던 SUBJECT_META[sub] 직접 접근이 실제 과목에서 KeyError를 내던 걸 대체한다."""
+    if sub in SUBJECT_META:
+        return SUBJECT_META[sub]
+    if not sub or sub == "기타":
+        return _DEFAULT_META
+    h = 0
+    for ch in sub:
+        h = (h * 31 + ord(ch)) & 0xFFFFFFFF
+    return _META_PALETTE[h % len(_META_PALETTE)]
+
 # 챕터지도 CHAPTERS (이름/문제수) — 6과목 x 5챕터
 CHAPTERS = {
     "국어": [("자음·모음", 4), ("낱말 읽기", 5), ("짧은 문장", 4), ("받아쓰기", 3), ("종합 복습", 5)],

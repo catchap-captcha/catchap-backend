@@ -430,18 +430,21 @@ def student_records(db: Session, me: StudentProfile) -> dict | None:
         r for r in rows
         if r.created_at and _prev_month_start(today) <= r.created_at.date() < _ms
     ]
+    # 하드코딩 6과목(D.SUBJECT_ORDER)이 아니라 학생이 실제로 푼 과목(코스 subject — 안전/일반/
+    # 어학 등)을 돈다. 시도에서 나온 과목이라 항상 데이터가 있고, 메타는 subject_meta 폴백.
     mastery = []
-    for sub in D.SUBJECT_ORDER:
+    _seen_sub: list[str] = []
+    for r in recent:
+        if r.subject and r.subject not in _seen_sub:
+            _seen_sub.append(r.subject)
+    for sub in _seen_sub:
         sub_rows = [r for r in recent if r.subject == sub]
-        if not sub_rows:
-            continue
         pct = _acc(sub_rows) or 0
         prev_pct = _acc([r for r in prior if r.subject == sub])
-        meta = D.SUBJECT_META[sub]
+        meta = D.subject_meta(sub)
         mastery.append(
             {
-                # 과목명 그대로 — 게임 제목(gameTitle: '한글 낱말 찾기' 등)은 게임화 은퇴로 폐기,
-                # '나의 기록'은 학습 리포트라 과목명이 맞다(0719 재중심화).
+                # 과목명 그대로 — '나의 기록'은 학습 리포트라 과목명이 맞다(0719 재중심화).
                 "name": sub,
                 "icon": meta["icon"],
                 "color": meta["color"],
@@ -458,14 +461,19 @@ def student_records(db: Session, me: StudentProfile) -> dict | None:
     six_buckets = [
         (this_ws - timedelta(weeks=i), this_ws - timedelta(weeks=i - 1)) for i in range(5, -1, -1)
     ]
-    series: dict[str, dict] = {}
-    for key, design in D.RECORD_ACC_SERIES.items():
-        sub_rows = rows if key == "전체" else [r for r in rows if r.subject == key]
-        if sub_rows:
-            data = _acc_series(sub_rows, six_buckets)
-        else:
-            data = design["data"]  # 시도 없는 과목은 D 유지 (빈 차트 방지)
-        series[key] = {"color": design["color"], "data": data}
+    # '전체' + 학생이 실제로 푼 과목만(하드코딩 6과목·데모 데이터 폐기). 실제 시도로 계산.
+    series: dict[str, dict] = {
+        "전체": {"color": "#17B08C", "data": _acc_series(rows, six_buckets)},
+    }
+    _seen_ser: list[str] = []
+    for r in rows:
+        if r.subject and r.subject not in _seen_ser:
+            _seen_ser.append(r.subject)
+    for sub in _seen_ser:
+        series[sub] = {
+            "color": D.subject_meta(sub)["color"],
+            "data": _acc_series([r for r in rows if r.subject == sub], six_buckets),
+        }
 
     # 최근 학습 기록 4건 — (날짜, 과목) 세션 단위
     sessions: dict[tuple[date, str], list[LearningAttempt]] = {}
@@ -478,7 +486,7 @@ def student_records(db: Session, me: StudentProfile) -> dict | None:
         if sub in seen_subjects:
             continue
         seen_subjects.add(sub)
-        meta = D.SUBJECT_META[sub]
+        meta = D.subject_meta(sub)
         acc = _acc(group) or 0
         activities.append(
             {
