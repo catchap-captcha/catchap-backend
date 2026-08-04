@@ -2157,7 +2157,8 @@
       }
       var PAIRC = ['#FF7A59', '#2E7BFF', '#17B08C', '#8B6BFF', '#FF922E', '#E0489E'];
       // 보기 내용 채우기 — svg(그림) 문항은 서버 뱅크의 신뢰된 SVG 마크업을 렌더(+라벨).
-      function setOpt(el, o) {
+      // n(1-based)을 주면 텍스트 보기 앞에 'N번) '을 붙인다(객관식 보기 번호).
+      function setOpt(el, o, n) {
         if (o.svg) {
           el.innerHTML = '<span class="cc-svg" style="display:block">' + o.svg + '</span>'
             + (o.text ? '<span style="display:block;font-size:12px;margin-top:4px;color:#6B6157">' + o.text + '</span>' : '');
@@ -2181,7 +2182,7 @@
             el.appendChild(ocap);
           }
         } else {
-          el.textContent = (o.emoji ? o.emoji + '  ' : '') + o.text;
+          el.textContent = (n ? n + '번) ' : '') + (o.emoji ? o.emoji + '  ' : '') + o.text;
         }
       }
 
@@ -2350,10 +2351,10 @@
             // 게이트·컴팩트 — 2열 자동 그리드(카드 폭을 살리고 드래그 거리도 줄인다)
             : { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))',
                 gap: '10px', maxWidth: '470px', margin: '0 auto', width: '100%' }));
-        lastOptions.forEach(function (o) {
+        lastOptions.forEach(function (o, i) {
           var mb = h('button');
           mb.setAttribute('aria-pressed', 'false');
-          setOpt(mb, o);
+          setOpt(mb, o, i + 1);
           css(mb, mFrame && d.screenStyle === 'chat'
             ? { textAlign: 'left', padding: '10px 14px', border: '2px solid #F0E4D8', borderRadius: '4px 16px 16px 16px',
                 background: '#F6F1E9', cursor: 'pointer', fontSize: '14px', fontWeight: '700', color: '#3A3226', maxWidth: '85%' }
@@ -2868,7 +2869,7 @@
         css(opts, footerOn
           ? { display: 'flex', flexWrap: 'wrap', justifyContent: 'center', gap: '12px' }
           : { display: 'grid', gap: '8px' });
-        d.options.forEach(function (o) {
+        d.options.forEach(function (o, i) {
           var b = h('button');
           b.setAttribute('aria-pressed', 'false'); // 선택 상태를 보조기기에 노출
           if (d.type === 'listen' && o.emoji && o.text) {
@@ -2877,7 +2878,7 @@
             var ltx = h('div'); ltx.textContent = o.text; css(ltx, { fontSize: '13px', fontWeight: '800', marginTop: '2px' });
             b.appendChild(lem); b.appendChild(ltx);
           } else {
-            setOpt(b, o);
+            setOpt(b, o, i + 1);
           }
           css(b, footerOn
             ? { textAlign: 'center', padding: '16px 24px', minWidth: '110px', minHeight: T.tap,
