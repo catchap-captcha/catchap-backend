@@ -16,7 +16,7 @@ from app.models import (
     StudentProgress,
     UserSetting,
 )
-from app.schemas.settings import ChangePasswordRequest, SettingsSave
+from app.schemas.settings import AccountDeleteRequest, ChangePasswordRequest, SettingsSave
 from app.utils.helpers import audit
 
 router = APIRouter(prefix="/settings", tags=["settings"])
@@ -199,9 +199,14 @@ def export_data(
 
 @router.delete("/me/account")
 def delete_account(
-    principal: Principal = Depends(get_current_principal), db: Session = Depends(get_db)
+    req: AccountDeleteRequest,
+    principal: Principal = Depends(get_current_principal),
+    db: Session = Depends(get_db),
 ):
     target = principal.student if principal.kind == "student" else principal.user
+    # 본인 비밀번호 재확인 — 되돌리기 어려운 파괴적 작업이라 인증을 한 번 더 요구한다.
+    if target is None or not verify_password(req.password or "", target.password_hash):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="비밀번호가 일치하지 않습니다.")
     target.status = "disabled"
     now = datetime.now()  # revoked_at — auth_service._now()·created_at과 같은 KST 규약
     subject_type = "student" if principal.kind == "student" else "user"
