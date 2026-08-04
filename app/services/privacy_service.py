@@ -16,7 +16,10 @@ def anonymize_student(db: Session, student: StudentProfile) -> bool:
     """학생의 식별 PII를 파기(익명화)한다. 이미 익명화됐으면 False, 파기했으면 True.
 
     커밋은 호출자 책임. 로그인은 status='disabled'로 차단된다(권한 미들웨어가 즉시 무효화)."""
-    if student.real_name is None and student.status == "disabled":
+    # 멱등 판정은 로그인ID의 'del_' 토큰으로 본다(anonymize_user와 동일 규약). real_name으로
+    # 보면, 실명 없이 가입한(이메일 가입) 학생이 탈퇴로 disabled되면 익명화가 조용히 건너뛰어져
+    # 로그인ID(이메일)가 해제되지 않는 버그가 있었다.
+    if student.status == "disabled" and (student.student_login_id or "").startswith("del_"):
         return False  # 멱등 — 이미 파기됨
     student.real_name = None
     student.age = None
