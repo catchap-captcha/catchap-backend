@@ -1,25 +1,39 @@
 """운영 모니터링 — 서버별 자원(CPU/메모리/디스크/GPU) + LLM API 사용량·비용.
 
-두 경로:
-- POST /internal/metrics : 각 VM의 에이전트(scripts/metrics_agent.py)가 X-Metrics-Token으로
-  자기 지표를 밀어넣는다(server_key 유니크 upsert). 배포 시 연결.
-- GET /ops/monitoring : 운영자 대시보드. 요청 시 백엔드 자신을 psutil로 즉시 측정(에이전트
-  불요)해 upsert하고, 모든 서버 최신값 + 신선도(오래됨) + LLM 사용량 집계를 돌려준다.
+값이 들어오는 길 세 가지. 어느 길로 왔든 ★같은 표(server_metrics)에 쌓이므로 화면은
+출처를 모른다.
 
-설계 주석(팀 학습용): push-based node metrics. 최신 1행/서버(현황판) — 시계열/추이는 v2.
+- ★클러스터 수집 : 백엔드가 프로메테우스에 물어 노드·서비스 지표를 걷는다(쿠버네티스 배포).
+  기동 시 배경 작업으로 30초마다 돌고, 대시보드를 열 때도 한 번 걷는다.
+- POST /internal/metrics : 쿠버네티스 밖 VM의 에이전트(scripts/metrics_agent.py)가
+  X-Metrics-Token으로 밀어넣는다. ★GPU STT 워커처럼 클러스터 밖에 있는 것이 여기로 온다.
+- GET /ops/monitoring : 운영자 대시보드. 최신값 + 신선도(오래됨) + LLM 사용량 집계.
+
+★왜 클러스터 수집이 생겼나 (0805)
+  옛 환경은 VM 5대라 에이전트를 심을 대상이 고정이었다. 새 환경은 파드가 수시로 생겼다
+  사라진다. 게다가 백엔드가 자기를 psutil로 재던 방식은 파드가 2벌이 되면서 ★둘이 같은
+  행을 덮어썼고(요청마다 값이 튐), 컨테이너 안 psutil은 cgroup을 안 봐서 ★파드가 아니라
+  노드를 재고 있었다. 자세한 것은 app/services/cluster_metrics.py 머리말.
+
+설계 주석(팀 학습용): 최신 1행/서버(현황판) + raw 표본 48h + 시간별 롤업 35일.
 """
 
+import logging
 from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
 from pydantic import BaseModel
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.clients.prometheus_client import PrometheusNotConfiguredError
 from app.core.config import get_settings
 from app.core.permissions import Principal, require_ops
 from app.db.session import get_db
 from app.models import AiModelConfig, ServerMetric, ServerMetricHourly, ServerMetricSample
-from app.services import host_metrics
+from app.services import cluster_metrics, host_metrics
+
+_log = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -58,14 +72,23 @@ def _alerts(row: ServerMetric) -> list[dict]:
         chk("VRAM", (row.gpu_mem_used_mb or 0) / row.gpu_mem_total_mb * 100)
     return out
 
-# 대시보드가 보여줄 '기대 서버' — 데이터가 아직 없어도 카드로 노출(미수집 표시). CatChap 5대 VM.
+# 대시보드가 보여줄 '기대 서비스' — 데이터가 아직 없어도 카드로 노출(미수집 표시).
+#
+# ★노드는 여기에 없다. 노드 이름은 카카오가 정하고 교체될 수 있어 코드에 못 박으면 안 된다.
+#   수집기가 "node:" 접두사를 붙여 넣고, 화면에서는 ★서비스보다 앞에 놓는다(아래 정렬).
+#
+# ⚠️옛 VM 시절 키("backend"·"ai")는 여기서 빠졌다 — 새 환경엔 그런 서버가 없다.
+#   그 행들은 지워지지 않고 '오래됨'으로 뒤에 남는다. ★그게 정직하다(옛 서버 에이전트가
+#   멈춰 있다는 사실 그대로). 컷오버로 옛 서버를 내린 뒤에 지우면 된다.
 EXPECTED_SERVERS: list[tuple[str, str]] = [
-    ("backend", "백엔드 API"),
-    ("db", "DB (MySQL)"),
-    ("gpu-stt", "GPU STT 워커"),
+    ("backend-api", "백엔드 API"),
     ("frontend", "프론트"),
+    ("captcha-api", "캡차 API"),
+    ("behavior-ai", "행동 AI"),
+    ("gpu-stt", "GPU STT 워커"),  # 클러스터 밖 VM — 에이전트 push
+    ("db", "DB (MySQL)"),  # 관리형이라 에이전트를 못 넣는다 — 카카오 Metric Export 연동 예정
 ]
-STALE_AFTER_SEC = 120  # 이 시간 넘게 갱신 없으면 '오래됨'(에이전트 중단 의심)
+STALE_AFTER_SEC = 120  # 이 시간 넘게 갱신 없으면 '오래됨'(수집 중단 의심)
 
 
 class MetricIn(BaseModel):
@@ -151,6 +174,38 @@ def _prune(db: Session) -> None:
     db.query(ServerMetricHourly).filter(ServerMetricHourly.hour < hourly_cutoff).delete(
         synchronize_session=False
     )
+
+
+def collect_cluster(db: Session) -> int:
+    """프로메테우스에서 노드·서비스 지표를 걷어 표에 쓴다 → 걷은 대상 수.
+
+    대시보드 요청(아래)과 기동 시 배경 작업(app/main.py)이 ★같은 이 함수를 쓴다.
+    수집 주기가 두 군데로 갈라지면 하나만 고쳐서 어긋나기 때문이다.
+
+    설정이 없거나(쿠버네티스가 아닌 배포) 못 읽으면 예외를 그대로 올린다 — 무엇을 할지는
+    호출부가 정한다. ★여기서 0으로 채워 '수집 정상'처럼 보이게 만들지 않는다.
+
+    ★★한 번 되돌리고 다시 하는 이유 (0805 프로덕션 실측)
+      수집기가 여럿이다 — uvicorn --workers 2 × 파드 2벌 = ★4개. 배포 직후 첫 주기에는
+      노드 행이 아직 없어서 넷 다 신선도 관문을 통과하고 ★같은 server_key 를 INSERT 한다.
+        (1062, "Duplicate entry 'node:host-10-0-6-202' for key 'ix_server_metrics_key'")
+      한 행이 부딪히면 트랜잭션 전체가 죽어 ★그 주기의 수집이 통째로 날아간다.
+      되돌리고 한 번 더 하면 이번엔 행이 있으므로 _upsert 가 UPDATE 로 지나간다.
+    """
+    snaps = cluster_metrics.collect(get_settings().PROMETHEUS_URL)
+    for attempt in (1, 2):
+        try:
+            for snap in snaps:
+                _upsert(db, snap)
+            _prune(db)
+            db.commit()
+            return len(snaps)
+        except IntegrityError:
+            db.rollback()
+            if attempt == 2:
+                raise  # 두 번째도 부딪히면 다른 원인이다 — 감추지 않는다
+            _log.info("클러스터 지표: 다른 수집기와 겹쳐 다시 시도합니다")
+    return 0  # 여기 오지 않는다(위에서 return 아니면 raise)
 
 
 def _downsample(rows: list, points: int) -> list:
@@ -265,21 +320,41 @@ def ops_monitoring(
 ):
     """운영자 모니터링 대시보드 — 서버별 자원 + LLM 사용량·비용.
 
-    백엔드 자신은 요청 시 psutil로 즉시 측정해 upsert(항상 신선). 다른 서버는 에이전트가
-    밀어넣은 최신값(없으면 no_data). LLM은 AiModelConfig 누적 토큰×단가로 추정 비용 집계."""
-    # 백엔드 self-collect — 에이전트 없이도 이 서버는 실데이터(+표본 append로 추이가 쌓인다)
+    열 때 클러스터 지표를 한 번 걷는다(배경 작업이 30초마다 걷지만, 방금 뜬 파드도 바로
+    보이게 하려고). 클러스터 밖 서버는 에이전트가 밀어넣은 최신값(없으면 no_data).
+    LLM은 AiModelConfig 누적 토큰×단가로 추정 비용 집계."""
     try:
-        _upsert(db, host_metrics.collect("backend", "백엔드 API", host="self"))
-        _prune(db)
-        db.commit()
-    except Exception:
-        db.rollback()  # 측정 실패해도 대시보드 자체는 나머지로 뜬다(정직: 백엔드가 no_data로 보일 수 있음)
+        collect_cluster(db)
+    except PrometheusNotConfiguredError:
+        # 쿠버네티스가 아닌 배포(로컬 개발·단일 VM) — 종전대로 이 서버만 psutil로 잰다.
+        # ⚠️컨테이너 안에서는 노드를 재게 되지만, 그 환경에서는 파드가 1벌이라 문제되지 않는다.
+        try:
+            _upsert(db, host_metrics.collect("backend-api", "백엔드 API", host="self"))
+            _prune(db)
+            db.commit()
+        except Exception:
+            db.rollback()  # 측정 실패해도 대시보드는 나머지로 뜬다(백엔드가 no_data로 보일 수 있음)
+    except Exception as exc:
+        db.rollback()
+        # 화면은 마지막으로 성공한 값으로 뜨고, 시간이 지나면 각 카드가 '오래됨'이 된다.
+        # ★그게 "수집이 끊겼다"를 운영자에게 알리는 방식이다(0으로 덮지 않는다).
+        _log.warning("클러스터 지표 수집 실패: %s", exc)
 
     rows = {r.server_key: r for r in db.query(ServerMetric).all()}
-    servers = [_row_out(rows.get(key), key, label) for key, label in EXPECTED_SERVERS]
-    # 기대 목록에 없는 추가 서버도 뒤에 붙인다(확장성)
-    extra = [k for k in rows if k not in {k for k, _ in EXPECTED_SERVERS}]
-    servers += [_row_out(rows[k], k, rows[k].label) for k in extra]
+    expected_keys = {k for k, _ in EXPECTED_SERVERS}
+    # 노드를 맨 앞에 — 서비스가 앉아 있는 바닥이라 먼저 보는 것이 자연스럽다.
+    node_keys = sorted(
+        k for k in rows if k not in expected_keys and k.startswith(cluster_metrics.NODE_KEY_PREFIX)
+    )
+    # 기대 목록에도 노드에도 없는 것(옛 VM 잔재 등)은 맨 뒤에(확장성 + 정직)
+    other_keys = sorted(
+        k
+        for k in rows
+        if k not in expected_keys and not k.startswith(cluster_metrics.NODE_KEY_PREFIX)
+    )
+    servers = [_row_out(rows[k], k, rows[k].label) for k in node_keys]
+    servers += [_row_out(rows.get(key), key, label) for key, label in EXPECTED_SERVERS]
+    servers += [_row_out(rows[k], k, rows[k].label) for k in other_keys]
     # 서버별 추이(그래프용) — 데이터 있는 서버에만
     for s in servers:
         if not s.get("no_data"):

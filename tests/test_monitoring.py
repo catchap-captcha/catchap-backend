@@ -4,28 +4,92 @@ from tests.test_captcha_api import _instructor, _ops, auth
 
 
 def test_monitoring_dashboard_ops_only(client, db):
+    """★PROMETHEUS_URL이 없는 환경(로컬·시험)에서는 종전대로 self-collect(psutil)로 동작한다.
+
+    쿠버네티스 배포에서는 클러스터 수집이 이 자리를 대신한다(test_cluster_metrics.py 참고).
+    이 시험은 ★하위호환을 지킨다 — 프로메테우스가 없어도 대시보드가 떠야 한다.
+    """
     otok = _ops(client, db)
     r = client.get("/api/v1/ops/monitoring", headers=auth(otok))
     assert r.status_code == 200, r.text
     body = r.json()
     keys = {s["server_key"] for s in body["servers"]}
-    # 기대 서버 5대 중 코드 정의 4키는 데이터 없어도 카드로(no_data) 노출
-    assert {"backend", "db", "gpu-stt", "frontend"} <= keys
+    # 기대 서비스 키는 데이터 없어도 카드로(no_data) 노출
+    assert {"backend-api", "db", "gpu-stt", "frontend"} <= keys
     # 백엔드는 요청 시 self-collect(psutil) — no_data가 아니고 실측값이 있어야
-    be = next(s for s in body["servers"] if s["server_key"] == "backend")
+    be = next(s for s in body["servers"] if s["server_key"] == "backend-api")
     assert be["no_data"] is False and be["cpu_cores"] >= 1 and be["mem_total_mb"] > 0
     # 추이(그래프) — self-collect가 표본을 append하므로 이력이 최소 1점 있어야
     assert "history" in be and len(be["history"]["cpu"]) >= 1
     # 두 번째 호출이면 표본이 하나 더 쌓인다(append-only 시계열)
     n1 = len(be["history"]["cpu"])
     be2 = next(s for s in client.get("/api/v1/ops/monitoring", headers=auth(otok)).json()["servers"]
-               if s["server_key"] == "backend")
+               if s["server_key"] == "backend-api")
     assert len(be2["history"]["cpu"]) >= n1 + 1
     # LLM 집계 필드 존재
     assert "est_cost_usd" in body["llm"] and "providers" in body["llm"]
     # 비운영자(강사)는 403
     itok = _instructor(client, db)
     assert client.get("/api/v1/ops/monitoring", headers=auth(itok)).status_code == 403
+
+
+def test_dashboard_uses_cluster_metrics_and_puts_nodes_first(client, db, monkeypatch):
+    """★PROMETHEUS_URL이 있으면 클러스터 수집을 쓰고, 노드 카드를 서비스보다 앞에 놓는다.
+
+    노드는 EXPECTED_SERVERS에 없다(이름을 카카오가 정하므로 코드에 못 박을 수 없다).
+    그래서 정렬을 따로 하지 않으면 ★서비스 뒤로 밀린다 — 바닥을 나중에 보게 된다.
+    """
+    from app.api.v1.endpoints import monitoring
+
+    class _S:
+        PROMETHEUS_URL = "http://prom"
+        METRICS_INGEST_TOKEN = ""
+
+    snaps = [
+        {"server_key": "node:host-10-0-2-128", "label": "노드 (10.0.2.128)", "host": "10.0.2.128",
+         "cpu_pct": 12.0, "cpu_cores": 4, "mem_pct": 40.0, "mem_used_mb": 6553,
+         "mem_total_mb": 16383, "disk_pct": 25.0, "disk_used_gb": 25.0, "disk_total_gb": 100.0},
+        {"server_key": "backend-api", "label": "백엔드 API (파드 2)", "host": "catchap 네임스페이스",
+         "cpu_pct": 0.5, "cpu_cores": 2, "mem_pct": 14.0, "mem_used_mb": 431,
+         "mem_total_mb": 3072, "disk_pct": 0.0, "disk_used_gb": 0.0, "disk_total_gb": 0.0},
+    ]
+    monkeypatch.setattr(monitoring, "get_settings", lambda: _S())
+    monkeypatch.setattr(monitoring.cluster_metrics, "collect", lambda _url: snaps)
+
+    otok = _ops(client, db)
+    body = client.get("/api/v1/ops/monitoring", headers=auth(otok)).json()
+    order = [s["server_key"] for s in body["servers"]]
+    assert order[0] == "node:host-10-0-2-128", order
+    node = body["servers"][0]
+    assert node["no_data"] is False and node["disk_total_gb"] == 100.0
+    # 서비스 카드도 클러스터 값으로 채워진다(psutil이 아니라)
+    be = next(s for s in body["servers"] if s["server_key"] == "backend-api")
+    assert be["mem_total_mb"] == 3072 and be["cpu_cores"] == 2
+
+
+def test_dashboard_survives_prometheus_outage(client, db, monkeypatch):
+    """★프로메테우스가 죽어도 대시보드는 뜬다 — 마지막 값 + '오래됨'으로 정직하게 보인다.
+
+    여기서 500을 주면 운영자는 "모니터링 화면이 고장났다"고 읽는다. 실제로는 수집만
+    끊긴 것이고 나머지(LLM 비용·다른 서버)는 멀쩡하다.
+    """
+    from app.api.v1.endpoints import monitoring
+    from app.clients.prometheus_client import PrometheusError
+
+    class _S:
+        PROMETHEUS_URL = "http://prom"
+        METRICS_INGEST_TOKEN = ""
+
+    def _boom(_url):
+        raise PrometheusError("연결 실패")
+
+    monkeypatch.setattr(monitoring, "get_settings", lambda: _S())
+    monkeypatch.setattr(monitoring.cluster_metrics, "collect", _boom)
+
+    otok = _ops(client, db)
+    r = client.get("/api/v1/ops/monitoring", headers=auth(otok))
+    assert r.status_code == 200, r.text
+    assert "est_cost_usd" in r.json()["llm"]
 
 
 def test_monitoring_threshold_alerts(client, db):
@@ -115,3 +179,62 @@ def test_monitoring_hourly_rollup_and_range(client, db, monkeypatch):
     gx = next(s for s in body["servers"] if s["server_key"] == "gpu-x")
     assert gx["history"]["range"] == "6h"
     assert len(gx["history"]["cpu"]) >= 3
+
+
+def _one_node_snapshot():
+    return [{"server_key": "node:a", "label": "노드 A", "host": "10.0.0.1",
+             "cpu_pct": 1.0, "cpu_cores": 4, "mem_pct": 2.0, "mem_used_mb": 1,
+             "mem_total_mb": 100, "disk_pct": 3.0, "disk_used_gb": 1.0, "disk_total_gb": 10.0}]
+
+
+def _patch_cluster(monkeypatch, monitoring, snaps):
+    class _S:
+        PROMETHEUS_URL = "http://prom"
+        METRICS_INGEST_TOKEN = ""
+
+    monkeypatch.setattr(monitoring, "get_settings", lambda: _S())
+    monkeypatch.setattr(monitoring.cluster_metrics, "collect", lambda _url: snaps)
+
+
+def test_collect_cluster_retries_once_when_another_collector_inserts_first(db, monkeypatch):
+    """★수집기가 여럿이라 같은 server_key 를 동시에 INSERT 할 수 있다.
+
+    배포 직후 첫 주기에는 노드 행이 없어서 4개(파드 2 × uvicorn 워커 2)가 전부
+    신선도 관문을 통과한다. 한 행이 유니크에 부딪히면 ★그 주기 수집이 통째로 날아간다.
+    되돌리고 한 번 더 하면 행이 이미 있으므로 UPDATE 로 지나간다.
+    """
+    from sqlalchemy.exc import IntegrityError
+
+    from app.api.v1.endpoints import monitoring
+
+    _patch_cluster(monkeypatch, monitoring, _one_node_snapshot())
+    calls = {"n": 0}
+    real_commit = db.commit
+
+    def flaky_commit():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise IntegrityError("INSERT", {}, Exception("Duplicate entry 'node:a'"))
+        return real_commit()
+
+    monkeypatch.setattr(db, "commit", flaky_commit)
+    assert monitoring.collect_cluster(db) == 1
+    assert calls["n"] == 2, "한 번 부딪히면 다시 시도해야 한다"
+
+
+def test_collect_cluster_does_not_hide_a_persistent_integrity_error(db, monkeypatch):
+    """★두 번째도 부딪히면 감추지 않는다 — 다른 원인일 수 있고, 조용히 넘기면 못 찾는다."""
+    from sqlalchemy.exc import IntegrityError
+
+    import pytest
+
+    from app.api.v1.endpoints import monitoring
+
+    _patch_cluster(monkeypatch, monitoring, _one_node_snapshot())
+
+    def always_fails():
+        raise IntegrityError("INSERT", {}, Exception("Duplicate entry 'node:a'"))
+
+    monkeypatch.setattr(db, "commit", always_fails)
+    with pytest.raises(IntegrityError):
+        monitoring.collect_cluster(db)

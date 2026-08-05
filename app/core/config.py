@@ -97,6 +97,13 @@ class Settings(BaseSettings):
     # 각 VM의 메트릭 에이전트가 POST /internal/metrics 할 때 쓰는 공유 시크릿(X-Metrics-Token).
     # 비면 인제스트 비활성(백엔드 self-collect·시드만) — 배포 시 설정.
     METRICS_INGEST_TOKEN: str = ""
+    # 클러스터 지표를 읽어올 프로메테우스(쿠버네티스 배포에서만 씀). 비면 노드·파드 수집을
+    # 건너뛴다 — 로컬·VM 배포는 종전대로 에이전트 push만으로 동작한다(하위호환).
+    # 비밀이 아니다(클러스터 내부 주소라 밖에서 닿지 않는다) → ConfigMap에 둔다.
+    PROMETHEUS_URL: str = ""
+    # 클러스터 지표를 몇 초마다 걷을지. ⚠️짧게 잡을수록 server_metric_samples가 빨리 쌓인다
+    # (48시간 보존 × 서버 수). 30초면 서버당 5,760행/일 — 종전 에이전트 주기와 같다.
+    CLUSTER_METRICS_INTERVAL_SEC: int = 30
     LLM_MODEL: str = "claude-opus-4-8"
 
     # 코스 수강 결제. PG 비밀 키는 서버에서만 사용하고 프런트로 내보내지 않는다.

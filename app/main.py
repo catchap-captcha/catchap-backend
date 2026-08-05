@@ -1,10 +1,13 @@
+import asyncio
 import logging
 import re
 from contextlib import asynccontextmanager
+from datetime import datetime
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
+from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from app.api.v1.router import api_router
@@ -15,9 +18,58 @@ setup_logging()  # 모든 모듈 로거 일관 초기화 (조용한 실패 방�
 settings = get_settings()
 
 
+def _collect_cluster_metrics_once(interval_sec: int) -> None:
+    """클러스터 지표 1회 수집 — ★동기 코드라 이벤트 루프 밖(스레드)에서 부른다.
+
+    ⚠️백엔드 파드가 2벌이라 둘 다 이 고리를 돈다. 그대로 두면 표본이 2배로 쌓이므로
+    "직전 수집이 충분히 오래됐을 때만" 걷는다. 리더 선출 같은 무거운 장치 대신 ★DB 한 줄
+    조회로 겹침을 줄인다 — 완벽한 배타는 아니지만, 겹쳐도 시간별 롤업 평균은 sum/count라
+    옳은 값이 나오고 raw 표본이 조금 촘촘해질 뿐이다.
+
+    ★★신선도를 볼 때 ★노드 행만 본다. server_metrics 전체를 보면, 클러스터 밖에서
+    에이전트가 밀어넣는 서버(GPU STT 워커)의 시각이 항상 신선해서 ★클러스터 수집이
+    영원히 건너뛰어진다. 노드 행은 이 수집기만 쓰므로 자기 주기를 정확히 잰다."""
+    from app.api.v1.endpoints.monitoring import collect_cluster
+    from app.db.session import SessionLocal
+    from app.models import ServerMetric
+    from app.services.cluster_metrics import NODE_KEY_PREFIX
+
+    db = SessionLocal()
+    try:
+        newest = (
+            db.query(func.max(ServerMetric.collected_at))
+            .filter(ServerMetric.server_key.startswith(NODE_KEY_PREFIX))
+            .scalar()
+        )
+        if newest and (datetime.now() - newest).total_seconds() < interval_sec * 0.8:
+            return  # 다른 파드(또는 방금 열린 대시보드)가 이미 걷었다
+        collect_cluster(db)
+    except Exception:
+        db.rollback()  # 쓰다 만 트랜잭션을 남기지 않는다 — 다음 주기가 깨끗하게 시작한다
+        raise
+    finally:
+        db.close()
+
+
+async def _cluster_metrics_loop(interval_sec: int) -> None:
+    """주기 수집 고리 — ★화면을 아무도 안 열어도 추이가 이어지게.
+
+    옛 구조는 대시보드를 열 때만 백엔드 자신을 쟀다. 그래서 아무도 안 보면 그래프에 구멍이
+    났다(0805 실측: backend 행이 ★8일 전 값이었다). 배경에서 걷어야 추이가 성립한다."""
+    while True:
+        await asyncio.sleep(interval_sec)
+        try:
+            await asyncio.to_thread(_collect_cluster_metrics_once, interval_sec)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — 한 번 실패해도 고리는 계속 돈다
+            _log.warning("클러스터 지표 배경 수집 실패: %s", exc)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """기동 시 1회: 프로세스 재시작으로 고아가 된 AI 문항 생성 잡을 정리한다.
+    그리고 클러스터 지표 배경 수집 고리를 띄운다(쿠버네티스 배포에서만).
 
     생성 잡은 프로세스 내 BackgroundTasks로 돌아, 재배포·크래시 순간 'running'이던 잡은
     마감 코드가 다시 안 돌아 DB에 유령 행으로 남는다(프론트는 "생성 중…" 무한 표시).
@@ -41,7 +93,22 @@ async def lifespan(app: FastAPI):
             db.close()
     except SQLAlchemyError as exc:
         _log.warning("기동 정리 건너뜀(DB 미준비 등): %s", exc)
-    yield
+
+    # PROMETHEUS_URL이 비면 띄우지 않는다 — 로컬·VM 배포는 종전대로 에이전트 push만 쓴다.
+    task: asyncio.Task | None = None
+    if settings.PROMETHEUS_URL.strip():
+        interval = max(10, settings.CLUSTER_METRICS_INTERVAL_SEC)  # 너무 짧으면 표본이 폭증한다
+        task = asyncio.create_task(_cluster_metrics_loop(interval))
+        _log.info("클러스터 지표 배경 수집 시작 — %d초 주기", interval)
+    try:
+        yield
+    finally:
+        if task is not None:
+            task.cancel()  # 종료 신호를 받으면 다음 sleep에서 깨어나 끝난다
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
 
 def _init_sentry() -> None:

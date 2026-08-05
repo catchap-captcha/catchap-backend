@@ -1,0 +1,205 @@
+"""클러스터 지표 수집 — 프로메테우스 응답을 우리 스냅샷으로 옮기는 계산이 맞는지.
+
+★여기서 지키려는 것은 두 가지다.
+  ① 백분율의 분모가 맞는가 — 파드 메모리는 ★제한 대비여야 한다(OOMKill까지 남은 여유).
+     분모를 노드 용량으로 잘못 잡으면 죽기 직전에도 14%로 보인다.
+  ② 못 읽었을 때 ★0을 돌려주지 않는가 — 0%는 화면에서 '한가함'으로 읽혀서
+     수집이 끊긴 상태를 정상으로 위장한다.
+"""
+
+import pytest
+
+from app.clients.prometheus_client import PrometheusError
+from app.services import cluster_metrics
+
+
+def _fake_query(answers: dict[str, list[dict]]):
+    """PromQL 문자열 → 미리 정한 응답. 없는 질의는 빈 목록."""
+
+    def _q(expr, *, base_url, timeout=None):  # noqa: ARG001
+        return answers.get(expr, [])
+
+    return _q
+
+
+def _node_answers():
+    """노드 2대. 메모리 16GiB 중 2GiB 남음(=87.5% 사용), 디스크 100GiB 중 25GiB 남음(=75%)."""
+    gib = 1024**3
+    return {
+        cluster_metrics._Q_NODE_NAME: [
+            {"labels": {"instance": "10.0.2.128:9100", "nodename": "host-10-0-2-128"}, "value": 1.0},
+            {"labels": {"instance": "10.0.6.202:9100", "nodename": "host-10-0-6-202"}, "value": 1.0},
+        ],
+        cluster_metrics._Q_NODE_CPU: [
+            {"labels": {"instance": "10.0.2.128:9100"}, "value": 12.34},
+            {"labels": {"instance": "10.0.6.202:9100"}, "value": 5.0},
+        ],
+        cluster_metrics._Q_NODE_CORES: [
+            {"labels": {"instance": "10.0.2.128:9100"}, "value": 4.0},
+            {"labels": {"instance": "10.0.6.202:9100"}, "value": 4.0},
+        ],
+        cluster_metrics._Q_NODE_LOAD1: [
+            {"labels": {"instance": "10.0.2.128:9100"}, "value": 0.42},
+        ],
+        cluster_metrics._Q_NODE_MEM_TOTAL: [
+            {"labels": {"instance": "10.0.2.128:9100"}, "value": 16.0 * gib},
+            {"labels": {"instance": "10.0.6.202:9100"}, "value": 16.0 * gib},
+        ],
+        cluster_metrics._Q_NODE_MEM_AVAIL: [
+            {"labels": {"instance": "10.0.2.128:9100"}, "value": 2.0 * gib},
+            {"labels": {"instance": "10.0.6.202:9100"}, "value": 2.0 * gib},
+        ],
+        cluster_metrics._Q_NODE_FS_SIZE: [
+            {"labels": {"instance": "10.0.2.128:9100"}, "value": 100.0 * gib},
+            {"labels": {"instance": "10.0.6.202:9100"}, "value": 100.0 * gib},
+        ],
+        cluster_metrics._Q_NODE_FS_AVAIL: [
+            {"labels": {"instance": "10.0.2.128:9100"}, "value": 25.0 * gib},
+            {"labels": {"instance": "10.0.6.202:9100"}, "value": 25.0 * gib},
+        ],
+    }
+
+
+def test_node_percentages_use_the_right_denominator(monkeypatch):
+    """노드 카드 — 메모리는 (전체-남음)/전체, 디스크는 (크기-남음)/크기."""
+    monkeypatch.setattr(cluster_metrics, "instant_query", _fake_query(_node_answers()))
+    snaps = cluster_metrics.collect("http://prom")
+
+    nodes = [s for s in snaps if s["server_key"].startswith(cluster_metrics.NODE_KEY_PREFIX)]
+    assert len(nodes) == 2
+    a = next(s for s in nodes if s["server_key"] == "node:host-10-0-2-128")
+    assert a["cpu_pct"] == 12.3
+    assert a["cpu_cores"] == 4
+    assert a["load1"] == 0.42
+    assert a["mem_pct"] == 87.5  # 16GiB 중 2GiB 남음
+    assert a["mem_total_mb"] == 16 * 1024
+    assert a["disk_pct"] == 75.0  # 100GiB 중 25GiB 남음
+    assert a["disk_total_gb"] == 100.0
+    assert a["host"] == "10.0.2.128"
+
+    # load1이 없는 노드는 ★0이 아니라 None — "0.0 부하"와 "못 읽었다"는 다르다
+    b = next(s for s in nodes if s["server_key"] == "node:host-10-0-6-202")
+    assert b["load1"] is None
+
+
+def test_pod_memory_is_measured_against_its_limit(monkeypatch):
+    """★파드 메모리 백분율의 분모는 메모리 '제한'이다 — 노드 용량이 아니다.
+
+    파드 2벌이 각각 700MiB를 쓰고 제한이 각각 768MiB면, 합계 1400/1536 = 91.1%.
+    이건 OOMKill 직전이라는 뜻이고 CRIT(85%)를 넘겨 경보가 떠야 한다.
+    ⚠️분모를 노드(32GiB)로 잡았다면 4.3%로 보여 아무 일도 없는 것처럼 지나간다.
+    """
+    mib = 1024**2
+    answers = _node_answers()
+    answers[cluster_metrics._Q_POD_MEM] = [
+        {"labels": {"pod": "captcha-api-5444b4d7df-4qjvr"}, "value": 700.0 * mib},
+        {"labels": {"pod": "captcha-api-5444b4d7df-hncbl"}, "value": 700.0 * mib},
+    ]
+    answers[cluster_metrics._Q_POD_MEM_LIMIT] = [
+        {"labels": {"pod": "captcha-api-5444b4d7df-4qjvr"}, "value": 768.0 * mib},
+        {"labels": {"pod": "captcha-api-5444b4d7df-hncbl"}, "value": 768.0 * mib},
+    ]
+    answers[cluster_metrics._Q_POD_CPU] = [
+        {"labels": {"pod": "captcha-api-5444b4d7df-4qjvr"}, "value": 0.2},
+        {"labels": {"pod": "captcha-api-5444b4d7df-hncbl"}, "value": 0.2},
+    ]
+    monkeypatch.setattr(cluster_metrics, "instant_query", _fake_query(answers))
+
+    snaps = cluster_metrics.collect("http://prom")
+    captcha = next(s for s in snaps if s["server_key"] == "captcha-api")
+    assert captcha["mem_pct"] == 91.1  # 1400/1536
+    assert captcha["mem_used_mb"] == 1400
+    assert captcha["mem_total_mb"] == 1536
+    assert captcha["cpu_cores"] == 2  # 이 자리는 '몇 벌인지'
+    # CPU는 클러스터 전체 코어(8) 대비 — 0.4/8 = 5.0%
+    assert captcha["cpu_pct"] == 5.0
+    assert captcha["label"] == "캡차 API (파드 2)"
+
+
+def test_service_with_no_pods_is_omitted_not_zeroed(monkeypatch):
+    """파드가 하나도 없는 서비스는 ★카드를 만들지 않는다 → 화면에 '미수집'으로 남는다.
+
+    0으로 채운 카드를 만들면 "떠 있는데 한가하다"로 읽혀서, 서비스가 죽은 것을 감춘다.
+    """
+    monkeypatch.setattr(cluster_metrics, "instant_query", _fake_query(_node_answers()))
+    snaps = cluster_metrics.collect("http://prom")
+    keys = {s["server_key"] for s in snaps}
+    for group, _ in cluster_metrics.POD_GROUPS:
+        assert group not in keys
+
+
+def test_no_nodes_raises_instead_of_returning_zeros(monkeypatch):
+    """노드를 하나도 못 읽으면 ★예외 — 0으로 채운 스냅샷을 돌려주지 않는다."""
+    monkeypatch.setattr(cluster_metrics, "instant_query", _fake_query({}))
+    with pytest.raises(PrometheusError):
+        cluster_metrics.collect("http://prom")
+
+
+def test_keys_fit_the_database_column(monkeypatch):
+    """server_key는 String(40) — 노드 이름은 카카오가 정하므로 넘칠 수 있다. 잘라서 넣는다."""
+    answers = _node_answers()
+    answers[cluster_metrics._Q_NODE_NAME] = [
+        {"labels": {"instance": "10.0.2.128:9100", "nodename": "host-" + "x" * 80}, "value": 1.0},
+    ]
+    monkeypatch.setattr(cluster_metrics, "instant_query", _fake_query(answers))
+    snaps = cluster_metrics.collect("http://prom")
+    assert all(len(s["server_key"]) <= 40 for s in snaps)
+    assert all(len(s["label"]) <= 60 for s in snaps)
+
+
+# ─────────────────────────────────────────────────────────────
+# 배경 수집의 겹침 방지 — ★어떤 행을 보고 "방금 걷었다"를 판정하는가
+# ─────────────────────────────────────────────────────────────
+
+
+def _fresh_row(db, key: str, seconds_ago: int = 0):
+    from datetime import datetime, timedelta
+
+    from app.models import ServerMetric
+
+    db.add(
+        ServerMetric(
+            server_key=key,
+            label=key,
+            collected_at=datetime.now() - timedelta(seconds=seconds_ago),
+        )
+    )
+    db.commit()
+
+
+def _run_once(db, monkeypatch, interval=30):
+    """_collect_cluster_metrics_once를 시험용 세션으로 돌리고, 수집이 일어났는지 돌려준다."""
+    import app.db.session as db_session
+    from app import main
+
+    called: list[int] = []
+    monkeypatch.setattr(db_session, "SessionLocal", lambda: db)
+    monkeypatch.setattr(db, "close", lambda: None)
+    monkeypatch.setattr(
+        "app.api.v1.endpoints.monitoring.collect_cluster", lambda _db: called.append(1)
+    )
+    main._collect_cluster_metrics_once(interval)
+    return bool(called)
+
+
+def test_agent_pushed_rows_do_not_block_cluster_collection(db, monkeypatch):
+    """★클러스터 밖 에이전트(GPU STT)가 방금 밀어넣었어도 클러스터 수집은 돌아야 한다.
+
+    server_metrics 전체의 최신 시각으로 판정하면, 30초마다 밀어넣는 에이전트 때문에
+    ★클러스터 수집이 영원히 건너뛰어진다(노드·파드 카드가 절대 안 갱신된다).
+    판정은 ★노드 행(이 수집기만 쓰는 행)으로 해야 한다.
+    """
+    _fresh_row(db, "gpu-stt", seconds_ago=0)  # 에이전트가 방금 밀어넣음
+    assert _run_once(db, monkeypatch) is True
+
+
+def test_recent_node_row_skips_duplicate_collection(db, monkeypatch):
+    """노드 행이 방금 갱신됐으면 건너뛴다 — 파드 2벌이 같은 표본을 두 번 쌓지 않게."""
+    _fresh_row(db, "node:host-10-0-2-128", seconds_ago=1)
+    assert _run_once(db, monkeypatch) is False
+
+
+def test_stale_node_row_triggers_collection(db, monkeypatch):
+    """노드 행이 주기를 넘겨 오래됐으면 걷는다."""
+    _fresh_row(db, "node:host-10-0-2-128", seconds_ago=60)
+    assert _run_once(db, monkeypatch) is True
