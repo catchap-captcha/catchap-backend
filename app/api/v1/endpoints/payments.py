@@ -812,14 +812,15 @@ def _refund_quote(db: Session, order: CourseOrder) -> dict:
     if not watched:
         return q(True, None, deadline, 1.0, order.amount)
 
-    # 진행률 구간별 비율(학원법 별표4식)
+    # 진행률 구간별 비율(학원법 별표4식). 금액은 정수 연산으로 — float(2/3) 곱은 3만원에서
+    # 19,999원처럼 1원 내려간다. ratio는 표시용(%)으로만 넘긴다.
     if progress < 1 / 3:
-        ratio = REFUND_TIER_1_RATIO
+        ratio, amount = REFUND_TIER_1_RATIO, order.amount * 2 // 3
     elif progress < 1 / 2:
-        ratio = REFUND_TIER_2_RATIO
+        ratio, amount = REFUND_TIER_2_RATIO, order.amount // 2
     else:
         return q(False, "progress_over", deadline, 0.0, 0)
-    return q(True, None, deadline, ratio, int(order.amount * ratio))
+    return q(True, None, deadline, ratio, amount)
 
 
 class MyOrderOut(OrderOut):
