@@ -168,12 +168,22 @@ class TossPaymentsGateway:
         return payment
 
     def cancel(
-        self, payment_key: str, *, reason: str, idempotency_key: str
+        self,
+        payment_key: str,
+        *,
+        reason: str,
+        idempotency_key: str,
+        cancel_amount: int | None = None,
     ) -> ApprovedPayment:
+        # cancel_amount가 주어지면 부분 취소(cancelAmount) — 진행률 기반 비율 환불용.
+        # None이면 전액 취소(종전 동작 그대로).
+        payload: dict = {"cancelReason": reason[:200]}
+        if cancel_amount is not None:
+            payload["cancelAmount"] = int(cancel_amount)
         body = self._request(
             "POST",
             f"{self.API_BASE}/payments/{quote(payment_key, safe='')}/cancel",
-            json={"cancelReason": reason[:200]},
+            json=payload,
             idempotency_key=idempotency_key,
         )
         payment = self._payment(body)

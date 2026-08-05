@@ -726,36 +726,79 @@ class OrderOut(BaseModel):
 
 
 # ---- 환불 정책 ----
-# 전자상거래법상 디지털 콘텐츠는 7일 이내 청약철회가 원칙이되, **제공이 개시된 경우**
-# 제한할 수 있다(콘텐츠이용자보호지침). 강의는 시청을 시작한 순간 제공이 개시된 것으로 본다.
-#
-# 비율 환불(수강기간 1/3 경과 시 2/3 환불 같은 학원법 별표4 방식)은 **부분 취소가 필요한데
-# 토스 게이트웨이가 전액 취소만 지원한다.** 그래서 지금은 "전액 아니면 불가" 두 갈래로 둔다.
-# 부분 환불이 필요해지면 게이트웨이에 cancelAmount 를 먼저 붙여야 한다.
+# 전자상거래법상 디지털 콘텐츠는 7일 이내 청약철회가 원칙이되, 제공이 개시된 경우 제한할 수
+# 있다(콘텐츠이용자보호지침). 강의는 시청 시작을 제공 개시로 본다. 여기에 학원법 별표4식
+# '수강 진행률에 따른 비율 환불'을 얹는다(사용자 결정 2026-08-05):
+#   · 미시청(1분 미만) + 7일 이내 → 전액(100%)
+#   · 진행률 1/3 미만 → 2/3 환불 / 진행률 1/3~1/2 → 1/2 환불 / 1/2 초과 → 환불 불가
+#   · 수료증 발급자 → 환불 불가(진행률 무관) / 결제 7일 초과 → 환불 불가
+# 진행률 = 완료(done) 강의 수 / 전체 활성 강의 수. 부분 환불은 게이트웨이 cancelAmount로
+# 집행하고(TossPaymentsGateway.cancel), mock 결제는 논리적으로 처리한다.
 REFUND_WINDOW_DAYS = 7
 # 재생을 아주 잠깐 건드린 것까지 '수강 시작'으로 보면 실수 클릭·미리보기로 환불이 막혀
 # 문의가 늘어난다. 1분 미만은 시청하지 않은 것으로 본다.
 REFUND_WATCHED_GRACE_SEC = 60
+REFUND_TIER_1_RATIO = 2 / 3  # 진행률 1/3 미만
+REFUND_TIER_2_RATIO = 1 / 2  # 진행률 1/3~1/2
 
 
-def _refund_state(db: Session, order: CourseOrder) -> tuple[bool, str | None, datetime | None]:
-    """(환불 가능?, 불가 사유 코드, 환불 기한).
+def _refund_quote(db: Session, order: CourseOrder) -> dict:
+    """환불 견적 — {refundable, blocked, deadline, ratio, amount, progress}.
 
-    사유 코드는 프런트가 문구를 고르는 데 쓴다 — 서버 문장을 그대로 박아 두면 화면마다
-    말투가 갈린다. 기한은 남은 시간을 보여주기 위한 것이다.
+    blocked 코드(not_paid | window_over | completed | progress_over)는 프런트가 문구를
+    고르는 데 쓴다(서버 문장을 박아 두면 화면마다 말투가 갈린다). amount=실제 환불 금액(원),
+    ratio=비율(0~1), progress=수강 진행률(%). 실제 차단·집행은 cancel_payment가 이 견적을
+    다시 계산해 수행한다(화면 표시는 안내용).
     """
+    from app.models.course_exam import CourseCompletion
+    from app.models.lecture import Lecture, LectureWatchProgress
+
     if order.status != "paid" or not order.payment_key:
-        return False, "not_paid", None
-    if order.paid_at is None:
-        # 결제 시각을 모르면 기간 판단을 할 수 없다 — 막지 말고 사람이 보게 둔다.
-        return True, None, None
+        return {"refundable": False, "blocked": "not_paid", "deadline": None, "ratio": 0.0, "amount": 0, "progress": 0}
 
-    deadline = order.paid_at + timedelta(days=REFUND_WINDOW_DAYS)
-    if datetime.now() > deadline:
-        return False, "window_over", deadline
+    # 진행률 = 완료 강의 / 전체 활성 강의
+    total = (
+        db.query(Lecture.id)
+        .filter(Lecture.course_id == order.course_id, Lecture.status == "active")
+        .count()
+    )
+    done = 0
+    if total:
+        done = (
+            db.query(LectureWatchProgress.id)
+            .join(Lecture, Lecture.id == LectureWatchProgress.lecture_id)
+            .filter(
+                LectureWatchProgress.student_id == order.student_id,
+                Lecture.course_id == order.course_id,
+                Lecture.status == "active",
+                LectureWatchProgress.status == "done",
+            )
+            .count()
+        )
+    progress = (done / total) if total else 0.0
+    progress_pct = round(progress * 100)
 
-    from app.models import Lecture, LectureWatchProgress
+    def q(refundable, blocked, deadline, ratio, amount):
+        return {"refundable": refundable, "blocked": blocked, "deadline": deadline,
+                "ratio": ratio, "amount": amount, "progress": progress_pct}
 
+    # 수료증 발급자 → 환불 불가(진행률 무관)
+    cert = (
+        db.query(CourseCompletion.id)
+        .filter(
+            CourseCompletion.student_id == order.student_id,
+            CourseCompletion.course_id == order.course_id,
+        )
+        .first()
+    )
+    if cert:
+        return q(False, "completed", None, 0.0, 0)
+
+    deadline = order.paid_at + timedelta(days=REFUND_WINDOW_DAYS) if order.paid_at else None
+    if deadline and datetime.now() > deadline:
+        return q(False, "window_over", deadline, 0.0, 0)
+
+    # 미시청(1분 미만) → 전액 환불
     watched = (
         db.query(LectureWatchProgress.id)
         .join(Lecture, Lecture.id == LectureWatchProgress.lecture_id)
@@ -766,22 +809,34 @@ def _refund_state(db: Session, order: CourseOrder) -> tuple[bool, str | None, da
         )
         .first()
     )
-    if watched:
-        return False, "already_watched", deadline
-    return True, None, deadline
+    if not watched:
+        return q(True, None, deadline, 1.0, order.amount)
+
+    # 진행률 구간별 비율(학원법 별표4식)
+    if progress < 1 / 3:
+        ratio = REFUND_TIER_1_RATIO
+    elif progress < 1 / 2:
+        ratio = REFUND_TIER_2_RATIO
+    else:
+        return q(False, "progress_over", deadline, 0.0, 0)
+    return q(True, None, deadline, ratio, int(order.amount * ratio))
 
 
 class MyOrderOut(OrderOut):
     """주문 내역 한 줄 — 목록 화면에 필요한 맥락을 붙인다."""
 
     course_title: str
-    # 취소 가능 여부 — 서버 정책(_refund_state)의 결과를 그대로 담는다. 프런트가 status·날짜를
+    # 취소 가능 여부 — 서버 정책(_refund_quote)의 결과를 그대로 담는다. 프런트가 status·날짜를
     # 보고 자기 나름대로 판단하면 정책이 바뀔 때 화면만 어긋난다. 실제 차단도 서버가 한다.
     refundable: bool
-    # 불가 사유 코드(not_paid | window_over | already_watched). 문구는 프런트가 고른다.
+    # 불가 사유 코드(not_paid | window_over | completed | progress_over). 문구는 프런트가 고른다.
     refund_blocked: str | None = None
     # 환불 기한 — 남은 시간을 보여주기 위한 값
     refund_deadline: datetime | None = None
+    # 진행률 기반 비율 환불 안내값 — 학생이 누르기 전에 얼마 돌려받는지 보여준다.
+    refund_amount: int = 0  # 환불 예정 금액(원) — 부분 환불이면 결제액보다 작다
+    refund_ratio: float = 0.0  # 환불 비율(0~1)
+    refund_progress: int = 0  # 수강 진행률(%)
     # 환불하면 잃는 것 — 학생이 누르기 전에 알아야 한다.
     enrolled: bool
     completed: bool
@@ -807,7 +862,7 @@ def my_orders(
         .outerjoin(Course, Course.id == CourseOrder.course_id)
         .filter(
             CourseOrder.student_id == principal.id,
-            CourseOrder.status.in_(("paid", "cancelled", "refunded")),
+            CourseOrder.status.in_(("paid", "cancelled", "refunded", "partially_refunded")),
         )
         .order_by(CourseOrder.paid_at.desc(), CourseOrder.created_at.desc())
         .all()
@@ -831,17 +886,23 @@ def my_orders(
             CourseCompletion.course_id.in_(course_ids),
         )
     }
-    return [
-        MyOrderOut(
+    def _row(o: CourseOrder, title: str | None) -> MyOrderOut:
+        quote = _refund_quote(db, o)
+        return MyOrderOut(
             **OrderOut.model_validate(o, from_attributes=True).model_dump(),
             # 코스가 삭제돼도 결제 기록은 남는다 — 제목이 비면 화면이 빈칸이 되므로 대체 문구를 준다.
             course_title=title or "(삭제된 코스)",
-            **dict(zip(("refundable", "refund_blocked", "refund_deadline"), _refund_state(db, o))),
+            refundable=quote["refundable"],
+            refund_blocked=quote["blocked"],
+            refund_deadline=quote["deadline"],
+            refund_amount=quote["amount"],
+            refund_ratio=quote["ratio"],
+            refund_progress=quote["progress"],
             enrolled=o.course_id in active,
             completed=o.course_id in done,
         )
-        for o, title in rows
-    ]
+
+    return [_row(o, title) for o, title in rows]
 
 
 @router.get("/payments/{order_uid}", response_model=OrderOut)
@@ -874,7 +935,8 @@ def cancel_payment(
     principal: Principal = Depends(require_student),
     db: Session = Depends(get_db),
 ):
-    """본인 결제 전액 취소. PG 취소 성공 후에만 로컬 주문과 수강권을 변경한다."""
+    """본인 결제 취소·환불. 진행률 기반 비율 환불(부분/전액)을 계산해, PG 취소 성공 후에만
+    로컬 주문·수강권에 반영하고 그 코스의 학습 이력·풀이 데이터를 삭제한다."""
     order = (
         db.query(CourseOrder)
         .filter(
@@ -886,27 +948,33 @@ def cancel_payment(
     )
     if order is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="주문을 찾을 수 없어요.")
-    if order.status in ("cancelled", "refunded"):
+    if order.status in ("cancelled", "refunded", "partially_refunded"):
         return OrderOut.model_validate(order, from_attributes=True)
     if order.status != "paid" or not order.payment_key:
         raise HTTPException(status.HTTP_409_CONFLICT, detail="취소할 수 있는 결제가 아니에요.")
 
-    # 환불 정책은 여기가 실제 게이트다(화면 표시는 안내용).
-    ok, blocked, deadline = _refund_state(db, order)
-    if not ok:
+    # 환불 정책은 여기가 실제 게이트다(화면 표시는 안내용) — 견적을 서버에서 다시 계산한다.
+    quote = _refund_quote(db, order)
+    if not quote["refundable"]:
+        blocked = quote["blocked"]
+        message = {
+            "window_over": f"환불 가능 기간({REFUND_WINDOW_DAYS}일)이 지났어요.",
+            "completed": "수료증이 발급된 코스는 환불되지 않아요.",
+            "progress_over": "수강 진행률이 50%를 넘어 환불되지 않아요.",
+            "not_paid": "취소할 수 있는 결제가 아니에요.",
+        }.get(blocked, "환불할 수 없는 주문이에요.")
         raise HTTPException(
             status.HTTP_403_FORBIDDEN,
             detail={
-                "message": (
-                    f"수강을 시작한 강의는 환불되지 않아요."
-                    if blocked == "already_watched"
-                    else f"환불 가능 기간({REFUND_WINDOW_DAYS}일)이 지났어요."
-                ),
+                "message": message,
                 "reason": blocked,
-                "refund_deadline": deadline.isoformat() if deadline else None,
+                "refund_deadline": quote["deadline"].isoformat() if quote["deadline"] else None,
                 "help": "자세한 사항은 고객 지원으로 문의해 주세요.",
             },
         )
+    # 부분 환불이면 결제액보다 작다. 게이트웨이에는 이 금액으로 취소를 요청한다.
+    refund_amount = int(quote["amount"])
+    partial = refund_amount < order.amount
 
     settings = get_settings()
     try:
@@ -917,6 +985,7 @@ def cancel_payment(
                 order.payment_key,
                 reason=body.reason,
                 idempotency_key=f"cancel-{order.order_uid}",
+                cancel_amount=refund_amount if partial else None,
             )
         elif order.provider == "kakaopay":
             if not settings.kakaopay_enabled:
@@ -927,7 +996,7 @@ def cancel_payment(
                 settings.KAKAOPAY_CID,
                 settings.KAKAOPAY_SECRET_KEY,
                 cid_secret=settings.KAKAOPAY_CID_SECRET,
-            ).cancel(order.payment_key, amount=order.amount)
+            ).cancel(order.payment_key, amount=refund_amount)
         elif order.provider == "portone":
             if not settings.portone_enabled:
                 raise HTTPException(
@@ -936,7 +1005,7 @@ def cancel_payment(
             # 취소 대상은 우리 order_uid(= 포트원 paymentId). 취소 후 재조회로 반영을 확인한다.
             PortOneGateway(
                 settings.PORTONE_API_SECRET, store_id=settings.PORTONE_STORE_ID
-            ).cancel(order.order_uid, amount=order.amount, reason=body.reason)
+            ).cancel(order.order_uid, amount=refund_amount, reason=body.reason)
         elif order.provider == "mock" and settings.payment_mock_enabled:
             pass
         else:
@@ -946,10 +1015,15 @@ def cancel_payment(
     except PaymentGatewayError as exc:
         raise _provider_failure(exc)
 
-    order.status = "refunded"
+    order.status = "refunded" if refund_amount >= order.amount else "partially_refunded"
     order.cancelled_at = datetime.now()
-    order.cancel_reason = body.reason
+    # 부분 환불이면 얼마 돌려줬는지 사유에 남긴다(주문 모델에 환불액 컬럼이 없어 감사 기록 용도).
+    order.cancel_reason = f"{body.reason} [환불 {refund_amount:,}원/{order.amount:,}원]"[:200]
     _revoke_enrollment_if_unpaid_elsewhere(db, order)
+    # 수강 취소·환불 시 그 코스의 학습 이력·풀이 데이터 삭제(사용자 결정 2026-08-05).
+    from app.services.enrollment_lifecycle import purge_course_learning_data
+
+    purge_course_learning_data(db, order.student_id, order.course_id)
     db.commit()
     return OrderOut.model_validate(order, from_attributes=True)
 

@@ -48,7 +48,9 @@ router = APIRouter(tags=["course-exam"])
 # 회차당 최대 문항 수 — 한 번에 다 풀게 하지 않는 이유는 좌절 방지 + '틀린 것만
 # 다시'의 리듬을 만들기 위해(문제은행 세트 10문항과 같은 보폭).
 EXAM_SITTING_SIZE = 10
-ORIGINS = {"manual", "past_exam", "lecture", "llm"}
+ORIGINS = {"manual", "past_exam", "lecture", "llm", "bank"}
+# 문제은행 → 수료시험 추출 개수(사용자 결정 2026-08-05: 10문항).
+BANK_EXAM_IMPORT_N = 10
 # LLM 시험 생성 시 강의 전사(자막)를 프롬프트에 넣는 예산 — 실제 내용 근거로 더 깊은 문항을
 # 만들되, 코스에 강의가 많으면 전체 자막이 토큰을 폭발시키므로 총·강의별 상한으로 자른다.
 _COURSE_EXAM_TR_TOTAL_CAP = 30000  # 총 문자 예산(대략 수천 토큰 규모)
@@ -593,6 +595,80 @@ def ops_import_exam_from_lectures(
         for k in copied_keys:  # DB에 참조가 안 남았으니 복사한 파일도 되돌린다(유령 파일 방지)
             get_media_storage().delete(k)
         raise
+    return {"imported": imported, "skipped": skipped}
+
+
+@router.post("/ops/courses/{course_id}/exam-questions/import-from-bank")
+def ops_import_exam_from_bank(
+    course_id: str,
+    principal: Principal = Depends(require_content_author),
+    db: Session = Depends(get_db),
+):
+    """코스 문제은행에서 최대 10문항을 무작위로 뽑아 수료시험 문항(origin=bank, draft)으로 생성.
+
+    왜: 강사가 시험 문항을 손으로 넣지 않게 — 코스에 배치된 문제은행 문항을 재활용한다.
+    문제은행은 옵션-id 기반(options=[{id,text}], answer="o1")이라 시험 문항의 인덱스 기반
+    (options=[str], answer_indexes=[int])으로 변환한다. 객관식(single/multi)만 가져온다 —
+    input/drag·보기 없는 문항은 4지선다 시험 형식에 맞지 않아 건너뛴다. 가져온 문항은
+    draft(강사 검수 후 active). 형식 불량은 조용히 건너뛰되 개수를 정직하게 반환한다."""
+    from app.api.v1.endpoints.lectures import _get_ops_course
+    from app.services import subject_banks
+
+    course = _get_ops_course(db, course_id, principal)
+    ids = bank_mode.course_question_ids(db, course.subject, course_id)
+    if not ids:
+        return {"imported": 0, "skipped": 0}
+    picked = random.sample(ids, min(BANK_EXAM_IMPORT_N, len(ids)))
+    max_order = (
+        db.query(CourseExamQuestion).filter(CourseExamQuestion.course_id == course_id).count()
+    )
+    imported = 0
+    skipped = 0
+    for qid in picked:
+        q = subject_banks.get_question(course.subject, qid)
+        if not q:
+            skipped += 1
+            continue
+        prompt = (q.get("prompt") or "").strip()
+        raw_opts = [o for o in (q.get("options") or []) if isinstance(o, dict)]
+        opt_texts = [(o.get("text") or "").strip() for o in raw_opts]
+        opt_ids = [o.get("id") for o in raw_opts]
+        ans = q.get("answer")
+        ans_ids = ans if isinstance(ans, list) else [ans]
+        try:
+            answer_indexes = sorted({opt_ids.index(a) for a in ans_ids})
+        except ValueError:
+            skipped += 1  # 정답 id가 보기에 없음(형식 불량)
+            continue
+        if (
+            not prompt
+            or not (2 <= len(opt_texts) <= 6)
+            or not all(opt_texts)
+            or not answer_indexes
+            or any(i < 0 or i >= len(opt_texts) for i in answer_indexes)
+        ):
+            skipped += 1
+            continue
+        max_order += 1
+        db.add(
+            CourseExamQuestion(
+                course_id=course_id,
+                prompt=prompt,
+                options=opt_texts,
+                answer_indexes=answer_indexes,
+                explain=(q.get("explain") or "").strip() or None,
+                origin="bank",
+                source=f"문제은행: {qid}",
+                order_no=max_order,
+                status="draft",
+                created_by=principal.id,
+            )
+        )
+        imported += 1
+    audit(db, action="course.exam_question.import_bank", actor_user_id=principal.id,
+          target_type="course", target_id=course_id,
+          after={"imported": imported, "skipped": skipped})
+    db.commit()
     return {"imported": imported, "skipped": skipped}
 
 

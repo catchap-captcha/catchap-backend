@@ -800,8 +800,9 @@ def unenroll_course(
     principal: Principal = Depends(require_student),
     db: Session = Depends(get_db),
 ):
-    """수강 취소 — 내 코스에서 빠진다(status='withdrawn'). 진행 이력(시청·수료·시험)은 지우지
-    않아 재신청하면 이어갈 수 있다. 결제한 코스는 이 경로로 못 빼고 결제 취소(환불)로 보낸다."""
+    """수강 취소 — 내 코스에서 빠진다(status='withdrawn'). 그 코스의 학습 이력·풀이 데이터
+    (시청 진행·확인문항 통과 이력·수료시험 회차/응답·수료)는 함께 삭제한다(사용자 결정
+    2026-08-05). 결제한 코스는 이 경로로 못 빼고 결제 취소(환불)로 보낸다."""
     e = (
         db.query(CourseEnrollment)
         .filter(
@@ -832,6 +833,10 @@ def unenroll_course(
                 },
             )
         e.status = "withdrawn"
+        # 학습 이력·풀이 데이터 삭제(환불 경로 cancel_payment와 동일 규약).
+        from app.services.enrollment_lifecycle import purge_course_learning_data
+
+        purge_course_learning_data(db, principal.id, course_id)
         db.commit()
     return {"ok": True, "enrolled": False}
 
