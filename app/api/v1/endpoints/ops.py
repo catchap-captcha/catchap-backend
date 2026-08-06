@@ -2235,6 +2235,29 @@ def ops_test_ai_key(
 # 프롬프트 편집은 2종 — 생성('출제 규칙')과 검증('자기검증 판정 지침'). 둘 다 같은 규약:
 # 구조부(생성=JSON형식·변수주입·시점지침 / 검증=근거소스·JSON출력)는 서버가 고정하고,
 # '규칙' 부분만 편집 가능(파서·판정 로직 보호). setting key와 기본값 상수만 다르다.
+def _prev_key(setting_key: str) -> str:
+    """직전 저장값을 담아 두는 형제 설정 키."""
+    return f"{setting_key}__prev"
+
+
+def _ai_prompt_previous(db: Session, setting_key: str) -> str:
+    """직전 저장값 — 저장할 때 형제 키에 따로 넣어 둔 것을 그대로 읽는다.
+
+    왜 필요한가: SystemSetting 은 제자리 덮어쓰기(set_setting)라 이전 값이 남지 않는다.
+    잘못 저장했을 때 되돌릴 수 있는 게 서버 기본값뿐이면, 0722 수율 튜닝(임의값 강제·
+    anti-leakage)이 담긴 사용자 지정본까지 한꺼번에 잃는다.
+    ★감사기록(audit_logs.before_json)에서 최신 행을 골라 쓰지 않는다 — 그 표는 id 가
+      랜덤 UUID(CHAR(36))이고 created_at 이 초 단위 DATETIME이라, 같은 초에 저장이 두 번
+      일어나면 정렬이 무작위가 된다(실제 왕복 시험에서 직전값 대신 그 이전 값이 나왔다).
+      전용 키에 명시적으로 써 두면 정렬이 개입하지 않아 항상 정확하다.
+    ★이 기능 배포 이전에 저장된 값은 형제 키가 없어 빈 문자열이 나온다(기능이 없는 게
+      아니라 이력이 아직 없는 것) — 다음 저장부터 채워진다."""
+    from app.services import settings_service
+
+    prev = settings_service.get_setting(db, _prev_key(setting_key))
+    return prev if prev and prev.strip() else ""
+
+
 def _ai_prompt_payload(db: Session, *, setting_key: str, default_rules: str) -> dict:
     from app.services import settings_service
 
@@ -2243,6 +2266,7 @@ def _ai_prompt_payload(db: Session, *, setting_key: str, default_rules: str) -> 
     return {
         "rules": custom if has else default_rules,  # 지금 실제로 쓰이는 규칙
         "default_rules": default_rules,  # '기본값으로 복원'용
+        "previous_rules": _ai_prompt_previous(db, setting_key),  # '이전 값으로 복원'용
         "is_custom": has,
     }
 
@@ -2270,8 +2294,14 @@ def ops_put_ai_prompt(
     from app.clients.ai_client import DEFAULT_GEN_RULES
     from app.services import settings_service
 
+    prior = settings_service.get_setting(db, "llm_gen_rules") or ""
     settings_service.set_setting(
         db, "llm_gen_rules", (req.rules or "").strip(), updated_by=principal.id
+    )
+    # 덮어쓰기 전 값을 형제 키에 보관 — '이전 값으로 복원'의 근거(같은 트랜잭션이라
+    # 본 값과 직전 값이 어긋날 수 없다). 빈 값이면 set_setting 이 행을 지워 준다.
+    settings_service.set_setting(
+        db, _prev_key("llm_gen_rules"), prior, updated_by=principal.id
     )
     audit(
         db,
@@ -2279,7 +2309,11 @@ def ops_put_ai_prompt(
         actor_user_id=principal.id,
         target_type="system_setting",
         target_id=None,
-        after={"len": len((req.rules or "").strip())},  # 원문은 안 남기고 길이만
+        # 감사기록에도 직전 원문을 남긴다 — 복원용이 아니라 '언제 누가 무엇을 바꿨나'를
+        # 되짚기 위한 것. 프롬프트는 자격증명이 아니라 운영 설정이라 원문 보존이 과하지
+        # 않다(API 키 등은 여전히 길이·마스킹만 남긴다).
+        before={"len": len(prior), "rules": prior},
+        after={"len": len((req.rules or "").strip())},
     )
     db.commit()
     return _ai_prompt_payload(db, setting_key="llm_gen_rules", default_rules=DEFAULT_GEN_RULES)
@@ -2293,7 +2327,9 @@ def ops_get_ai_verify_prompt(
     근거 소스(블라인드/자막)·JSON 출력 형식은 서버가 고정하고, '얼마나 엄격히 볼지'만 편집한다."""
     from app.clients.ai_client import DEFAULT_VERIFY_RULES
 
-    return _ai_prompt_payload(db, setting_key="llm_verify_rules", default_rules=DEFAULT_VERIFY_RULES)
+    return _ai_prompt_payload(
+        db, setting_key="llm_verify_rules", default_rules=DEFAULT_VERIFY_RULES
+    )
 
 
 @router.put("/settings/ai/verify-prompt")
@@ -2306,8 +2342,12 @@ def ops_put_ai_verify_prompt(
     from app.clients.ai_client import DEFAULT_VERIFY_RULES
     from app.services import settings_service
 
+    prior = settings_service.get_setting(db, "llm_verify_rules") or ""
     settings_service.set_setting(
         db, "llm_verify_rules", (req.rules or "").strip(), updated_by=principal.id
+    )
+    settings_service.set_setting(  # 위와 동일 — 복원 근거
+        db, _prev_key("llm_verify_rules"), prior, updated_by=principal.id
     )
     audit(
         db,
@@ -2315,10 +2355,13 @@ def ops_put_ai_verify_prompt(
         actor_user_id=principal.id,
         target_type="system_setting",
         target_id=None,
-        after={"len": len((req.rules or "").strip())},  # 원문은 안 남기고 길이만
+        before={"len": len(prior), "rules": prior},  # 위와 동일 — 되짚기용 기록
+        after={"len": len((req.rules or "").strip())},
     )
     db.commit()
-    return _ai_prompt_payload(db, setting_key="llm_verify_rules", default_rules=DEFAULT_VERIFY_RULES)
+    return _ai_prompt_payload(
+        db, setting_key="llm_verify_rules", default_rules=DEFAULT_VERIFY_RULES
+    )
 
 
 # ---------------------------------------------------------------- AI 모델 선택(런타임) #26
