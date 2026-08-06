@@ -7,6 +7,7 @@ from app.api.v1.endpoints import (
     auth,
     captcha_api,
     course_exam,
+    deployments,
     drag_captcha,
     forest_captcha,
     health,
@@ -43,5 +44,6 @@ for _mod in (
     course_exam,
     monitoring,
     alerts,
+    deployments,
 ):
     api_router.include_router(_mod.router)
