@@ -4,6 +4,8 @@ from pathlib import Path
 from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from app.core.secrets_loader import load_secrets_into_env
+
 # 프로덕션에서 절대 쓰면 안 되는 개발용 기본값
 _INSECURE_JWT_DEFAULT = "dev-only-secret-change-me"
 
@@ -265,4 +267,8 @@ class Settings(BaseSettings):
 
 @lru_cache
 def get_settings() -> Settings:
+    # ★Settings를 만들기 전에 Secrets Manager를 읽어 환경변수로 넣는다.
+    # 비밀값이 Settings의 재료라 순서가 반대면 의미가 없다.
+    # SECRETS_BACKEND 기본값이 none이라 로컬 개발·테스트에서는 아무 일도 일어나지 않는다.
+    load_secrets_into_env()
     return Settings()
