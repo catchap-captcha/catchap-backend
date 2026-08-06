@@ -8,6 +8,10 @@ LLM 문항 생성의 재료: 전사 세그먼트([start, end, text])가 있어�
 않는다. 기존 의존성 httpx로 직접 호출한다(신규 SDK 불필요 — ai_client와 같은 이유).
 """
 
+import os
+import shutil
+import subprocess
+import tempfile
 from pathlib import Path
 
 import httpx
@@ -90,10 +94,54 @@ def transcribe_video(path: Path, *, api_key: str) -> list[dict]:
     return out
 
 
+# 워커로 보낼 오디오 규격 — whisper가 내부적으로 16kHz 모노로 리샘플하므로 이 규격으로
+# 미리 뽑으면 품질 손실이 없다. FLAC은 이 샘플레이트 기준 무손실이라 전사 품질에 영향 없음.
+_AUDIO_SR = "16000"
+_AUDIO_EXTRACT_TIMEOUT_SEC = 1800.0
+
+
+def _extract_audio(path: Path) -> Path:
+    """강의 영상 → 16kHz 모노 FLAC 임시파일. 실패는 SttError로 정직하게 전파한다.
+
+    ★왜 영상을 그대로 보내지 않나(2026-08-06 장애에서 배운 것):
+    faster-whisper는 오디오만 디코딩하고 영상 트랙은 버린다. 그런데 예전 구현은 원본
+    mp4를 통째로 POST했고, 11.9GB 강의에서 GPU 워커가 그 크기만큼 임시파일을 쓰려다
+    디스크가 가득 차(Errno 28) 전사가 중단됐다. 오디오만 보내면 12GB → 수십 MB가 되어
+    전송·워커 디스크·디코딩이 모두 줄고, 결과는 동일하다."""
+    if shutil.which("ffmpeg") is None:
+        raise SttError("ffmpeg이 설치되어 있지 않아 강의 오디오를 추출할 수 없습니다.")
+    fd, tmp_name = tempfile.mkstemp(prefix="stt-audio-", suffix=".flac")
+    os.close(fd)
+    out_path = Path(tmp_name)
+    cmd = [
+        "ffmpeg", "-nostdin", "-y",
+        "-i", str(path),
+        "-vn",                # 영상 트랙 버림
+        "-ac", "1",           # 모노
+        "-ar", _AUDIO_SR,     # 16kHz — whisper 내부 규격
+        "-c:a", "flac",
+        str(out_path),
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, timeout=_AUDIO_EXTRACT_TIMEOUT_SEC)
+    except subprocess.TimeoutExpired as e:
+        out_path.unlink(missing_ok=True)
+        raise SttError("강의 오디오 추출이 제한 시간 안에 끝나지 않았습니다.") from e
+    except OSError as e:
+        out_path.unlink(missing_ok=True)
+        raise SttError(f"강의 오디오 추출 실행에 실패했습니다: {e}") from e
+    if proc.returncode != 0 or not out_path.is_file() or out_path.stat().st_size == 0:
+        lines = (proc.stderr or b"").decode("utf-8", "replace").strip().splitlines()
+        detail = lines[-1] if lines else f"ffmpeg 종료코드 {proc.returncode}"
+        out_path.unlink(missing_ok=True)
+        raise SttError(f"강의 오디오 추출에 실패했습니다: {detail[:200]}")
+    return out_path
+
+
 def transcribe_via_worker(path: Path, *, worker_url: str, worker_token: str = "") -> list[dict]:
     """자체 호스팅 faster-whisper 워커로 전사 → [{start, end, text}] (OpenAI 경로와 동일 형태).
 
-    stt-worker/(GPU·faster-whisper)로 영상을 그대로 POST한다. OpenAI와 달리 25MB 상한이 없고
+    stt-worker/(GPU·faster-whisper)로 **추출한 오디오만** POST한다. OpenAI와 달리 25MB 상한이 없고
     과금이 없다. 반환 형태·예외(SttError)는 transcribe_video와 같아, 호출부는 소스를 모른 채
     동일하게 쓴다. 빈 결과는 SttError — 가짜 성공 금지."""
     url = (worker_url or "").strip().rstrip("/")
@@ -101,18 +149,21 @@ def transcribe_via_worker(path: Path, *, worker_url: str, worker_token: str = ""
         raise SttNotConfiguredError("STT 워커 URL(STT_WORKER_URL)이 설정되지 않았습니다.")
     if not path.is_file():
         raise SttError(f"강의 영상 파일을 찾을 수 없습니다: {path.name}")
-    media_type = _MEDIA_TYPES.get(path.suffix.lower(), "application/octet-stream")
+    # 영상이 아니라 '오디오만' 보낸다 — _extract_audio 주석 참고(12GB → 수십 MB).
+    audio_path = _extract_audio(path)
     try:
-        with open(path, "rb") as f:
+        with open(audio_path, "rb") as f:
             resp = httpx.post(
                 f"{url}/transcribe",
                 params={"language": "ko"},
                 headers={"X-Worker-Token": worker_token or ""},
-                files={"file": (path.name, f, media_type)},
+                files={"file": (audio_path.name, f, "audio/flac")},
                 timeout=_WORKER_TIMEOUT_SEC,
             )
     except httpx.HTTPError as e:
         raise SttError(f"STT 워커 호출 실패(네트워크): {e}") from e
+    finally:
+        audio_path.unlink(missing_ok=True)  # 추출본은 항상 치운다(실패해도 남기지 않는다)
     if resp.status_code != 200:
         raise SttError(f"STT 워커 오류(HTTP {resp.status_code}): {resp.text[:300]}")
     body = resp.json()

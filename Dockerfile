@@ -12,7 +12,9 @@ WORKDIR /app
 
 # 타임존을 한국(KST)으로 고정 — 앱이 datetime.now()(naive 로컬)로 created_at·감사로그·
 # '오늘/이번 주' 집계를 잡는데, 컨테이너 기본(UTC)이면 9시간 어긋난다. tzdata 설치 후 KST 고정.
-RUN apt-get update && apt-get install -y --no-install-recommends tzdata \
+# ffmpeg — STT 워커로 보내기 전 강의 영상에서 오디오만 뽑는 데 쓴다(stt_client._extract_audio).
+# 영상을 그대로 보내면 워커 디스크·전송이 통째로 낭비된다(faster-whisper는 오디오만 쓴다).
+RUN apt-get update && apt-get install -y --no-install-recommends tzdata ffmpeg \
     && ln -sf /usr/share/zoneinfo/Asia/Seoul /etc/localtime \
     && echo "Asia/Seoul" > /etc/timezone \
     && rm -rf /var/lib/apt/lists/*

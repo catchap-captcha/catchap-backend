@@ -7,6 +7,13 @@ services:
     env_file: .env.production          # 시크릿·설정 주입(이미지엔 안 굽음)
     environment:
       TZ: Asia/Seoul                   # 컨테이너 시간을 KST로 — created_at·감사로그가 로컬 기준
+      # 업로드 임시파일을 미디어 볼륨과 '같은 파일시스템'에 둔다.
+      # 기본 /tmp 는 컨테이너 overlay(다른 장치)라 media_storage.save_path 의
+      # shutil.move 가 원자적 rename 이 아니라 전체 복사로 떨어졌다 — 11.9GB 업로드에서
+      # 본문 수신 후 3분간 무응답이 되어 브라우저가 연결을 끊었다(2026-08-06 실측).
+      # 미디어 루트 '밖'에 두는 것이 중요하다: /app/media 안에 두면 업로드 중인 조각이
+      # 미디어 키로 접근 가능해진다.
+      TMPDIR: /app/staging
     restart: unless-stopped
     expose:
       - "8000"                          # Caddy만 접근(호스트 공개 X)
@@ -14,6 +21,8 @@ services:
       # 강의 영상·자료 영속화 — 컨테이너는 일회용이라 볼륨이 없으면 재배포 때 업로드 파일이 전부 소실된다.
       # 컨테이너 내부 기본 경로 ./media/lectures(=/app/media/lectures)를 호스트 볼륨에 묶는다.
       - lecture_media:/app/media
+      # 업로드 스테이징 — 호스트 /dev/vda1 위라 lecture_media 볼륨과 같은 장치가 된다.
+      - /var/lib/catchap-staging:/app/staging
     # DB는 별도 VM(사설 10.0.1.168) — compose가 DB를 띄우지 않는다.
 
   caddy:

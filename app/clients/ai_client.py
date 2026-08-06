@@ -184,8 +184,12 @@ def test_key(provider: str | None, key: str) -> tuple[bool, str]:
     return False, f"확인 실패({r.status_code}){': ' + detail if detail else ''}."
 
 
-def _anthropic_extract(body: dict) -> tuple[str, int, int, bool]:
-    """Anthropic 응답 → (text, tokens_in, tokens_out, refused)."""
+def _anthropic_extract(body: dict) -> tuple[str, int, int, bool, bool]:
+    """Anthropic 응답 → (text, tokens_in, tokens_out, refused, truncated).
+
+    truncated = 모델이 max_tokens에 걸려 도중에 끊긴 것. ★thinking을 쓰는 모델은 그
+    토큰도 max_tokens를 함께 소비하므로, 예산이 빠듯하면 본문(text)이 중간에 잘린다.
+    잘린 JSON을 정상처럼 돌려주면 호출부가 파싱에서 터지고 원인이 안 보인다(2026-08-06)."""
     usage = body.get("usage") or {}
     text = "".join(
         block.get("text", "")
@@ -197,11 +201,12 @@ def _anthropic_extract(body: dict) -> tuple[str, int, int, bool]:
         int(usage.get("input_tokens") or 0),
         int(usage.get("output_tokens") or 0),
         body.get("stop_reason") == "refusal",
+        body.get("stop_reason") == "max_tokens",
     )
 
 
-def _openai_extract(body: dict) -> tuple[str, int, int, bool]:
-    """OpenAI Chat Completions 응답 → (text, tokens_in, tokens_out, refused)."""
+def _openai_extract(body: dict) -> tuple[str, int, int, bool, bool]:
+    """OpenAI Chat Completions 응답 → (text, tokens_in, tokens_out, refused, truncated)."""
     usage = body.get("usage") or {}
     choices = body.get("choices") or []
     first = choices[0] if choices and isinstance(choices[0], dict) else {}
@@ -212,6 +217,7 @@ def _openai_extract(body: dict) -> tuple[str, int, int, bool]:
         int(usage.get("prompt_tokens") or 0),
         int(usage.get("completion_tokens") or 0),
         refused,
+        first.get("finish_reason") == "length",  # 예산 초과로 도중에 끊김
     )
 
 
@@ -272,14 +278,27 @@ def _post_messages(
         if not isinstance(body, dict):
             last_err = AiGenerationError("LLM 응답이 JSON 객체가 아닙니다(HTTP 200).")
             continue
-        text, tin, tout, refused = (_openai_extract if is_oa else _anthropic_extract)(body)
+        text, tin, tout, refused, truncated = (
+            _openai_extract if is_oa else _anthropic_extract
+        )(body)
         # 토큰 사용량 기록(성공 호출) — 거절/빈 응답이어도 입력 토큰은 소비됐다
         if on_usage is not None:
             on_usage(cand.get("config_id"), tin, tout)
         if refused:
             raise AiGenerationError("LLM이 요청을 거절했습니다.")
+        if truncated:
+            # ★잘린 응답은 '요청 내용 문제'가 아니라 이 모델의 예산 문제다 → 다음 후보로 스왑.
+            # 잘린 JSON을 그대로 돌려주면 호출부가 파싱에서 터지고 원인이 가려진다.
+            # (thinking을 쓰는 모델은 thinking 토큰도 max_tokens를 함께 먹는다 — 2026-08-06
+            #  sonnet-5가 1024 중 763~1002를 thinking에 써 답변이 중간에 끊겼다.)
+            last_err = AiGenerationError(
+                f"LLM 응답이 max_tokens에 걸려 잘렸습니다({model_id}, 출력 {tout}토큰)."
+            )
+            continue
         if not text.strip():
-            raise AiGenerationError("LLM 응답에 텍스트가 없습니다.")
+            # 텍스트가 비는 것도 대개 예산 문제(thinking이 전부 먹음)라 다음 후보를 시도한다.
+            last_err = AiGenerationError(f"LLM 응답에 텍스트가 없습니다({model_id}).")
+            continue
         return text
     # 모든 후보 실패 — 마지막 오류를 정직하게 전파
     raise last_err or AiGenerationError("LLM 호출 가능한 모델이 없습니다.")
@@ -362,10 +381,15 @@ def solve_questions(
     if not key and not oa:
         raise AiNotConfiguredError("LLM API 키가 설정되지 않았습니다.")
 
+    # ★max_tokens 산정: 답변 자체는 문항당 ~18토큰(20문항 ≈ 360)이면 충분하지만, 검증 슬롯
+    # 모델이 thinking을 쓰면 그 토큰도 같은 예산을 먹는다(실측 763~1289). 종전 1024 고정은
+    # thinking이 예산을 다 써 JSON이 중간에 잘렸다. max_tokens는 '상한'이라 실제 과금은 출력한
+    # 만큼만 되므로 넉넉히 잡는 편이 안전하다.
+    solve_max_tokens = 4096 + 64 * len(questions)
     text = _post_messages(
         key,
         _solve_prompt(questions, context=context, transcript=transcript, rules_override=rules_override),
-        max_tokens=1024,
+        max_tokens=solve_max_tokens,
         models=models,
         on_usage=on_usage,
         openai_key=oa,

@@ -4160,9 +4160,13 @@ def _notify_gen_result(db: Session, job: LectureQuestionGenJob, lec_title: str, 
         )
     else:
         title = f"‘{lec_title}’ 문항 생성이 실패했어요"
+        # ★원인을 단정하지 않는다. 예전엔 사유와 무관하게 "설정(LLM 키·자막)을 확인하라"고
+        # 안내했는데, 실제 원인이 STT 워커 디스크 부족이던 2026-08-06에 강사가 멀쩡한
+        # LLM 키를 들여다보게 만들었다. 서버가 준 사유를 그대로 보여 주고, 그 다음 행동만 안내한다.
+        detail = (job.error_detail or "알 수 없는 오류")[:200]
         message = (
-            f"자동 생성 중 문제가 생겼어요: {(job.error_detail or '알 수 없는 오류')[:200]} "
-            "설정(LLM 키·자막)을 확인한 뒤 다시 시도해 주세요."
+            f"자동 생성 중 문제가 생겼어요: {detail} "
+            "잠시 후 다시 시도해 보시고, 같은 오류가 반복되면 위 내용을 운영자에게 알려 주세요."
         )
     notify_service.notify_user(
         db,
