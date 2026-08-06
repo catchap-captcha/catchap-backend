@@ -15,6 +15,7 @@
 - 기출(origin=past_exam)은 source 필수 — 비영리 교육용 이용 전제(§2), 화면 상시 노출.
 """
 
+import math
 import os
 import random
 import shutil
@@ -48,6 +49,9 @@ router = APIRouter(tags=["course-exam"])
 # 회차당 최대 문항 수 — 한 번에 다 풀게 하지 않는 이유는 좌절 방지 + '틀린 것만
 # 다시'의 리듬을 만들기 위해(문제은행 세트 10문항과 같은 보폭).
 EXAM_SITTING_SIZE = 10
+# 수료 합격 기준(사용자 결정 2026-08-05): 전 문항 정복(100%)이 아니라 활성 문항의 이 비율 이상
+# 정답이면 수료. 예: 10문항이면 ceil(10*0.8)=8개 이상. 프런트 안내 문구도 이 비율(0.8)에 맞춘다.
+EXAM_PASS_RATIO = 0.8
 ORIGINS = {"manual", "past_exam", "lecture", "llm", "bank"}
 # 문제은행 → 수료시험 추출 개수(사용자 결정 2026-08-05: 10문항).
 BANK_EXAM_IMPORT_N = 10
@@ -179,7 +183,7 @@ def _grant_completion_if_mastered(
     db: Session, student_id: str, course_id: str, active_ids: set[str],
     *, perfect_sitting: bool = False,
 ) -> CourseCompletion | None:
-    """전 활성 문항 정복이면 수료 부여(멱등). 수료 시점 스냅샷을 남긴다.
+    """활성 문항의 EXAM_PASS_RATIO(80%) 이상 정복이면 수료 부여(멱등). 수료 시점 스냅샷을 남긴다.
 
     **perfect(완벽 통과) = 현재 활성 전 문항을 '한 회차에 모두 맞힌 적'이 있는가**
     (0719 정책 재설계 — 재도전 경로+공정성). perfect_sitting=이번 제출이 그 완벽 회차였나.
@@ -199,7 +203,10 @@ def _grant_completion_if_mastered(
             db.flush()
         return existing
     mastered = _mastered_ids(db, student_id, course_id)
-    if not active_ids <= mastered:
+    # 수료 기준: 전 문항 정복(100%)이 아니라 활성 문항의 EXAM_PASS_RATIO(80%) 이상 정답
+    # (10문항이면 8개 이상). 사용자 결정 2026-08-05.
+    need = math.ceil(len(active_ids) * EXAM_PASS_RATIO)
+    if len(active_ids & mastered) < need:
         return None
     sittings = (
         db.query(CourseExamSitting)
