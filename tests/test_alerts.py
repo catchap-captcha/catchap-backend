@@ -39,6 +39,19 @@ def _catch_mail(monkeypatch) -> list[tuple[str, str]]:
     return sent
 
 
+def _catch_mail_html(monkeypatch) -> list[str]:
+    """메일 ★본문(HTML)만 모은다 — 생김새를 검사하려고."""
+    bodies: list[str] = []
+    from app.services import notify_service
+
+    def _fake(db, to_email, subject, html, user_id=None):  # noqa: ARG001
+        bodies.append(html)
+        return True
+
+    monkeypatch.setattr(notify_service, "send_email", _fake)
+    return bodies
+
+
 def _more_ops(db, n: int, *, status: str = "active", email: str | None = None) -> list[User]:
     made = []
     for i in range(n):
@@ -183,6 +196,71 @@ def test_only_active_ops_with_email_are_notified(client, db, monkeypatch):
 
     assert _post(client, _payload()).json()["notified"] == 1
     assert {e for e, _ in sent} == {"ops@t.dev"}
+
+
+# ─────────────────────────────────────────────────────────────
+# ②-2 메일이 ★한눈에 들어와야 한다
+# ─────────────────────────────────────────────────────────────
+
+
+def test_mail_is_not_one_blob_of_text(client, db, monkeypatch):
+    """★메일 본문이 글 한 덩어리면 안 된다.
+
+    ⚠️email_html 을 안 넘기면 notify_user 가 본문을 <p> 하나로 감싸는데,
+    우리 본문은 여러 줄이고 ★HTML 은 줄바꿈을 무시한다 — 그러면 무엇이 급한지
+    알아볼 수 없는 한 덩어리가 된다(0806 지적). 그래서 형태를 검사한다.
+    """
+    _patch_token(monkeypatch)
+    bodies = _catch_mail_html(monkeypatch)
+    _ops(client, db)
+
+    _post(client, _payload(n=2))
+    assert len(bodies) == 1
+    html = bodies[0]
+    # 등급이 ★글자로도 있어야 한다 — 색만 쓰면 못 보는 사람이 생긴다
+    assert "급함" in html
+    # 경보마다 칸이 따로 있어야 한다(한 덩어리가 아니라는 뜻)
+    assert html.count("border-left:4px solid") == 2
+    # 라벨이 사람 말로 바뀌어야 한다
+    assert "서비스" in html and "묶음" in html
+    # ★인라인 스타일만 — 메일 클라이언트가 <style> 블록을 자주 지운다
+    assert "<style" not in html
+    # 어디를 보면 되는지가 있어야 한다
+    assert "시스템 경보" in html
+
+
+def test_mail_marks_resolved_differently(client, db, monkeypatch):
+    """해제 메일은 ★다르게 보여야 한다 — 급한 것과 같은 색이면 또 놀란다."""
+    from app.api.v1.endpoints import alerts
+
+    html = alerts._email_html(
+        alerts.AlertmanagerPayload(
+            status="resolved",
+            alerts=[alerts.AlertItem(labels={"alertname": "X", "severity": "critical"})],
+        )
+    )
+    assert "해제됨" in html
+    assert "#dcfce7" in html  # 초록 계열
+    assert "조치하지 않으셔도" in html
+
+
+def test_mail_escapes_values(client, db, monkeypatch):
+    """라벨 값에 꺾쇠가 들어와도 ★메일이 깨지지 않는다."""
+    from app.api.v1.endpoints import alerts
+
+    html = alerts._email_html(
+        alerts.AlertmanagerPayload(
+            alerts=[
+                alerts.AlertItem(
+                    labels={"alertname": "X", "severity": "warning", "pod": "<img src=x>"},
+                    annotations={"summary": "a & b"},
+                )
+            ]
+        )
+    )
+    assert "<img src=x>" not in html
+    assert "&lt;img src=x&gt;" in html
+    assert "a &amp; b" in html
 
 
 # ─────────────────────────────────────────────────────────────

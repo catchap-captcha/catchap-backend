@@ -124,6 +124,96 @@ def _message(payload: AlertmanagerPayload) -> str:
     return "\n".join(lines).strip()
 
 
+# 등급별 색 — 메일에서 ★한눈에 급한 정도를 알아보게. (배경, 글자, 띠)
+_TONE = {
+    "critical": ("#fee2e2", "#b91c1c", "#dc2626"),
+    "warning": ("#fef3c7", "#92400e", "#f59e0b"),
+    "info": ("#f3f4f6", "#4b5563", "#9ca3af"),
+    "none": ("#f3f4f6", "#4b5563", "#9ca3af"),
+    "resolved": ("#dcfce7", "#166534", "#16a34a"),
+}
+
+# 라벨 이름 → 사람 말. 영어 키를 그대로 두면 메일에서 읽는 데 시간이 걸린다.
+_LABEL_KO = {
+    "namespace": "묶음",
+    "pod": "파드",
+    "deployment": "서비스",
+    "instance": "서버",
+    "reason": "이유",
+    "container": "컨테이너",
+}
+
+
+def _esc(s: str) -> str:
+    return (
+        str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+    )
+
+
+def _email_html(payload: AlertmanagerPayload) -> str:
+    """메일 본문 — ★훑어보고 바로 판단할 수 있게.
+
+    ★왜 따로 만드나 — notify_user 는 email_html 이 없으면 본문을 <p> 하나로 감싼다.
+    그런데 우리 본문은 여러 줄이고, HTML 에서 줄바꿈은 ★무시된다. 그래서 메일이
+    한 덩어리 글로 보여 무엇이 급한지 알아보기 어려웠다(0806 지적).
+
+    메일 클라이언트는 <style> 블록을 자주 지운다 — 그래서 ★인라인 스타일만 쓴다.
+    """
+    sev = "resolved" if payload.status == "resolved" else _severity(payload.alerts)
+    bg, fg, bar = _TONE.get(sev, _TONE["none"])
+    head = "해제됨" if payload.status == "resolved" else SEVERITY_KO.get(sev, "안내")
+    lead = (
+        "아래 문제가 풀렸습니다. 조치하지 않으셔도 됩니다."
+        if payload.status == "resolved"
+        else "아래 문제가 감지되었습니다."
+    )
+
+    cards: list[str] = []
+    for a in payload.alerts:
+        name = a.labels.get("alertname", "?")
+        summary = _esc(a.annotations.get("summary") or name)
+        desc = _esc((a.annotations.get("description") or "").strip())
+        chips = "".join(
+            f'<span style="display:inline-block;background:#f3f4f6;color:#374151;'
+            f'border-radius:5px;padding:2px 7px;margin:0 5px 5px 0;font-size:12px">'
+            f"{_esc(_LABEL_KO.get(k, k))} <b>{_esc(v)}</b></span>"
+            for k, v in a.labels.items()
+            if k in _LABEL_KO
+        )
+        started = (
+            f'<div style="margin-top:6px;font-size:12px;color:#9ca3af">시작 {_esc(a.startsAt)}</div>'
+            if a.startsAt
+            else ""
+        )
+        cards.append(
+            f'<div style="border:1px solid #e5e7eb;border-left:4px solid {bar};'
+            f'border-radius:8px;padding:14px 16px;margin:0 0 10px">'
+            f'<div style="font-size:15px;font-weight:700;color:#111827;line-height:1.5">{summary}</div>'
+            f'{f"<div style=\'margin-top:8px\'>{chips}</div>" if chips else ""}'
+            f'{f"<div style=\'margin-top:8px;font-size:13px;color:#4b5563;line-height:1.65\'>{desc}</div>" if desc else ""}'
+            f"{started}</div>"
+        )
+
+    return (
+        '<div style="font-family:-apple-system,BlinkMacSystemFont,\'Malgun Gothic\',sans-serif;'
+        'max-width:640px;margin:0 auto;padding:20px 16px;color:#111827">'
+        # ★맨 위 띠 — 색과 글자 둘 다로 급한 정도를 알린다(색만 쓰면 못 보는 사람이 생긴다)
+        f'<div style="background:{bg};border-radius:10px;padding:14px 16px;margin-bottom:16px">'
+        f'<span style="display:inline-block;background:{fg};color:#fff;border-radius:6px;'
+        f'padding:3px 10px;font-size:13px;font-weight:700">{head}</span>'
+        f'<span style="margin-left:10px;font-size:14px;color:{fg}">{lead}</span>'
+        f'<div style="margin-top:6px;font-size:13px;color:{fg}">모두 {len(payload.alerts)}건</div>'
+        "</div>"
+        + "".join(cards)
+        + '<div style="margin-top:16px;padding-top:14px;border-top:1px solid #e5e7eb;'
+        'font-size:12px;color:#6b7280;line-height:1.7">'
+        "운영 콘솔의 <b>시스템 경보</b>에서 지난 경보를 모아 볼 수 있고, 그 화면에서 "
+        "<b>메일 수신을 끄고 켤 수</b> 있습니다.<br>"
+        "추이는 그라파나 <b>「CatChap 한눈에」</b>와 운영 콘솔 <b>모니터링</b>에서 봅니다."
+        "</div></div>"
+    )
+
+
 def _wants_email(db: Session, user_id: str) -> bool:
     """이 운영자가 경보 메일을 받기로 했나 — 설정이 없으면 ★받는 것이 기본이다.
 
@@ -210,7 +300,8 @@ def ingest_alerts(
 
     sev = _severity(payload.alerts)
     title = _title(payload)
-    message = _message(payload)
+    message = _message(payload)   # 콘솔 벨에 뜰 평문
+    html = _email_html(payload)   # ★메일에 갈 형태 — 없으면 여러 줄이 한 덩어리로 보인다
     # 해제 알림은 메일까지 보내지 않는다 — 급한 일이 끝났다는 소식이라 벨로 충분하다.
     mail_ok = sev in EMAIL_SEVERITIES and payload.status != "resolved"
 
@@ -237,6 +328,7 @@ def ingest_alerts(
                 category=ALERT_CATEGORY,
                 title=title,
                 message=message,
+                email_html=html,
                 send_mail=mail_ok and _wants_email(db, user.id),
             )
             notified += 1
