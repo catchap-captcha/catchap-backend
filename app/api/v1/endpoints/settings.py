@@ -43,7 +43,10 @@ DEFAULT_SETTINGS = {
         "twofa": True,
     },
     "org_admin": {"autopay": True, "twofa": True},
-    "ops": {},
+    # ops.alerts.email — 시스템 경보(Alertmanager)를 메일로도 받을지. 끄면 콘솔 벨에만 남는다.
+    # ★기본이 True인 이유: 기본을 False로 두면 아무도 설정을 만지지 않아 경보가 조용히
+    # 아무 데도 안 가는 상태가 된다. 읽는 쪽은 alerts._wants_email().
+    "ops": {"alerts": {"email": True}},
 }
 
 
