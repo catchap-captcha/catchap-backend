@@ -18,6 +18,7 @@ from app.api.v1.endpoints import (
     ops,
     payments,
     settings as settings_ep,
+    social_auth,
     students,
     widget,
 )
@@ -28,6 +29,7 @@ api_router = APIRouter()
 for _mod in (
     health,
     auth,
+    social_auth,
     institutions,
     students,
     notifications,

@@ -179,3 +179,58 @@ class MeResponse(BaseModel):
     student: MeStudent | None = None
     must_change_password: bool = False  # 학생 비번 초기화 후 True → 강제 변경
     managed_grade: int | None = None  # 학년부장(grade_head)의 담당 학년 (그 외 None)
+
+
+# --- 소셜 로그인(카카오·네이버·구글) ---
+class SocialAuthorizeResponse(BaseModel):
+    provider: str
+    authorize_url: str
+    # 프론트는 이 값을 저장할 필요가 없다(서명 토큰이라 서버가 검증한다). provider가
+    # 콜백으로 돌려주는 state를 그대로 다시 보내면 된다.
+    state: str
+
+
+class SocialCallbackRequest(BaseModel):
+    code: str = Field(min_length=1, max_length=2048)
+    state: str = Field(min_length=1, max_length=4096)
+
+
+class SocialSignupRequest(BaseModel):
+    """소셜 신규 가입 마무리 — 콜백이 준 signup_token + 생년월일.
+
+    birth_date는 provider가 생년월일을 안 준 경우(needs_birth_date=true)에만 필요하다.
+    provider가 준 값이 있으면 서버가 토큰 안의 값을 쓰고 이 필드는 무시한다."""
+
+    signup_token: str = Field(min_length=1, max_length=4096)
+    birth_date: date | None = None
+    nickname: str | None = Field(default=None, max_length=50)
+
+
+class SocialProfilePreview(BaseModel):
+    email: str | None = None
+    nickname: str | None = None
+    birth_date: str | None = None
+    needs_birth_date: bool = False
+
+
+class SocialStudentBrief(BaseModel):
+    id: str
+    nickname: str
+    student_code: str
+
+
+class SocialLoginResponse(BaseModel):
+    """콜백·가입 공통 응답.
+
+    status=logged_in  → tokens 사용(로그인 완료)
+    status=signup_required → signup_token·profile로 가입 화면을 띄운 뒤 /auth/social/signup 호출
+    """
+
+    status: str  # logged_in | signup_required
+    provider: str
+    tokens: TokenPair | None = None
+    signup_token: str | None = None
+    profile: SocialProfilePreview | None = None
+    student: SocialStudentBrief | None = None
+    linked_now: bool = False  # 기존 계정에 이번 요청으로 연결됐는가
+    is_new_account: bool = False

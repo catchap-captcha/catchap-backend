@@ -76,6 +76,7 @@ from app.models.site import (
     CaptchaSetting,
     Site,
 )
+from app.models.social_account import SocialAccount
 from app.models.stat import StatBlob
 from app.models.throttle import CaptchaStore, LoginThrottle
 from app.models.student import ClassAssignment, ParentStudentLink, StudentProfile
@@ -143,6 +144,7 @@ __all__ = [
     "ClassAssignment",
     "ParentStudentLink",
     "StudentJoinCode",
+    "SocialAccount",
     "PasswordResetToken",
     "PaymentMethod",
     "Plan",

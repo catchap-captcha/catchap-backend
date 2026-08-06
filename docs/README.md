@@ -32,6 +32,9 @@
   확장 설계(구현 전). 만 개 규모에서 무한 스트림이 왜 무너지는지, 학생×문항 상태
   기계 + 간격 반복(SRS)·"오늘의 큐"·세트 단위·20주 챕터의 한계와 코스 기반 재편.
 - **[onboarding-security-design.md](onboarding-security-design.md)** — 가입·코드 보안 설계.
+- **[social-login-design.md](social-login-design.md)** — 카카오·네이버·구글 소셜 로그인.
+  왜 신규 가입이 2단계인지(연령 게이트 우회 방지), 검증되지 않은 이메일을 자동 연결하지
+  않는 이유, state·redirect_uri 허용목록·토큰 미저장 같은 보안 장치와 운영 준비 목록.
 - **[BEHAVIOR_DATA.md](BEHAVIOR_DATA.md)** — 행동 데이터 수집·의미.
 - **[monitoring.md](monitoring.md)** — 서버 모니터링(자원·GPU·LLM + 임계 경보). 왜 push
   기반·최신 1행/서버인지, 에이전트 배포(systemd)·실시간성·부하, 임계(CRIT) 기준.
