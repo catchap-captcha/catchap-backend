@@ -1,0 +1,160 @@
+name: 이미지 만들고 배포 태그 갱신
+
+# ★「main 병합 = 자동 배포」의 마지막 조각입니다.
+#
+#   main 에 병합  →  ★이 워크플로가 이미지를 만들어 Container Registry 에 올리고
+#                 →  catchap-infra 의 매니페스트에서 ★이미지 태그를 그 커밋 해시로 고칩니다
+#                 →  ArgoCD 가 그걸 보고 클러스터에 반영합니다
+#
+# ★태그는 반드시 ★커밋 해시입니다. latest 를 쓰면 무엇이 떠 있는지 알 수 없어집니다.
+#
+# ⬜필요한 Secret 3개 (저장소 Settings → Secrets and variables → Actions)
+#     CR_USERNAME        Container Registry 용 ★IAM 액세스 키 ID
+#     CR_PASSWORD        〃 보안 액세스 키
+#     INFRA_DEPLOY_KEY   catchap-infra 에 ★쓰기 권한이 있는 Deploy key 의 ★비밀키
+#                        (ArgoCD 가 쓰는 읽기 전용 키와 ★다른 키입니다)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:      # 손으로도 돌릴 수 있게
+
+permissions:
+  contents: read
+
+concurrency:
+  # 같은 저장소에서 연달아 병합되면 ★뒤엣것만 남깁니다 (태그가 엎치락뒤치락하지 않게)
+  group: deploy-backend
+  cancel-in-progress: false
+
+env:
+  REGISTRY: kc-sfacspace05.kr-central-2.kcr.dev
+  IMAGE_PATH: catchap-backend-repo/catchap-backend          # 예) catchap-backend-repo/catchap-backend
+  MANIFEST: k8s/backend/30-deployment.yaml
+
+jobs:
+  build-and-update:
+    name: 이미지 → 레지스트리 → 매니페스트 태그
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: 코드 받기
+        uses: actions/checkout@v4
+
+      - name: 태그 정하기 (커밋 해시 7자리)
+        id: tag
+        run: echo "sha=$(git rev-parse --short=7 HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: 필요한 Secret 이 다 있나 먼저 본다
+        env:
+          U: ${{ secrets.CR_USERNAME }}
+          P: ${{ secrets.CR_PASSWORD }}
+          K: ${{ secrets.INFRA_DEPLOY_KEY }}
+        run: |
+          # ★값은 찍지 않고 있는지만 봅니다
+          MISS=""
+          [ -z "$U" ] && MISS="$MISS CR_USERNAME"
+          [ -z "$P" ] && MISS="$MISS CR_PASSWORD"
+          [ -z "$K" ] && MISS="$MISS INFRA_DEPLOY_KEY"
+          if [ -n "$MISS" ]; then
+            echo "::error::Secret 이 없습니다 →$MISS"
+            echo "저장소 Settings → Secrets and variables → Actions 에서 넣어 주세요."
+            exit 1
+          fi
+          echo "✅ Secret 3개 확인"
+
+      - name: Buildx 준비
+        uses: docker/setup-buildx-action@v3
+
+      - name: 레지스트리 로그인
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.CR_USERNAME }}
+          password: ${{ secrets.CR_PASSWORD }}
+
+      - name: 이미지 만들고 올리기
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_PATH }}:${{ steps.tag.outputs.sha }}
+          # ★latest 는 일부러 안 붙입니다 — 무엇이 떠 있는지 알 수 없어집니다
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+
+      - name: catchap-infra 받기 (쓰기 키로)
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "${{ secrets.INFRA_DEPLOY_KEY }}" > ~/.ssh/infra
+          chmod 600 ~/.ssh/infra
+          ssh-keyscan -t ed25519 github.com >> ~/.ssh/known_hosts 2>/dev/null
+          GIT_SSH_COMMAND="ssh -i ~/.ssh/infra -o IdentitiesOnly=yes" \
+            git clone --quiet --depth 1 git@github.com:catchap-captcha/catchap-infra.git infra
+          test -d infra/.git || { echo "::error::catchap-infra 를 못 받았습니다"; exit 1; }
+
+      - name: 매니페스트 태그 갱신
+        id: bump
+        env:
+          SHA: ${{ steps.tag.outputs.sha }}
+        run: |
+          cd infra
+          F="$MANIFEST"
+          test -f "$F" || { echo "::error::$F 가 없습니다"; exit 1; }
+          BEFORE=$(grep -oE 'image: [^ ]+' "$F" | head -1)
+          NEW="image: ${REGISTRY}/${IMAGE_PATH}:${SHA}"
+          # ★이 저장소의 이미지 줄만 바꿉니다
+          python3 - "$F" "$REGISTRY/$IMAGE_PATH" "$SHA" <<'PY'
+          import io,re,sys
+          f,path,sha = sys.argv[1], sys.argv[2], sys.argv[3]
+          s = io.open(f, encoding='utf-8').read()
+          s2, n = re.subn(r'(image:\s*)'+re.escape(path)+r':[^\s]+', r'\g<1>'+path+':'+sha, s)
+          if n != 1:
+              print("::error::이미지 줄을 %d 개 찾았습니다 (1개여야 합니다)" % n); sys.exit(1)
+          io.open(f, 'w', encoding='utf-8', newline='\n').write(s2)
+          PY
+          AFTER=$(grep -oE 'image: [^ ]+' "$F" | head -1)
+          echo "  전: $BEFORE"
+          echo "  후: $AFTER"
+          if [ "$BEFORE" = "$AFTER" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::태그가 이미 같습니다 — 커밋하지 않습니다."
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: catchap-infra 에 올리기
+        if: steps.bump.outputs.changed == 'true'
+        env:
+          SHA: ${{ steps.tag.outputs.sha }}
+        run: |
+          cd infra
+          git config user.name  'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add "$MANIFEST"
+          git commit -q -m "ci(deploy): backend 이미지를 ${SHA} 로" \
+                        -m "${GITHUB_REPOSITORY}@${GITHUB_SHA} 가 main 에 들어와 만든 이미지다. ArgoCD 가 이 커밋을 보고 반영한다."
+          GIT_SSH_COMMAND="ssh -i ~/.ssh/infra -o IdentitiesOnly=yes" git push -q origin HEAD:main
+          echo "✅ catchap-infra 갱신 — backend → ${SHA}"
+
+      - name: 뒷정리
+        if: always()
+        run: shred -u ~/.ssh/infra 2>/dev/null || rm -f ~/.ssh/infra
+
+      - name: 요약
+        if: always()
+        env:
+          SHA: ${{ steps.tag.outputs.sha }}
+        run: |
+          {
+            echo "### 배포 이미지"
+            echo ""
+            echo '```'
+            echo "${REGISTRY}/${IMAGE_PATH}:${SHA}"
+            echo '```'
+            echo ""
+            echo "매니페스트: \`${MANIFEST}\` (catchap-infra)"
+            echo ""
+            echo "⚠️ ArgoCD 의 자동 동기화가 꺼져 있으면 화면에서 **Sync** 를 눌러야 반영됩니다."
+          } >> "$GITHUB_STEP_SUMMARY"
