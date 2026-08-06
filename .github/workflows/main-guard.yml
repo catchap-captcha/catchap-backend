@@ -1,0 +1,96 @@
+name: main 직접 push 감시
+
+# ★왜 있나 — 우리 조직은 Free 플랜이고 저장소가 비공개라 브랜치 보호가
+#   강제되지 않는다("won't be enforced on this private repository").
+#   그래서 main 직접 push 를 ★막을 수는 없다. 대신 ★즉시 드러나게 한다.
+#
+#   PR 을 거치지 않은 커밋이 main 에 들어오면 이 작업이 빨간불이 되고,
+#   GitHub 이 push 한 사람에게 메일을 보낸다.
+#
+# ⚠️이 작업이 빨간불이어도 코드가 되돌려지지는 않는다. 사람이 보고 판단한다.
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  guard:
+    name: PR 을 거쳤는지 확인
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: 이 커밋이 PR 에서 왔나
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          ACTOR: ${{ github.actor }}
+          # ★checkout 을 안 하므로 git 로 제목을 못 읽는다. 이벤트에서 받는다.
+          SUBJ: ${{ github.event.head_commit.message }}
+        run: |
+          set -uo pipefail
+
+          # 봇이 올린 것은 넘어간다 (CI 가 이미지 태그를 고치는 경우 등)
+          case "$ACTOR" in
+            *"[bot]"|github-actions|dependabot)
+              echo "::notice::봇($ACTOR)이 올린 커밋이라 넘어갑니다."
+              exit 0 ;;
+          esac
+
+          # 이 커밋을 담고 있는 PR 이 있는지 GitHub 에 묻는다.
+          # squash 병합이면 그 커밋이 PR 에 연결돼 있다.
+          if ! OUT=$(gh api "repos/$REPO/commits/$SHA/pulls" \
+                       -H "Accept: application/vnd.github+json" 2>&1); then
+            echo "::warning::PR 조회에 실패했습니다. 판정하지 않고 넘어갑니다."
+            echo "$OUT" | head -3
+            exit 0        # ★측정 실패를 위반으로 읽지 않는다
+          fi
+
+          # ★응답이 JSON 이 아닐 수도 있다. 그때는 판정하지 않는다 —
+          #   ★측정 실패를 위반으로 읽으면 엉뚱한 사람을 잡는다.
+          COUNT=$(printf '%s' "$OUT" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))' 2>/dev/null || true)
+          case "$COUNT" in
+            ''|*[!0-9]*)
+              echo "::warning::PR 조회 응답을 읽지 못했습니다. 판정하지 않고 넘어갑니다."
+              printf '%s' "$OUT" | head -3
+              exit 0 ;;
+          esac
+
+          if [ "$COUNT" -gt 0 ]; then
+            NUM=$(printf '%s' "$OUT" | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["number"])')
+            echo "✅ PR #$NUM 을 거쳐 들어왔습니다."
+            exit 0
+          fi
+
+          SUBJ=$(printf '%s' "$SUBJ" | head -1)
+          cat <<MSG
+          ────────────────────────────────────────────────────────────
+          ⚠️ main 에 ★직접 push 되었습니다 — PR 을 거치지 않았습니다.
+
+            저장소   $REPO
+            커밋     $SHA
+            제목     $SUBJ
+            올린 사람 $ACTOR
+
+          ★막지는 못했습니다. 우리 조직은 Free 플랜 + 비공개 저장소라
+            브랜치 보호가 강제되지 않습니다. 그래서 이렇게 알립니다.
+
+          앞으로는 이렇게 해 주세요.
+
+            git switch -c fix/<요약>
+            git push -u origin HEAD
+            gh pr create --fill
+            gh pr checks --watch
+            gh pr merge --squash
+
+          ⬜이미 올린 것을 되돌리려면
+            git revert $SHA        (squash 라 커밋 하나만 되돌리면 됩니다)
+
+          ★급해서 그러셨다면 그대로 두셔도 됩니다. 다만 이 기록은 남습니다.
+          ────────────────────────────────────────────────────────────
+          MSG
+          exit 1
