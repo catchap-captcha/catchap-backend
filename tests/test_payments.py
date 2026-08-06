@@ -352,9 +352,12 @@ def test_full_cancel_refunds_and_revokes_enrollment(payment_context, monkeypatch
         == 200
     )
 
-    def fake_cancel(_self, payment_key, *, reason, idempotency_key):
+    # ★cancel_amount 는 2026-08-05 비율 환불에서 생겼다. 전액이면 None 이 온다.
+    #   기본값을 안 주면 실제 호출에서 TypeError 로 터진다(CI 가 그렇게 빨간불이었다).
+    def fake_cancel(_self, payment_key, *, reason, idempotency_key, cancel_amount=None):
         assert payment_key == "toss-cancel-key"
         assert idempotency_key == f"cancel-{order['order_uid']}"
+        assert cancel_amount is None, "미시청 전액 환불이면 부분취소 금액이 없어야 한다"
         return ApprovedPayment(
             provider_payment_id=payment_key,
             order_id=order["order_uid"],
@@ -793,7 +796,16 @@ def test_my_orders_survives_deleted_course(payment_context, monkeypatch):
 
 # ===================== 환불 정책 =====================
 # 전자상거래법상 디지털 콘텐츠는 7일 이내 청약철회가 원칙이되 제공이 개시되면 제한할 수 있다.
-# 강의는 '시청 시작'을 제공 개시로 본다. 비율 환불은 토스가 부분취소를 지원하지 않아 못 한다.
+# 강의는 '시청 시작'을 제공 개시로 본다.
+#
+# ★2026-08-05 정책이 바뀌었다(bebca8e) — '시청하면 환불 불가'에서 ★진행률 기반 비율 환불로.
+#   학원법 별표4 식이다. 토스도 cancel_amount 로 부분취소를 지원한다(payments.py 985).
+#
+#   미시청(1분 미만)   전액        진행률 1/3 미만   2/3
+#   진행률 1/3~1/2     1/2         진행률 1/2 이상   ★progress_over 로 차단
+#   수료증 발급        completed   7일 지남          window_over
+#
+#   ⚠️차단 코드에서 `already_watched` 는 ★없어졌다. 시청 자체는 더 이상 차단 사유가 아니다.
 
 
 def _paid_order(ctx, monkeypatch, *, key="pk-policy"):
@@ -839,21 +851,68 @@ def test_refund_allowed_within_window_and_unwatched(payment_context, monkeypatch
     assert row["refund_deadline"] is not None
 
 
-def test_refund_blocked_after_watching(payment_context, monkeypatch):
-    """시청을 시작하면 기간이 남아 있어도 환불되지 않는다(제공 개시)."""
+def test_watching_gives_partial_refund_not_a_block(payment_context, monkeypatch):
+    """★시청을 시작해도 막지 않는다 — 진행률만큼 덜 돌려준다(2026-08-05 정책).
+
+    ⚠️이 시험은 원래 `refund_blocked == "already_watched"` 를 기대했다. 정책이 비율 환불로
+    바뀌면서 그 코드 자체가 없어졌는데 시험이 안 따라가 ★CI 가 8/5부터 계속 빨간불이었다.
+    지금 동작(진행률 0 → 2/3 환불)을 그대로 적는다.
+    """
     ctx = payment_context
     order = _paid_order(ctx, monkeypatch)
-    _watch(ctx, payments.REFUND_WATCHED_GRACE_SEC + 30)
+    _watch(ctx, payments.REFUND_WATCHED_GRACE_SEC + 30)  # 시청했지만 완료는 아님 → 진행률 0
+
+    row = ctx["client"].get("/api/v1/payments/orders").json()[0]
+    assert row["refundable"] is True          # ★막지 않는다
+    assert row["refund_blocked"] is None
+    assert row["refund_progress"] == 0        # 완료 강의가 없으니 진행률 0
+    # 진행률 1/3 미만 → 2/3. 금액은 ★정수 연산(float 곱은 1원 내려간다)
+    assert row["refund_amount"] == order.amount * 2 // 3
+
+    # 실제로 취소하면 그 금액만 게이트웨이로 간다
+    called = {}
+
+    def fake_cancel(_self, payment_key, *, reason, idempotency_key, cancel_amount=None):
+        called.update({"key": payment_key, "amount": cancel_amount})
+        return ApprovedPayment(provider_payment_id=payment_key, order_id=order.order_uid,
+                               amount=cancel_amount or order.amount, status="CANCELED")
+
+    monkeypatch.setattr(payments.TossPaymentsGateway, "cancel", fake_cancel)
+    res = ctx["client"].post(f"/api/v1/payments/{order.order_uid}/cancel",
+                             json={"reason": "그냥"})
+    assert res.status_code == 200, res.text
+    # ★부분 환불이므로 결제액이 아니라 견적 금액을 넘겨야 한다
+    assert called["amount"] == order.amount * 2 // 3
+
+
+def test_refund_blocked_when_progress_over_half(payment_context, monkeypatch):
+    """★절반 넘게 들었으면 환불하지 않는다 — 비율 환불에도 상한이 있다."""
+    from app.models import Lecture, LectureWatchProgress
+
+    ctx = payment_context
+    order = _paid_order(ctx, monkeypatch)
+    # 강의 2개 중 1개 완료 → 진행률 1/2 (1/2 이상이면 차단)
+    for i in range(2):
+        lec = Lecture(course_id=ctx["course"].id, title=f"{i + 1}강", subject="일반",
+                      video_ext=".mp4", duration_sec=600, status="active")
+        ctx["db"].add(lec)
+        ctx["db"].flush()
+        ctx["db"].add(LectureWatchProgress(
+            student_id=ctx["student"].id, lecture_id=lec.id,
+            watched_max_sec=payments.REFUND_WATCHED_GRACE_SEC + 30, next_checkpoint_sec=None,
+            checkpoints_passed=0, status="done" if i == 0 else "watching"))
+    ctx["db"].commit()
 
     row = ctx["client"].get("/api/v1/payments/orders").json()[0]
     assert row["refundable"] is False
-    assert row["refund_blocked"] == "already_watched"
+    assert row["refund_blocked"] == "progress_over"
+    assert row["refund_progress"] == 50
 
     # 화면을 우회해 직접 불러도 서버가 막는다
     res = ctx["client"].post(f"/api/v1/payments/{order.order_uid}/cancel",
                              json={"reason": "그냥"})
     assert res.status_code == 403, res.text
-    assert res.json()["detail"]["reason"] == "already_watched"
+    assert res.json()["detail"]["reason"] == "progress_over"
     ctx["db"].expire_all()
     assert ctx["db"].query(CourseOrder).filter(
         CourseOrder.order_uid == order.order_uid).one().status == "paid"

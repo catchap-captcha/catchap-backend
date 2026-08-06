@@ -20,6 +20,33 @@ def _video(tmp_path):
     return p
 
 
+@pytest.fixture(autouse=True)
+def _stub_audio_extract(monkeypatch, tmp_path):
+    """오디오 추출을 대역으로 바꾼다 — ★이 파일의 주제는 HTTP 계약이지 ffmpeg 이 아니다.
+
+    ⚠️2026-08-06 에 '오디오만 전송'이 들어오면서 transcribe_via_worker 가 POST 전에
+    ffmpeg 을 부르게 됐다. 그래서
+      · ffmpeg 이 없는 기계에서는 세그먼트 정규화 시험이 ★엉뚱한 이유로 실패하고
+      · SttError 를 기대하는 시험 둘은 ★엉뚱한 이유로 통과했다
+        (워커 로직이 통째로 망가져도 초록불이 된다 — 시험이 아무것도 안 지킨다)
+    추출을 대역으로 두면 시험이 ★보려던 것만 본다. 추출 자체는 별도 시험에서 본다.
+    """
+    made = tmp_path / "stub.flac"
+    made.write_bytes(b"\x00" * 32)
+    monkeypatch.setattr(stt_client, "_extract_audio", lambda path: made)
+
+
+def test_extract_audio_without_ffmpeg_is_honest_error(tmp_path, monkeypatch):
+    """★ffmpeg 이 없으면 조용히 넘어가지 않고 무엇이 없는지 말한다.
+
+    (이 시험만 대역을 쓰지 않는다 — 추출 자체가 주제다)
+    """
+    monkeypatch.undo()  # autouse 대역 해제
+    monkeypatch.setattr(stt_client.shutil, "which", lambda name: None)
+    with pytest.raises(SttError, match="ffmpeg"):
+        stt_client._extract_audio(_video(tmp_path))
+
+
 def test_transcribe_lecture_prefers_worker(tmp_path, monkeypatch):
     """워커 URL이 있으면 OpenAI가 아니라 워커를 쓴다(우선순위)."""
     called = {}
