@@ -449,3 +449,16 @@ def test_anonymize_student_purges_social_links(client, db, social_env, monkeypat
     assert anonymize_student(db, student) is True
     db.commit()
     assert db.query(SocialAccount).count() == 0
+
+
+def test_kakao_scope_is_configurable(monkeypatch, social_env):
+    """콘솔에서 열어 둔 동의항목만 요청해야 한다 — 권한 없는 scope는 카카오가 거절(KOE205).
+
+    기본값은 닉네임만. 비즈 앱 전환으로 이메일이 열리면 KAKAO_SCOPES로 넣는다."""
+    from app.services.social_auth import build_provider
+
+    st = get_settings()
+    assert "account_email" not in build_provider(st, "kakao").authorize_url(REDIRECT, "s")
+    monkeypatch.setattr(st, "KAKAO_SCOPES", "profile_nickname account_email")
+    url = build_provider(st, "kakao").authorize_url(REDIRECT, "s")
+    assert "scope=profile_nickname+account_email" in url

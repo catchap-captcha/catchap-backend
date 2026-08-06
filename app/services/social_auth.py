@@ -92,9 +92,14 @@ class SocialProvider:
         *,
         client: httpx.Client | None = None,
         timeout: float = 10.0,
+        scope: str | None = None,
     ):
         if not client_id.strip():
             raise SocialAuthError(f"{self.label} 로그인이 아직 설정되지 않았어요.")
+        # 콘솔에서 실제로 열어 둔 동의항목만 요청해야 한다 — 없는 항목을 요청하면
+        # provider가 로그인을 거절한다(카카오 KOE205). 설정으로 덮어쓸 수 있게 둔다.
+        if scope is not None:
+            self.scope = scope.strip()
         self._client_id = client_id.strip()
         self._client_secret = (client_secret or "").strip()
         self._client = client
@@ -184,9 +189,10 @@ class KakaoProvider(SocialProvider):
     authorize_endpoint = "https://kauth.kakao.com/oauth/authorize"
     token_endpoint = "https://kauth.kakao.com/oauth/token"
     profile_endpoint = "https://kapi.kakao.com/v2/user/me"
-    # 이메일은 선택 동의 항목이다 — 미동의로 와도 로그인은 성립해야 하므로 scope로 강제하지
-    # 않는다(강제하면 이메일을 안 주는 사용자가 아예 못 들어온다).
-    scope = "profile_nickname account_email"
+    # ★기본값은 닉네임만이다. 카카오는 이메일(account_email) 동의항목을 **비즈 앱**에만
+    # 열어 주고, 권한 없는 항목을 요청하면 로그인 자체가 거절된다(KOE205). 비즈 앱 전환 후
+    # settings.KAKAO_SCOPES 에 "profile_nickname account_email" 로 넣으면 이메일도 받는다.
+    scope = "profile_nickname"
 
     def fetch_profile(self, access_token: str) -> SocialProfile:
         body = self._profile_body(access_token)
@@ -312,9 +318,13 @@ def is_configured(settings, provider: str) -> bool:
 
 
 def build_provider(settings, provider: str, *, client: httpx.Client | None = None) -> SocialProvider:
-    """provider 어댑터 생성 — 지원하지 않거나 키가 없으면 SocialAuthError."""
+    """provider 어댑터 생성 — 지원하지 않거나 키가 없으면 SocialAuthError.
+
+    {PROVIDER}_SCOPES 설정이 있으면 그 값으로 동의항목 요청을 덮어쓴다(콘솔에서 열어 둔
+    항목과 어긋나면 로그인이 거절되므로 환경별로 맞출 수 있어야 한다)."""
     cls = _CLASSES.get(provider)
     if cls is None:
         raise SocialAuthError("지원하지 않는 소셜 로그인이에요.")
     client_id, client_secret = provider_credentials(settings, provider)
-    return cls(client_id, client_secret, client=client)
+    scope = (getattr(settings, f"{provider.upper()}_SCOPES", "") or "").strip() or None
+    return cls(client_id, client_secret, client=client, scope=scope)

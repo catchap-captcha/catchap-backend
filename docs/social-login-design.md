@@ -119,9 +119,16 @@ provider가 "이 이메일의 소유자가 맞다"고 확인해 주지 않은 �
 
 ## 7. 운영 준비 체크리스트
 
-- [ ] 카카오 개발자 콘솔: 앱 생성 → 카카오 로그인 ON → Redirect URI 등록 →
-      동의항목에서 `profile_nickname`·`account_email`(선택) 설정 → REST API 키를
-      `KAKAO_CLIENT_ID`로. 보안 탭에서 Client Secret을 켰다면 `KAKAO_CLIENT_SECRET`도.
+- [x] **카카오 (2026-08-06 완료)**: 앱 `CATCHAP`(ID 1535749) · 카카오 로그인 ON ·
+      리다이렉트 URI 2개(운영 www.catchap5.com, 로컬 localhost:5173) · 동의항목 닉네임=필수.
+      키는 새 콘솔에서 **앱 설정 → 플랫폼 키 → REST API 키**에 있고, 리다이렉트 URI도
+      그 키의 [수정] 안에 있다(예전 '플랫폼/카카오 로그인' 위치가 아니다).
+      ★**이메일(account_email)은 '권한 없음'** — 카카오는 비즈 앱에만 이메일을 연다.
+      그래서 `KAKAO_SCOPES` 기본값이 `profile_nickname`이고, 카카오 가입자는 이메일 없이
+      `kakao_{uid}` 아이디로 만들어진다(기존 계정 자동 연결도 이메일이 없어 동작하지 않는다).
+      비즈 앱 전환(사업자 정보 또는 개인 개발자 본인인증) 후 동의항목을 열고
+      `KAKAO_SCOPES=profile_nickname account_email` 로 바꾸면 둘 다 살아난다.
+      ★클라이언트 시크릿이 **활성화 ON** 상태라 `KAKAO_CLIENT_SECRET`이 **필수**다.
 - [ ] 네이버 개발자센터: 애플리케이션 등록 → 로그인 오픈 API → Callback URL 등록 →
       Client ID/Secret. 회원이름·이메일·생일 항목 사용 신청.
 - [ ] GCP: OAuth 동의 화면 구성 → 사용자 인증 정보 → OAuth 클라이언트 ID(웹) →

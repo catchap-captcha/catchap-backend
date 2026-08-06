@@ -144,6 +144,12 @@ class Settings(BaseSettings):
     # 비우면 FRONTEND_URL/auth/social/callback 하나만 허용한다.
     # ★provider 콘솔(카카오 개발자·네이버 개발자센터·GCP)에 등록한 값과 반드시 일치해야 한다.
     SOCIAL_REDIRECT_URIS: str = ""
+    # 카카오 동의항목(scope) — 콘솔에서 '사용 안 함/권한 없음'인 항목을 요청하면 카카오가
+    # 로그인 자체를 거절한다(KOE205). 그래서 기본값은 닉네임만이다.
+    # ★이메일(account_email)은 비즈 앱 전환(사업자 정보 또는 개인 개발자 본인인증) 후에야
+    #   동의항목으로 열린다. 열고 나면 여기에 "profile_nickname account_email"로 바꾸면 된다
+    #   — 이메일이 들어오면 기존 계정 자동 연결(검증된 이메일 매칭)도 함께 살아난다.
+    KAKAO_SCOPES: str = "profile_nickname"
 
     @property
     def toss_enabled(self) -> bool:
