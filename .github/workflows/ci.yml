@@ -10,7 +10,7 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20  # 병렬로 2~3분이지만, 러너가 느린 날을 위한 여유
     steps:
       - uses: actions/checkout@v4
 
@@ -28,4 +28,11 @@ jobs:
         env:
           PYTHONPATH: .
           PYTHONIOENCODING: utf-8
-        run: pytest -q
+        # -n auto : 코어 수만큼 프로세스를 나눠 돌린다.
+        #   conftest 의 SQLite 는 in-memory 라 프로세스마다 따로 생긴다 - 서로 안 밟는다.
+        #   0807 실측(32코어): 28분 05초 -> 1분 56초. CI 러너는 코어가 적어 2~3배쯤 된다.
+        #
+        # 왜 하나 - 빠른 것 자체보다 "장애 창에 덜 노출되는 것" 이 크다.
+        #   0807 에 GitHub 러너 배정이 고장나 큐에서 15분 기다리다 잘렸다.
+        #   짧게 끝날수록 그런 창을 덜 맞는다.
+        run: pytest -q -n auto
