@@ -48,6 +48,9 @@ class Course(Base, UUIDPk, Timestamps):
     # 과목 안에서의 코스 정렬(학생 화면: 같은 과목의 코스들 순서). 미지정 시 max+1로 맨 뒤.
     order_no: Mapped[int] = mapped_column(default=0)
     status: Mapped[str] = mapped_column(String(20), default="active")  # active|hidden|deleted
+    # 코스 대표 썸네일 — 강의 없이도 코스 자체에 커버를 달 수 있다(강의 유래 유도보다 우선).
+    # 경로는 lectures/course-thumbnails/{id}{thumbnail_ext}로 유도(경로조작 원천 차단). 없으면 None.
+    thumbnail_ext: Mapped[str | None] = mapped_column(String(10), nullable=True, default=None)
 
 
 class Lecture(Base, UUIDPk, Timestamps):

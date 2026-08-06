@@ -187,11 +187,29 @@ def _thumbnail_url(lec: Lecture) -> str | None:
     return f"/api/v1/lectures/{lec.id}/thumbnail?v={v}"
 
 
+def _course_thumbnail_key(c: Course) -> str:
+    return f"lectures/course-thumbnails/{c.id}{c.thumbnail_ext or ''}"
+
+
+def _course_own_thumbnail_url(c: Course) -> str | None:
+    """코스 자체에 업로드된 대표 썸네일 서빙 경로 — 없으면 None. 강의 유래 유도보다 우선한다.
+    updated_at 캐시버스터(v=)로 교체 시 브라우저가 옛 이미지를 물지 않게 한다."""
+    if not getattr(c, "thumbnail_ext", None):
+        return None
+    v = int(c.updated_at.timestamp()) if getattr(c, "updated_at", None) else 0
+    return f"/api/v1/courses/{c.id}/thumbnail?v={v}"
+
+
 def _course_thumbnail_url(db: Session, course_id: str | None) -> str | None:
-    """코스 대표 썸네일 — 그 코스에서 썸네일이 있는 첫 강의(목차순)의 것을 쓴다. 코스 자체
-    썸네일 컬럼은 없다(강의 목차 첫 화면을 대표로 삼는 인강 표준). 없으면 None."""
+    """코스 대표 썸네일 — 코스 자체 썸네일(있으면 우선), 없으면 썸네일 있는 첫 강의(목차순)의
+    것. 코스 썸네일 기능 도입으로 강의 없는 코스도 커버를 가질 수 있다. 둘 다 없으면 None."""
     if not course_id:
         return None
+    c = db.get(Course, course_id)
+    if c is not None:
+        own = _course_own_thumbnail_url(c)
+        if own:
+            return own
     lec = (
         db.query(Lecture)
         .filter(
@@ -650,7 +668,7 @@ def list_student_courses(
                 "order_no": int(c.order_no or 0),
                 "instructor_name": names.get(c.instructor_id),
                 "lecture_count": len(lec_ids),
-                "thumbnail_url": course_thumb_url.get(c.id),
+                "thumbnail_url": _course_own_thumbnail_url(c) or course_thumb_url.get(c.id),
                 # 가격 — 서버 정본. 프런트는 표시에만 쓰고, 결제 금액은 주문 생성 때 서버가 다시 정한다.
                 "pricing": _course_pricing_row(c),
                 # 수강신청 여부 — true면 '내 코스'(신청함), false면 카탈로그(수강신청/결제 버튼)
@@ -1385,6 +1403,20 @@ def lecture_thumbnail(lecture_id: str, db: Session = Depends(get_db)):
     return media_response(
         _thumbnail_key(lec),
         media_type=_THUMB_MEDIA_TYPES.get(lec.thumbnail_ext, "application/octet-stream"),
+    )
+
+
+@router.get("/courses/{course_id}/thumbnail")
+def course_thumbnail(course_id: str, db: Session = Depends(get_db)):
+    """코스 대표 썸네일 서빙(인라인) — 코스 카드의 <img src>가 로드한다. 강의 썸네일과 동일
+    원칙: 인증 없음(<img>는 Authorization 못 실음), id(UUID)+화이트리스트 확장자로만 경로
+    유도. 코스 자체에 업로드된 썸네일만 여기서 낸다(강의 유래 커버는 강의 썸네일 경로로)."""
+    c = db.get(Course, course_id)
+    if not c or not c.thumbnail_ext:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="썸네일이 없습니다.")
+    return media_response(
+        _course_thumbnail_key(c),
+        media_type=_THUMB_MEDIA_TYPES.get(c.thumbnail_ext, "application/octet-stream"),
     )
 
 
@@ -3702,6 +3734,76 @@ def ops_delete_lecture_thumbnail(
         )
         db.commit()
     return _lecture_row(db, lec)
+
+
+@router.post("/ops/courses/{course_id}/thumbnail")
+def ops_upload_course_thumbnail(
+    course_id: str,
+    file: UploadFile = File(...),
+    principal: Principal = Depends(require_content_author),
+    db: Session = Depends(get_db),
+):
+    """코스 대표 썸네일 업로드(multipart) — 강의 썸네일과 동일 패턴(임시파일 청크 복사 →
+    원자적 이동 → DB commit, 실패 시 파일 미잔존). 파일명은 항상 {course_id}{ext}라 코스당
+    1장(교체는 덮어쓰기). 강의가 없어도 코스에 커버를 달 수 있다. 5MB 상한.
+    소유권: 강사는 자기 코스만(_get_ops_course가 남의 코스를 404로 흘림)."""
+    c = _get_ops_course(db, course_id, principal)  # 소유권 검증(강사=자기 코스만·404)
+    ext = os.path.splitext(file.filename or "")[1].lower()
+    if ext not in _THUMB_MEDIA_TYPES:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST, detail="jpg/png/webp 이미지만 업로드할 수 있습니다."
+        )
+    ct = (file.content_type or "").lower()
+    if ct and not ct.startswith("image/"):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="이미지 파일을 올려주세요.")
+    old_key = _course_thumbnail_key(c) if c.thumbnail_ext else None
+    new_key = f"lectures/course-thumbnails/{c.id}{ext}"
+    tmp = _staging_path(f"cthumb-{c.id}")
+    try:
+        total = _copy_upload_to_tmp(file, tmp, 5 * 1024 * 1024)  # 5MB 상한
+        if total == 0:
+            tmp.unlink(missing_ok=True)
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="빈 파일은 업로드할 수 없습니다.")
+        get_media_storage().save_path(new_key, tmp)
+    except BaseException:
+        tmp.unlink(missing_ok=True)  # 저장 실패 포함 — 임시파일을 남기지 않는다
+        raise
+    if old_key and old_key != new_key:
+        get_media_storage().delete(old_key)  # 확장자가 바뀌면 옛 파일 제거(같은 키면 이미 덮어씀)
+    c.thumbnail_ext = ext
+    audit(
+        db,
+        action="course.thumbnail",
+        actor_user_id=principal.id,
+        target_type="course",
+        target_id=c.id,
+        after={"ext": ext, "bytes": total},
+    )
+    db.commit()
+    return _course_row(db, c)
+
+
+@router.delete("/ops/courses/{course_id}/thumbnail")
+def ops_delete_course_thumbnail(
+    course_id: str,
+    principal: Principal = Depends(require_content_author),
+    db: Session = Depends(get_db),
+):
+    """코스 대표 썸네일 제거 — 코스는 유지하고 커버 이미지만 없앤다(다시 강의 유래 유도/자동
+    커버로 복귀). 파일도 물리 제거(멱등)."""
+    c = _get_ops_course(db, course_id, principal)  # 소유권 검증(강사=자기 코스만·404)
+    if c.thumbnail_ext:
+        get_media_storage().delete(_course_thumbnail_key(c))  # 파일 물리 제거(이미 없어도 무해)
+        c.thumbnail_ext = None
+        audit(
+            db,
+            action="course.thumbnail_delete",
+            actor_user_id=principal.id,
+            target_type="course",
+            target_id=c.id,
+        )
+        db.commit()
+    return _course_row(db, c)
 
 
 @router.delete("/ops/lectures/{lecture_id}/questions/{question_id}/images")
