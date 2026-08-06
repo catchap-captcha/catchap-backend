@@ -46,6 +46,7 @@ jobs:
         run: echo "sha=$(git rev-parse --short=7 HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: 필요한 Secret 이 다 있나 먼저 본다
+        id: gate
         env:
           U: ${{ secrets.CR_USERNAME }}
           P: ${{ secrets.CR_PASSWORD }}
@@ -57,16 +58,32 @@ jobs:
           [ -z "$P" ] && MISS="$MISS CR_PASSWORD"
           [ -z "$K" ] && MISS="$MISS INFRA_DEPLOY_KEY"
           if [ -n "$MISS" ]; then
-            echo "::error::Secret 이 없습니다 →$MISS"
-            echo "저장소 Settings → Secrets and variables → Actions 에서 넣어 주세요."
-            exit 1
+            # ★실패가 아니라 ★건너뜁니다 — 아직 Secret 을 안 넣은 동안 main 이 빨개지지 않게.
+            #   넣으면 그때부터 저절로 돕니다.
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Secret 이 아직 없습니다 →$MISS · 이미지 빌드를 건너뜁니다."
+            {
+              echo "### ⬜아직 준비 중입니다"
+              echo ""
+              echo "다음 Secret 을 넣으면 이 워크플로가 저절로 돕니다."
+              echo ""
+              echo '```'
+              echo "$MISS"
+              echo '```'
+              echo ""
+              echo "저장소 Settings → Secrets and variables → Actions"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
           fi
-          echo "✅ Secret 3개 확인"
+          echo "ready=true" >> "$GITHUB_OUTPUT"
+          echo "Secret 3개 확인"
 
       - name: Buildx 준비
+        if: steps.gate.outputs.ready == 'true'
         uses: docker/setup-buildx-action@v3
 
       - name: 레지스트리 로그인
+        if: steps.gate.outputs.ready == 'true'
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
@@ -74,6 +91,7 @@ jobs:
           password: ${{ secrets.CR_PASSWORD }}
 
       - name: 이미지 만들고 올리기
+        if: steps.gate.outputs.ready == 'true'
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -85,6 +103,7 @@ jobs:
           provenance: false
 
       - name: catchap-infra 받기 (쓰기 키로)
+        if: steps.gate.outputs.ready == 'true'
         run: |
           mkdir -p ~/.ssh && chmod 700 ~/.ssh
           printf '%s\n' "${{ secrets.INFRA_DEPLOY_KEY }}" > ~/.ssh/infra
@@ -95,6 +114,7 @@ jobs:
           test -d infra/.git || { echo "::error::catchap-infra 를 못 받았습니다"; exit 1; }
 
       - name: 매니페스트 태그 갱신
+        if: steps.gate.outputs.ready == 'true'
         id: bump
         env:
           SHA: ${{ steps.tag.outputs.sha }}
@@ -125,7 +145,7 @@ jobs:
           fi
 
       - name: catchap-infra 에 올리기
-        if: steps.bump.outputs.changed == 'true'
+        if: steps.gate.outputs.ready == 'true' && steps.bump.outputs.changed == 'true'
         env:
           SHA: ${{ steps.tag.outputs.sha }}
         run: |
@@ -143,7 +163,7 @@ jobs:
         run: shred -u ~/.ssh/infra 2>/dev/null || rm -f ~/.ssh/infra
 
       - name: 요약
-        if: always()
+        if: steps.gate.outputs.ready == 'true'
         env:
           SHA: ${{ steps.tag.outputs.sha }}
         run: |
