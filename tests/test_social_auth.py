@@ -393,10 +393,28 @@ def test_naver_adapter_rejects_non_success_resultcode():
             NaverProvider("cid", "sec", client=http).login("code", REDIRECT, "state")
 
 
+def test_naver_token_error_is_surfaced():
+    """★네이버는 실패도 HTTP 200 에 error 로 싣는다 — 이걸 삼키면 원인을 못 찾는다.
+
+    (실제로 이 회귀가 있었다: 시크릿/코드 문제가 전부 '토큰을 못 받았어요'로만 보였다)"""
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, json={"error": "invalid_request", "error_description": "no valid data in session"}
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http:
+        with pytest.raises(SocialAuthError, match="invalid_request"):
+            NaverProvider("cid", "sec", client=http).exchange_code("code", REDIRECT, "st")
+
+
 def test_naver_adapter_parses_profile():
     def handler(request: httpx.Request) -> httpx.Response:
         if "token" in request.url.path:
-            assert b"state=st-1" in request.content  # 네이버는 토큰 교환에도 state를 요구
+            # 네이버 토큰 발급은 GET + 쿼리스트링이고 state 를 함께 요구한다
+            assert request.method == "GET"
+            assert request.url.params["state"] == "st-1"
+            assert "redirect_uri" not in request.url.params
             return httpx.Response(200, json={"access_token": "naver-at"})
         return httpx.Response(
             200,

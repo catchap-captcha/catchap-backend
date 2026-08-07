@@ -226,23 +226,34 @@ class NaverProvider(SocialProvider):
     email_verified_default = True
 
     def exchange_code(self, code: str, redirect_uri: str, state: str) -> str:
-        # 네이버 토큰 발급은 state를 함께 요구한다(다른 provider와 다른 유일한 지점).
+        """네이버 토큰 발급 — 공식 규격은 **GET + 쿼리스트링**이다.
+
+        다른 provider(POST form)와 유일하게 다른 지점이 둘 있다:
+        ① state 를 함께 보내야 한다  ② 문서화된 메서드가 GET 이다.
+        redirect_uri 는 네이버 토큰 요청 규격에 없어 보내지 않는다(무시되거나 오류가 된다).
+        """
         body = self._request(
-            "POST",
+            "GET",
             self.token_endpoint,
-            data={
+            params={
                 "grant_type": "authorization_code",
                 "client_id": self._client_id,
                 "client_secret": self._client_secret,
                 "code": code,
                 "state": state,
-                "redirect_uri": redirect_uri,
             },
-            headers={"Content-Type": "application/x-www-form-urlencoded;charset=utf-8"},
         )
         token = str(body.get("access_token") or "")
         if not token:
-            raise SocialAuthError("네이버 인증 토큰을 받지 못했어요.")
+            # ★네이버는 실패도 HTTP 200 에 error/error_description 으로 싣는다. 이 값을 삼키면
+            # "토큰을 못 받았다"만 남아 원인(잘못된 시크릿·만료된 코드·미저장 Callback URL)을
+            # 구분할 수 없다 — 사용자 메시지 끝에 코드를 붙여 진단 가능하게 한다.
+            code_ = str(body.get("error") or "")[:60]
+            desc = str(body.get("error_description") or "")[:120]
+            detail = f" ({code_}{': ' + desc if desc else ''})" if code_ else ""
+            raise SocialAuthError(
+                f"네이버 인증 토큰을 받지 못했어요.{detail}", provider_code=code_ or None
+            )
         return token
 
     def fetch_profile(self, access_token: str) -> SocialProfile:
