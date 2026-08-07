@@ -23,14 +23,24 @@ class SocialAccount(Base, UUIDPk, Timestamps):
 
     __tablename__ = "social_accounts"
     __table_args__ = (
-        # 같은 소셜 계정이 두 학생에 붙지 못하게 DB에서 막는다(계정 탈취 경로 차단).
+        # 같은 소셜 계정이 두 주체에 붙지 못하게 DB에서 막는다(계정 탈취 경로 차단).
         UniqueConstraint("provider", "provider_user_id", name="uq_social_provider_user"),
         # 한 학생이 같은 provider를 두 번 연결하지 못하게.
         UniqueConstraint("student_id", "provider", name="uq_social_student_provider"),
+        # 콘솔 계정도 마찬가지. MySQL은 NULL을 유일성 검사에서 제외하므로, student 행이
+        # 아무리 많아도(user_id가 전부 NULL) 서로 충돌하지 않는다.
+        UniqueConstraint("user_id", "provider", name="uq_social_user_provider"),
     )
 
+    # ★student_id 와 user_id 중 **정확히 하나**만 채운다(주체 판별).
+    # 서비스 계층이 이를 강제한다 — 이 테이블에 쓰는 경로가 _create_link 하나뿐이라
+    # DB CHECK 제약 없이도 불변식이 지켜진다(MySQL 8 미만 호환·마이그레이션 부담 회피).
     # 소프트 참조(FK 없이 인덱스만) — 신규 테이블 규약(collation 정합 회피).
-    student_id: Mapped[str] = mapped_column(CHAR(36), index=True)
+    student_id: Mapped[str | None] = mapped_column(CHAR(36), nullable=True, index=True)
+    # 콘솔 계정(운영자·강사 등) 연결. ★이메일이 같다고 자동으로 붙이지 않는다 —
+    # 본인이 로그인한 상태에서 명시적으로 연결한 경우에만 채워진다(connect).
+    # 고권한 계정을 외부 IdP에 여는 결정이므로 '동의의 증거'가 행 자체다.
+    user_id: Mapped[str | None] = mapped_column(CHAR(36), nullable=True, index=True)
     provider: Mapped[str] = mapped_column(String(20))  # kakao|naver|google
     provider_user_id: Mapped[str] = mapped_column(String(191))
     email: Mapped[str | None] = mapped_column(String(255), nullable=True)

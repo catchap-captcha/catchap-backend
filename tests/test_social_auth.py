@@ -480,3 +480,118 @@ def test_kakao_scope_is_configurable(monkeypatch, social_env):
     monkeypatch.setattr(st, "KAKAO_SCOPES", "profile_nickname account_email")
     url = build_provider(st, "kakao").authorize_url(REDIRECT, "s")
     assert "scope=profile_nickname+account_email" in url
+
+
+# ---------------------------------------------------------------- 콘솔 계정 수동 연결
+def _console_token(client, db, email="ops@test.dev", role="instructor"):
+    """콘솔 계정 생성 + 로그인 토큰. 콘솔 계정은 소셜로 '가입'되지 않으므로 먼저 만들어 둔다."""
+    from app.core.security import hash_password as _hp
+
+    db.add(
+        User(
+            email=email,
+            password_hash=_hp("Password123!"),
+            name="강사",
+            role=role,
+            email_verified_at=datetime.now(),
+        )
+    )
+    db.commit()
+    return client.post(
+        "/api/v1/auth/ops-login", json={"email": email, "password": "Password123!"}
+    ).json()["access_token"]
+
+
+def test_console_account_is_not_auto_linked_but_can_link_manually(client, db, social_env, monkeypatch):
+    """★핵심 불변식 — 콘솔 계정은 이메일이 같아도 자동 연결되지 않는다.
+
+    본인이 로그인한 뒤 명시적으로 연결해야만 소셜 로그인이 열린다. 고권한 계정을 외부
+    IdP에 여는 결정은 '본인의 명시적 행위'로만 만들어져야 한다."""
+    tok = _console_token(client, db, email="staff@test.dev")
+    _stub(monkeypatch, _profile(email="staff@test.dev", email_verified=True))
+
+    # ① 연결 전: 이메일이 같아도 자동 로그인 안 됨 → 연결 방법 안내
+    r = _callback(client, state=_state(client))
+    assert r.status_code == 400 and "설정에서" in r.json()["detail"]
+    assert db.query(SocialAccount).count() == 0
+
+    # ② 로그인한 상태에서 직접 연결
+    linked = client.post(
+        "/api/v1/auth/social/kakao/connect",
+        json={"code": "code-1", "state": _state(client)},
+        headers=auth(tok),
+    )
+    assert linked.status_code == 200, linked.text
+    assert [c["provider"] for c in linked.json()["connections"]] == ["kakao"]
+    assert linked.json()["has_password"] is True  # 콘솔 계정은 항상 비밀번호가 있다
+    link = db.query(SocialAccount).one()
+    assert link.user_id is not None and link.student_id is None  # 주체 판별 불변식
+
+    # ③ 이제 소셜 로그인이 통한다 — 학생이 아니라 콘솔 계정으로
+    body = _callback(client, state=_state(client)).json()
+    assert body["status"] == "logged_in"
+    assert body["student"] is None  # 콘솔 계정이므로 학생 정보 없음
+    me = client.get("/api/v1/auth/me", headers=auth(body["tokens"]["access_token"]))
+    assert me.status_code == 200 and me.json()["role"] == "instructor"
+
+
+def test_console_link_cannot_be_stolen_by_student(client, db, social_env, monkeypatch):
+    """콘솔 계정에 연결된 소셜 계정을 학생이 가져갈 수 없다(그 반대도 마찬가지)."""
+    ctok = _console_token(client, db, email="staff2@test.dev")
+    _stub(monkeypatch, _profile(provider="google", provider_user_id="g-share"))
+    client.post(
+        "/api/v1/auth/social/google/connect",
+        json={"code": "code-1", "state": _state(client, "google")},
+        headers=auth(ctok),
+    )
+    stok = _social_login(client, db, monkeypatch, _profile(provider_user_id="kakao-x"))
+
+    _stub(monkeypatch, _profile(provider="google", provider_user_id="g-share"))
+    r = client.post(
+        "/api/v1/auth/social/google/connect",
+        json={"code": "code-1", "state": _state(client, "google")},
+        headers=auth(stok),
+    )
+    assert r.status_code == 409
+
+
+def test_console_account_is_never_created_by_social(client, db, social_env, monkeypatch):
+    """소셜로는 콘솔 계정이 만들어지지 않는다 — 권한을 자동으로 부여하지 않는다."""
+    _stub(monkeypatch, _profile(email="newbie@test.dev"))
+    body = _callback(client, state=_state(client)).json()
+    assert body["status"] == "signup_required"  # 콘솔이 아니라 '학생 가입'으로 흐른다
+    client.post(
+        "/api/v1/auth/social/signup",
+        json={"signup_token": body["signup_token"], "birth_date": "1995-01-01"},
+    )
+    assert db.query(User).count() == 0 and db.query(StudentProfile).count() == 1
+
+
+def test_console_can_disconnect_last_link(client, db, social_env, monkeypatch):
+    """콘솔 계정은 비밀번호가 있으므로 마지막 연결도 해제할 수 있다(학생과 다른 지점)."""
+    tok = _console_token(client, db, email="staff3@test.dev")
+    _stub(monkeypatch, _profile(provider_user_id="kakao-c3"))
+    client.post(
+        "/api/v1/auth/social/kakao/connect",
+        json={"code": "code-1", "state": _state(client)},
+        headers=auth(tok),
+    )
+    r = client.delete("/api/v1/auth/social/kakao", headers=auth(tok))
+    assert r.status_code == 200 and r.json()["connections"] == []
+
+
+def test_disabled_console_account_cannot_login_via_social(client, db, social_env, monkeypatch):
+    """정지된 콘솔 계정이 소셜 경로로 우회 입장하지 못한다 — 연결은 남아 있어도 막힌다."""
+    tok = _console_token(client, db, email="staff4@test.dev")
+    _stub(monkeypatch, _profile(provider_user_id="kakao-c4"))
+    client.post(
+        "/api/v1/auth/social/kakao/connect",
+        json={"code": "code-1", "state": _state(client)},
+        headers=auth(tok),
+    )
+    user = db.query(User).filter(User.email == "staff4@test.dev").one()
+    user.status = "disabled"
+    db.commit()
+
+    _stub(monkeypatch, _profile(provider_user_id="kakao-c4"))
+    assert _callback(client, state=_state(client)).status_code == 403
