@@ -44,8 +44,10 @@ def _fake_http(*, catalog, values, token="tok-abc"):
         calls.append(url)
         if url.endswith("/auth/tokens"):
             return _Resp({}, {"X-Subject-Token": token})
-        if url.endswith("/api/v1/secrets"):
-            return _Resp({"secrets": catalog})
+        # ★목록 주소에는 ?limit=&offset= 이 붙는다 (페이지 넘기기 때문)
+        if "/api/v1/secrets" in url and "/versions/" not in url:
+            return _Resp({"secrets": catalog,
+                          "pagination": {"offset": 0, "limit": 100, "total": len(catalog)}})
         for name, sid, payload in values:
             if f"/secrets/{sid}/versions/" in url:
                 return _Resp(payload)
@@ -306,3 +308,90 @@ def test_실패하면_결과가_안_남는다(monkeypatch):
 def test_로거_이름이_catchap_아래여야_한다():
     """★catchap.* 가 아니면 root(WARNING)로 떨어져 INFO 가 버려진다."""
     assert sl.logger.name.startswith("catchap.")
+
+
+# ── ⑧ 목록이 여러 장으로 나뉘어 올 때 ─────────────────────────────────────
+#
+# ★★2026-08-07 실제로 터질 뻔한 것. 이 API 는 한 번에 ★10건만 준다.
+#     {"pagination": {"offset": 0, "limit": 10, "total": 11}, "secrets": [...10건...]}
+#   시크릿을 8개에서 11개로 늘린 날 이 선을 넘었고, 첫 장만 읽던 로더가
+#   11번째(catchap-portone-keys)를 "없는 것"으로 보고 예외를 던졌다.
+#   ★파드가 재시작되는 순간 백엔드 전체가 못 뜨는 상태였다.
+
+def _paged_http(pages, values, token="tok"):
+    """secrets 목록을 여러 장으로 나눠서 주는 가짜 _http."""
+    calls = []
+
+    def http(url, *, method="GET", body=None, headers=None):
+        calls.append(url)
+        if url.endswith("/auth/tokens"):
+            return _Resp({}, {"X-Subject-Token": token})
+        if "/api/v1/secrets?" in url:
+            import urllib.parse as up
+            q = up.parse_qs(up.urlparse(url).query)
+            off = int(q.get("offset", ["0"])[0])
+            flat = [s for pg in pages for s in pg]
+            page = flat[off:off + 10]          # ★서버가 limit 을 무시하고 10건만 준다
+            return _Resp({"secrets": page,
+                          "pagination": {"offset": off, "limit": 10, "total": len(flat)}})
+        for name, sid, payload in values:
+            if f"/secrets/{sid}/versions/" in url:
+                return _Resp(payload)
+        raise AssertionError(f"예상 못 한 요청: {url}")
+
+    http.calls = calls
+    return http
+
+
+def _many(n):
+    return [{"name": f"s-{i:02d}", "id": f"sid-{i:02d}", "default_version": "v1"} for i in range(n)]
+
+
+def test_목록이_11건이면_두_번째_장까지_읽는다(monkeypatch):
+    """★첫 장만 읽으면 11번째를 못 찾는다 — 이것이 실제로 일어난 일이다."""
+    catalog = _many(11)
+    last = catalog[-1]["name"]                 # s-10 — 두 번째 장에만 있다
+    monkeypatch.setattr(sl, "_http", _paged_http(
+        [catalog],
+        values=[(last, "sid-10", {"version": {"secret": {"JWT_SECRET_KEY": "j"}}})],
+    ))
+    env = _env(SECRETS_NAMES=last)
+    r = sl.load_secrets_into_env(env)          # 첫 장만 읽으면 여기서 예외가 난다
+    assert r.secrets_read == [last]
+    assert env["JWT_SECRET_KEY"] == "j"
+
+
+def test_장이_여러_개여도_전부_모은다(monkeypatch):
+    catalog = _many(35)
+    http = _paged_http([catalog], values=[
+        ("s-34", "sid-34", {"version": {"secret": {"JWT_SECRET_KEY": "a"}}}),
+        ("s-00", "sid-00", {"version": {"secret": {"SMTP_APP_PASSWORD": "b"}}}),
+    ])
+    monkeypatch.setattr(sl, "_http", http)
+    env = _env(SECRETS_NAMES="s-00,s-34")
+    r = sl.load_secrets_into_env(env)
+    assert sorted(r.secrets_read) == ["s-00", "s-34"]
+    # ★목록 요청이 여러 번 나갔는지 (한 번만 나갔으면 페이지를 안 넘긴 것)
+    assert len([u for u in http.calls if "/api/v1/secrets?" in u]) >= 4
+
+
+def test_못_찾으면_몇_건을_봤는지_말해_준다(monkeypatch):
+    """★「없다」만 말하면 페이지가 잘린 것인지 진짜 없는 것인지 구분이 안 된다."""
+    monkeypatch.setattr(sl, "_http", _paged_http([_many(11)], values=[]))
+    with pytest.raises(sl.SecretsLoadError) as e:
+        sl.load_secrets_into_env(_env(SECRETS_NAMES="없는-시크릿"))
+    msg = str(e.value)
+    assert "없는-시크릿" in msg and "11건" in msg
+
+
+def test_페이지_정보가_없어도_동작한다(monkeypatch):
+    """옛 응답 모양(배열만) 대비."""
+    def http(url, *, method="GET", body=None, headers=None):
+        if url.endswith("/auth/tokens"):
+            return _Resp({}, {"X-Subject-Token": "t"})
+        if "/api/v1/secrets?" in url:
+            return _Resp([{"name": "only", "id": "sid-1", "default_version": "v1"}])
+        return _Resp({"version": {"secret": {"JWT_SECRET_KEY": "j"}}})
+    monkeypatch.setattr(sl, "_http", http)
+    env = _env(SECRETS_NAMES="only")
+    assert sl.load_secrets_into_env(env).secrets_read == ["only"]

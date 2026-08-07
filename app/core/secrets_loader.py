@@ -170,6 +170,44 @@ def _remember(result: LoadResult) -> LoadResult:
     return result
 
 
+def _list_secrets(sm: str, headers: dict) -> list[dict]:
+    """시크릿 목록을 ★끝까지 가져온다.
+
+    ⚠️★★이 API 는 한 번에 ★10건만 준다 (2026-08-07 실측).
+
+        {"pagination": {"offset": 0, "limit": 10, "total": 11}, "secrets": [...10건...]}
+
+    첫 장만 읽으면 11번째 시크릿이 "없는 것"이 되어 ★기동이 막힌다.
+    실제로 그렇게 됐다 — 시크릿을 8개에서 11개로 늘린 날 바로 이 선을 넘었고,
+    `catchap-portone-keys` 가 목록에서 빠져 "찾을 수 없습니다" 로 죽을 상태였다.
+    (마침 파드가 안 뜨는 시점이라 서비스는 안 끊겼지만, ★재시작 한 번이면 전부 죽었다.)
+
+    ★`limit` 을 크게 줘도 되지만 그것만 믿지 않는다 — 서버가 조용히 잘라도 알 수 없다.
+      `pagination.total` 에 닿을 때까지 `offset` 을 넘겨서 ★센 개수로 확인한다.
+    """
+    out: list[dict] = []
+    seen: set = set()
+    offset = 0
+    for _ in range(50):                      # 무한 루프 방지 (100건×50 = 5000건까지)
+        body = json.load(_http(f"{sm}/api/v1/secrets?limit=100&offset={offset}", headers=headers))
+        if isinstance(body, list):           # 페이지 정보 없이 배열만 주는 경우 대비
+            page, total = body, len(body)
+        else:
+            page = body.get("secrets") or []
+            total = (body.get("pagination") or {}).get("total")
+        if not isinstance(page, list) or not page:
+            break
+        for item in page:
+            name = item.get("name") if isinstance(item, dict) else None
+            if name and name not in seen:
+                seen.add(name)
+                out.append(item)
+        offset += len(page)
+        if not isinstance(total, int) or offset >= total:
+            break
+    return out
+
+
 def load_secrets_into_env(environ: dict | None = None) -> LoadResult:
     """Secrets Manager를 읽어 환경변수로 주입한다. 기본값(none)이면 아무것도 안 한다."""
     env = os.environ if environ is None else environ
@@ -199,14 +237,15 @@ def load_secrets_into_env(environ: dict | None = None) -> LoadResult:
     sm = (env.get("SECRETS_ENDPOINT") or _SM_DEFAULT).rstrip("/")
     headers = {"X-Auth-Token": _token(iam, access_key, secret_key)}
 
-    listing = json.load(_http(f"{sm}/api/v1/secrets", headers=headers))
-    catalog = listing.get("secrets", listing if isinstance(listing, list) else [])
+    catalog = _list_secrets(sm, headers)
     by_name = {s.get("name"): s for s in catalog if isinstance(s, dict)}
 
     unknown = [n for n in names if n not in by_name]
     if unknown:
+        # ★목록을 몇 건 봤는지 같이 말한다 — 페이지가 잘렸는지 바로 알 수 있게.
         raise SecretsLoadError(
             "SECRETS_NAMES에 있는 시크릿을 찾을 수 없습니다: " + ", ".join(unknown)
+            + f" (목록 {len(by_name)}건을 확인했습니다)"
         )
 
     result = LoadResult(backend=backend)
