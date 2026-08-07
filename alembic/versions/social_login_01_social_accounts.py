@@ -1,7 +1,7 @@
 """소셜 로그인 연결 — social_accounts
 
 Revision ID: social_login_01
-Revises: student_interests_01
+Revises: course_thumbnail_01
 Create Date: 2026-08-06
 
 카카오·네이버·구글 계정을 학생 계정에 연결한다. (provider, provider_user_id)가 유일키라
@@ -20,7 +20,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "social_login_01"
-down_revision: Union[str, None] = "student_interests_01"
+down_revision: Union[str, None] = "course_thumbnail_01"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
