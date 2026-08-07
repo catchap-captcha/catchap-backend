@@ -13,9 +13,19 @@ from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from app.api.v1.router import api_router
 from app.core.config import get_settings
 from app.core.logging_config import setup_logging
+from app.core import secrets_loader
 
 setup_logging()  # 모든 모듈 로거 일관 초기화 (조용한 실패 방지)
 settings = get_settings()
+
+# ★비밀값을 어디서 읽었는지 기동 로그에 남긴다.
+#   로더는 setup_logging() 안에서(=로그 설정 전에) 이미 끝나므로 여기서 찍어야 보인다.
+#   ⚠️제일 위험한 경우는 SECRETS_BACKEND 가 없어서 로더가 ★조용히 아무것도 안 한 것이다.
+#   그때도 이 줄이 「미사용」이라고 말해 준다.
+_secrets = secrets_loader.last_result()
+logging.getLogger("catchap.main").info(
+    "%s", _secrets.summary() if _secrets else "Secrets Manager 로더가 실행되지 않았습니다"
+)
 
 
 def _collect_cluster_metrics_once(interval_sec: int) -> None:
