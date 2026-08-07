@@ -225,6 +225,15 @@ def callback(
         .first()
     )
     if link is not None:
+        if link.user_id:
+            # 콘솔 계정 연결 — 본인이 로그인한 상태에서 직접 연결한 행만 여기 온다.
+            # (이메일 일치로는 절대 만들어지지 않는다 — connect 경로에서만 생성)
+            user = db.get(User, link.user_id)
+            if user is None or user.status == "disabled":
+                raise HTTPException(
+                    status.HTTP_403_FORBIDDEN, detail="이용할 수 없는 계정이에요. 고객센터로 문의해 주세요."
+                )
+            return _console_login_result(db, user, link, profile)
         student = db.get(StudentProfile, link.student_id)
         if student is None or student.status == "disabled":
             raise HTTPException(
@@ -246,10 +255,16 @@ def callback(
             db.query(User.id).filter(func.lower(User.email) == profile.email).first() is not None
         )
         if console_user:
-            # 운영자·강사 계정은 소셜 로그인 대상이 아니다(고권한 계정을 소셜 공격면에 두지 않는다).
+            # ★콘솔 계정은 이메일이 같아도 자동으로 붙이지 않는다. 고권한 계정을 외부 IdP에
+            # 여는 결정은 본인이 인증된 상태에서 명시적으로 해야 한다 — 그렇게 만들어진
+            # 연결(link.user_id)이 있으면 위에서 이미 로그인 처리됐다. 여기 온다는 것은
+            # 아직 연결한 적이 없다는 뜻이므로, 연결 방법을 안내한다.
             raise HTTPException(
                 status.HTTP_400_BAD_REQUEST,
-                detail="이 이메일은 콘솔 계정으로 사용 중이에요. 이메일 로그인을 이용해 주세요.",
+                detail=(
+                    "이 이메일은 콘솔 계정으로 사용 중이에요. 이메일로 로그인한 뒤 "
+                    "설정에서 소셜 계정을 연결하면 다음부터 소셜 로그인을 쓸 수 있어요."
+                ),
             )
         if existing is not None and not profile.email_verified:
             # provider가 이메일 소유를 확인해 주지 않았다 — 자동 연결하면 남의 계정을
@@ -262,7 +277,7 @@ def callback(
                 ),
             )
         if existing is not None:
-            new_link = _create_link(db, existing.id, profile)
+            new_link = _create_link(db, profile, student_id=existing.id)
             return _login_result(db, existing, new_link, profile, linked_now=True)
 
     return {
@@ -279,9 +294,19 @@ def callback(
     }
 
 
-def _create_link(db: Session, student_id: str, profile: SocialProfile) -> SocialAccount:
+def _create_link(
+    db: Session,
+    profile: SocialProfile,
+    *,
+    student_id: str | None = None,
+    user_id: str | None = None,
+) -> SocialAccount:
+    """연결 행 생성 — student_id 와 user_id 중 정확히 하나만 채운다(모델 주석의 불변식)."""
+    if bool(student_id) == bool(user_id):
+        raise ValueError("student_id 와 user_id 중 정확히 하나만 지정해야 한다")
     link = SocialAccount(
         student_id=student_id,
+        user_id=user_id,
         provider=profile.provider,
         provider_user_id=profile.provider_user_id,
         email=profile.email,
@@ -334,6 +359,29 @@ def _login_result(
             "nickname": student.nickname,
             "student_code": student.student_code,
         },
+    }
+
+
+def _console_login_result(
+    db: Session, user: User, link: SocialAccount, profile: SocialProfile
+) -> dict:
+    """콘솔 계정(운영자·강사 등) 소셜 로그인 — 연결된 계정만 여기 도달한다.
+
+    학생과 달리 **가입 경로가 없다**: 연결된 계정이 없으면 callback 이 400 으로 안내하고
+    끝난다. 콘솔 계정은 소셜로 새로 만들어지지 않는다(권한을 자동으로 부여하지 않는다).
+    토큰의 role 은 계정의 실제 역할이라, 로그인하면 각자 콘솔로 들어간다."""
+    now = _now()
+    link.last_login_at = now
+    if profile.email and link.email != profile.email:
+        link.email = profile.email
+        link.email_verified = profile.email_verified
+    db.commit()
+    return {
+        "status": "logged_in",
+        "provider": profile.provider,
+        "tokens": auth_service.issue_tokens(db, user.id, user.role, "user"),
+        "linked_now": False,
+        "student": None,
     }
 
 
@@ -448,15 +496,32 @@ def signup(db: Session, req: s.SocialSignupRequest) -> dict:
 
 
 # ---------------------------------------------------------------- 연결 관리(로그인 후)
-def connections(db: Session, student: StudentProfile) -> dict:
+def _subject_filter(principal):
+    """이 주체의 연결 행을 고르는 조건 — 학생이면 student_id, 콘솔 계정이면 user_id."""
+    if principal.kind == "student":
+        return SocialAccount.student_id == principal.id
+    return SocialAccount.user_id == principal.id
+
+
+def _subject_has_password(principal) -> bool:
+    """비밀번호 로그인이 가능한 주체인가 — 마지막 연결 해제를 허용할지의 판단 근거.
+
+    콘솔 계정은 항상 비밀번호로 들어올 수 있다(소셜 전용 콘솔 계정은 만들어지지 않는다).
+    소셜 전용은 학생만 존재한다."""
+    if principal.kind == "student":
+        return has_password(principal.student)
+    return True
+
+
+def connections(db: Session, principal) -> dict:
     rows = (
         db.query(SocialAccount)
-        .filter(SocialAccount.student_id == student.id)
+        .filter(_subject_filter(principal))
         .order_by(SocialAccount.created_at)
         .all()
     )
     return {
-        "has_password": has_password(student),
+        "has_password": _subject_has_password(principal),
         "connections": [
             {
                 "provider": r.provider,
@@ -473,7 +538,7 @@ def connections(db: Session, student: StudentProfile) -> dict:
 
 def connect(
     db: Session,
-    student: StudentProfile,
+    principal,
     provider: str,
     *,
     code: str,
@@ -482,8 +547,9 @@ def connect(
 ) -> dict:
     """로그인한 상태에서 소셜 계정을 추가 연결한다(계정 설정 화면).
 
-    콜백과 달리 '누구의 계정인가'가 이미 정해져 있으므로 이메일 검증 여부를 따지지 않는다 —
-    본인이 로그인한 채로 본인의 소셜 계정에 동의한 것이기 때문이다."""
+    학생·콘솔 계정 모두 이 경로를 쓴다. 콜백과 달리 '누구의 계정인가'가 이미 정해져 있으므로
+    이메일 검증 여부를 따지지 않는다 — 본인이 로그인한 채로 본인의 소셜 계정에 동의한 것이기
+    때문이다. ★콘솔 계정이 소셜 로그인을 쓸 수 있는 **유일한** 통로가 여기다(자동 연결 없음)."""
     _assert_supported(provider)
     redirect_uri = verify_state(state, provider)
     adapter = _adapter(provider, client)
@@ -500,41 +566,44 @@ def connect(
         )
         .first()
     )
-    if existing is not None and existing.student_id != student.id:
+    mine = existing is not None and (
+        existing.student_id == principal.id or existing.user_id == principal.id
+    )
+    if existing is not None and not mine:
         raise HTTPException(
             status.HTTP_409_CONFLICT,
             detail=f"이 {PROVIDER_LABELS[provider]} 계정은 다른 계정에 연결돼 있어요.",
         )
     if existing is None:
-        if (
-            db.query(SocialAccount)
-            .filter(SocialAccount.student_id == student.id, SocialAccount.provider == provider)
-            .first()
-            is not None
-        ):
+        if db.query(SocialAccount).filter(
+            _subject_filter(principal), SocialAccount.provider == provider
+        ).first() is not None:
             raise HTTPException(
                 status.HTTP_409_CONFLICT,
                 detail=f"이미 {PROVIDER_LABELS[provider]} 계정이 연결돼 있어요.",
             )
-        _create_link(db, student.id, profile)
+        if principal.kind == "student":
+            _create_link(db, profile, student_id=principal.id)
+        else:
+            _create_link(db, profile, user_id=principal.id)
         db.commit()
-    return connections(db, student)
+    return connections(db, principal)
 
 
-def disconnect(db: Session, student: StudentProfile, provider: str) -> dict:
+def disconnect(db: Session, principal, provider: str) -> dict:
     link = (
         db.query(SocialAccount)
-        .filter(SocialAccount.student_id == student.id, SocialAccount.provider == provider)
+        .filter(_subject_filter(principal), SocialAccount.provider == provider)
         .first()
     )
     if link is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="연결된 계정이 없어요.")
     others = (
         db.query(SocialAccount)
-        .filter(SocialAccount.student_id == student.id, SocialAccount.id != link.id)
+        .filter(_subject_filter(principal), SocialAccount.id != link.id)
         .count()
     )
-    if others == 0 and not has_password(student):
+    if others == 0 and not _subject_has_password(principal):
         # 마지막 로그인 수단을 끊으면 계정에 다시 못 들어온다 — 비밀번호부터 만들게 한다.
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
@@ -542,4 +611,4 @@ def disconnect(db: Session, student: StudentProfile, provider: str) -> dict:
         )
     db.delete(link)
     db.commit()
-    return connections(db, student)
+    return connections(db, principal)

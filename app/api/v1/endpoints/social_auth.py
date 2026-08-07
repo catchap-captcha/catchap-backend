@@ -8,8 +8,9 @@
   POST   /auth/social/{provider}/connect   로그인 상태에서 소셜 계정 추가 연결
   DELETE /auth/social/{provider}           연결 해제 (마지막 로그인 수단이면 거절)
 
-운영자·강사(콘솔 계정)는 소셜 로그인 대상이 아니다 — 고권한 계정을 외부 IdP 공격면에
-두지 않는다는 기존 방침(운영자 전용 /auth/ops-login 분리)과 같은 이유다.
+콘솔 계정(운영자·강사)은 **자동 연결 대상이 아니다** — 이메일이 같아도 붙이지 않는다.
+다만 본인이 비밀번호로 로그인한 뒤 /connect 로 명시적으로 연결하면 그때부터 소셜 로그인을
+쓸 수 있다. 고권한 계정을 외부 IdP에 여는 결정을 '본인의 명시적 행위'로만 만드는 설계다.
 
 판정 로직은 services/social_login_service.py, provider HTTP 규격은 services/social_auth.py.
 """
@@ -17,7 +18,7 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy.orm import Session
 
-from app.core.permissions import Principal, require_student
+from app.core.permissions import Principal, get_current_principal
 from app.db.session import get_db
 from app.schemas import auth as s
 from app.services import auth_service, social_login_service
@@ -32,9 +33,8 @@ def _client_ip(request: Request) -> str:
     return request.client.host if request.client else "unknown"
 
 
-def _me(principal: Principal):
-    assert principal.student is not None
-    return principal.student
+def _subject_label(principal: Principal) -> str:
+    return "학생" if principal.kind == "student" else "콘솔 계정"
 
 
 @router.get("/providers")
@@ -45,9 +45,10 @@ def providers():
 
 @router.get("/connections")
 def my_connections(
-    principal: Principal = Depends(require_student), db: Session = Depends(get_db)
+    principal: Principal = Depends(get_current_principal), db: Session = Depends(get_db)
 ):
-    return social_login_service.connections(db, _me(principal))
+    """내 소셜 연결 목록 — 학생·콘솔 계정 공용."""
+    return social_login_service.connections(db, principal)
 
 
 @router.post("/signup", response_model=s.SocialLoginResponse)
@@ -85,21 +86,23 @@ def callback(
 def connect(
     provider: str,
     req: s.SocialCallbackRequest,
-    principal: Principal = Depends(require_student),
+    principal: Principal = Depends(get_current_principal),
     db: Session = Depends(get_db),
 ):
-    """로그인한 계정에 소셜 계정을 추가 연결한다(계정 설정 화면)."""
+    """로그인한 계정에 소셜 계정을 추가 연결한다(계정 설정 화면).
+
+    ★콘솔 계정이 소셜 로그인을 쓸 수 있게 되는 유일한 통로다 — 자동 연결은 없다."""
     return social_login_service.connect(
-        db, _me(principal), provider, code=req.code, state=req.state
+        db, principal, provider, code=req.code, state=req.state
     )
 
 
 @router.delete("/{provider}")
 def disconnect(
     provider: str,
-    principal: Principal = Depends(require_student),
+    principal: Principal = Depends(get_current_principal),
     db: Session = Depends(get_db),
 ):
     if provider not in [p["provider"] for p in social_login_service.available_providers()]:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="지원하지 않는 소셜 로그인이에요.")
-    return social_login_service.disconnect(db, _me(principal), provider)
+    return social_login_service.disconnect(db, principal, provider)
