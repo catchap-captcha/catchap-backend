@@ -110,7 +110,7 @@ jobs:
           chmod 600 ~/.ssh/infra
           ssh-keyscan -t ed25519 github.com >> ~/.ssh/known_hosts 2>/dev/null
           GIT_SSH_COMMAND="ssh -i ~/.ssh/infra -o IdentitiesOnly=yes" \
-            git clone --quiet --depth 1 git@github.com:catchap-captcha/catchap-infra.git infra
+            git clone --quiet git@github.com:catchap-captcha/catchap-infra.git infra
           test -d infra/.git || { echo "::error::catchap-infra 를 못 받았습니다"; exit 1; }
 
       - name: 매니페스트 태그 갱신
@@ -155,8 +155,27 @@ jobs:
           git add "$MANIFEST"
           git commit -q -m "ci(deploy): backend 이미지를 ${SHA} 로" \
                         -m "${GITHUB_REPOSITORY}@${GITHUB_SHA} 가 main 에 들어와 만든 이미지다. ArgoCD 가 이 커밋을 보고 반영한다."
-          GIT_SSH_COMMAND="ssh -i ~/.ssh/infra -o IdentitiesOnly=yes" git push -q origin HEAD:main
-          echo "✅ catchap-infra 갱신 — backend → ${SHA}"
+          # ★다른 저장소가 같은 때 병합되면 이 push 가 거절된다(non-fast-forward).
+          #   concurrency 는 ★저장소 안에서만 겹침을 막아 주므로
+          #   저장소끼리의 경쟁은 여기서 따로 견딜야 한다.
+          #   ★우리는 이미지 줄 한 줄만 고치므로 다시 얹으면 그대로 맞는다.
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/infra -o IdentitiesOnly=yes"
+          for i in 1 2 3 4 5; do
+            if git push -q origin HEAD:main; then
+              echo "✅ catchap-infra 갱신 — backend → ${SHA}"
+              exit 0
+            fi
+            echo "  push 거절 — 다른 저장소가 먼저 넣은 것으로 보고 다시 얹습니다 ($i/5)"
+            git fetch -q origin main || { echo "::error::catchap-infra fetch 실패"; exit 1; }
+            git rebase -q origin/main || {
+              git rebase --abort 2>/dev/null
+              echo "::error::rebase 충돌 — 손으로 봐야 합니다"
+              exit 1
+            }
+            sleep $((i * 3))
+          done
+          echo "::error::5번 시도했는데 catchap-infra 에 push 가 안 됩니다"
+          exit 1
 
       - name: 뒷정리
         if: always()
