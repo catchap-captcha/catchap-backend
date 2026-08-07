@@ -33,7 +33,25 @@ def anonymize_student(db: Session, student: StudentProfile) -> bool:
     student.password_hash = ""  # 로그인 불가
     student.class_id = None  # 학급 명단에서 제외
     student.status = "disabled"
+    _purge_social_accounts(db, student.id)
     return True
+
+
+def _purge_social_accounts(db: Session, student_id: str) -> None:
+    """소셜 로그인 연결 파기 — 연결 행에 provider 이메일(식별 PII) 사본이 있다.
+
+    로그인 자체는 status='disabled'로 이미 막히지만, 파기 대상 PII가 남으면 안 된다.
+    연결을 지우면 같은 소셜 계정으로 새로 가입할 수 있다(탈퇴 후 재가입 = 새 계정) —
+    이는 의도된 동작이다. 테이블이 아직 없는 배포 창(DDL 미적용)에서는 익명화 자체가
+    실패하면 안 되므로 조용히 건너뛴다(record_class_assignment와 같은 규약)."""
+    from app.models import SocialAccount
+
+    try:
+        db.query(SocialAccount).filter(SocialAccount.student_id == student_id).delete(
+            synchronize_session=False
+        )
+    except Exception:
+        db.rollback()
 
 
 def anonymize_user(db: Session, user: User) -> bool:

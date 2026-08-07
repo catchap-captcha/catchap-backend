@@ -127,6 +127,30 @@ class Settings(BaseSettings):
     PAYMENT_FAIL_URL: str = ""
     PAYMENT_CANCEL_URL: str = ""
 
+    # 소셜 로그인(카카오·네이버·구글) — 학생 계정 전용, 인가 코드 그랜트.
+    # client_id는 authorize URL에 들어가는 공개값이고, client_secret은 서버 전용이다
+    # (토큰 교환에만 쓰고 응답에 절대 싣지 않는다). 구글은 secret이 필수, 카카오는
+    # '보안' 설정에서 켠 경우에만 필요, 네이버는 필수다.
+    # 값이 비면 그 provider는 자동으로 비활성(버튼 미노출 + 호출 시 503)이다 —
+    # 키 없이 동작하는 척하지 않는다(가짜 성공 금지).
+    KAKAO_CLIENT_ID: str = ""
+    KAKAO_CLIENT_SECRET: str = ""
+    NAVER_CLIENT_ID: str = ""
+    NAVER_CLIENT_SECRET: str = ""
+    GOOGLE_CLIENT_ID: str = ""
+    GOOGLE_CLIENT_SECRET: str = ""
+    # 콜백을 받을 프론트 주소 허용목록(쉼표 구분). 여기 없는 redirect_uri는 400으로 거절한다
+    # — 없으면 공격자가 자기 사이트로 인가 코드를 흘릴 수 있다(오픈 리다이렉트).
+    # 비우면 FRONTEND_URL/auth/social/callback 하나만 허용한다.
+    # ★provider 콘솔(카카오 개발자·네이버 개발자센터·GCP)에 등록한 값과 반드시 일치해야 한다.
+    SOCIAL_REDIRECT_URIS: str = ""
+    # 카카오 동의항목(scope) — 콘솔에서 '사용 안 함/권한 없음'인 항목을 요청하면 카카오가
+    # 로그인 자체를 거절한다(KOE205). 그래서 기본값은 닉네임만이다.
+    # ★이메일(account_email)은 비즈 앱 전환(사업자 정보 또는 개인 개발자 본인인증) 후에야
+    #   동의항목으로 열린다. 열고 나면 여기에 "profile_nickname account_email"로 바꾸면 된다
+    #   — 이메일이 들어오면 기존 계정 자동 연결(검증된 이메일 매칭)도 함께 살아난다.
+    KAKAO_SCOPES: str = "profile_nickname"
+
     @property
     def toss_enabled(self) -> bool:
         """실제 토스 결제 경로 활성 여부 — 두 키가 모두 있어야 승인 검증이 가능하다."""
@@ -148,6 +172,15 @@ class Settings(BaseSettings):
             and bool(self.PORTONE_CHANNEL_KEY.strip())
             and bool(self.PORTONE_API_SECRET.strip())
         )
+
+    @property
+    def social_providers_enabled(self) -> list[str]:
+        """설정이 끝난 소셜 provider 키 목록 — client_id가 있으면 사용 가능으로 본다."""
+        return [
+            p
+            for p in ("kakao", "naver", "google")
+            if (getattr(self, f"{p.upper()}_CLIENT_ID", "") or "").strip()
+        ]
 
     @property
     def payment_mock_enabled(self) -> bool:
