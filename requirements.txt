@@ -12,6 +12,7 @@ email-validator>=2.2
 python-multipart>=0.0.17
 httpx>=0.27
 pytest>=8.3
+pytest-xdist>=3.8      # 시험 병렬 실행 — CI 시간을 줄여 장애 창에 덜 노출된다
 sentry-sdk>=2.0
 psutil>=5.9  # 서버 모니터링 self-collect(CPU/메모리/디스크) — host_metrics가 사용
 # 미디어 오브젝트 스토리지(카카오클라우드 Object Storage · S3 호환 API). 왜 필요한가:
