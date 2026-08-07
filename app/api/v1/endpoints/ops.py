@@ -2570,6 +2570,11 @@ def ops_ai_runtime_config(
 # 강사(instructor)는 공개 가입이 없다 — 운영자가 여기서 발급(초대)해야만 계정이 생긴다.
 # 로그인은 운영자와 같은 숨겨진 진입구(/ops/login)를 쓰고, 콘솔에서는 자기 강의만 보인다
 # (lectures.py의 require_lecture_manager + uploaded_by 스코프).
+# 임시 비번 유효기간 — 발급 후 이 시간이 지나면 로그인이 막힌다(auth_service.ops_login에서 검사).
+# 첫 로그인을 안 한 채 방치된 임시 비번의 노출 창을 좁힌다(메일 유출 대비). 만료 시 재발급.
+INSTRUCTOR_TEMP_PW_TTL = timedelta(hours=72)
+
+
 def _instructor_row(u: User) -> dict:
     return {
         "id": u.id,
@@ -2615,6 +2620,7 @@ def create_instructor(
         status="active",
         email_verified_at=datetime.now(),  # 사용자 기록 시각 — 로컬(KST) 규약
         must_change_password=True,  # 첫 로그인 시 새 비번 강제 (전역 ForcePasswordGate)
+        password_reset_expires_at=datetime.now() + INSTRUCTOR_TEMP_PW_TTL,  # 임시 비번 만료(72h)
     )
     db.add(inst)
     db.flush()
@@ -2676,6 +2682,7 @@ def reset_instructor_password(
     temp_password = secrets.token_urlsafe(9)
     inst.password_hash = hash_password(temp_password)
     inst.must_change_password = True
+    inst.password_reset_expires_at = datetime.now() + INSTRUCTOR_TEMP_PW_TTL  # 새 임시 비번 만료(72h)
     auth_service.logout(db, inst.id)  # 기존 모든 세션 폐기
     db.flush()
     pw = escape(temp_password)

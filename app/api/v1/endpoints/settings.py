@@ -123,6 +123,8 @@ def change_password(
     target.password_hash = hash_password(req.new_password)
     if hasattr(target, "must_change_password"):
         target.must_change_password = False  # 변경 완료 → 게이트 해제
+    if hasattr(target, "password_reset_expires_at"):
+        target.password_reset_expires_at = None  # 임시 비번 만료 타이머도 함께 해제
     audit(
         db,
         action="settings.change_password",

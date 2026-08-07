@@ -307,6 +307,21 @@ def _assert_org_approved(db: Session, user: User) -> None:
         )
 
 
+def _assert_temp_password_not_expired(user: User) -> None:
+    """임시 비번(강제 변경 대상)이 만료됐으면 로그인 차단 — 재발급 필요.
+
+    발급 시 password_reset_expires_at을 미래로 심고, 첫 로그인 전 방치되면 그 시각을 지나
+    로그인 자체가 막힌다(메일 유출 시 무기한 사용 방지). 비번을 바꾸면(must_change_password
+    해제 + 만료 None) 이 검사는 더 이상 걸리지 않는다. 자격 증명은 이미 확인한 뒤라 존재
+    노출이 아니다(만료 컬럼이 없는/미설정 계정은 통과 — 운영자 등 기존 동작 무영향)."""
+    exp = getattr(user, "password_reset_expires_at", None)
+    if user.must_change_password and exp is not None and datetime.now() > exp:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            detail="임시 비밀번호가 만료되었어요. 운영자에게 재발급을 요청해 주세요.",
+        )
+
+
 def ops_login(db: Session, req: s.LoginRequest) -> s.TokenPair:
     """운영자·강사 로그인 — 전용 경로(/ops/login → /auth/ops-login)와 공개 로그인 폼
     (/login → /auth/public-login 통합 폴백) 양쪽 모두에서 호출된다(사용자 결정 2026-07-26:
@@ -336,6 +351,7 @@ def ops_login(db: Session, req: s.LoginRequest) -> s.TokenPair:
         raise _login_failed(db, identifier, "이메일 또는 비밀번호가 올바르지 않습니다.")
     if user.status == "disabled":
         raise HTTPException(status.HTTP_403_FORBIDDEN, detail="비활성화된 계정입니다.")
+    _assert_temp_password_not_expired(user)  # 임시 비번 72h 만료 시 로그인 차단(재발급 필요)
     _reset_fails(db, identifier)
     user.last_login_at = datetime.now()  # 사용자 노출 시각 → 로컬(KST) 규약
     db.commit()

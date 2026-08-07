@@ -4,7 +4,7 @@
 """
 
 from tests.test_captcha_api import _instructor, _ops, auth
-from tests.test_instructor import _create_instructor, _instructor_login
+from tests.test_instructor import _instructor_ready
 from tests.test_lectures import _student_token, _upload_lecture, media_dir  # noqa: F401 (fixture 재사용)
 
 
@@ -34,12 +34,10 @@ def test_course_crud_and_subject_fixed(client, db, media_dir):
 def test_course_scope_instructor_owns_only(client, db, media_dir):
     """강사는 자기 코스만 — 목록 필터 + 남의 코스는 수정/삭제/강의연결 전부 404."""
     ops = _ops(client, db)
-    created = _create_instructor(client, ops, email="c-inst@catchap.dev")
-    itok = _instructor_login(client, "c-inst@catchap.dev", created["temp_password"]).json()["access_token"]
+    created, itok = _instructor_ready(client, ops, email="c-inst@catchap.dev")
 
     # '남의 코스'는 다른 강사가 만든다 — 운영자는 저작하지 않으므로(감독·검수만, 0720).
-    other = _create_instructor(client, ops, email="c-inst-b@catchap.dev")
-    otok = _instructor_login(client, "c-inst-b@catchap.dev", other["temp_password"]).json()["access_token"]
+    other, otok = _instructor_ready(client, ops, email="c-inst-b@catchap.dev")
     ops_course = _create_course(client, otok, title="다른 강사 코스", subject="과학")
     my_course = _create_course(client, itok, title="강사 코스", subject="영어")
 
@@ -145,11 +143,9 @@ def test_lecture_reorder_within_course(client, db, media_dir):
 def test_lecture_reorder_scope_foreign_404(client, db, media_dir):
     """강사는 남의 강의를 섞어 재배열할 수 없다(404, 존재 미노출). 자기 것만은 OK."""
     ops = _ops(client, db)
-    created = _create_instructor(client, ops, email="reord-inst@catchap.dev")
-    itok = _instructor_login(client, "reord-inst@catchap.dev", created["temp_password"]).json()["access_token"]
+    created, itok = _instructor_ready(client, ops, email="reord-inst@catchap.dev")
     # '남의 강의'는 다른 강사 것 — 운영자는 저작하지 않으므로(감독·검수만, 0720).
-    other = _create_instructor(client, ops, email="reord-inst-b@catchap.dev")
-    otok = _instructor_login(client, "reord-inst-b@catchap.dev", other["temp_password"]).json()["access_token"]
+    other, otok = _instructor_ready(client, ops, email="reord-inst-b@catchap.dev")
     ops_lec = _upload_lecture(client, otok, title="다른 강사 강의", subject="수학").json()
     my_lec = _upload_lecture(client, itok, title="강사강의", subject="수학").json()
 

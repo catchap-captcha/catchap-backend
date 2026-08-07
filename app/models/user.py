@@ -24,6 +24,9 @@ class User(Base, UUIDPk, Timestamps):
     two_factor_enabled: Mapped[bool] = mapped_column(default=False)
     # 임시 비번(기관 승인 발급/관리자 초기화)으로 로그인 시 True → 첫 로그인에서 강제 변경
     must_change_password: Mapped[bool] = mapped_column(default=False)
+    # 임시 비번 만료 시각(발급 시 now+TTL). must_change_password와 함께 쓰여, 만료된 임시
+    # 비번으로는 로그인 자체를 막는다(재발급 필요). 비번 변경 시 None으로 해제.
+    password_reset_expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     organization_id: Mapped[str | None] = mapped_column(
         CHAR(36), index=True, nullable=True
     )  # 주 소속 기관 (멀티 소속은 memberships)
