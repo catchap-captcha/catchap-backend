@@ -53,55 +53,32 @@ EXAM_SITTING_SIZE = 10
 # 정답이면 수료. 예: 10문항이면 ceil(10*0.8)=8개 이상. 프런트 안내 문구도 이 비율(0.8)에 맞춘다.
 EXAM_PASS_RATIO = 0.8
 ORIGINS = {"manual", "past_exam", "lecture", "llm", "bank"}
-# 문제은행 → 수료시험 추출 개수(사용자 결정 2026-08-05: 10문항).
-BANK_EXAM_IMPORT_N = 10
+# 문제은행 → 수료시험 추출 개수. per-attempt 재시험(2026-08-07)은 매 회차 새 조합을 내려면
+# 풀이 회차 크기(10)보다 넉넉해야 해서 20으로 상향(문제은행에 그만큼 있으면 최대 20개 가져옴).
+BANK_EXAM_IMPORT_N = 20
 # LLM 시험 생성 시 강의 전사(자막)를 프롬프트에 넣는 예산 — 실제 내용 근거로 더 깊은 문항을
 # 만들되, 코스에 강의가 많으면 전체 자막이 토큰을 폭발시키므로 총·강의별 상한으로 자른다.
 _COURSE_EXAM_TR_TOTAL_CAP = 30000  # 총 문자 예산(대략 수천 토큰 규모)
 _COURSE_EXAM_TR_PER_LECTURE = 5000  # 강의 하나당 상한(한 강의가 예산을 독식하지 않게)
 
 # ---- 자동화 방어 ----
-# mastery 설계상 '정답 1건 = 영구 정복'이고 회차는 미정복 문항만 낸다. 되돌림이 없는
-# 누적이라, 시도 비용이 0이면 무작위 제출을 반복하는 것만으로 수료가 된다(4지선다 기준
-# 문항당 기대 4회, 50문항이면 HTTP 요청 수십 번 = 수십 초). 아래 셋이 그 비용을 올린다.
+# per-attempt(2026-08-07) 재시험은 한 회차 8/10을 요구한다 — 4지선다 무작위로 8/10은 사실상
+# 불가능하다. 다만 시도 비용이 0이면 반복 자체가 문제라, 아래 셋이 그 비용을 올린다.
 #
-# ① 오답 쿨다운 — 틀린 문항은 이 시간 동안 재출제하지 않는다. 시도 사이에 대기가 끼면
-#    총 소요가 '회차 수'가 아니라 '시계 시간'에 지배된다(50문항 기준 수십 초 → 2~3시간).
-#    정상 학생에게는 해설을 읽고 다시 도전하기까지의 간격이라 학습상으로도 무리가 없다.
-EXAM_WRONG_COOLDOWN_MIN = 10
-# ② 응시 레이트리밋 — 쿨다운은 '미정복이 회차 크기보다 많은' 초반 구간을 못 막는다
-#    (50문항이면 첫 5회차는 대기 없이 돌아간다). 그 구간은 이쪽이 막는다.
-#    정상 학생은 50문항이어도 5회차면 끝나므로 4배 여유다.
+# ① 응시·제출 레이트리밋 — 회차 발급·제출 횟수 상한(시간당). 무작위 반복을 막는다.
 RATE_EXAM_SESSION_PER_HOUR = 20
 RATE_EXAM_SUBMIT_PER_HOUR = 20
-# ③ 문항당 최소 풀이 시간 — 읽지도 않고 제출하는 것을 막는다. 봇이 그냥 기다리면 되므로
-#    이것만으로 방어가 되지는 않지만, 아래 solve_time_ms 서버 계산과 짝이다.
+# ② 문항당 최소 풀이 시간 — 읽지도 않고 제출하는 것을 막는다(solve_time_ms 서버 계산과 짝).
 EXAM_MIN_SEC_PER_QUESTION = 3
+# ③ 재응시 게이트(사용자 결정 2026-08-07) — 미통과 회차 제출 후 이 시간 동안 다음 회차를 막아,
+#    총 소요가 '회차 수'가 아니라 '시계 시간'에 지배되게 한다(무작위 반복 무의미화). 미통과면
+#    지난 오답을 포함한 새 회차로 이 간격마다 재도전한다.
+EXAM_RETRY_COOLDOWN_MIN = 10
 
 
-def _cooling_down_ids(db: Session, student_id: str, course_id: str) -> dict[str, datetime]:
-    """쿨다운 중인 문항 → 해제 시각. 최근 오답의 created_at 기준.
-
-    새 컬럼이 필요 없다 — CourseExamAttempt 가 Timestamps 를 상속해 created_at 을 이미
-    갖고 있고, 인덱스 ix_cea_student_course_q 가 이 조회에 그대로 맞는다.
-    """
-    since = datetime.now() - timedelta(minutes=EXAM_WRONG_COOLDOWN_MIN)
-    rows = (
-        db.query(CourseExamAttempt.question_id, func.max(CourseExamAttempt.created_at))
-        .filter(
-            CourseExamAttempt.student_id == student_id,
-            CourseExamAttempt.course_id == course_id,
-            CourseExamAttempt.result == "incorrect",
-            CourseExamAttempt.created_at >= since,
-        )
-        .group_by(CourseExamAttempt.question_id)
-        .all()
-    )
-    return {
-        qid: last + timedelta(minutes=EXAM_WRONG_COOLDOWN_MIN)
-        for qid, last in rows
-        if last is not None
-    }
+def _pass_need(n: int) -> int:
+    """한 회차 통과 기준 — 문항 수의 EXAM_PASS_RATIO(올림). 10문항이면 8개."""
+    return math.ceil(n * EXAM_PASS_RATIO) if n else 0
 
 
 # ---------------------------------------------------------------- 공통 로더·파생
@@ -117,33 +94,48 @@ def _active_questions(db: Session, course_id: str) -> list[CourseExamQuestion]:
     )
 
 
-def _mastered_ids(db: Session, student_id: str, course_id: str) -> set[str]:
-    """정복 집합 — 응답 원장에서 파생(정답 1건 이상). 별도 상태 테이블 없음(설계 §4)."""
-    return {
-        r[0]
-        for r in db.query(CourseExamAttempt.question_id)
+def _last_submitted_sitting(
+    db: Session, student_id: str, course_id: str
+) -> CourseExamSitting | None:
+    """가장 최근 제출 회차 — 재응시 게이트(10분)·지난 오답 재출제의 기준(2026-08-07)."""
+    return (
+        db.query(CourseExamSitting)
         .filter(
-            CourseExamAttempt.student_id == student_id,
-            CourseExamAttempt.course_id == course_id,
-            CourseExamAttempt.result == "correct",
+            CourseExamSitting.student_id == student_id,
+            CourseExamSitting.course_id == course_id,
+            CourseExamSitting.submitted_at.isnot(None),
         )
-        .distinct()
-        .all()
-    }
+        .order_by(CourseExamSitting.submitted_at.desc())
+        .first()
+    )
 
 
-def _wrong_ever_ids(db: Session, student_id: str, course_id: str) -> set[str]:
+def _sitting_wrong_ids(db: Session, sitting_id: str) -> set[str]:
+    """그 회차에서 틀린 문항 id — 다음 회차에 반드시 다시 넣는다(사용자 결정 2026-08-07)."""
     return {
         r[0]
         for r in db.query(CourseExamAttempt.question_id)
         .filter(
-            CourseExamAttempt.student_id == student_id,
-            CourseExamAttempt.course_id == course_id,
+            CourseExamAttempt.sitting_id == sitting_id,
             CourseExamAttempt.result == "incorrect",
         )
-        .distinct()
         .all()
     }
+
+
+def _best_correct_and_attempts(db: Session, student_id: str, course_id: str) -> tuple[int, int]:
+    """제출 회차들의 (최고 정답 수, 회차 수) — 인트로의 '최근 최고 점수' 표시용."""
+    rows = (
+        db.query(CourseExamSitting.correct)
+        .filter(
+            CourseExamSitting.student_id == student_id,
+            CourseExamSitting.course_id == course_id,
+            CourseExamSitting.submitted_at.isnot(None),
+        )
+        .all()
+    )
+    corrects = [int(c) for (c,) in rows if c is not None]
+    return (max(corrects, default=0), len(rows))
 
 
 def _sitting_valid(sitting: CourseExamSitting, by_id: dict) -> bool:
@@ -179,34 +171,24 @@ def _completion(db: Session, student_id: str, course_id: str) -> CourseCompletio
     )
 
 
-def _grant_completion_if_mastered(
+def _grant_completion_on_pass(
     db: Session, student_id: str, course_id: str, active_ids: set[str],
-    *, perfect_sitting: bool = False,
+    *, passed_this: bool, perfect_sitting: bool = False,
 ) -> CourseCompletion | None:
-    """활성 문항의 EXAM_PASS_RATIO(80%) 이상 정복이면 수료 부여(멱등). 수료 시점 스냅샷을 남긴다.
+    """per-attempt 수료 부여(사용자 결정 2026-08-07) — 이번 회차 단독으로 통과 기준(≤10문항의
+    80%=8/10)을 넘으면 그 자리에서 수료. 누적 정복이 아니라 '한 회차 성적'으로 판정한다.
 
-    **perfect(완벽 통과) = 현재 활성 전 문항을 '한 회차에 모두 맞힌 적'이 있는가**
-    (0719 정책 재설계 — 재도전 경로+공정성). perfect_sitting=이번 제출이 그 완벽 회차였나.
-    - 첫 회차에 전 문항을 다 담아 아싸면 → 수료와 동시에 perfect=True.
-    - 여러 회차로 조금씩 정복해 수료하면 perfect=False(한 회차 무결점이 아님).
-    - 수료 후 '완벽 도전'(전 문항 한 판)을 아싸면 기존 수료를 perfect로 **승급**한다
-      — 한 번 틀렸다고 영구 박탈되던 옛 규칙의 가혹함을 없앤다.
-    이 정의는 오답 이력을 보지 않으므로, 강사가 나중에 삭제한 문항의 오답이 완벽 통과를
-    막던 불공정(skeptic 지적)도 자연히 사라진다. 문항이 0개면 수료 대상 아님(시험 없는 코스)."""
+    이미 수료면 perfect_sitting일 때만 완벽으로 승급(완벽 도전 경로). 동시 제출 경합은 아래
+    SAVEPOINT로 격리한다(UNIQUE 위반 시 500 대신 이미 부여된 수료 반환). 문항 0개면 대상 아님."""
     if not active_ids:
         return None
     existing = _completion(db, student_id, course_id)
     if existing:
-        # 이미 수료 — 완벽 도전으로 전 문항을 한 회차에 정복하면 perfect로 승급(멱등)
         if perfect_sitting and not existing.perfect:
             existing.perfect = True
             db.flush()
         return existing
-    mastered = _mastered_ids(db, student_id, course_id)
-    # 수료 기준: 전 문항 정복(100%)이 아니라 활성 문항의 EXAM_PASS_RATIO(80%) 이상 정답
-    # (10문항이면 8개 이상). 사용자 결정 2026-08-05.
-    need = math.ceil(len(active_ids) * EXAM_PASS_RATIO)
-    if len(active_ids & mastered) < need:
+    if not passed_this:
         return None
     sittings = (
         db.query(CourseExamSitting)
@@ -226,9 +208,6 @@ def _grant_completion_if_mastered(
         perfect=perfect_sitting,
     )
     try:
-        # 수료 삽입만 SAVEPOINT로 격리 — 동시 최종 제출(두 탭) 경합 시 UNIQUE(student,course)
-        # 위반이 나도 500 대신 이미 부여된 수료를 돌려준다. 바깥 트랜잭션(이 회차 응답·제출)은
-        # 보존된다(전체 rollback이 아니라 savepoint만 되감김).
         with db.begin_nested():
             db.add(row)
         return row
@@ -1136,21 +1115,37 @@ def ops_exam_stats(
 
 # ---------------------------------------------------------------- 학생: 상태·발급·채점
 def _exam_state(db: Session, student_id: str, course_id: str) -> dict:
-    """시험 카드 상태의 단일 원천 — 강의 완주 게이트 + 풀/정복 + 수료."""
+    """시험 카드 상태의 단일 원천 — 강의 완주 게이트 + per-attempt 재시험 상태.
+
+    per-attempt(사용자 결정 2026-08-07): 매 회차 exam_size(≤10)문항 중 pass_need(80%) 이상
+    맞히면 수료. 미통과 후에는 retry_after_sec(10분 게이트) 동안 재응시를 기다린다."""
     active = _active_questions(db, course_id)
     active_ids = {q.id for q in active}
     lec_ids = _course_lecture_ids(db, course_id)
     done = bank_mode.completed_lecture_ids(db, student_id)
     lectures_done = len(lec_ids & done)
     completion = _completion(db, student_id, course_id)
-    mastered = _mastered_ids(db, student_id, course_id) & active_ids
+    exam_size = min(len(active_ids), EXAM_SITTING_SIZE)
+    pass_need = _pass_need(exam_size)
+    best_correct, attempts = _best_correct_and_attempts(db, student_id, course_id)
     available = bool(active_ids) and bool(lec_ids) and lec_ids <= done
     passed = completion is not None
     perfect = bool(completion.perfect) if completion else False
+    # 재응시 게이트 — 미수료 상태에서 마지막 미통과 회차 제출 후 10분. 수료했으면 게이트 없음.
+    retry_after = 0
+    if not passed:
+        last = _last_submitted_sitting(db, student_id, course_id)
+        # 실제 응시(채점 문항 있음)만 게이트 — 강사 편집으로 전부 stale였던 회차(total=0)는 제외.
+        if last is not None and last.submitted_at is not None and (last.total or 0) > 0:
+            opens_at = last.submitted_at + timedelta(minutes=EXAM_RETRY_COOLDOWN_MIN)
+            retry_after = max(0, int((opens_at - datetime.now()).total_seconds()))
     return {
         "has_exam": bool(active_ids),
-        "question_count": len(active_ids),
-        "mastered_count": len(mastered),
+        "question_count": len(active_ids),  # 풀 전체 크기(참고용)
+        "exam_size": exam_size,             # 한 회차 문항 수 = min(풀, 10)
+        "pass_need": pass_need,             # 통과 기준 = ceil(exam_size * 0.8)
+        "best_correct": best_correct,       # 지금까지 한 회차 최고 정답 수
+        "attempts": attempts,               # 제출한 회차 수
         "lectures_total": len(lec_ids),
         "lectures_done": lectures_done,
         # 응시 자격 = 코스의 모든 활성 강의 완주(문제은행 잠금과 같은 정본)
@@ -1160,6 +1155,9 @@ def _exam_state(db: Session, student_id: str, course_id: str) -> dict:
         "passed_at": completion.passed_at.isoformat() if completion else None,
         # 완벽 도전 가능 = 수료했지만 아직 완벽 통과 아님(재도전 경로 — 전 문항 한 판 아싸기)
         "can_perfect_challenge": passed and not perfect and available,
+        # 재응시 게이트 남은 초(0=지금 가능) + 게이트 길이(분)
+        "retry_after_sec": retry_after,
+        "cooldown_minutes": EXAM_RETRY_COOLDOWN_MIN,
     }
 
 
@@ -1245,8 +1243,10 @@ def exam_session(
 ):
     """회차 발급 — 정답·해설 미포함, 보기는 문항별 셔플(순열은 서버 보관).
 
-    일반 모드: 정복 못 한 문항(안 푼 → 틀린 순)을 최대 10문항. 미제출 회차 재사용(파밍 차단).
-    완벽 도전(perfect=True): 현재 활성 **전 문항을 한 회차에**(10 상한 없음). 수료 후에도
+    일반 모드(per-attempt 재시험, 2026-08-07): 최대 10문항 — 지난 미통과 회차의 오답을 반드시
+    포함하고 나머지는 풀에서 새로 뽑아 채운다(매 회차 새 조합). 미통과 후 10분 게이트 동안은
+    회차를 내주지 않고 남은 시간을 알린다. 미제출 회차 재사용(파밍 차단).
+    완벽 도전(perfect=True): 현재 활성 **전 문항을 한 회차에**(10 상한·게이트 없음). 수료 후에도
     가능 — 한 회차에 다 맞히면 완벽 통과로 승급(0719 정책 재설계·재도전 경로)."""
     from app.models import Course
 
@@ -1294,48 +1294,43 @@ def exam_session(
     if reusable:
         sitting = open_sitting
     else:
+        # per-attempt 재시험(사용자 결정 2026-08-07): 미통과 후 10분 게이트, 그다음 회차는
+        # 지난 오답을 반드시 포함해 풀에서 새로 뽑아 최대 10문항으로 재구성. 완벽 도전은
+        # 게이트·재구성 없이 전 문항 한 판(수료 후 승급 경로라 구조가 자기제한적).
+        last = _last_submitted_sitting(db, principal.id, course_id)
+        # 실제 응시(채점 문항 있음)만 게이트 — 전부 stale였던 회차(total=0)는 제외.
+        if not challenge and last is not None and last.submitted_at is not None and (last.total or 0) > 0:
+            wait = int(
+                (last.submitted_at + timedelta(minutes=EXAM_RETRY_COOLDOWN_MIN) - datetime.now())
+                .total_seconds()
+            )
+            if wait > 0:
+                # 미통과 후 아직 10분이 안 지났다 — 빈 회차 대신 남은 시간을 정직히 알린다.
+                return {
+                    "passed": False,
+                    "cooldown": True,
+                    "retry_after_sec": wait,
+                    "cooldown_minutes": EXAM_RETRY_COOLDOWN_MIN,
+                    "progress": {"mastered": st["best_correct"], "total": st["exam_size"]},
+                }
         if open_sitting:
             # 재사용 불가 회차 폐기 — 문항 소실/보기 수 변경으로 순열이 어긋났거나(skeptic
-            # CONFIRMED: 그대로 두면 채점 시 IndexError/ValueError로 시험 영구 봉쇄) 또는
-            # 완벽 도전인데 커버리지가 어긋난 경우.
+            # CONFIRMED: 그대로 두면 채점 시 IndexError/ValueError로 시험 봉쇄) 또는 완벽
+            # 도전인데 커버리지가 어긋난 경우.
             db.delete(open_sitting)
         if challenge:
             # 완벽 도전 — 전 문항(정복 여부 무관·10 상한 없음)을 한 회차에
             picked = list(active)
             random.shuffle(picked)
         else:
-            mastered = _mastered_ids(db, principal.id, course_id)
-            wrong = _wrong_ever_ids(db, principal.id, course_id)
-            unmastered = [q for q in active if q.id not in mastered]
-            if not unmastered:
-                # 전부 정복인데 수료가 없는 상태(예: 틀렸던 문항을 강사가 삭제) — 정합 회복
-                comp = _grant_completion_if_mastered(db, principal.id, course_id, active_ids)
-                db.commit()
-                st2 = _exam_state(db, principal.id, course_id)
-                return {"passed": comp is not None, "perfect": st2["perfect"], "passed_at": st2["passed_at"]}
-            # 방금 틀린 문항은 쿨다운 동안 빼둔다. 완벽 도전(challenge)에는 걸지 않는다 —
-            # 수료 후 재도전 전용이고 전 문항을 한 회차에 다 맞혀야 해 무작위로는 사실상
-            # 불가능하다(구조가 자기제한적). 걸면 정당한 재도전자만 불편해진다.
-            cooling = _cooling_down_ids(db, principal.id, course_id)
-            ready = [q for q in unmastered if q.id not in cooling]
-            if not ready:
-                # 남은 미정복이 전부 쿨다운 중 — 빈 회차를 내주는 대신 언제 다시 열리는지
-                # 정직하게 알려준다. 쿨다운 중인 문항을 그냥 내면 쿨다운이 무의미해진다.
-                soonest = min(cooling[q.id] for q in unmastered if q.id in cooling)
-                wait = max(0, int((soonest - datetime.now()).total_seconds()))
-                return {
-                    "passed": False,
-                    "cooldown": True,
-                    "retry_after_sec": wait,
-                    "cooldown_minutes": EXAM_WRONG_COOLDOWN_MIN,
-                    "progress": {"mastered": st["mastered_count"], "total": st["question_count"]},
-                }
-            # 안 푼 것(오답 이력도 없는 것) 먼저, 그다음 틀린 것 — 각 그룹 안에서 섞는다
-            fresh = [q for q in ready if q.id not in wrong]
-            retry = [q for q in ready if q.id in wrong]
+            # 지난 미통과 회차의 오답을 먼저(반드시 포함), 나머지는 풀에서 새로 뽑아 채운다.
+            wrong_ids = _sitting_wrong_ids(db, last.id) & active_ids if last is not None else set()
+            retry_qs = [q for q in active if q.id in wrong_ids]
+            fresh = [q for q in active if q.id not in wrong_ids]
+            random.shuffle(retry_qs)
             random.shuffle(fresh)
-            random.shuffle(retry)
-            picked = (fresh + retry)[:EXAM_SITTING_SIZE]
+            picked = (retry_qs + fresh)[:EXAM_SITTING_SIZE]
+            random.shuffle(picked)  # 오답이 늘 앞에 오지 않게 최종 한 번 더 섞기
         sitting = _shuffled_sitting(principal.id, course_id, picked)
         db.add(sitting)
         db.commit()
@@ -1364,7 +1359,9 @@ def exam_session(
         "questions": questions,
         # 완벽 도전 회차인가 — 화면이 '완벽 도전(전 문항 한 판)'으로 안내한다
         "perfect_challenge": challenge,
-        "progress": {"mastered": st["mastered_count"], "total": st["question_count"]},
+        # 이번 회차 문항 수 + 통과 기준(화면 헤더 안내). per-attempt라 누적 진행은 안 쓴다.
+        "sitting_size": len(questions),
+        "pass_need": _pass_need(len(questions)),
     }
 
 
@@ -1481,24 +1478,33 @@ def exam_submit(
     db.flush()
 
     active_ids = {q.id for q in _active_questions(db, course_id)}
+    graded_n = len(results)
+    need = _pass_need(graded_n)
+    # per-attempt(2026-08-07): 이 회차 단독으로 통과 기준(80%=8/10) 이상이면 수료.
+    passed_this = graded_n > 0 and correct_n >= need
     # 완벽 회차 = 이 한 회차가 현재 활성 전 문항을 담아 하나도 안 틀리고 다 맞힘(stale 없음).
+    # 풀이 10보다 크면 일반 회차는 전 문항 커버가 아니라, 완벽 통과는 완벽 도전으로만 난다.
     perfect_sitting = (
-        stale == 0 and len(results) > 0
-        and correct_n == len(results) and graded_ids == active_ids
+        stale == 0 and graded_n > 0
+        and correct_n == graded_n and graded_ids == active_ids
     )
-    completion = _grant_completion_if_mastered(
-        db, principal.id, course_id, active_ids, perfect_sitting=perfect_sitting
+    completion = _grant_completion_on_pass(
+        db, principal.id, course_id, active_ids,
+        passed_this=passed_this, perfect_sitting=perfect_sitting,
     )
-    mastered = _mastered_ids(db, principal.id, course_id) & active_ids
+    passed = completion is not None
     db.commit()
     return {
-        "total": len(results),
+        "total": graded_n,
         "correct": correct_n,
+        "need": need,  # 통과 기준(문항 수의 80%) — 결과 팝업이 "8개 필요"를 안내
         "results": results,
         # 발급 후 강사 편집으로 채점 못 한 문항 수 — 0보다 크면 화면이 "일부 문항이 바뀌어
         # 다음 회차에서 다시 나와요"를 안내한다(조용히 삼키지 않는다)
         "stale": stale,
-        "progress": {"mastered": len(mastered), "total": len(active_ids)},
-        "passed": completion is not None,
+        "passed": passed,
         "perfect": bool(completion.perfect) if completion else False,
+        # 미통과면 10분 재응시 게이트가 시작된다 — 결과 팝업 카운트다운·다음 회차 차단의 원천
+        "retry_after_sec": 0 if passed else EXAM_RETRY_COOLDOWN_MIN * 60,
+        "cooldown_minutes": EXAM_RETRY_COOLDOWN_MIN,
     }

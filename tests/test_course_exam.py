@@ -67,18 +67,18 @@ def _ready(db, sitting_id, *, seconds=600):
     return sitting_id
 
 
-def _cool_off(db, course_id, *, minutes=60):
-    """오답 기록 시각을 과거로 당겨 쿨다운을 만료시킨다.
+def _open_gate(db, course_id, *, minutes=30):
+    """미통과 회차의 재응시 게이트(10분)를 지나가게 한다 — 제출 시각을 과거로 당긴다.
 
-    서버는 방금 틀린 문항을 EXAM_WRONG_COOLDOWN_MIN 분간 재출제하지 않는다(자동화 방어).
-    쿨다운 자체를 검증하는 테스트가 아니면 이걸로 넘기고 원래 보려던 것을 본다.
+    per-attempt(2026-08-07): 미통과 후 EXAM_RETRY_COOLDOWN_MIN분간 다음 회차를 막는다.
+    게이트 자체를 검증하는 테스트가 아니면 이걸로 넘기고 원래 보려던 것을 본다.
     """
-    from app.models import CourseExamAttempt
+    from app.models import CourseExamSitting
 
-    for a in (db.query(CourseExamAttempt)
-                .filter(CourseExamAttempt.course_id == course_id,
-                        CourseExamAttempt.result == "incorrect").all()):
-        a.created_at = a.created_at - dt.timedelta(minutes=minutes)
+    for s in (db.query(CourseExamSitting)
+                .filter(CourseExamSitting.course_id == course_id,
+                        CourseExamSitting.submitted_at.isnot(None)).all()):
+        s.submitted_at = s.submitted_at - dt.timedelta(minutes=minutes)
     db.commit()
 
 
@@ -96,9 +96,9 @@ def _answer_all_correct(db, sess):
 def _submit_all_correct(client, stok, course_id, db, *, perfect=False):
     """현재 회차(perfect=True면 완벽 도전)를 발급받아 전 문항 정답으로 제출 — 결과 dict 반환.
 
-    상태를 진행시키는 용도라 오답 쿨다운은 먼저 풀어 둔다(쿨다운은 별도 테스트에서 본다).
+    상태를 진행시키는 용도라 재응시 게이트는 먼저 열어 둔다(게이트는 별도 테스트에서 본다).
     """
-    _cool_off(db, course_id)
+    _open_gate(db, course_id)
     url = f"/api/v1/courses/{course_id}/exam/session" + ("?perfect=true" if perfect else "")
     sess = client.post(url, headers=auth(stok)).json()
     if sess.get("passed") and not sess.get("questions"):
@@ -195,64 +195,49 @@ def test_no_exam_when_no_active_questions(client, db, seed_org):
 
 
 # ---------------------------------------------------------------- mastery·수료
-def test_mastery_retry_only_wrong_until_pass(client, db, seed_org):
-    """완전학습 — 회차마다 정복 못 한 것만 나오고, 누적 전 문항 정답 시 수료.
-    한 문항을 일부러 틀리면 그것만 다시 나온다(만점 1회 강제 아님).
-
-    단 방금 틀린 문항은 쿨다운 동안 나오지 않는다(자동화 방어) — 낼 게 남지 않으면
-    빈 회차 대신 cooldown 응답으로 언제 열리는지 알려준다. 쿨다운이 지나면 재출제된다."""
+def test_per_attempt_fail_gate_then_pass(client, db, seed_org):
+    """per-attempt 재시험(2026-08-07) — 한 회차 성적으로 판정. 통과 기준(80%) 미달이면
+    미통과, 그다음 10분 게이트 동안은 회차를 안 내주고 남은 시간을 알린다. 게이트가 지나면
+    지난 오답을 포함한 새 회차로 다시 도전해 통과할 수 있다."""
     tok = _instructor(client, db)
     course = _mk_course(client, tok, db)
     lec = _assign_lecture(client, tok, course["id"])
     _complete_lecture(db, seed_org["student"].id, lec["id"])
-    for i in range(3):
+    # 5문항 → 한 회차 5문항·통과 기준 ceil(5*0.8)=4
+    for i in range(5):
         _add_exam_q(client, tok, course["id"], prompt=f"q{i}", options=["a", "b", "c"],
                     answer_indexes=[i % 3])
 
     stok = _student_token(client, seed_org)
-    # 1회차: 3문항 중 2개만 맞히고 1개는 일부러 오답
+    st = client.get(f"/api/v1/courses/{course['id']}/exam", headers=auth(stok)).json()
+    assert st["exam_size"] == 5 and st["pass_need"] == 4 and st["attempts"] == 0
+
+    # 1회차: 3문항만 맞히고 2문항 오답 → 미통과(기준 4)
     sess = client.post(f"/api/v1/courses/{course['id']}/exam/session", headers=auth(stok)).json()
-    assert len(sess["questions"]) == 3 and sess["progress"] == {"mastered": 0, "total": 3}
-    answers = []
-    wrong_qid = None
-    for idx, item in enumerate(sess["questions"]):
+    assert len(sess["questions"]) == 5 and sess["pass_need"] == 4
+    answers, wrong = [], 0
+    for item in sess["questions"]:
         q = db.get(CourseExamQuestion, item["question_id"])
-        correct_texts = {q.options[i] for i in q.answer_indexes}
-        picks = [i for i, opt in enumerate(item["options"]) if opt in correct_texts]
-        if idx == 0:
-            wrong_qid = q.id
-            picks = [i for i, opt in enumerate(item["options"]) if opt not in correct_texts][:1]
+        ct = {q.options[i] for i in q.answer_indexes}
+        picks = [i for i, o in enumerate(item["options"]) if o in ct]
+        if wrong < 2:  # 앞 2문항 일부러 오답
+            picks = [i for i, o in enumerate(item["options"]) if o not in ct][:1]
+            wrong += 1
         answers.append({"question_id": q.id, "picks": picks})
     res = client.post(f"/api/v1/courses/{course['id']}/exam/submit",
                       json={"sitting_id": _ready(db, sess["sitting_id"]), "answers": answers},
                       headers=auth(stok)).json()
-    assert res["correct"] == 2 and res["passed"] is False
-    assert res["progress"] == {"mastered": 2, "total": 3}
+    assert res["correct"] == 3 and res["need"] == 4 and res["passed"] is False
+    assert res["retry_after_sec"] == res["cooldown_minutes"] * 60  # 게이트 시작
 
-    # 방금 틀렸으므로 쿨다운 — 남은 미정복이 그 하나뿐이라 낼 게 없다.
-    # 빈 회차를 주는 대신 언제 다시 열리는지 알려준다.
+    # 게이트 중 — 세션 요청은 빈 회차 대신 cooldown(남은 시간)을 준다
     cd = client.post(f"/api/v1/courses/{course['id']}/exam/session", headers=auth(stok)).json()
     assert cd["cooldown"] is True and "sitting_id" not in cd
     assert 0 < cd["retry_after_sec"] <= cd["cooldown_minutes"] * 60
-    assert cd["progress"] == {"mastered": 2, "total": 3}
 
-    # 쿨다운이 지나면 그 문항만 다시 나온다
-    _cool_off(db, course["id"])
-    sess2 = client.post(f"/api/v1/courses/{course['id']}/exam/session", headers=auth(stok)).json()
-    assert len(sess2["questions"]) == 1
-    assert sess2["questions"][0]["question_id"] == wrong_qid
-
-    # 그 문항 정답 → 전 문항 정복 → 수료(단, 오답 이력 있으니 perfect 아님)
-    q = db.get(CourseExamQuestion, wrong_qid)
-    item = sess2["questions"][0]
-    correct_texts = {q.options[i] for i in q.answer_indexes}
-    picks = [i for i, opt in enumerate(item["options"]) if opt in correct_texts]
-    res2 = client.post(f"/api/v1/courses/{course['id']}/exam/submit",
-                       json={"sitting_id": _ready(db, sess2["sitting_id"]),
-                             "answers": [{"question_id": wrong_qid, "picks": picks}]},
-                       headers=auth(stok)).json()
-    assert res2["passed"] is True and res2["perfect"] is False
-    assert res2["progress"] == {"mastered": 3, "total": 3}
+    # 게이트가 지나면 새 회차(5문항) → 이번엔 다 맞혀 통과(_submit_all_correct가 게이트를 연다)
+    res2 = _submit_all_correct(client, stok, course["id"], db)
+    assert res2["passed"] is True and res2["correct"] == 5
 
     # 수료 후 세션 요청 → passed 반환(재응시 아님)
     after = client.post(f"/api/v1/courses/{course['id']}/exam/session", headers=auth(stok)).json()
@@ -275,32 +260,17 @@ def test_perfect_when_all_correct_one_sitting(client, db, seed_org):
 
 
 def test_perfect_challenge_upgrade_after_pass(client, db, seed_org):
-    """★0719 정책 재설계 — 한 번 틀려 완벽을 놓치고 수료해도, '완벽 도전'(전 문항 한 판)을
-    아싸면 완벽 통과로 승급한다(옛 규칙의 '한 번 틀리면 영구 박탈' 폐지 = 재도전 경로).
-    perfect 판정은 오답 이력을 보지 않으므로 공정성 문제(삭제 문항 오답)도 함께 사라진다."""
+    """완벽 도전 승급 — 풀이 10보다 크면 일반 회차(10문항)는 전 문항 커버가 아니라, 통과해도
+    완벽은 아니다. '완벽 도전'(전 문항 한 판)을 다 맞히면 완벽 통과로 승급한다(2026-08-07)."""
     tok = _instructor(client, db)
     course = _mk_course(client, tok, db)
     lec = _assign_lecture(client, tok, course["id"])
     _complete_lecture(db, seed_org["student"].id, lec["id"])
-    for i in range(3):
+    for i in range(12):
         _add_exam_q(client, tok, course["id"], prompt=f"q{i}", options=["a", "b", "c"], answer_indexes=[i % 3])
     stok = _student_token(client, seed_org)
 
-    # 1회차: 한 문항 일부러 오답(→ 첫 판 무결점 실패)
-    sess = client.post(f"/api/v1/courses/{course['id']}/exam/session", headers=auth(stok)).json()
-    answers = []
-    for idx, item in enumerate(sess["questions"]):
-        q = db.get(CourseExamQuestion, item["question_id"])
-        ct = {q.options[a] for a in q.answer_indexes}
-        picks = [i for i, o in enumerate(item["options"]) if o in ct]
-        if idx == 0:
-            picks = [i for i, o in enumerate(item["options"]) if o not in ct][:1]
-        answers.append({"question_id": q.id, "picks": picks})
-    r = client.post(f"/api/v1/courses/{course['id']}/exam/submit",
-                    json={"sitting_id": _ready(db, sess["sitting_id"]), "answers": answers}, headers=auth(stok)).json()
-    assert r["passed"] is False and r["perfect"] is False
-
-    # 2회차: 틀린 것만 맞혀 수료(완벽 아님 — 한 회차 무결점이 아님)
+    # 일반 회차(10문항)를 다 맞혀 수료 — 하지만 12문항 전체 커버가 아니라 완벽은 아니다
     res = _submit_all_correct(client, stok, course["id"], db)
     assert res["passed"] is True and res["perfect"] is False
 
@@ -308,9 +278,9 @@ def test_perfect_challenge_upgrade_after_pass(client, db, seed_org):
     st = client.get(f"/api/v1/courses/{course['id']}/exam", headers=auth(stok)).json()
     assert st["passed"] and not st["perfect"] and st["can_perfect_challenge"] is True
 
-    # 완벽 도전 발급 → 전 문항(3)을 한 회차에
+    # 완벽 도전 발급 → 전 문항(12)을 한 회차에
     ch = client.post(f"/api/v1/courses/{course['id']}/exam/session?perfect=true", headers=auth(stok)).json()
-    assert ch["perfect_challenge"] is True and len(ch["questions"]) == 3
+    assert ch["perfect_challenge"] is True and len(ch["questions"]) == 12
     up = client.post(f"/api/v1/courses/{course['id']}/exam/submit",
                      json={"sitting_id": _ready(db, ch["sitting_id"]), "answers": _answer_all_correct(db, ch)},
                      headers=auth(stok)).json()
@@ -984,10 +954,10 @@ def test_instructor_dashboard_weak_checkpoint_questions(client, db, seed_org):
     assert cq[1]["question_id"] == q_easy.id and cq[1]["pass_rate"] == 0.8 and cq[1]["review"] is False
 
 
-# ================= 자동화 방어 (쿨다운·레이트리밋·최소 풀이 시간) =================
-# mastery 는 '정답 1건 = 영구 정복'이라 되돌림이 없다. 시도 비용이 0이면 무작위 제출을
-# 반복하는 것만으로 수료가 된다. 아래는 그 비용을 올리는 세 장치를 각각 검증하고,
-# 마지막에 공격 시나리오 자체를 재현해 실제로 막히는지 본다.
+# ================= 자동화 방어 (재응시 게이트·레이트리밋·최소 풀이 시간) =================
+# per-attempt(2026-08-07)는 한 회차 8/10을 요구한다. 4지선다 무작위로 8/10은 사실상 불가능
+# 하지만 시도 비용이 0이면 반복 자체가 문제다. 아래 세 장치가 그 비용을 올린다: 미통과 후
+# 10분 재응시 게이트, 회차 발급 레이트리밋, 문항당 최소 풀이 시간. 마지막에 공격을 재현한다.
 
 
 def _exam_ready_course(client, db, seed_org, *, n_questions=3):
@@ -1015,13 +985,13 @@ def _answer_all_wrong(db, sess):
     return out
 
 
-# ---- 오답 쿨다운
-def test_wrong_answer_is_not_reserved_during_cooldown(client, db, seed_org):
-    """틀린 문항은 쿨다운 동안 재출제되지 않는다 — 이게 무작위 반복의 비용을 올린다."""
+# ---- 재응시 게이트
+def test_retry_gate_blocks_then_opens(client, db, seed_org):
+    """미통과 후 10분 게이트 — 다음 세션은 빈 회차 대신 cooldown(남은 시간)을 주고, 게이트가
+    지나면 새 회차가 나온다. 재도전 비용을 시계 시간으로 만든다(2026-08-07)."""
     _tok, course, stok = _exam_ready_course(client, db, seed_org, n_questions=3)
     url = f"/api/v1/courses/{course['id']}"
     sess = client.post(f"{url}/exam/session", headers=auth(stok)).json()
-    wrong_ids = {a["question_id"] for a in _answer_all_wrong(db, sess)}
     client.post(f"{url}/exam/submit",
                 json={"sitting_id": _ready(db, sess["sitting_id"]),
                       "answers": _answer_all_wrong(db, sess)}, headers=auth(stok))
@@ -1031,65 +1001,65 @@ def test_wrong_answer_is_not_reserved_during_cooldown(client, db, seed_org):
     assert "sitting_id" not in cd  # 빈 회차를 주지 않는다
     assert 0 < cd["retry_after_sec"] <= cd["cooldown_minutes"] * 60
 
-    # 쿨다운 만료 → 전부 다시 나온다(영구 차단이 아니다)
-    _cool_off(db, course["id"])
+    # 게이트가 지나면 새 회차가 나온다(영구 차단이 아니다)
+    _open_gate(db, course["id"])
     again = client.post(f"{url}/exam/session", headers=auth(stok)).json()
-    assert {q["question_id"] for q in again["questions"]} == wrong_ids
+    assert len(again["questions"]) == 3
 
 
-def test_cooldown_only_blocks_wrong_ones_not_untouched(client, db, seed_org):
-    """쿨다운은 틀린 문항에만 걸린다 — 안 푼 문항은 그대로 나와서 학습이 멈추지 않는다."""
+def test_retry_includes_previous_wrong_plus_fresh(client, db, seed_org):
+    """재응시 회차 구성 — 지난 미통과 회차의 오답을 반드시 포함하고, 나머지는 풀에서 새로
+    뽑아 10문항을 채운다(사용자 결정 2026-08-07). 풀이 10보다 커야 새 조합이 돈다."""
     tok, course, stok = _exam_ready_course(client, db, seed_org, n_questions=3)
-    # 문항을 더 넣어 회차(10) 밖의 미출제분을 만든다
-    for i in range(3, 12):
+    for i in range(3, 12):  # 풀 12로 확장(회차 10 + 여유)
         _add_exam_q(client, tok, course["id"], prompt=f"q{i}",
                     options=["a", "b", "c", "d"], answer_indexes=[i % 4])
     url = f"/api/v1/courses/{course['id']}"
     sess = client.post(f"{url}/exam/session", headers=auth(stok)).json()
-    wrong_ids = {a["question_id"] for a in _answer_all_wrong(db, sess)}
-    client.post(f"{url}/exam/submit",
-                json={"sitting_id": _ready(db, sess["sitting_id"]),
-                      "answers": _answer_all_wrong(db, sess)}, headers=auth(stok))
+    assert len(sess["questions"]) == 10  # 한 회차 10문항
 
-    nxt = client.post(f"{url}/exam/session", headers=auth(stok)).json()
-    served = {q["question_id"] for q in nxt["questions"]}
-    assert served, "안 푼 문항이 남았으면 회차가 나와야 한다"
-    assert not (served & wrong_ids), "쿨다운 중인 문항이 섞이면 안 된다"
-
-
-def test_perfect_challenge_is_exempt_from_cooldown(client, db, seed_org):
-    """완벽 도전은 쿨다운 면제 — 수료 후 재도전 전용이고 전 문항을 한 판에 다 맞혀야 해
-    무작위로는 사실상 불가능하다(구조가 자기제한적). 걸면 정당한 재도전자만 불편해진다."""
-    _tok, course, stok = _exam_ready_course(client, db, seed_org, n_questions=3)
-    url = f"/api/v1/courses/{course['id']}"
-    # 완벽 도전은 '수료했지만 perfect 는 아닌' 상태에서만 열린다. perfect 판정은 오답
-    # 이력이 아니라 '한 회차에 전 문항 정복'이므로, 마지막 회차가 일부만 담기게 만든다 —
-    # 1회차에 하나만 맞히고, 2회차에 나머지 둘을 맞히면 어느 회차도 전 문항 커버가 아니다.
-    first = client.post(f"{url}/exam/session", headers=auth(stok)).json()
-    answers = []
-    for idx, item in enumerate(first["questions"]):
+    # 앞 4문항만 오답, 나머지 정답 → 미통과(기준 8)
+    answers, wrong_ids = [], set()
+    for idx, item in enumerate(sess["questions"]):
         q = db.get(CourseExamQuestion, item["question_id"])
         ct = {q.options[i] for i in q.answer_indexes}
-        if idx == 0:
-            picks = [i for i, o in enumerate(item["options"]) if o in ct]
-        else:
+        picks = [i for i, o in enumerate(item["options"]) if o in ct]
+        if idx < 4:
             picks = [i for i, o in enumerate(item["options"]) if o not in ct][:1]
+            wrong_ids.add(q.id)
         answers.append({"question_id": q.id, "picks": picks})
-    client.post(f"{url}/exam/submit",
-                json={"sitting_id": _ready(db, first["sitting_id"]), "answers": answers},
-                headers=auth(stok))
+    r = client.post(f"{url}/exam/submit",
+                    json={"sitting_id": _ready(db, sess["sitting_id"]), "answers": answers},
+                    headers=auth(stok)).json()
+    assert r["passed"] is False and len(wrong_ids) == 4
+
+    # 게이트가 지나면 새 회차 = 지난 오답 4개(반드시 포함) + 새 문항 6개 = 10문항
+    _open_gate(db, course["id"])
+    nxt = client.post(f"{url}/exam/session", headers=auth(stok)).json()
+    served = {q["question_id"] for q in nxt["questions"]}
+    assert len(served) == 10
+    assert wrong_ids <= served, "지난 오답이 새 회차에 반드시 포함돼야 한다"
+
+
+def test_perfect_challenge_is_exempt_from_retry_gate(client, db, seed_org):
+    """완벽 도전은 재응시 게이트 면제 — 수료 후 재도전 전용이고 전 문항을 한 판에 다 맞혀야 해
+    무작위로는 사실상 불가능하다(구조가 자기제한적). 걸면 정당한 재도전자만 불편해진다."""
+    tok, course, stok = _exam_ready_course(client, db, seed_org, n_questions=12)
+    url = f"/api/v1/courses/{course['id']}"
+    # 일반 회차(10)로 수료 — 12문항 전체 커버가 아니라 완벽은 아님
     done = _submit_all_correct(client, stok, course["id"], db)
     assert done["passed"] is True and done["perfect"] is False
 
+    # 완벽 도전(전 12문항)을 일부러 다 틀린다
     ch = client.post(f"{url}/exam/session?perfect=true", headers=auth(stok)).json()
-    assert "sitting_id" in ch, ch
+    assert "sitting_id" in ch and len(ch["questions"]) == 12
     client.post(f"{url}/exam/submit",
                 json={"sitting_id": _ready(db, ch["sitting_id"]),
                       "answers": _answer_all_wrong(db, ch)}, headers=auth(stok))
-    # 방금 전 문항을 틀렸는데도 곧바로 다시 도전할 수 있어야 한다
+    # 방금 전 문항을 틀렸는데도 게이트 없이 곧바로 다시 도전할 수 있어야 한다
     again = client.post(f"{url}/exam/session?perfect=true", headers=auth(stok)).json()
     assert again.get("cooldown") is not True
-    assert len(again["questions"]) == 3
+    assert len(again["questions"]) == 12
 
 
 # ---- 응시 레이트리밋
