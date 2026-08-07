@@ -11,7 +11,7 @@ principal 은 (kind, id) — kind: 'user' | 'student'
 
 from dataclasses import dataclass
 
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jwt import PyJWTError
 from sqlalchemy.orm import Session
@@ -40,7 +40,32 @@ class Principal:
         return None
 
 
+# 임시 비밀번호(강제 변경 대상)로 로그인한 계정은, 새 비밀번호를 정하기 전까지 아래 최소
+# 경로(내 정보 조회·로그아웃·비밀번호 변경)만 허용하고 나머지 API는 전부 막는다. 프론트
+# ForcePasswordGate(화면 오버레이)는 브라우저 UI만 덮을 뿐 API 직접 호출을 못 막으므로,
+# 임시 비번 그대로 기능을 쓰는 우회를 서버에서도 차단한다(경로 suffix 기준 허용목록).
+_PW_GATE_ALLOW = (
+    "/auth/me",  # ForcePasswordGate가 플래그를 읽는 경로 — 막으면 게이트 화면 자체가 안 뜬다
+    "/auth/logout",
+    "/settings/me/change-password",  # 운영자·강사·기관관리자 강제 변경
+    "/students/me/password",  # 학생 강제 변경
+)
+
+
+def _enforce_password_change_gate(principal: Principal, request: Request) -> None:
+    acct = principal.user or principal.student
+    if not getattr(acct, "must_change_password", False):
+        return
+    if request.url.path.endswith(_PW_GATE_ALLOW):
+        return
+    raise HTTPException(
+        status.HTTP_403_FORBIDDEN,
+        detail="비밀번호를 먼저 변경해야 계속할 수 있어요.",
+    )
+
+
 def get_current_principal(
+    request: Request,
     credentials: HTTPAuthorizationCredentials | None = Depends(bearer),
     db: Session = Depends(get_db),
 ) -> Principal:
@@ -61,12 +86,15 @@ def get_current_principal(
         # 탈퇴/비활성(status=disabled) 학생은 기존 토큰이 남아 있어도 접근 차단 (B3)
         if student is None or student.status == "disabled":
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail="학생을 찾을 수 없습니다.")
-        return Principal(kind="student", id=subject_id, role="student", student=student)
+        principal = Principal(kind="student", id=subject_id, role="student", student=student)
+    else:
+        user = db.get(User, subject_id)
+        if user is None or user.status == "disabled":
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail="사용자를 찾을 수 없습니다.")
+        principal = Principal(kind="user", id=subject_id, role=user.role, user=user)
 
-    user = db.get(User, subject_id)
-    if user is None or user.status == "disabled":
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail="사용자를 찾을 수 없습니다.")
-    return Principal(kind="user", id=subject_id, role=user.role, user=user)
+    _enforce_password_change_gate(principal, request)
+    return principal
 
 
 def require_roles(*roles: str):
