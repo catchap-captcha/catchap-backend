@@ -262,3 +262,47 @@ def test_IAM_이_토큰을_안_주면_기동을_막는다(monkeypatch):
     with pytest.raises(sl.SecretsLoadError) as e:
         sl.load_secrets_into_env(_env())
     assert "X-Subject-Token" in str(e.value)
+
+
+# ── ⑦ 결과가 기동 로그까지 도달하는가 ─────────────────────────────────────
+#
+# ★로더의 요약문은 원래 화면에 ★한 번도 안 나왔다. 두 가지가 겹쳐서다.
+#   ① main.py 는 setup_logging() 을 먼저 부르는데, setup_logging() 자신이
+#      get_settings() 를 부른다 → 로더는 dictConfig 가 적용되기 ★전에 끝난다
+#   ② 로거 이름이 "app.core.secrets_loader" 라 catchap.* 설정에 안 걸리고
+#      root(WARNING)로 떨어져 INFO 가 버려진다
+# 제일 위험한 경우 — SECRETS_BACKEND 가 없어서 ★조용히 아무것도 안 한 경우 —
+# 를 알려 주는 유일한 신호가 이 요약문이라 반드시 보여야 한다.
+
+def test_결과를_나중에_꺼내_볼_수_있다(monkeypatch):
+    monkeypatch.setattr(sl, "_http", lambda *a, **k: pytest.fail("나가면 안 된다"))
+    sl.load_secrets_into_env({})
+    r = sl.last_result()
+    assert r is not None and r.backend == "none"
+    assert "미사용" in r.summary()
+
+
+def test_켜져_있을_때도_결과가_남는다(monkeypatch):
+    monkeypatch.setattr(sl, "_http", _fake_http(
+        catalog=_CATALOG,
+        values=[("x", "sid-1", {"version": {"secret": {"JWT_SECRET_KEY": "j"}}})],
+    ))
+    sl.load_secrets_into_env(_env())
+    r = sl.last_result()
+    assert r is not None and r.backend == "kakaocloud"
+    assert "JWT_SECRET_KEY" in r.summary()
+
+
+def test_실패하면_결과가_안_남는다(monkeypatch):
+    """★실패는 예외로 알린다 — 낡은 결과가 남아서 성공처럼 보이면 안 된다."""
+    monkeypatch.setattr(sl, "_http", lambda *a, **k: pytest.fail("나가면 안 된다"))
+    sl.load_secrets_into_env({})                    # 먼저 성공시켜 값을 남겨 두고
+    assert sl.last_result().backend == "none"
+    with pytest.raises(sl.SecretsLoadError):
+        sl.load_secrets_into_env(_env(SECRETS_ACCESS_KEY=None, SECRETS_SECRET_KEY=None))
+    assert sl.last_result().backend == "none"       # 예외 뒤에도 옛 결과 그대로(덮어쓰지 않음)
+
+
+def test_로거_이름이_catchap_아래여야_한다():
+    """★catchap.* 가 아니면 root(WARNING)로 떨어져 INFO 가 버려진다."""
+    assert sl.logger.name.startswith("catchap.")

@@ -43,7 +43,20 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("catchap.secrets")
+
+# ★기동 순서 때문에 이 모듈의 로그는 화면에 안 나온다 —
+#   main.py 는 setup_logging() 을 먼저 부르는데, setup_logging() 자신이
+#   get_settings() 를 부르므로 ★로더는 dictConfig 가 적용되기 전에 끝난다.
+#   그래서 결과를 여기 남겨 두고, 로그 설정이 끝난 뒤 main.py 가 찍는다.
+#   ⚠️이게 없으면 제일 위험한 경우 — SECRETS_BACKEND 가 없어서 로더가
+#   조용히 아무것도 안 한 경우 — 를 아무도 모른다.
+_LAST: "LoadResult | None" = None
+
+
+def last_result() -> "LoadResult | None":
+    """직전 load_secrets_into_env() 의 결과. 한 번도 안 불렀으면 None."""
+    return _LAST
 
 _IAM_DEFAULT = "https://iam.kakaocloud.com/identity/v3"
 _SM_DEFAULT = "https://secrets-manager-service.kr-central-2.kakaocloud.com"
@@ -151,12 +164,18 @@ def _unwrap(payload: dict) -> dict:
     return node
 
 
+def _remember(result: LoadResult) -> LoadResult:
+    global _LAST
+    _LAST = result
+    return result
+
+
 def load_secrets_into_env(environ: dict | None = None) -> LoadResult:
     """Secrets Manager를 읽어 환경변수로 주입한다. 기본값(none)이면 아무것도 안 한다."""
     env = os.environ if environ is None else environ
     backend = (env.get("SECRETS_BACKEND") or "none").strip().lower()
     if backend in ("", "none", "off", "false", "0"):
-        return LoadResult(backend="none")
+        return _remember(LoadResult(backend="none"))
     if backend != "kakaocloud":
         raise SecretsLoadError(
             f"SECRETS_BACKEND 값이 올바르지 않습니다: {backend!r} (none | kakaocloud)"
@@ -216,4 +235,4 @@ def load_secrets_into_env(environ: dict | None = None) -> LoadResult:
             f"시크릿 {len(names)}건을 읽었지만 주입할 변수가 하나도 없습니다"
         )
     logger.info("%s", result.summary())
-    return result
+    return _remember(result)
