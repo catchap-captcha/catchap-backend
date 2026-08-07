@@ -16,12 +16,12 @@
 (같은 이유로 drag_captcha 도 idx_challenge_expiry 를 두고 ORDER BY + LIMIT 으로 지운다)
 
 Revision ID: captcha_purge_01
-Revises: lecture_botsusp_01
+Revises: social_login_01
 """
 from alembic import op
 
 revision = "captcha_purge_01"
-down_revision = "lecture_botsusp_01"
+down_revision = "social_login_01"
 branch_labels = None
 depends_on = None
 
