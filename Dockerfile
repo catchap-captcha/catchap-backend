@@ -39,4 +39,22 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=25s --retries=3 \
   CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health',timeout=3).status==200 else 1)"
 
 # 프로덕션 구동 — 워커 2개(각자 DB 엔진). 스키마 마이그레이션은 배포 절차에서 별도 실행(DEPLOY.md).
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]
+# ★--proxy-headers — 로드밸런서/인그레스 뒤에서 ★사용자 IP 를 그대로 보게 한다.
+#   이게 없으면 request.client.host 가 ★앞단(노드·LB)의 IP 가 되고,
+#   IP 기준 횟수 제한(로그인·재설정·캡차·업로드·소셜콜백 등 ★7개 모듈)이
+#   사용자별이 아니라 ★전체 한 덩어리로 돌아간다.
+#   실제로 그랬다 — login_throttle 에 pwresetip:192.168.57.1(노드 IP) 하나로 쌓이고 있었다.
+#
+# ★--forwarded-allow-ips 는 반드시 좁힌다. 이 헤더는 ★누구나 보낼 수 있으므로
+#   신뢰할 앞단만 지정해야 한다. 안 그러면 IP 를 위조해 횟수 제한을 우회할 수 있다.
+#     10.0.0.0/16     VPC (LB·노드)
+#     192.168.0.0/16  파드 네트워크 (인그레스가 hostNetwork 라 게이트웨이로 들어온다)
+#   실측한 앞단 주소 — 192.168.57.1 · 10.0.6.202
+#   ⚠️`*` 로 열지 말 것. uvicorn 0.52 의 _TrustedHosts 는 CIDR 를 지원한다(확인함).
+#
+# 전제 — ingress-nginx 에 use-forwarded-headers=true · proxy-real-ip-cidr=10.0.0.0/16
+#        그리고 LB 리스너에 X-Forwarded-For 삽입이 켜져 있어야 한다(2-a·2-b 둘 다).
+#
+# ★스킴은 문제되지 않는다 — 이 앱은 요청에서 절대 URL 을 만들지 않는다.
+#   리다이렉트는 전부 설정값(FRONTEND_URL·SOCIAL_REDIRECT_URIS·PAYMENT_*)에서 온다.
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2", "--proxy-headers", "--forwarded-allow-ips", "10.0.0.0/16,192.168.0.0/16"]
