@@ -39,7 +39,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: 코드 받기
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: 태그 정하기 (커밋 해시 7자리)
         id: tag
