@@ -214,6 +214,26 @@ class KakaoProvider(SocialProvider):
         )
 
 
+def _naver_reason(code: str, desc: str) -> str:
+    """네이버 토큰 오류를 '사용자가 다음에 무엇을 하면 되는지'로 바꾼다.
+
+    왜: 종전엔 전부 "네이버 인증 토큰을 받지 못했어요"였다. 원문 코드를 괄호로 붙여 뒀지만
+    `invalid_request: no valid data in session` 같은 문구는 사용자에게 아무 지시도 주지 못한다.
+    실제로 운영자가 이 화면에서 막혔다(2026-08-10) — 원인은 '이미 쓴 인가 코드'였고,
+    할 일은 '처음부터 다시'였는데 그 말이 화면에 없었다.
+
+    ★인가 코드는 1회용이다. 콜백 화면에서 새로고침하거나 뒤로 가기로 되돌아오면 같은 코드를
+    다시 보내게 되고, 네이버는 그것을 'no valid data in session'으로 거절한다. 흔한 경로라
+    오류가 아니라 안내로 다룬다.
+    """
+    low = f"{code} {desc}".lower()
+    if "session" in low or "expire" in low or "invalid_request" in code:
+        return "인증이 만료됐거나 이미 사용된 요청이에요. 로그인 화면에서 처음부터 다시 시도해 주세요."
+    if "client" in code:  # invalid_client · unauthorized_client — 설정 문제(사용자 잘못 아님)
+        return "네이버 로그인 설정에 문제가 있어요. 잠시 후 다시 시도하거나 관리자에게 알려 주세요."
+    return "네이버 인증 토큰을 받지 못했어요."
+
+
 class NaverProvider(SocialProvider):
     key = "naver"
     label = "네이버"
@@ -247,13 +267,11 @@ class NaverProvider(SocialProvider):
         if not token:
             # ★네이버는 실패도 HTTP 200 에 error/error_description 으로 싣는다. 이 값을 삼키면
             # "토큰을 못 받았다"만 남아 원인(잘못된 시크릿·만료된 코드·미저장 Callback URL)을
-            # 구분할 수 없다 — 사용자 메시지 끝에 코드를 붙여 진단 가능하게 한다.
+            # 구분할 수 없다 — 원문 코드는 괄호로 남겨 진단할 수 있게 한다.
             code_ = str(body.get("error") or "")[:60]
             desc = str(body.get("error_description") or "")[:120]
             detail = f" ({code_}{': ' + desc if desc else ''})" if code_ else ""
-            raise SocialAuthError(
-                f"네이버 인증 토큰을 받지 못했어요.{detail}", provider_code=code_ or None
-            )
+            raise SocialAuthError(f"{_naver_reason(code_, desc)}{detail}", provider_code=code_ or None)
         return token
 
     def fetch_profile(self, access_token: str) -> SocialProfile:
