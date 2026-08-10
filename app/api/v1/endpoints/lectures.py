@@ -4090,8 +4090,10 @@ def _generate_questions_now(
     verify_models = _to_models(verify_cands)
 
     def _on_usage(config_id, tokens_in, tokens_out):
-        if config_id:
-            ai_models_service.record_usage(db, config_id, tokens_in, tokens_out)
+        # 토큰 사용량은 부가 지표 — AI 호출을 감싼 긴 트랜잭션 밖에서, 같은 엔진(db.get_bind())에 붙은
+        # 별도 짧은 세션으로 즉시 커밋한다(잡 db에 얹으면 UPDATE 락이 잡 커밋까지 유지돼 동시 생성과
+        # 1205 락 타임아웃). 격리·재시도·로그는 헬퍼가 담당.
+        ai_models_service.record_usage_isolated(db.get_bind(), config_id, tokens_in, tokens_out)
 
     # 전사 우선순위: 강사 제공 자막(저장됨) > 자동 STT. 저장된 전사가 있으면 STT를 건너뛴다
     # (강사 자막이 품질↑·비용↓·OpenAI 키·25MB 한계 우회). 없을 때만 자동 STT하고, 그 결과를

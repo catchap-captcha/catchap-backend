@@ -729,8 +729,9 @@ def ops_generate_exam_questions(
     gen_models = _to_models(ai_models_service.resolve_candidates(db, "generate"))
 
     def _on_usage(config_id, tokens_in, tokens_out):
-        if config_id:
-            ai_models_service.record_usage(db, config_id, tokens_in, tokens_out)
+        # 토큰 사용량은 부가 지표 — 긴 생성 트랜잭션 밖, 같은 엔진의 별도 짧은 세션으로 즉시 커밋
+        # (잡 db에 얹으면 1205 위험). 격리·재시도·로그는 헬퍼가 담당.
+        ai_models_service.record_usage_isolated(db.get_bind(), config_id, tokens_in, tokens_out)
 
     try:
         items = generate_course_exam_questions(
