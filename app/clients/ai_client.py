@@ -9,6 +9,7 @@ Messages API(기본·폴백) 또는 OpenAI Chat Completions(GPT 계열). provide
 """
 
 import json
+import random
 import re
 
 import httpx
@@ -549,6 +550,12 @@ def _parse_questions(text: str, n: int) -> list[dict]:
             "answer_index": answer_index,
             "explain": explain.strip() if isinstance(explain, str) else "",
         }
+        # ★정답 위치 무작위화 — LLM이 정답을 자꾸 1번(answer_index=0)에 두는 편향을 서버에서 없앤다
+        #   (프롬프트로 '고르게 흩어라' 지시해도 편중이 남았다). 보기 순서만 섞고 정답의 새 위치를
+        #   다시 찾는다(보기·정답 '내용'은 그대로 — 해설은 위치가 아니라 내용을 근거로 하니 안 깨진다).
+        correct_opt = parsed["options"][answer_index]
+        random.shuffle(parsed["options"])
+        parsed["answer_index"] = parsed["options"].index(correct_opt)
         # 시점 제안(전사 기반 프롬프트일 때만 옴) — 형식이 어긋난 시점은 문항 전체를
         # 버리지 않고 시점만 버린다(시점 미배치 draft로 저장돼 운영자가 지정).
         pos = item.get("position_sec")
