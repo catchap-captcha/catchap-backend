@@ -4045,7 +4045,9 @@ def _dedupe_generated(db: Session, lec: Lecture, items: list[dict]) -> tuple[lis
     return kept, skipped
 
 
-def _generate_questions_now(db: Session, lec: Lecture, n: int, actor_id: str, on_phase=None) -> dict:
+def _generate_questions_now(
+    db: Session, lec: Lecture, n: int, actor_id: str, on_phase=None, should_cancel=None
+) -> dict:
     """AI 문항 자동 생성 실작업 — STT 전사(키 설정 시) → LLM 출제, source=llm·status=draft 저장.
 
     키는 호출 시점마다 해석한다(운영 콘솔 입력(DB) → .env 폴백). 정직성 규약:
@@ -4138,6 +4140,7 @@ def _generate_questions_now(db: Session, lec: Lecture, n: int, actor_id: str, on
             openai_key=openai_key,
             # 운영자가 콘솔에서 수정한 출제 규칙(비었으면 기본값 사용)
             rules_override=settings_service.get_setting(db, "llm_gen_rules"),
+            should_cancel=should_cancel,  # 배치 사이 취소 반영(큰 n의 '생성 중지')
         )
     except AiNotConfiguredError:
         raise HTTPException(
@@ -4325,6 +4328,29 @@ def ops_question_gen_job(
     return _gen_job_row(job)
 
 
+@router.post("/ops/lectures/{lecture_id}/questions/gen-jobs/{job_id}/cancel")
+def ops_cancel_question_gen_job(
+    lecture_id: str,
+    job_id: str,
+    principal: Principal = Depends(require_content_author),
+    db: Session = Depends(get_db),
+):
+    """진행 중인 문항 생성 잡을 '중지' 요청한다(강사 스코프). 러너는 다음 단계·배치 경계에서
+    이 상태를 보고 멈춘다 — 진행 중인 STT/생성 자체를 즉시 끊진 못하지만, 다음으로 넘어가기 전에
+    중단해 그 이후 작업(생성·저장·검증)을 하지 않는다. 이미 끝난(done/error/cancelled) 잡은
+    현재 상태를 그대로 돌려준다(무해)."""
+    _get_ops_lecture(db, lecture_id, principal)  # 소유 스코프 — 남의 강의 404
+    job = db.get(LectureQuestionGenJob, job_id)
+    if job is None or job.lecture_id != lecture_id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="생성 작업을 찾을 수 없습니다.")
+    if job.status in ("pending", "running"):
+        job.status = "cancelled"
+        job.phase = None
+        job.finished_at = datetime.now()
+        db.commit()
+    return _gen_job_row(job)
+
+
 def _notify_gen_result(db: Session, job: LectureQuestionGenJob, lec_title: str, *, ok: bool) -> None:
     """문항 생성 잡 완료/실패를 요청 강사에게 알린다(인앱 + 이메일). 알림 실패가 잡을
     오염시키지 않도록 호출부에서 예외를 삼킨다 — 알림은 부가 기능이지 잡 결과가 아니다."""
@@ -4464,6 +4490,10 @@ def _fail_gen_job(db: Session, job_id: str, detail: str) -> None:
         db.rollback()
 
 
+class _GenCancelled(Exception):
+    """문항 생성 잡이 사용자 요청으로 중지됨 — 러너 내부 신호(에러가 아니라 정상 중단)."""
+
+
 def _run_question_gen_job(job_id: str, *, session_factory=SessionLocal) -> None:
     """백그라운드 러너 — 잡의 STT+생성+자기검증+draft 저장을 수행하고 잡 상태를 갱신한다.
 
@@ -4484,12 +4514,22 @@ def _run_question_gen_job(job_id: str, *, session_factory=SessionLocal) -> None:
         job.status = "running"
         db.commit()
 
+        def _check_cancel() -> None:
+            # 취소 엔드포인트가 다른 세션에서 status='cancelled'로 커밋했을 수 있으니 최신 상태를
+            # 읽고, 그렇다면 중단 신호를 던진다(단계 경계 + 생성 배치 사이에서 호출된다).
+            db.refresh(job)
+            if job.status == "cancelled":
+                raise _GenCancelled()
+
         def _set_phase(p: str) -> None:
+            _check_cancel()
             job.phase = p  # 강사 폴링이 읽는 세부 단계(자막 변환/문항 생성/검증)
             db.commit()
 
         # 실작업은 동기 헬퍼 재사용 — 문항·감사를 db에 commit하고 요약 dict를 돌려준다.
-        summary = _generate_questions_now(db, lec, job.n, job.requested_by, on_phase=_set_phase)
+        summary = _generate_questions_now(
+            db, lec, job.n, job.requested_by, on_phase=_set_phase, should_cancel=_check_cancel
+        )
         job.status = "done"
         job.phase = None  # 완료 — 단계 표시 종료
         job.created_count = int(summary.get("created") or 0)
@@ -4506,6 +4546,15 @@ def _run_question_gen_job(job_id: str, *, session_factory=SessionLocal) -> None:
             _notify_gen_result(db, job, lec.title, ok=True)
         except Exception as exc:
             _log.warning("생성 완료 알림 전송 실패 job=%s: %s", job_id, exc)
+    except _GenCancelled:  # 사용자가 '생성 중지' — 단계/배치 경계에서 멈춘다(에러 아님, 조용히 마감)
+        db.rollback()  # 진행 중이던 미커밋 변경 정리(이미 커밋된 초안은 그대로 남는다)
+        j = db.get(LectureQuestionGenJob, job_id)
+        if j is not None and j.status not in ("done", "error"):
+            j.status = "cancelled"
+            j.phase = None
+            if j.finished_at is None:
+                j.finished_at = datetime.now()
+            db.commit()
     except HTTPException as e:  # 헬퍼의 503/502(키없음·STT실패) — 잡 error로 정직 노출
         _fail_gen_job(db, job_id, str(e.detail))
     except Exception as e:  # 예기치 못한 실패도 잡에 남긴다(조용한 실패 금지)
