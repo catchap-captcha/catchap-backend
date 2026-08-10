@@ -4140,8 +4140,8 @@ def _generate_questions_now(
             models=gen_models,
             on_usage=_on_usage,
             openai_key=openai_key,
-            # 운영자가 콘솔에서 수정한 출제 규칙(비었으면 기본값 사용)
-            rules_override=settings_service.get_setting(db, "llm_gen_rules"),
+            # 출제 규칙 — (강사 계정 × 이 강의 과목) 전용 → 전역 → 기본값 순으로 해석한다.
+            rules_override=settings_service.resolve_gen_rules(db, actor_id, lec.subject),
             should_cancel=should_cancel,  # 배치 사이 취소 반영(큰 n의 '생성 중지')
         )
     except AiNotConfiguredError:

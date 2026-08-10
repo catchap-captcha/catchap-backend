@@ -2319,6 +2319,70 @@ def ops_put_ai_prompt(
     return _ai_prompt_payload(db, setting_key="llm_gen_rules", default_rules=DEFAULT_GEN_RULES)
 
 
+class _ScopedPromptUpdate(BaseModel):
+    instructor_id: str
+    subject: str
+    rules: str = ""  # 빈 값 = 이 (강사·과목) 전용본 삭제 → 전역/기본값으로 복귀
+
+
+@router.get("/settings/ai/prompts/scoped")
+def ops_get_scoped_ai_prompts(
+    principal: Principal = Depends(require_ops), db: Session = Depends(get_db)
+):
+    """(강사 계정 × 코스 과목)별 출제 규칙 — 저장된 전용본 목록 + 설정 가능한 (강사,과목) 쌍.
+    생성 시 강의의 (강사,과목)에 맞는 전용본이 있으면 그걸, 없으면 전역/기본값을 쓴다."""
+    from app.models import Course, User
+    from app.services import settings_service
+
+    overrides = settings_service.list_scoped_gen_rules(db)
+    # 설정 가능한 조합 = 강사가 올린 코스의 (강사, 과목) 조합(중복 제거)
+    pairs_rows = db.query(Course.instructor_id, Course.subject).distinct().all()
+    ids = {r[0] for r in pairs_rows} | {o["instructor_id"] for o in overrides}
+    names = {u.id: u.name for u in db.query(User).filter(User.id.in_(ids or [""])).all()}
+    return {
+        "overrides": [
+            {**o, "instructor_name": names.get(o["instructor_id"], "(알 수 없는 강사)")}
+            for o in overrides
+        ],
+        "pairs": [
+            {"instructor_id": iid, "instructor_name": names.get(iid, "(알 수 없는 강사)"), "subject": subj}
+            for iid, subj in pairs_rows
+            if iid and subj
+        ],
+    }
+
+
+@router.put("/settings/ai/prompts/scoped")
+def ops_put_scoped_ai_prompt(
+    req: _ScopedPromptUpdate,
+    principal: Principal = Depends(require_ops),
+    db: Session = Depends(get_db),
+):
+    """(강사, 과목) 전용 출제 규칙 저장 — 빈 값이면 그 조합의 전용본 삭제(전역/기본값 복귀).
+    다음 문항 생성부터 즉시 반영(재기동 불필요)."""
+    from app.services import settings_service
+
+    iid = (req.instructor_id or "").strip()
+    subject = (req.subject or "").strip()
+    if not iid or not subject:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="강사와 과목을 지정해 주세요.")
+    settings_service.set_setting(
+        db, settings_service.scoped_gen_key(iid, subject), (req.rules or "").strip(),
+        updated_by=principal.id,
+    )
+    audit(
+        db,
+        action="system.settings.ai_prompt_scoped",
+        actor_user_id=principal.id,
+        target_type="system_setting",
+        target_id=None,
+        before={"instructor_id": iid, "subject": subject},
+        after={"len": len((req.rules or "").strip())},
+    )
+    db.commit()
+    return {"ok": True}
+
+
 @router.get("/settings/ai/verify-prompt")
 def ops_get_ai_verify_prompt(
     principal: Principal = Depends(require_ops), db: Session = Depends(get_db)
