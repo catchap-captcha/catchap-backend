@@ -32,6 +32,9 @@ class Settings(BaseSettings):
     JWT_ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
     REFRESH_TOKEN_EXPIRE_DAYS: int = 14
+    # 운영자(ops)는 짧게 — 공용/내부 콘솔이라 방치된 세션이 오래 살아있으면 위험하다.
+    # 학생·강사는 위 14일, 운영자만 8시간으로 재발급(회전)마다 갱신되는 슬라이딩 만료.
+    REFRESH_TOKEN_OPS_HOURS: int = 8
 
     # Gmail SMTP (비어 있으면 콘솔 dry-run)
     SMTP_HOST: str = "smtp.gmail.com"

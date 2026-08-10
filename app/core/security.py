@@ -65,8 +65,14 @@ def create_access_token(user_id: str, role: str) -> str:
     return jwt.encode(payload, settings.JWT_SECRET_KEY, algorithm=settings.JWT_ALGORITHM)
 
 
-def create_refresh_token(user_id: str) -> tuple[str, datetime]:
-    expires_at = _now() + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)
+def create_refresh_token(user_id: str, role: str | None = None) -> tuple[str, datetime]:
+    # 로그인 유지 기간은 역할로 갈린다 — 운영자(ops)는 공용 콘솔을 가정해 8시간으로 짧게,
+    # 학생·강사는 14일. issue_tokens가 발급·회전 양쪽에서 role을 넘겨주므로
+    # 재발급(회전)마다 아래 만료가 다시 계산되는 슬라이딩 방식이 된다.
+    if role == "ops":
+        expires_at = _now() + timedelta(hours=settings.REFRESH_TOKEN_OPS_HOURS)
+    else:
+        expires_at = _now() + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)
     payload = {
         "sub": user_id,
         "type": "refresh",

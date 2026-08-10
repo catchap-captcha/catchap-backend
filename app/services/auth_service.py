@@ -199,7 +199,9 @@ def rate_limit(db: Session, identifier: str, limit: int, window_seconds: int = 3
 
 def issue_tokens(db: Session, subject_id: str, role: str, subject_type: str) -> s.TokenPair:
     access = create_access_token(subject_id, role)
-    refresh, expires_at = create_refresh_token(subject_id)
+    # role을 넘겨 만료를 역할별로 — 운영자 8시간, 그 외 14일. issue_tokens는 로그인·회전
+    # 양쪽의 단일 발급 지점이라 여기 한 곳만 고치면 재발급까지 같은 규칙을 탄다.
+    refresh, expires_at = create_refresh_token(subject_id, role)
     db.add(
         RefreshToken(
             user_id=subject_id,
