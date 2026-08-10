@@ -404,8 +404,22 @@ def test_naver_token_error_is_surfaced():
         )
 
     with httpx.Client(transport=httpx.MockTransport(handler)) as http:
-        with pytest.raises(SocialAuthError, match="invalid_request"):
+        with pytest.raises(SocialAuthError, match="invalid_request") as err:
             NaverProvider("cid", "sec", client=http).exchange_code("code", REDIRECT, "st")
+    # ★원문 코드만으로는 사용자가 무엇을 해야 할지 모른다 — 할 일이 문장에 있어야 한다.
+    assert "다시 시도" in err.value.message
+
+
+def test_naver_client_error_reads_as_setup_problem():
+    """invalid_client 는 사용자 잘못이 아니다 — '다시 해보라'가 아니라 '알려 달라'로 안내한다."""
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"error": "invalid_client"})
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http:
+        with pytest.raises(SocialAuthError) as err:
+            NaverProvider("cid", "sec", client=http).exchange_code("code", REDIRECT, "st")
+    assert "관리자" in err.value.message
 
 
 def test_naver_adapter_parses_profile():
