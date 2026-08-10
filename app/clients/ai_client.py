@@ -72,6 +72,7 @@ def _prompt(
     n: int,
     transcript: list[dict] | None,
     rules_override: str | None = None,
+    avoid_positions: list[int] | None = None,
 ) -> str:
     head = (
         # 대상 중립화(2026-07-20): 옛 아동 제품 잔재('초등학생용') 제거 — 성인 인강으로 전환됐고,
@@ -95,6 +96,11 @@ def _prompt(
     # 전사 기반 — 자막의 실제 발화만 근거로 삼고, 출제 시점(그 대목 설명이 끝난 직후)과
     # 내용 시작 시점(오답 3회 시 되감을 지점)까지 함께 제안하게 한다. 시점은 초 단위 정수.
     lines = "\n".join(f"[{seg['start']:.0f}s~{seg['end']:.0f}s] {seg['text']}" for seg in transcript)
+    # 배치 생성(큰 n)에서 이미 낸 대목을 알려 겹침을 줄인다. 없으면(1회 생성) 아무 것도 덧붙이지 않는다.
+    avoid_note = ""
+    if avoid_positions:
+        secs = ", ".join(f"{int(s)}s" for s in list(avoid_positions)[:80])
+        avoid_note = f"- 이미 다음 시점 부근에서 문제를 냈어요 — 그 대목은 피하고 아직 다루지 않은 다른 구간에서 내세요: {secs}\n"
     return (
         head
         + "\n아래는 이 강의의 음성 전사(자막)입니다. 각 줄 앞의 [시작~끝]은 초 단위 시점입니다.\n"
@@ -104,8 +110,9 @@ def _prompt(
         + "- 전사에 없는 내용을 지어내지 마세요(상식으로 풀리는 문제 금지).\n"
         "- position_sec: 이 문제를 낼 시점(초, 정수) — 그 내용 설명이 '끝난 직후'의 자막 시점.\n"
         "- content_start_sec: 그 내용 설명이 '시작되는' 자막 시점(초, 정수) — 반드시 position_sec보다 앞.\n"
-        "- 서로 다른 문제는 서로 다른 대목에서 내고, position_sec이 겹치지 않게 하세요.\n\n"
-        "다음 JSON 배열만 출력하세요(코드펜스·설명 없이):\n"
+        "- 서로 다른 문제는 서로 다른 대목에서 내고, position_sec이 겹치지 않게 하세요.\n"
+        + avoid_note
+        + "\n다음 JSON 배열만 출력하세요(코드펜스·설명 없이):\n"
         '[{"prompt": "질문", "options": ["보기1", "보기2", "보기3", "보기4"], '
         '"answer_index": 0, "explain": "해설", "position_sec": 45, "content_start_sec": 12}]'
     )
@@ -568,6 +575,7 @@ def generate_lecture_questions(
     on_usage=None,
     openai_key: str | None = None,
     rules_override: str | None = None,
+    should_cancel=None,
 ) -> list[dict]:
     """강의 메타(+전사)에서 확인 문항 n개 생성.
 
@@ -583,16 +591,38 @@ def generate_lecture_questions(
     if not key and not oa:
         raise AiNotConfiguredError("LLM API 키가 설정되지 않았습니다.")
 
-    n = max(1, min(int(n), 20))
-    text = _post_messages(
-        key,
-        _prompt(lecture_title, description, subject, n, transcript, rules_override),
-        max_tokens=8192,
-        models=models,
-        on_usage=on_usage,
-        openai_key=oa,
-    )
-    return _parse_questions(text, n)
+    n = max(1, min(int(n), 100))
+    # 큰 수(>20)를 한 번에 뽑으면 JSON이 잘리거나 품질이 떨어진다 — 20개씩 나눠 채우고,
+    # 이미 낸 대목(position_sec)을 다음 배치에 알려 겹침을 줄인다. n<=20이면 루프 1회 = 종전과 동일.
+    # should_cancel()은 배치 사이에 호출된다 — 운영자가 '생성 중지'를 누르면 여기서 예외로 멈춘다.
+    BATCH = 20
+    collected: list[dict] = []
+    seen: set[str] = set()
+    for _ in range((n + BATCH - 1) // BATCH):
+        if len(collected) >= n:
+            break
+        if should_cancel is not None:
+            should_cancel()
+        want = min(BATCH, n - len(collected))
+        avoid = [q["position_sec"] for q in collected if q.get("position_sec") is not None]
+        text = _post_messages(
+            key,
+            _prompt(lecture_title, description, subject, want, transcript, rules_override, avoid),
+            max_tokens=8192,
+            models=models,
+            on_usage=on_usage,
+            openai_key=oa,
+        )
+        added = 0
+        for q in _parse_questions(text, want):
+            p = (q.get("prompt") or "").strip()
+            if p and p not in seen:
+                seen.add(p)
+                collected.append(q)
+                added += 1
+        if added == 0:  # 더 못 만들면(짧은 강의 등) 중단 — 무한 반복·중복 누적 방지
+            break
+    return collected[:n]
 
 
 def _course_exam_prompt(course_title: str, subject: str, lectures: list[dict], n: int) -> str:
