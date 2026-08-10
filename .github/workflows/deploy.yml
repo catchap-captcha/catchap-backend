@@ -30,7 +30,10 @@ concurrency:
 env:
   REGISTRY: kc-sfacspace05.kr-central-2.kcr.dev
   IMAGE_PATH: catchap-backend-repo/catchap-backend          # 예) catchap-backend-repo/catchap-backend
-  MANIFEST: k8s/backend/30-deployment.yaml
+  # ★파일 하나가 아니라 ★디렉터리입니다 — 이미지 줄이 ★두 곳에 있습니다.
+  #   30-deployment.yaml (앱)  ·  20-migrate-job.yaml (마이그레이션 Job)
+  #   ★태그가 어긋나면 「옛 코드의 마이그레이션」을 돌리게 됩니다.
+  MANIFEST_DIR: k8s/backend
 
 jobs:
   build-and-update:
@@ -120,30 +123,42 @@ jobs:
           SHA: ${{ steps.tag.outputs.sha }}
         run: |
           cd infra
-          F="$MANIFEST"
-          test -f "$F" || { echo "::error::$F 가 없습니다"; exit 1; }
-          BEFORE=$(grep -oE 'image: [^ ]+' "$F" | head -1)
-          NEW="image: ${REGISTRY}/${IMAGE_PATH}:${SHA}"
-          # ★이 저장소의 이미지 줄만 바꿉니다
-          python3 - "$F" "$REGISTRY/$IMAGE_PATH" "$SHA" <<'PY'
-          import io,re,sys
-          f,path,sha = sys.argv[1], sys.argv[2], sys.argv[3]
-          s = io.open(f, encoding='utf-8').read()
-          s2, n = re.subn(r'(image:\s*)'+re.escape(path)+r':[^\s]+', r'\g<1>'+path+':'+sha, s)
-          if n != 1:
-              print("::error::이미지 줄을 %d 개 찾았습니다 (1개여야 합니다)" % n); sys.exit(1)
-          io.open(f, 'w', encoding='utf-8', newline='\n').write(s2)
+          test -d "$MANIFEST_DIR" || { echo "::error::$MANIFEST_DIR 가 없습니다"; exit 1; }
+          # ★디렉터리 안의 ★모든 이미지 줄을 바꿉니다.
+          #   앱(Deployment)과 마이그레이션(Job)이 ★같은 태그여야 하기 때문입니다.
+          #   ★한 파일만 고치면 「옛 코드의 마이그레이션」을 돌리게 됩니다.
+          python3 - "$MANIFEST_DIR" "$REGISTRY/$IMAGE_PATH" "$SHA" <<'PY'
+          import io, os, re, sys
+          d, path, sha = sys.argv[1], sys.argv[2], sys.argv[3]
+          pat = re.compile(r'(image:\s*)' + re.escape(path) + r':(\S+)')
+          before, after, touched = set(), set(), []
+          for name in sorted(os.listdir(d)):
+              if not name.endswith(('.yaml', '.yml')) or '예시' in name:
+                  continue
+              f = os.path.join(d, name)
+              t = io.open(f, encoding='utf-8').read()
+              found = pat.findall(t)
+              if not found:
+                  continue
+              before.update(tag for _, tag in found)
+              t2 = pat.sub(lambda m: m.group(1) + path + ':' + sha, t)
+              io.open(f, 'w', encoding='utf-8', newline='\n').write(t2)
+              after.add(sha)
+              touched.append('%s(%d)' % (name, len(found)))
+          if not touched:
+              print('::error::%s 안에서 %s 이미지 줄을 하나도 못 찾았습니다' % (d, path))
+              sys.exit(1)
+          print('  고친 곳: %s' % ', '.join(touched))
+          print('  전: %s' % ' '.join(sorted(before)))
+          print('  후: %s' % ' '.join(sorted(after)))
+          # ★고친 뒤 태그가 ★한 종류로 모였는지 확인한다
+          if len(after) != 1:
+              print('::error::태그가 %d 종류입니다 — 앱과 마이그레이션이 어긋났습니다' % len(after))
+              sys.exit(1)
+          # ★바뀐 게 없으면 커밋하지 않는다
+          io.open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8').write(
+              'changed=%s\n' % ('false' if before == after else 'true'))
           PY
-          AFTER=$(grep -oE 'image: [^ ]+' "$F" | head -1)
-          echo "  전: $BEFORE"
-          echo "  후: $AFTER"
-          if [ "$BEFORE" = "$AFTER" ]; then
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::태그가 이미 같습니다 — 커밋하지 않습니다."
-          else
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-          fi
-
       - name: catchap-infra 에 올리기
         if: steps.gate.outputs.ready == 'true' && steps.bump.outputs.changed == 'true'
         env:
@@ -152,7 +167,7 @@ jobs:
           cd infra
           git config user.name  'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add "$MANIFEST"
+          git add "$MANIFEST_DIR"
           git commit -q -m "ci(deploy): backend 이미지를 ${SHA} 로" \
                         -m "${GITHUB_REPOSITORY}@${GITHUB_SHA} 가 main 에 들어와 만든 이미지다. ArgoCD 가 이 커밋을 보고 반영한다."
           # ★다른 저장소가 같은 때 병합되면 이 push 가 거절된다(non-fast-forward).
@@ -193,7 +208,7 @@ jobs:
             echo "${REGISTRY}/${IMAGE_PATH}:${SHA}"
             echo '```'
             echo ""
-            echo "매니페스트: \`${MANIFEST}\` (catchap-infra)"
+            echo "매니페스트: \`${MANIFEST_DIR}/\` (catchap-infra · 앱 + 마이그레이션 Job)"
             echo ""
             echo "⚠️ ArgoCD 의 자동 동기화가 꺼져 있으면 화면에서 **Sync** 를 눌러야 반영됩니다."
           } >> "$GITHUB_STEP_SUMMARY"
