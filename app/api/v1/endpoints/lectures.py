@@ -4295,6 +4295,25 @@ def ops_generate_questions(
     return {"job_id": job.id, "status": job.status, "n": job.n}
 
 
+@router.get("/ops/lectures/{lecture_id}/gen-rules-info")
+def ops_gen_rules_info(
+    lecture_id: str,
+    principal: Principal = Depends(require_content_author),
+    db: Session = Depends(get_db),
+):
+    """이 강의 문항 생성에 쓰일 '출제 규칙'의 출처·마지막 저장 시각 — 확인 문항 창에 표시한다.
+    생성 때와 같은 해석: (현재 사용자, 이 강의 과목) 전용본 → 전역 → 서버 기본값."""
+    from app.services import settings_service
+
+    lec = _get_ops_lecture(db, lecture_id, principal)
+    scoped_key = settings_service.scoped_gen_key(principal.id, lec.subject)
+    for source, key in (("scoped", scoped_key), ("global", settings_service.GEN_RULES_KEY)):
+        if settings_service.get_setting(db, key):
+            at = settings_service.setting_updated_at(db, key)
+            return {"source": source, "updated_at": at.isoformat() if at else None, "is_custom": True}
+    return {"source": "default", "updated_at": None, "is_custom": False}
+
+
 def _gen_job_row(job: LectureQuestionGenJob) -> dict:
     verified = bool(job.self_verified)
     return {

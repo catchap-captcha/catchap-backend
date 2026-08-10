@@ -58,6 +58,12 @@ def set_setting(db: Session, key: str, value: str, *, updated_by: str | None) ->
         row.updated_by = updated_by
 
 
+def setting_updated_at(db: Session, key: str):
+    """그 설정을 마지막으로 저장한 시각(datetime) — 없으면 None. 원문은 안 읽어 마스킹과 무관하다."""
+    row = db.query(SystemSetting).filter(SystemSetting.key == key).first()
+    return row.updated_at if row is not None else None
+
+
 def masked_status(db: Session, key: str, env_fallback: str = "") -> dict:
     """읽기 API용 상태 — 원문 미반환. {configured, last4, source, updated_at}."""
     row = db.query(SystemSetting).filter(SystemSetting.key == key).first()
