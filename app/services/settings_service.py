@@ -58,6 +58,12 @@ def set_setting(db: Session, key: str, value: str, *, updated_by: str | None) ->
         row.updated_by = updated_by
 
 
+def setting_updated_at(db: Session, key: str):
+    """그 설정을 마지막으로 저장한 시각(datetime) — 없으면 None. 원문은 안 읽어 마스킹과 무관하다."""
+    row = db.query(SystemSetting).filter(SystemSetting.key == key).first()
+    return row.updated_at if row is not None else None
+
+
 def masked_status(db: Session, key: str, env_fallback: str = "") -> dict:
     """읽기 API용 상태 — 원문 미반환. {configured, last4, source, updated_at}."""
     row = db.query(SystemSetting).filter(SystemSetting.key == key).first()
@@ -86,3 +92,40 @@ def resolve_anthropic_key(db: Session) -> str:
 def resolve_openai_key(db: Session) -> str:
     """STT(OpenAI Whisper) 키 — DB(콘솔) 우선, .env 폴백. 없으면 빈 문자열."""
     return get_setting(db, "openai_api_key") or (get_settings().OPENAI_API_KEY or "").strip()
+
+
+# ── 문항 생성 '출제 규칙'을 (강사 계정 × 코스 과목)별로 두기 ──────────────────────────
+# 전역 llm_gen_rules 하나 대신, 강사·과목 조합마다 전용 규칙을 둔다. 새 테이블 없이 같은
+# system_settings 에 복합 키로 넣어 마이그레이션이 없다(값은 다른 설정처럼 암호화 저장).
+# instructor_id 는 UUID, subject 는 '수학'·'일반' 등 구분자('::')가 없어 키 파싱이 안전하다.
+GEN_RULES_KEY = "llm_gen_rules"
+
+
+def scoped_gen_key(instructor_id: str, subject: str) -> str:
+    return f"{GEN_RULES_KEY}::i:{instructor_id}::s:{subject}"
+
+
+def resolve_gen_rules(db: Session, instructor_id: str | None, subject: str | None) -> str | None:
+    """생성 출제 규칙 해석 — (강사+과목) 전용 → 전역(llm_gen_rules) 순으로 첫 비어있지 않은 값.
+    둘 다 없으면 None(호출부가 서버 기본값 DEFAULT_GEN_RULES 를 쓴다)."""
+    if instructor_id and subject:
+        scoped = get_setting(db, scoped_gen_key(instructor_id, subject))
+        if scoped and scoped.strip():
+            return scoped
+    glob = get_setting(db, GEN_RULES_KEY)
+    return glob if glob and glob.strip() else None
+
+
+def list_scoped_gen_rules(db: Session) -> list[dict]:
+    """저장된 (강사, 과목)별 출제 규칙 전부 — [{instructor_id, subject, rules}]. 키 접두사로 찾아 복호."""
+    prefix = f"{GEN_RULES_KEY}::i:"
+    out: list[dict] = []
+    for row in db.query(SystemSetting).filter(SystemSetting.key.like(prefix + "%")).all():
+        rest = row.key[len(prefix):]
+        if "::s:" not in rest:
+            continue
+        iid, subject = rest.split("::s:", 1)
+        rules = get_setting(db, row.key)  # 복호
+        if rules and rules.strip():
+            out.append({"instructor_id": iid, "subject": subject, "rules": rules})
+    return out

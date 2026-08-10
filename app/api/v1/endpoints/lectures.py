@@ -4140,8 +4140,8 @@ def _generate_questions_now(
             models=gen_models,
             on_usage=_on_usage,
             openai_key=openai_key,
-            # 운영자가 콘솔에서 수정한 출제 규칙(비었으면 기본값 사용)
-            rules_override=settings_service.get_setting(db, "llm_gen_rules"),
+            # 출제 규칙 — (강사 계정 × 이 강의 과목) 전용 → 전역 → 기본값 순으로 해석한다.
+            rules_override=settings_service.resolve_gen_rules(db, actor_id, lec.subject),
             should_cancel=should_cancel,  # 배치 사이 취소 반영(큰 n의 '생성 중지')
         )
     except AiNotConfiguredError:
@@ -4293,6 +4293,25 @@ def ops_generate_questions(
     db.commit()
     background_tasks.add_task(_run_question_gen_job, job.id)
     return {"job_id": job.id, "status": job.status, "n": job.n}
+
+
+@router.get("/ops/lectures/{lecture_id}/gen-rules-info")
+def ops_gen_rules_info(
+    lecture_id: str,
+    principal: Principal = Depends(require_content_author),
+    db: Session = Depends(get_db),
+):
+    """이 강의 문항 생성에 쓰일 '출제 규칙'의 출처·마지막 저장 시각 — 확인 문항 창에 표시한다.
+    생성 때와 같은 해석: (현재 사용자, 이 강의 과목) 전용본 → 전역 → 서버 기본값."""
+    from app.services import settings_service
+
+    lec = _get_ops_lecture(db, lecture_id, principal)
+    scoped_key = settings_service.scoped_gen_key(principal.id, lec.subject)
+    for source, key in (("scoped", scoped_key), ("global", settings_service.GEN_RULES_KEY)):
+        if settings_service.get_setting(db, key):
+            at = settings_service.setting_updated_at(db, key)
+            return {"source": source, "updated_at": at.isoformat() if at else None, "is_custom": True}
+    return {"source": "default", "updated_at": None, "is_custom": False}
 
 
 def _gen_job_row(job: LectureQuestionGenJob) -> dict:
