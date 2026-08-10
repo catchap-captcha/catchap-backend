@@ -238,7 +238,7 @@ def test_console_account_email_is_rejected(client, db, social_env, monkeypatch):
     db.commit()
     _stub(monkeypatch, _profile(email="staff@test.dev"))
     r = _callback(client, state=_state(client))
-    assert r.status_code == 400 and "콘솔 계정" in r.json()["detail"]
+    assert r.status_code == 400 and "콘솔 계정" in r.json()["detail"]["message"]
 
 
 def test_disabled_account_cannot_log_in(client, db, social_env, monkeypatch):
@@ -512,7 +512,10 @@ def test_console_account_is_not_auto_linked_but_can_link_manually(client, db, so
 
     # ① 연결 전: 이메일이 같아도 자동 로그인 안 됨 → 연결 방법 안내
     r = _callback(client, state=_state(client))
-    assert r.status_code == 400 and "설정에서" in r.json()["detail"]
+    assert r.status_code == 400
+    # ★프런트가 이 경우에만 '연결하러 가기' 버튼을 띄운다 — 문구가 아니라 이 값으로 판별한다.
+    # 문구 비교로 두면 문구를 다듬는 순간 버튼이 조용히 사라진다.
+    assert r.json()["detail"]["action"] == "console_link"
     assert db.query(SocialAccount).count() == 0
 
     # ② 로그인한 상태에서 직접 연결
