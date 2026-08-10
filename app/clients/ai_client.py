@@ -583,6 +583,7 @@ def generate_lecture_questions(
     openai_key: str | None = None,
     rules_override: str | None = None,
     should_cancel=None,
+    is_duplicate=None,
 ) -> list[dict]:
     """강의 메타(+전사)에서 확인 문항 n개 생성.
 
@@ -591,7 +592,11 @@ def generate_lecture_questions(
     api_key는 호출자가 해석해 넘긴다(운영 콘솔 입력(DB) → .env 폴백 —
     settings_service.resolve_anthropic_key). None이면 .env만 본다(하위호환).
     키가 없으면 AiNotConfiguredError, 호출/파싱 실패는 AiGenerationError — 어떤 경우에도
-    stub 문항을 지어내 반환하지 않는다."""
+    stub 문항을 지어내 반환하지 않는다.
+
+    is_duplicate(prompt, kept_prompts)->bool: 채택 전 중복 판정 훅. 호출부가 기존 강의 문항·
+    근접중복(difflib) 기준을 주입해, 리필이 '진짜 새 문항'으로만 채워지게 한다. None이면
+    정확일치 폴백(하위호환)."""
     settings = get_settings()
     key = (api_key if api_key is not None else settings.ANTHROPIC_API_KEY or "").strip()
     oa = (openai_key or "").strip()
@@ -599,13 +604,23 @@ def generate_lecture_questions(
         raise AiNotConfiguredError("LLM API 키가 설정되지 않았습니다.")
 
     n = max(1, min(int(n), 100))
-    # 큰 수(>20)를 한 번에 뽑으면 JSON이 잘리거나 품질이 떨어진다 — 20개씩 나눠 채우고,
-    # 이미 낸 대목(position_sec)을 다음 배치에 알려 겹침을 줄인다. n<=20이면 루프 1회 = 종전과 동일.
-    # should_cancel()은 배치 사이에 호출된다 — 운영자가 '생성 중지'를 누르면 여기서 예외로 멈춘다.
-    BATCH = 20
+    # 한 배치를 작게(12개) 잡고, 요청 개수(n)에 못 미치면 '부족분'을 다시 요청해 채운다(리필).
+    # 왜 작게: 한 번에 많이 뽑으면 max_tokens에 걸려 JSON이 잘리기 쉽고(→ 통째 실패), 품질도
+    # 떨어진다. 왜 리필: 짧은 강의는 모델이 스스로 적게 반환하는데, 종전엔 한 번 부족하면 그대로
+    # 끝나 '20개 요청 → 12개'가 됐다. 이미 낸 대목(position_sec)과 이미 채택한 문항(is_duplicate)을
+    # 다음 배치에 알려 겹침·중복을 줄인다. 한 라운드가 새 문항을 하나도 못 보태면 멈춘다 —
+    # 내용이 허용하는 만큼만 만들고(중복 남발 금지), 호출부가 '요청 n개 중 몇 개'를 정직히 안내한다.
+    # should_cancel()은 배치 사이에 호출된다 — '생성 중지'를 누르면 여기서 예외로 멈춘다.
+    BATCH = 12
+
+    def _default_dup(prompt: str, kept: list[str]) -> bool:
+        return prompt in kept  # 하위호환: 훅이 없으면 정확일치만 거른다
+
+    is_dup = is_duplicate or _default_dup
     collected: list[dict] = []
-    seen: set[str] = set()
-    for _ in range((n + BATCH - 1) // BATCH):
+    kept_prompts: list[str] = []
+    max_attempts = (n + BATCH - 1) // BATCH + 5  # 리필 여유 + 무한루프 안전 상한(실 종료는 added==0)
+    for _ in range(max_attempts):
         if len(collected) >= n:
             break
         if should_cancel is not None:
@@ -623,11 +638,11 @@ def generate_lecture_questions(
         added = 0
         for q in _parse_questions(text, want):
             p = (q.get("prompt") or "").strip()
-            if p and p not in seen:
-                seen.add(p)
+            if p and not is_dup(p, kept_prompts):
+                kept_prompts.append(p)
                 collected.append(q)
                 added += 1
-        if added == 0:  # 더 못 만들면(짧은 강의 등) 중단 — 무한 반복·중복 누적 방지
+        if added == 0:  # 새 문항을 못 보탬(짧은 강의 등) — 무한 반복·중복 누적 방지
             break
     return collected[:n]
 

@@ -4129,6 +4129,31 @@ def _generate_questions_now(
 
     if on_phase:
         on_phase("generating")  # 단계 표시: 문항 생성 중
+    # 생성 단계 중복 판정 훅 — 리필이 '기존 강의 문항·이미 채택분과 유사하지 않은 진짜 새 문항'으로만
+    # 채우게 한다(뒤 _dedupe_generated와 같은 0.85 기준). 여기서 먼저 걸러야 리필이 중복을 만드느라
+    # 낭비하지 않고, 짧은 강의에서 '요청 n개 중 실제 몇 개'가 내용의 진짜 상한이 된다.
+    from difflib import SequenceMatcher as _SeqMatch
+
+    _existing_norms = [
+        m
+        for m in (
+            _norm_prompt((r.payload or {}).get("prompt", ""))
+            for r in db.query(LectureQuestion)
+            .filter(LectureQuestion.lecture_id == lec.id, LectureQuestion.status != "deleted")
+            .all()
+        )
+        if m
+    ]
+
+    def _is_dup(prompt: str, kept_prompts: list[str]) -> bool:
+        norm = _norm_prompt(prompt)
+        if not norm:
+            return False  # 빈 프롬프트는 뒤 파서/검증이 거른다
+        for s in (*_existing_norms, *(_norm_prompt(k) for k in kept_prompts)):
+            if norm == s or _SeqMatch(None, norm, s).ratio() >= _DUP_SIM_THRESHOLD:
+                return True
+        return False
+
     try:
         items = generate_lecture_questions(
             lecture_title=lec.title,
@@ -4143,6 +4168,7 @@ def _generate_questions_now(
             # 출제 규칙 — (강사 계정 × 이 강의 과목) 전용 → 전역 → 기본값 순으로 해석한다.
             rules_override=settings_service.resolve_gen_rules(db, actor_id, lec.subject),
             should_cancel=should_cancel,  # 배치 사이 취소 반영(큰 n의 '생성 중지')
+            is_duplicate=_is_dup,  # 리필이 기존/이미 채택분과 근접중복이 아닌 새 문항으로만 채우게
         )
     except AiNotConfiguredError:
         raise HTTPException(
