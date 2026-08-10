@@ -12,10 +12,16 @@
 '생성/검증' 백엔드로 붙이는 건 다음 단계(별도 호출 경로 필요).
 """
 
+import logging
+import time
+
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from app.models import AiModelConfig
 from app.services import settings_service
+
+_log = logging.getLogger("catchap.ai_models")
 
 AUTO_SWAP_KEY = "ai_auto_swap"
 SLOTS = ("generate", "verify")
@@ -79,6 +85,32 @@ def record_usage(db: Session, config_id: str, tokens_in: int, tokens_out: int) -
         },
         synchronize_session=False,
     )
+
+
+def record_usage_isolated(bind, config_id: str, tokens_in: int, tokens_out: int) -> None:
+    """토큰 사용량을 '별도 짧은 트랜잭션'으로 기록한다 — 생성 잡의 긴 트랜잭션(AI 호출 대기 포함)
+    밖에서, 같은 엔진(bind)에 붙은 새 세션으로 원자적 UPDATE 후 즉시 commit해 ai_model_configs
+    핫로우 락을 밀리초만 쥔다. 운영 MySQL은 별도 커넥션=별도 트랜잭션이라 AI 호출을 감싼 긴
+    트랜잭션과 분리된다(1205 락 타임아웃 방지). 같은 bind라 테스트(SQLite in-memory)도 그대로 동작.
+
+    핫로우 경합이 남으면 1205(락 대기) 등 일시적 오류엔 몇 번만 짧게 재시도한다(무한 재시도 금지).
+    끝내 실패해도 조용히 무시하지 않고 로그로 남긴다 — 토큰 집계는 부차라 생성 자체는 막지 않는다."""
+    if not config_id:
+        return
+    for attempt in range(3):
+        try:
+            with Session(bind=bind) as usage_db:
+                record_usage(usage_db, config_id, tokens_in, tokens_out)
+                usage_db.commit()
+            return
+        except OperationalError as e:  # 1205(락 대기) 등 일시적 경합 — 짧은 backoff 후 재시도
+            if attempt < 2:
+                time.sleep(0.2 * (attempt + 1))
+                continue
+            _log.warning("토큰 사용량 기록 재시도 초과(config=%s): %s", config_id, e)
+        except Exception as e:  # 그 외 오류도 생성은 막지 않되 조용히 넘기지 않는다
+            _log.warning("토큰 사용량 기록 실패(config=%s): %s", config_id, e)
+            return
 
 
 def estimate_cost_usd(m: AiModelConfig) -> float:
