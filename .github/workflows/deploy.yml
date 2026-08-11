@@ -151,10 +151,14 @@ jobs:
           print('  고친 곳: %s' % ', '.join(touched))
           print('  전: %s' % ' '.join(sorted(before)))
           print('  후: %s' % ' '.join(sorted(after)))
-          # ★고친 뒤 태그가 ★한 종류로 모였는지 확인한다
-          if len(after) != 1:
-              print('::error::태그가 %d 종류입니다 — 앱과 마이그레이션이 어긋났습니다' % len(after))
-              sys.exit(1)
+          # ★고치기 ★전에 파일들이 어긋나 있었는지 본다.
+          #   어긋남 = 앞선 배포가 일부만 바꿨다는 뜻이다. 지금 갱신이 하나로
+          #   모았으므로 막지는 않되, 그 사실을 남긴다.
+          #   2026-08-11: 여기 원래 고친 ★뒤(after)를 봤는데 ★죽은 검사였다.
+          #      우리가 전부 sha 로 덮어쓰므로 뒤는 ★항상 한 종류다.
+          if len(before) > 1:
+              print('::warning::고치기 전 태그가 %d 종류였다 (%s) — 지금 %s 로 모았다'
+                    % (len(before), ', '.join(sorted(before)), sha))
           # ★바뀐 게 없으면 커밋하지 않는다
           io.open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8').write(
               'changed=%s\n' % ('false' if before == after else 'true'))
