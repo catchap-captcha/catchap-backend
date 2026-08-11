@@ -2579,6 +2579,58 @@ def test_question_image_size_exception_and_other_paths_413(
     assert other.status_code == 413
 
 
+def test_thumbnail_and_exam_image_over_1mb_pass_middleware(
+    client, db, seed_org, media_dir, monkeypatch
+):
+    """대표 이미지 업로드(코스·강의 썸네일, 코스 시험문항 이미지)는 전역 1MB 예외(5MB).
+
+    회귀 방지 — 종전엔 이 세 경로가 화이트리스트에 없어 2MB 커버가 1MB 미들웨어에 걸려
+    413(Request Entity Too Large)로 막혔다. 2MB는 통과, 상한 초과·JSON·타 경로는 413.
+    """
+    from app.core.config import get_settings
+
+    ops_tok = _instructor(client, db)
+    lec = _upload_lecture(client, ops_tok).json()
+
+    # 강의 썸네일 2MB multipart → 전역 1MB 넘지만 이미지 예외(5MB)로 통과·정상 저장
+    ok = client.post(
+        f"/api/v1/ops/lectures/{lec['id']}/thumbnail",
+        files={"file": ("c.png", b"\x02" * (2 * 1024 * 1024), "image/png")},
+        headers=auth(ops_tok),
+    )
+    assert ok.status_code == 200, ok.text
+
+    # 코스 썸네일·시험문항 이미지 경로도 예외 대상 — 2MB가 413으로 막히지 않는다
+    # (없는 id라 라우팅 뒤 404지만, 핵심은 미들웨어에서 413이 아니라는 것)
+    for path in (
+        "/api/v1/ops/courses/nope/thumbnail",
+        "/api/v1/ops/courses/nope/exam-questions/nope/images",
+    ):
+        r = client.post(
+            path,
+            files={"file": ("c.png", b"\x02" * (2 * 1024 * 1024), "image/png")},
+            headers=auth(ops_tok),
+        )
+        assert r.status_code != 413, f"{path} -> {r.status_code} (413이면 미들웨어가 여전히 막는 것)"
+
+    # 이미지 상한 초과 → 413 (상한을 낮춰 실측 — 미들웨어가 이미지 상한을 실제로 본다)
+    monkeypatch.setattr(get_settings(), "MAX_QUESTION_IMAGE_BYTES", 10_000)
+    over = client.post(
+        f"/api/v1/ops/lectures/{lec['id']}/thumbnail",
+        files={"file": ("c.png", b"\x02" * 20_000, "image/png")},
+        headers=auth(ops_tok),
+    )
+    assert over.status_code == 413
+
+    # 같은 경로라도 JSON(비 multipart) 대용량 본문은 1MB에서 413 — 예외는 multipart 한정
+    big_json = client.post(
+        "/api/v1/ops/courses/nope/thumbnail",
+        content=b"x" * 1_100_000,
+        headers={"Content-Type": "application/json", **auth(ops_tok)},
+    )
+    assert big_json.status_code == 413
+
+
 def test_text_only_question_challenge_backward_compat(client, db, seed_org, media_dir):
     """기존 텍스트 전용 문항 — 챌린지 페이로드가 종전과 동일(이미지 키 자체가 없다)."""
     ops_tok = _instructor(client, db)
