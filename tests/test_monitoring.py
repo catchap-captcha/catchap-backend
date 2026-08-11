@@ -15,7 +15,12 @@ def test_monitoring_dashboard_ops_only(client, db):
     body = r.json()
     keys = {s["server_key"] for s in body["servers"]}
     # 기대 서비스 키는 데이터 없어도 카드로(no_data) 노출
-    assert {"backend-api", "db", "gpu-stt", "frontend"} <= keys
+    # ★2026-08-11: 기대 목록이 바뀌었다.
+    #   gpu-stt → stt-worker  (클러스터 밖 GPU VM 을 내리고 클러스터가 직접 모은다)
+    #   db 는 뺐다 — 관리형이라 에이전트를 못 넣어 ★영영 "없음"으로 남는다.
+    #                MySQL 은 Grafana 가 카카오 Metric Export 로 본다.
+    #   vm-jump·vm-ops 추가 — 클러스터 밖에 남은 VM 두 대(에이전트 push).
+    assert {"backend-api", "frontend", "stt-worker", "vm-jump", "vm-ops"} <= keys
     # 백엔드는 요청 시 self-collect(psutil) — no_data가 아니고 실측값이 있어야
     be = next(s for s in body["servers"] if s["server_key"] == "backend-api")
     assert be["no_data"] is False and be["cpu_cores"] >= 1 and be["mem_total_mb"] > 0
