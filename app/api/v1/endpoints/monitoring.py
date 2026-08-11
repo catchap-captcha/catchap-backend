@@ -86,6 +86,11 @@ EXPECTED_SERVERS: list[tuple[str, str]] = [
     ("captcha-api", "캡차 API"),
     ("behavior-ai", "행동 AI"),
     ("stt-worker", "STT 워커"),  # ★2026-08-11: 클러스터로 옮김(옛 gpu-stt VM 은 내렸다)
+    # ★클러스터 ★밖 VM 두 대 — 각 서버의 에이전트(scripts/metrics_agent.py)가 밀어 넣는다.
+    #   0806 STT 장애의 원인이 「클러스터 밖 GPU VM 의 디스크가 0바이트」였다.
+    #   그런 서버가 안 보이면 같은 일이 또 조용히 난다.
+    ("vm-jump", "점프서버"),
+    ("vm-ops", "빌드·운영 VM"),
 ]
 # ⚠️DB(MySQL)는 여기 없다. 관리형이라 에이전트를 못 넣는다.
 #   ★대신 Grafana 가 카카오클라우드 Metric Export 로 본다(kc-mysql 데이터소스).
