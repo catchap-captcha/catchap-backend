@@ -1,10 +1,19 @@
 name: CI
 
 # 배포 전 회귀 게이트 — push/PR마다 전체 테스트 실행. 테스트는 SQLite in-memory(conftest)라
-# 외부 DB가 필요 없다. 통과해야 머지하도록 브랜치 보호에 이 체크를 필수로 건다.
+# 외부 DB가 필요 없다. ⚠️브랜치 보호는 ★Free 플랜이라 강제되지 않는다 — 빨간불이어도 병합이 막히지 않으니
+# 사람이 보고 판단해야 한다.
+# ★언제 도는가 — ★PR 과 main 뿐이다 (2026-08-11 변경).
+#   그전에는 `branches: ['**']` 이라 ★모든 브랜치의 모든 푸시에서 돌았고,
+#   PR 작업 중에는 커밋 하나가 ★두 번 검사됐다 — PR 화면에
+#   `CI / test (push)` 와 `CI / test (pull_request)` 가 나란히 떴다.
+#   Free 플랜 + 비공개 저장소라 Actions 분(分)이 ★유료 계량 대상이다.
+#
+# ⚠️main 을 남기는 이유 — 브랜치 보호를 못 걸어(Free 플랜) ★main 직접 push 가
+#   막히지 않는다. 그때도 검사는 돌아야 한다.
 on:
   push:
-    branches: ['**']
+    branches: [main]
   pull_request:
 
 jobs:
