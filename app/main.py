@@ -205,6 +205,13 @@ _MATERIAL_UPLOAD_RE = re.compile(r"^/api/v1/ops/lectures/[^/]+/materials$")
 _QUESTION_IMAGE_UPLOAD_RE = re.compile(
     r"^/api/v1/ops/lectures/[^/]+/questions/[^/]+/images$"
 )
+# 대표 이미지 업로드(코스·강의 썸네일, 코스 시험문항 이미지) — 엔드포인트는 5MB를 허용하는데
+# 전역 기본 1MB에 걸려 413(Request Entity Too Large)이 나던 문제를 바로잡는다(작은 대표
+# 이미지라 5MB면 충분). multipart일 때만 예외 — 같은 경로에 JSON을 보내는 시도는 1MB 유지.
+_IMAGE_UPLOAD_RE = re.compile(
+    r"^/api/v1/ops/(?:courses|lectures)/[^/]+/thumbnail$"
+    r"|^/api/v1/ops/courses/[^/]+/exam-questions/[^/]+/images$"
+)
 
 
 @app.middleware("http")
@@ -224,6 +231,12 @@ async def _limit_body_size(request: Request, call_next):
             request.method == "POST"
             and content_type.startswith("multipart/form-data")
             and _QUESTION_IMAGE_UPLOAD_RE.match(request.url.path)
+        ):
+            limit = settings.MAX_QUESTION_IMAGE_BYTES
+        elif (
+            request.method == "POST"
+            and content_type.startswith("multipart/form-data")
+            and _IMAGE_UPLOAD_RE.match(request.url.path)
         ):
             limit = settings.MAX_QUESTION_IMAGE_BYTES
         else:
