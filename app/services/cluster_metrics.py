@@ -32,12 +32,17 @@ _log = logging.getLogger(__name__)
 NAMESPACE = "catchap"
 
 # 배포 이름 → 화면 이름. 파드 이름이 "<배포>-<복제셋해시>-<파드해시>"라 접두사로 묶는다.
-# ★넷 중 어느 것도 다른 것의 접두사가 아니다(backend-api·frontend·captcha-api·behavior-ai).
+# ★다섯 중 어느 것도 다른 것의 접두사가 아니다
+#   (backend-api·frontend·captcha-api·behavior-ai·stt-worker).
+# ★2026-08-11: stt-worker 를 넣었다. STT 지표는 그동안 ★클러스터 밖 옛 GPU VM 이
+#   에이전트로 밀어 넣고 있었는데(server_key="gpu-stt"), 그 VM 을 내리면서
+#   STT 만 화면에서 사라지게 됐다. 이제 클러스터가 직접 모은다.
 POD_GROUPS: list[tuple[str, str]] = [
     ("backend-api", "백엔드 API"),
     ("frontend", "프론트"),
     ("captcha-api", "캡차 API"),
     ("behavior-ai", "행동 AI"),
+    ("stt-worker", "STT 워커"),
 ]
 
 # 노드 지표는 node-exporter가 준다. instance는 "10.0.2.128:9100" 형태(노드 이름이 아니다) —

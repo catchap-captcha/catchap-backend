@@ -85,9 +85,11 @@ EXPECTED_SERVERS: list[tuple[str, str]] = [
     ("frontend", "프론트"),
     ("captcha-api", "캡차 API"),
     ("behavior-ai", "행동 AI"),
-    ("gpu-stt", "GPU STT 워커"),  # 클러스터 밖 VM — 에이전트 push
-    ("db", "DB (MySQL)"),  # 관리형이라 에이전트를 못 넣는다 — 카카오 Metric Export 연동 예정
+    ("stt-worker", "STT 워커"),  # ★2026-08-11: 클러스터로 옮김(옛 gpu-stt VM 은 내렸다)
 ]
+# ⚠️DB(MySQL)는 여기 없다. 관리형이라 에이전트를 못 넣는다.
+#   ★대신 Grafana 가 카카오클라우드 Metric Export 로 본다(kc-mysql 데이터소스).
+#   여기에 넣어 두면 ★영영 "없음"으로 빨갛게 남아 진짜 고장과 구별이 안 된다.
 STALE_AFTER_SEC = 120  # 이 시간 넘게 갱신 없으면 '오래됨'(수집 중단 의심)
 
 
