@@ -3321,6 +3321,77 @@ def ops_update_question(
     return _question_row(q)
 
 
+class _BulkPublishReq(BaseModel):
+    # 강사가 다중 선택한 draft id — 지정 시 그것만 공개. None/빈 리스트면 이 강의의 draft 전체.
+    question_ids: list[str] | None = None
+
+
+@router.post("/ops/lectures/{lecture_id}/questions/bulk-publish")
+def ops_bulk_publish_questions(
+    lecture_id: str,
+    req: _BulkPublishReq = _BulkPublishReq(),
+    principal: Principal = Depends(require_content_author),
+    db: Session = Depends(get_db),
+):
+    """강의별 draft 문항을 한 번에 공개(active)한다 — 한 개씩 PUT 누르던 걸 묶는다.
+    선택(question_ids)이 있으면 그것만, 없으면 이 강의의 draft 전체가 대상.
+
+    ★개별 공개(PUT status=active)와 같은 불변식을 지킨다: 시점이 영상 안(1초~길이)이고
+    되감기 지점이 어긋나지 않은 문항만 올리고, 같은 시점에 이미 공개 문항이 있으면
+    (이번 배치 안에서 함께 올라가는 것끼리의 충돌 포함) 건너뛴다 — 조용히 죽이는 대신
+    사유별 수(unplaced=시점 미지정·범위밖, conflict=같은 시점 중복)를 돌려준다. 건너뛴
+    문항은 강사가 개별로 시점을 지정한 뒤 올리면 된다."""
+    lec = _get_ops_lecture(db, lecture_id, principal)  # 소유 스코프(남의 강의 404)
+    base = db.query(LectureQuestion).filter(
+        LectureQuestion.lecture_id == lecture_id,
+        LectureQuestion.status == "draft",
+    )
+    if req.question_ids:
+        base = base.filter(LectureQuestion.id.in_(set(req.question_ids)))
+    cands = base.all()
+
+    # 이미 공개된 시점 — 여기에 담아 두고 공개할 때마다 채우면, 이번 배치 안에서 같은
+    # 시점을 둘 올리려는 충돌도 (개별 PUT의 _reject_duplicate_pin과 동일하게) 걸러진다.
+    active_positions: set[int] = {
+        int(p)
+        for (p,) in db.query(LectureQuestion.position_sec)
+        .filter(
+            LectureQuestion.lecture_id == lecture_id,
+            LectureQuestion.status == "active",
+        )
+        .all()
+    }
+    duration = int(lec.duration_sec or 0)
+    published = 0
+    skipped: dict[str, int] = {}
+    for q in cands:
+        pos = int(q.position_sec)
+        cs = q.content_start_sec
+        # 시점이 영상 밖(0초·길이 초과)이거나 되감기 지점이 출제 시점보다 뒤 — 개별 지정 필요
+        if pos < 1 or (duration and pos >= duration) or (cs is not None and cs >= pos):
+            skipped["unplaced"] = skipped.get("unplaced", 0) + 1
+            continue
+        if pos in active_positions:
+            skipped["conflict"] = skipped.get("conflict", 0) + 1
+            continue
+        q.status = "active"
+        active_positions.add(pos)
+        published += 1
+    if published:
+        db.flush()
+        _reconcile_progress(db, lecture_id)  # 새 활성 핀을 학생 예약에 반영(대량은 1회만)
+        audit(
+            db,
+            action="lecture.question.bulk_publish",
+            actor_user_id=principal.id,
+            target_type="lecture",
+            target_id=lecture_id,
+            after={"published": published, "skipped": skipped},
+        )
+    db.commit()
+    return {"published": published, "skipped": skipped, "candidates": len(cands)}
+
+
 @router.delete("/ops/lectures/{lecture_id}/questions/{question_id}")
 def ops_delete_question(
     lecture_id: str,
