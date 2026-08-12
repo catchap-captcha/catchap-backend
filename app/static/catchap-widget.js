@@ -2895,7 +2895,12 @@
                 fontWeight: '700', color: T.color.ink, fontFamily: 'inherit',
                 transition: 'border-color .15s, background .15s' });
           // 2열 격자에선 버튼이 셀을 꽉 채워야 폭이 균일해진다(넘침 방지: border-box).
-          if (footerOn && !hasVisual) { b.style.width = '100%'; b.style.boxSizing = 'border-box'; }
+          // 글자는 왼쪽 정렬 — 번호·문장이 가운데 정렬이면 보기마다 들쭉날쭉해 읽기 불편하다.
+          if (footerOn && !hasVisual) {
+            b.style.width = '100%';
+            b.style.boxSizing = 'border-box';
+            b.style.textAlign = 'left';
+          }
           if (gDnd) {
             // 빈칸에 끌어다 넣기 + 탭 폴백
             gDnd.drag(b, { disabled: function () { return answered; },
