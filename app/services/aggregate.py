@@ -503,7 +503,37 @@ def student_records(db: Session, me: StudentProfile) -> dict | None:
         if len(activities) >= 4:
             break
 
+    # 일자별(최근 7일) 학습 추이 — '요약' 그래프용. 문제 풀이는 개수로 센다(위젯 경로는
+    # solve_time_ms=0이라 시간은 못 믿는다). 강의 시청은 진행 행의 마지막 시청일에
+    # watched_max_sec를 귀속해 분으로 근사한다(단회 시청 가정 — 신규 학습자엔 정확).
+    from app.models.lecture import LectureWatchProgress
+
+    WD = ["월", "화", "수", "목", "금", "토", "일"]  # Python weekday(): 월=0
+    day_list = [today - timedelta(days=i) for i in range(6, -1, -1)]  # 오래된→오늘
+    solved_by_day: dict[date, int] = {}
+    for r in all_rows:
+        if r.created_at:
+            dd = r.created_at.date()
+            solved_by_day[dd] = solved_by_day.get(dd, 0) + 1
+    watch_sec_by_day: dict[date, int] = {}
+    for wp in (
+        db.query(LectureWatchProgress).filter(LectureWatchProgress.student_id == me.id).all()
+    ):
+        ts = wp.last_heartbeat_at or wp.updated_at
+        if ts and (wp.watched_max_sec or 0) > 0:
+            dd = ts.date()
+            watch_sec_by_day[dd] = watch_sec_by_day.get(dd, 0) + (wp.watched_max_sec or 0)
+    days = [
+        {
+            "label": WD[d.weekday()],
+            "solved": solved_by_day.get(d, 0),
+            "watch_min": round(watch_sec_by_day.get(d, 0) / 60),
+        }
+        for d in day_list
+    ]
+
     return {
+        "days": days,
         "weeks": weeks,
         "calendar": calendar,
         "mastery": mastery,

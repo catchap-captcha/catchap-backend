@@ -242,6 +242,8 @@ def records(
         {key: {"color": v["color"], "data": v["data"]} for key, v in D.RECORD_ACC_SERIES.items()},
     )
     return {
+        # 최근 7일 일자별 학습(문제 개수·강의 시청 분) — '요약' 그래프. 실집계 없으면 빈 배열.
+        "days": agg.get("days") or [],
         "weeks": weeks,
         "calendar": fb(agg.get("calendar"), {**D.RECORDS_CAL, "learned": D.RECORDS_CAL_LEARNED}),
         "mastery": mastery,
