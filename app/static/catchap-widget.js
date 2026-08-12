@@ -2865,10 +2865,15 @@
           if (footerOn) footerState(true, true);
           else verify(token, o.id);
         }
+        // 텍스트 보기는 2열 균등 격자 — 셀이 1fr이라 가장 긴 보기 폭에 전부 맞춰져 반듯한
+        // 직사각형이 된다. 그림·이모지 보기는 폭을 키우면 어색하므로 기존 중앙 흐름을 유지한다.
+        var hasVisual = (d.options || []).some(function (o) { return o.img || o.emoji; });
         var opts = h('div');
-        css(opts, footerOn
-          ? { display: 'flex', flexWrap: 'wrap', justifyContent: 'center', gap: '12px' }
-          : { display: 'grid', gap: '8px' });
+        css(opts, !footerOn
+          ? { display: 'grid', gap: '8px' }
+          : hasVisual
+            ? { display: 'flex', flexWrap: 'wrap', justifyContent: 'center', gap: '12px' }
+            : { display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: '12px' });
         d.options.forEach(function (o, i) {
           var b = h('button');
           b.setAttribute('aria-pressed', 'false'); // 선택 상태를 보조기기에 노출
@@ -2889,6 +2894,8 @@
                 borderRadius: T.radius.md, background: T.color.card, cursor: 'pointer', fontSize: T.font.md,
                 fontWeight: '700', color: T.color.ink, fontFamily: 'inherit',
                 transition: 'border-color .15s, background .15s' });
+          // 2열 격자에선 버튼이 셀을 꽉 채워야 폭이 균일해진다(넘침 방지: border-box).
+          if (footerOn && !hasVisual) { b.style.width = '100%'; b.style.boxSizing = 'border-box'; }
           if (gDnd) {
             // 빈칸에 끌어다 넣기 + 탭 폴백
             gDnd.drag(b, { disabled: function () { return answered; },
@@ -2899,6 +2906,10 @@
           optBtns.push(b);
           opts.appendChild(b);
         });
+        // 홀수 개 텍스트 보기: 마지막 한 칸이 반 폭 외톨이가 되지 않게 한 줄 전체를 차지하게 한다.
+        if (footerOn && !hasVisual && optBtns.length % 2 === 1 && optBtns.length > 1) {
+          optBtns[optBtns.length - 1].style.gridColumn = '1 / -1';
+        }
         body.appendChild(opts);
         // 이 분기는 지문(d.paragraph)·문장(d.sentence)을 셸 힌트 자리 뒤에 붙이므로, 힌트가
         // 그 맥락 위로 떠 보인다. 힌트 자리를 보기 바로 위로 옮겨 '지문/문장 → 힌트 → 보기'
