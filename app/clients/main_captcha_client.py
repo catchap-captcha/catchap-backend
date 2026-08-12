@@ -30,8 +30,22 @@ class MainCaptchaNotConfiguredError(RuntimeError):
     """캡차 호스트/시크릿 미설정. 승급을 켜두고 설정을 빼먹은 상태를 조용히 넘기지 않는다."""
 
 
-def verify_token(*, token: str, session_id: str, lecture_id: str) -> bool:
-    """캡차 서버에 토큰을 검증한다. 통과 확인이면 True, 그 외 전부 False."""
+def verify_token(
+    *,
+    token: str,
+    session_id: str,
+    lecture_id: str | None = None,
+    purpose: str = "lecture",
+) -> bool:
+    """캡차 서버에 토큰을 검증한다. 통과 확인이면 True, 그 외 전부 False.
+
+    `purpose` 는 발급 때 값과 **같아야** 한다 — 캡차가 대조하고 다르면 유효한 토큰도
+    거부한다. 강의 승급은 'lecture', 로그인 스텝업은 'login' 이다.
+
+    `lecture_id` 는 줄 거면 발급 때도 줬어야 한다(캡차가 일치를 확인한다). 로그인에는
+    강의가 없으므로 None 이고, 그 경우 아예 보내지 않는다 — None 을 실어 보내면
+    발급 때 없던 값과 대조하다 불일치로 떨어진다.
+    """
     settings = get_settings()
     base = (getattr(settings, "MAIN_CAPTCHA_URL", "") or "").strip().rstrip("/")
     secret = (getattr(settings, "MAIN_CAPTCHA_SITE_SECRET", "") or "").strip()
@@ -48,10 +62,11 @@ def verify_token(*, token: str, session_id: str, lecture_id: str) -> bool:
             headers={"X-Captcha-Site-Secret": secret},
             json={
                 "token": token,
-                # 캡차 위젯이 embed 모드에서 발급받는 목적값과 일치해야 한다.
-                "purpose": "lecture",
+                # 발급 때 값과 일치해야 한다(캡차가 대조한다).
+                "purpose": purpose,
                 "session_id": session_id,
-                "lecture_id": lecture_id,
+                # 로그인처럼 강의가 없으면 키 자체를 빼야 한다(위 docstring 참조).
+                **({"lecture_id": lecture_id} if lecture_id else {}),
             },
             timeout=_TIMEOUT_SEC,
         )

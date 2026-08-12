@@ -1,3 +1,4 @@
+import logging
 import re
 import secrets
 from datetime import datetime, timedelta
@@ -30,6 +31,8 @@ from app.models import (
     User,
 )
 from app.schemas import auth as s
+
+_log = logging.getLogger(__name__)
 
 EMAIL_CODE_TTL_MINUTES = 5
 # 이 횟수 이상 연속 실패하면 캡차 요구. 5회는 비밀번호를 아는 사용자가 오타 몇 번으로도
@@ -112,7 +115,13 @@ def _login_failed(db: Session, identifier: str, message: str) -> HTTPException:
     )
 
 
-def _require_captcha_if_needed(db: Session, identifier: str, captcha_token: str | None) -> None:
+def _require_captcha_if_needed(
+    db: Session,
+    identifier: str,
+    captcha_token: str | None,
+    captcha_session_id: str | None = None,
+    captcha_purpose: str | None = None,
+) -> None:
     """5회 이상 실패한 identifier면, 메인 캡차(forest) 통과 토큰을 요구·소비한다.
 
     자격 검증 '전에' 막는다 — 토큰이 없거나 무효면 401(captcha_required)로 즉시 거부하되
@@ -124,9 +133,35 @@ def _require_captcha_if_needed(db: Session, identifier: str, captcha_token: str 
     from app.core.config import get_settings
     from app.models import LoginThrottle
 
+    # CatChap Guard(성원·민서 캡차) 경로. 프론트가 그 캡차를 쓸 때만 session_id 를 함께
+    # 보내므로, 그 값이 있으면 Guard 토큰이다 — 우리가 발급한 토큰이 아니라 캡차 서버에
+    # 물어봐야 한다. 프론트 플래그가 꺼져 있으면 이 분기는 아예 안 탄다.
+    #
+    # 설정이 없으면 500 을 낸다. 여기서 기존 경로로 흘려보내면 Guard 토큰을 자체 캡차
+    # 토큰으로 검사하게 되고, 사용자는 캡차를 계속 풀어도 못 들어가는 루프에 빠진다.
+    # 설정 누락은 우리 잘못이므로 학생 탓처럼 보이는 401 이 아니라 500 이 맞다(강의 쪽과 동일).
+    if captcha_session_id:
+        from app.clients import main_captcha_client
+
+        try:
+            ok = main_captcha_client.verify_token(
+                token=captcha_token,
+                session_id=captcha_session_id,
+                purpose=captcha_purpose or "login",
+            )
+        except main_captcha_client.MainCaptchaNotConfiguredError:
+            _log.error("메인 캡차 설정 누락 — 로그인 캡차가 Guard 인데 검증할 수 없습니다")
+            raise HTTPException(
+                status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail={"message": "인증 서버 설정이 준비되지 않았습니다."},
+            ) from None
+        if ok:
+            return
+        # 실패는 아래 공통 401 로 떨어진다 — 새 문제를 받아 다시 풀면 된다.
+
     # 메인 캡차 교체: 플래그가 켜지면 forest 대신 우리 드래그 캡차 토큰을 소비한다(자체 완결).
     # 로그인 요청엔 session_id가 없어 토큰 유효성만으로 소비(발급된 토큰만 존재하므로 안전).
-    if get_settings().DRAG_CAPTCHA_ENABLED:
+    elif get_settings().DRAG_CAPTCHA_ENABLED:
         from app.services import drag_captcha_service as dc
 
         if dc.verify_and_consume_token(captcha_token):
@@ -220,7 +255,9 @@ def issue_tokens(db: Session, subject_id: str, role: str, subject_type: str) -> 
 def login(db: Session, req: s.LoginRequest) -> s.TokenPair:
     identifier = f"user:{req.email.strip().lower()}"
     _check_locked(db, identifier)  # H1: 과도한 실패 시 실제 차단
-    _require_captcha_if_needed(db, identifier, req.captcha_token)  # 5회+ 실패 → 메인 캡차 요구
+    _require_captcha_if_needed(
+        db, identifier, req.captcha_token, req.captcha_session_id, req.captcha_purpose
+    )  # 5회+ 실패 → 메인 캡차 요구
     user = db.query(User).filter(User.email == req.email.strip().lower()).first()
     if user is None or not verify_password(req.password, user.password_hash):
         raise _login_failed(db, identifier, "이메일 또는 비밀번호가 올바르지 않습니다.")
@@ -336,7 +373,9 @@ def ops_login(db: Session, req: s.LoginRequest) -> s.TokenPair:
     """
     identifier = f"user:{req.email.strip().lower()}"
     _check_locked(db, identifier)  # H1: 과도한 실패 시 실제 차단
-    _require_captcha_if_needed(db, identifier, req.captcha_token)  # 5회+ 실패 → 메인 캡차 요구
+    _require_captcha_if_needed(
+        db, identifier, req.captcha_token, req.captcha_session_id, req.captcha_purpose
+    )  # 5회+ 실패 → 메인 캡차 요구
     allowed_roles = ("ops", "instructor")
     user = (
         db.query(User)
@@ -363,7 +402,8 @@ def ops_login(db: Session, req: s.LoginRequest) -> s.TokenPair:
 def student_login(db: Session, req: s.StudentLoginRequest) -> s.TokenPair:
     _check_locked(db, f"student:{req.student_login_id.strip()}")  # H1: 과도한 실패 시 차단
     _require_captcha_if_needed(
-        db, f"student:{req.student_login_id.strip()}", req.captcha_token
+        db, f"student:{req.student_login_id.strip()}", req.captcha_token,
+        req.captcha_session_id, req.captcha_purpose,
     )  # 5회+ 실패 → 메인 캡차 요구
     # 탈퇴/비활성 학생은 로그인 차단 (B2) — 성인 로그인과 동일 정책
     query = db.query(StudentProfile).filter(

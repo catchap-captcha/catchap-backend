@@ -765,3 +765,73 @@ def test_password_reset_confirm_falls_through_to_student(client, db, seed_org):
         json={"student_login_id": "unified2@test.dev", "password": "NewPass123!"},
     )
     assert ok.status_code == 200, ok.text
+
+
+# ---- CatChap Guard(성원·민서 캡차) 로그인 경로 -------------------------------
+#
+# 프론트가 Guard 를 쓸 때만 captcha_session_id 를 함께 보낸다. 그 값이 있으면 우리가
+# 발급한 토큰이 아니라 캡차 서버에 물어봐야 한다. 아래 셋을 고정한다.
+#   ① session_id 가 없으면 기존 경로 그대로다 (플래그 꺼짐 = 지금 동작)
+#   ② session_id 가 있으면 캡차 서버에 묻고, 통과면 로그인이 진행된다
+#   ③ 설정이 없으면 500 이다 — 401 로 흘리면 사용자가 캡차를 계속 풀어도 못 들어간다
+
+
+def _fail_to_captcha_gate(client, email="t1@test.dev"):
+    """캡차가 요구되는 상태까지 실패시킨다."""
+    for _ in range(CAPTCHA_FAIL_THRESHOLD):
+        login(client, "teacher", email, "wrong-password")
+
+
+def test_guard_토큰은_캡차서버에_물어본다(client, seed_org, monkeypatch):
+    from app.clients import main_captcha_client
+
+    seen = {}
+
+    def fake_verify(*, token, session_id, lecture_id=None, purpose="lecture"):
+        seen.update(token=token, session_id=session_id, lecture_id=lecture_id, purpose=purpose)
+        return True
+
+    monkeypatch.setattr(main_captcha_client, "verify_token", fake_verify)
+    _fail_to_captcha_gate(client)
+
+    res = client.post("/api/v1/auth/login", json={
+        "role": "teacher", "email": "t1@test.dev", "password": "Password123!",
+        "captcha_token": "guard-token", "captcha_session_id": "guard-sess-1234",
+        "captcha_purpose": "login",
+    })
+    assert res.status_code == 200, res.text
+    assert seen["session_id"] == "guard-sess-1234"
+    # purpose 는 발급 때 값과 같아야 한다. 로그인은 login 이다.
+    assert seen["purpose"] == "login"
+    # 로그인에는 강의가 없다. 실어 보내면 발급 때 없던 값과 대조하다 불일치로 떨어진다.
+    assert seen["lecture_id"] is None
+
+
+def test_guard_설정이_없으면_500이다(client, seed_org, monkeypatch):
+    from app.clients import main_captcha_client
+
+    def boom(**_):
+        raise main_captcha_client.MainCaptchaNotConfiguredError("no secret")
+
+    monkeypatch.setattr(main_captcha_client, "verify_token", boom)
+    _fail_to_captcha_gate(client)
+
+    res = client.post("/api/v1/auth/login", json={
+        "role": "teacher", "email": "t1@test.dev", "password": "Password123!",
+        "captcha_token": "guard-token", "captcha_session_id": "guard-sess-1234",
+    })
+    # 401 이면 사용자는 캡차를 계속 풀어도 못 들어가는 루프에 빠진다. 우리 설정 잘못이다.
+    assert res.status_code == 500, res.text
+
+
+def test_session_id_가_없으면_기존_경로_그대로다(client, seed_org, monkeypatch):
+    from app.clients import main_captcha_client
+
+    def must_not_call(**_):
+        raise AssertionError("Guard 경로가 아닌데 캡차 서버를 불렀다")
+
+    monkeypatch.setattr(main_captcha_client, "verify_token", must_not_call)
+    _fail_to_captcha_gate(client)
+
+    res = login(client, "teacher", "t1@test.dev", "Password123!", captcha_token=forest_token())
+    assert res.status_code == 200, res.text

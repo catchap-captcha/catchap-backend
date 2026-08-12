@@ -18,6 +18,11 @@ class LoginRequest(BaseModel):
     password: str
     # 5회 이상 실패해 캡차가 요구된 뒤, 메인 캡차(forest)를 통과하고 받은 단일사용 토큰.
     captcha_token: str | None = None
+    # CatChap Guard(성원·민서 캡차)로 전환했을 때만 채워진다. 그 캡차의 토큰은
+    # 캡차 서버에 물어봐야 유효해지는데, POST /api/verify-token 이 발급 당시의
+    # session_id·purpose 와 대조하므로 토큰만으로는 검증이 실패한다.
+    captcha_session_id: str | None = None
+    captcha_purpose: str | None = None
     # 공개 로그인 폼(/login)에서 온 요청이면 True — 운영자(ops)는 여기서 인증하지 않고
     # 강사(instructor)만 허용한다(운영자 분리, 2026-07-20). 운영자는 전용 /ops/login에서만
     # 로그인한다(고권한 내부 계정을 공개 로그인 공격면에 노출하지 않기 위함).
@@ -30,6 +35,11 @@ class StudentLoginRequest(BaseModel):
     student_login_id: str
     password: str
     captcha_token: str | None = None  # 캡차 요구 후 forest 캡차 통과 토큰(단일사용)
+    # CatChap Guard(성원·민서 캡차)로 전환했을 때만 채워진다. 그 캡차의 토큰은
+    # 캡차 서버에 물어봐야 유효해지는데, POST /api/verify-token 이 발급 당시의
+    # session_id·purpose 와 대조하므로 토큰만으로는 검증이 실패한다.
+    captcha_session_id: str | None = None
+    captcha_purpose: str | None = None
 
 
 class RefreshRequest(BaseModel):
