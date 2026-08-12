@@ -605,6 +605,19 @@ def list_student_courses(
         .group_by(CourseExamAttempt.course_id)
         .all()
     }
+    # 코스별 이 학생의 시험 응시 횟수(제출한 회차 수 = distinct sitting_id) — 미통과 '진행 중'
+    # 칸에 'N/M문항 정복' 대신 '시험 N회 시도'를 보여 주는 근거.
+    exam_attempts = {
+        r[0]: r[1]
+        for r in db.query(
+            CourseExamAttempt.course_id,
+            func.count(func.distinct(CourseExamAttempt.sitting_id)),
+        )
+        .filter(CourseExamAttempt.student_id == principal.id,
+                CourseExamAttempt.course_id.in_(course_ids or [""]))
+        .group_by(CourseExamAttempt.course_id)
+        .all()
+    }
     passed_courses = {
         r[0]: {"perfect": bool(r[1]), "passed_at": r[2]}
         for r in db.query(
@@ -702,6 +715,8 @@ def list_student_courses(
                         if exam_last_activity.get(c.id)
                         else None
                     ),
+                    # 이 학생의 시험 응시 횟수(제출 회차) — 미통과 '진행 중' 표기용(#2)
+                    "attempts": int(exam_attempts.get(c.id, 0)),
                 },
             }
         )
