@@ -488,7 +488,14 @@ def public_login(db: Session, req: s.StudentLoginRequest) -> s.TokenPair:
     # 학생이 아닌 이메일 → 운영자·강사 로그인. 실패 시 그 오류 그대로 전파.
     return ops_login(
         db,
-        s.LoginRequest(email=login_id, password=req.password, captcha_token=req.captcha_token, public=True),
+        s.LoginRequest(
+            email=login_id,
+            password=req.password,
+            captcha_token=req.captcha_token,
+            captcha_session_id=req.captcha_session_id,
+            captcha_purpose=req.captcha_purpose,
+            public=True,
+        ),
     )
 
 
