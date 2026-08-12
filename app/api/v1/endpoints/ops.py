@@ -42,6 +42,7 @@ from app.models import (
     OrgRegistrationRequest,
     PaymentMethod,
     Plan,
+    ServerMetric,
     Site,
     StudentProfile,
     Subscription,
@@ -811,6 +812,15 @@ def resolve_inquiry(
     return {"ok": True, "status": "resolved"}
 
 
+# 시스템 상태에 띄울 클러스터 앱 — cluster_metrics.POD_GROUPS 에서 backend-api 를 뺀 것.
+# (backend-api 는 이 응답을 만드는 주체 자신이라 '정상'이 자명하고, 바로 위 디스크 카드가
+#  같은 컨테이너를 이미 말한다)
+# 표시 이름(라벨)은 프런트가 갖는다 — 다른 카드들과 같은 규약이라 여기선 키만 보낸다.
+_CLUSTER_APPS = ("captcha-api", "behavior-ai", "frontend", "stt-worker")
+# monitoring.STALE_AFTER_SEC 와 같은 값. 수집 주기가 30초라 2분이면 두 번 이상 걸렀다는 뜻.
+_CLUSTER_STALE_SEC = 120
+
+
 @router.get("/system")
 def system(principal: Principal = Depends(require_ops), db: Session = Depends(get_db)):
     """시스템 상태 — 전부 실측. 가짜 상수를 반환하던 스텁을 재구현(0712).
@@ -902,13 +912,49 @@ def system(principal: Principal = Depends(require_ops), db: Session = Depends(ge
     except OSError:
         services.append({"name": "disk", "status": "error", "latency_ms": None, "detail": None})
 
-    # AI 서버 — 배포 보류 중(엔드포인트 설정 자체가 없음)을 정직하게 표시
-    services.append({
-        "name": "ai-server",
-        "status": "not_deployed",
-        "latency_ms": None,
-        "detail": "행동 판정 모델 미배포 — 학습셋 구축 단계",
-    })
+    # 클러스터 앱 — 캡차 API·행동 AI·프론트·STT 워커
+    #
+    # ★종전엔 "AI 서버: 미배포"라는 ★고정 문자열이 있었다. 아무것도 점검하지 않으면서
+    #   이 페이지의 부제("전부 서버 실측입니다") 아래 앉아 있었고, 0809 컷오버로 그 앱이
+    #   실제로 클러스터에 뜬 뒤에도 영영 '미배포'라고 말했다. 실측인 척하는 카드는
+    #   없느니만 못하다 — 볼 때마다 사실 확인을 다시 해야 하기 때문이다.
+    #
+    # ★여기서 각 앱의 /health 를 직접 찌르지 않는 이유: 앱마다 파드가 2벌이라 한 번 찔러
+    #   봐야 그중 ★하나만 확인된다(로드밸런서가 고른 것). k8s 는 이미 전부를 보고 있고,
+    #   그 값이 cluster_metrics 수집기를 통해 server_metrics 에 들어와 있다. 있는 것을 읽는다.
+    _cluster = get_settings().PROMETHEUS_URL.strip()
+    _rows = {
+        r.server_key: r
+        for r in db.query(ServerMetric).filter(ServerMetric.server_key.in_(_CLUSTER_APPS)).all()
+    }
+    _now = datetime.now()
+    for key in _CLUSTER_APPS:
+        if not _cluster:
+            # 수집기가 꺼진 환경(로컬·옛 VM)에서 전부 '오류'로 빨갛게 만들지 않는다.
+            services.append({"name": key, "status": "unknown", "latency_ms": None,
+                             "detail": "클러스터 지표 미설정 — PROMETHEUS_URL 없음"})
+            continue
+        row = _rows.get(key)
+        if row is None:
+            services.append({"name": key, "status": "unknown", "latency_ms": None,
+                             "detail": "아직 수집된 지표가 없어요"})
+            continue
+        age = int((_now - row.collected_at).total_seconds())
+        if age > _CLUSTER_STALE_SEC:
+            # 파드가 죽었는지 수집이 끊겼는지는 여기서 구분할 수 없다 — 단정하지 않고
+            # '언제 마지막으로 봤는지'만 말한다(monitoring 화면의 '오래됨'과 같은 규약).
+            services.append({"name": key, "status": "degraded", "latency_ms": None,
+                             "detail": f"지표가 {age // 60}분째 갱신되지 않았어요 — 수집 중단 의심"})
+            continue
+        # 메모리는 ★제한 대비다. 넘으면 커널이 파드를 죽인다(OOMKill) — 그래서 85%가 경계.
+        bad = row.mem_pct >= 85
+        services.append({
+            "name": key,
+            "status": "degraded" if bad else "ok",
+            "latency_ms": None,
+            "detail": f"CPU {row.cpu_pct:.1f}% · 메모리 {row.mem_pct:.0f}%"
+                      + (" — 제한 임박(OOM 위험)" if bad else ""),
+        })
 
     return {
         "services": services,
