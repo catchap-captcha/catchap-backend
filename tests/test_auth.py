@@ -835,3 +835,33 @@ def test_session_id_가_없으면_기존_경로_그대로다(client, seed_org, m
 
     res = login(client, "teacher", "t1@test.dev", "Password123!", captcha_token=forest_token())
     assert res.status_code == 200, res.text
+
+
+def test_공개로그인이_이메일_경로로_넘길_때도_guard_값을_들고_간다(client, db, seed_org, monkeypatch):
+    """공개 로그인(/auth/public-login)은 이메일이면 ops_login 으로 위임한다. 그때 캡차
+    관련 값을 전부 옮겨야 한다 — captcha_token 만 넘기면 session_id 가 사라져 게이트가
+    'Guard 토큰이 아니다' 로 판단하고 자체 캡차 토큰으로 검사하다 실패한다. 사용자에게는
+    '정답을 맞혀도 캡차가 계속 뜨는' 것으로 보인다(2026-08-12 실측)."""
+    from app.clients import main_captcha_client
+
+    seen = {}
+
+    def fake_verify(*, token, session_id, lecture_id=None, purpose="lecture"):
+        seen.update(token=token, session_id=session_id, purpose=purpose)
+        return True
+
+    monkeypatch.setattr(main_captcha_client, "verify_token", fake_verify)
+    _add_instructor(db)  # 학생이 아닌 이메일 → ops_login 위임 경로를 타게 한다
+    for _ in range(CAPTCHA_FAIL_THRESHOLD):
+        client.post("/api/v1/auth/public-login",
+                    json={"student_login_id": "inst@test.dev", "password": "wrong"})
+
+    res = client.post("/api/v1/auth/public-login", json={
+        "student_login_id": "inst@test.dev", "password": "Password123!",
+        "captcha_token": "guard-token", "captcha_session_id": "guard-sess-9876",
+        "captcha_purpose": "login",
+    })
+    assert res.status_code == 200, res.text
+    # 값이 위임 과정에서 사라지지 않았는지가 이 테스트의 전부다.
+    assert seen.get("session_id") == "guard-sess-9876"
+    assert seen.get("purpose") == "login"
