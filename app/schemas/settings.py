@@ -24,5 +24,7 @@ class ChangePasswordRequest(BaseModel):
 
 
 class AccountDeleteRequest(BaseModel):
-    # 계정 탈퇴(비활성화)는 되돌리기 어려우므로 본인 비밀번호로 재확인한다.
-    password: str
+    # 계정 탈퇴(비활성화)는 되돌리기 어려우므로 재확인한다.
+    # 비밀번호 있는 계정은 password로, 소셜 전용(비밀번호 없음) 계정은 confirm='탈퇴'로 확인.
+    password: str | None = None
+    confirm: str | None = None
