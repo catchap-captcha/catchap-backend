@@ -1476,18 +1476,27 @@ def _lecture_row(db: Session, lec: Lecture) -> dict:
 # 코스 = 한 강사가 한 과목으로 묶는 강의 묶음(예: '수학 기초반'). 코스=과목 고정
 # (사용자 결정 0718). 강사는 자기 코스만, 운영자는 전체를 감독한다(강의 스코프와 동일
 # 규약 — 남의 코스는 404로 존재 미노출). 학생 화면: 과목 → 강사별 코스 → 강의(order_no).
+# 코스 분류용 과목 어휘 — 관심사 추천 분야(interestTaxonomy)와 1:1로 맞춘 정본 목록.
+# 강사 콘솔 과목 드롭다운·생성/수정 검증이 함께 쓴다. 문항 은행이 아직 없는 과목도 분류로
+# 고를 수 있다 — 그 코스의 강의 문항이 은행에 배치되면 연습이 열린다(is_live 동적 판정).
+COURSE_SUBJECT_VOCAB = ["수학", "어학", "안전", "IT", "디자인", "비즈니스", "자격증", "취미", "일반"]
+# 검증 허용 집합 — 위 어휘 + 레거시 6과목(기존 데이터 호환). 프론트 드롭다운은 어휘만 보여준다.
+ALLOWED_COURSE_SUBJECTS = set(COURSE_SUBJECT_VOCAB) | set(EDU_SUBJECTS)
+
+
 class _CourseCreate(BaseModel):
     title: str = Field(min_length=1, max_length=200)
-    # 코스 중심 전환(2026-07-21): 학교식 과목은 화면에서 안 받는다 — 기본 '일반'(정합용).
-    # 분류는 category(브라우징용 대분류)로 한다.
+    # 코스 = 과목 하나(분류). 기본 '일반'이되, 강사가 어휘에서 골라 분류할 수 있다.
+    # 세부 브라우징 태그는 category(선택)로 따로 단다.
     subject: str = "일반"
     category: str | None = Field(default=None, max_length=40)
     description: str | None = Field(default=None, max_length=2000)
 
 
 class _CourseUpdate(BaseModel):
-    # 미전송(None)은 변경 안 함. subject는 못 바꾼다(레거시·정합 고정).
+    # 미전송(None)은 변경 안 함. subject 변경은 코스=과목 고정 연쇄(강의·문항 이동)를 탄다.
     title: str | None = Field(default=None, min_length=1, max_length=200)
+    subject: str | None = Field(default=None, max_length=20)
     category: str | None = Field(default=None, max_length=40)
     description: str | None = Field(default=None, max_length=2000)
     order_no: int | None = None
@@ -1590,8 +1599,8 @@ def ops_create_course(
     db: Session = Depends(get_db),
 ):
     """코스 생성 — 소유자는 생성한 본인(강사 또는 운영자). 코스 중심 전환(2026-07-21) 후 학교식
-    과목 대신 category(선택)로 분류하고, subject는 기본 '일반'(레거시·정합용)으로 둔다."""
-    if req.subject not in EDU_SUBJECTS and req.subject != "일반":
+    과목은 분류 어휘(COURSE_SUBJECT_VOCAB)에서 고른다(기본 '일반'). 세부 태그는 category(선택)."""
+    if req.subject not in ALLOWED_COURSE_SUBJECTS:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="지원하지 않는 과목입니다.")
     # 맨 뒤 배정(학생 화면의 코스 나열 순서). 내 코스 기준 max+1.
     max_no = (
@@ -1620,6 +1629,38 @@ def ops_create_course(
     return _course_row(db, c)
 
 
+def _change_course_subject(db: Session, c: Course, new_subject: str) -> list[str]:
+    """코스 과목(분류) 변경 — 코스=과목 고정 불변식을 지키려 그 코스의 강의·강의유래 은행
+    문항의 subject를 함께 옮긴다. 문항 스코프가 subject라(course_question_ids가
+    playable_pool(subject)를 강의 lecture_id로 거른다) 코스만 바꾸면 연습이 빈 은행을
+    가리켜 깨진다. 반환: 이동한 은행 문항 id(런타임 은행 리로드 refresh_from_db는
+    호출자가 commit 뒤에 부른다)."""
+    from app.models import Lecture, Question, StudentQuestionState
+
+    old = c.subject
+    c.subject = new_subject
+    # 1) 소속 강의 subject 이동(삭제분 포함 — 되살아나도 코스와 정합)
+    lec_ids = [r[0] for r in db.query(Lecture.id).filter(Lecture.course_id == c.id).all()]
+    if lec_ids:
+        db.query(Lecture).filter(Lecture.course_id == c.id).update(
+            {Lecture.subject: new_subject}, synchronize_session=False
+        )
+    # 2) 그 강의들에서 유래한 은행 문항(payload.lecture_id로 판별)만 새 과목으로 이동
+    lec_set = set(lec_ids)
+    moved: list[str] = []
+    if lec_set:
+        for q in db.query(Question).filter(Question.subject == old).all():
+            if (q.payload or {}).get("lecture_id") in lec_set:
+                q.subject = new_subject
+                moved.append(q.id)
+    # 3) 옮긴 문항의 SRS 상태도 새 과목으로 — 안 옮기면 복습 이력이 끊겨 새 문제로 초기화된다
+    if moved:
+        db.query(StudentQuestionState).filter(
+            StudentQuestionState.question_id.in_(moved)
+        ).update({StudentQuestionState.subject: new_subject}, synchronize_session=False)
+    return moved
+
+
 @router.put("/ops/courses/{course_id}")
 def ops_update_course(
     course_id: str,
@@ -1630,19 +1671,20 @@ def ops_update_course(
     c = _get_ops_course(db, course_id, principal)
     if req.status is not None and req.status not in ("active", "hidden"):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="status는 active|hidden만 가능합니다.")
-    # 운영자(ops)는 감독·검수만 — 공개/숨김(status)만 바꿀 수 있고 내용 편집(제목·소개·순서)은
+    # 운영자(ops)는 감독·검수만 — 공개/숨김(status)만 바꿀 수 있고 내용 편집(제목·소개·순서·과목)은
     # 강사 전용(사용자 결정 0720). 강사는 자기 코스 전체를 편집한다.
     if principal.role == "ops" and (
         req.title is not None
         or req.description is not None
         or req.order_no is not None
+        or req.subject is not None
         or "category" in req.model_fields_set
     ):
         raise HTTPException(
             status.HTTP_403_FORBIDDEN,
             detail="운영자는 코스의 공개/숨김만 변경할 수 있어요. 내용 편집은 강사가 합니다.",
         )
-    before = {"title": c.title, "order_no": c.order_no, "status": c.status}
+    before = {"title": c.title, "subject": c.subject, "order_no": c.order_no, "status": c.status}
     if req.title is not None:
         c.title = req.title.strip()
     if req.description is not None:
@@ -1653,12 +1695,25 @@ def ops_update_course(
         c.order_no = int(req.order_no)
     if req.status is not None:
         c.status = req.status
+    # 과목(분류) 변경 — 코스=과목 고정이라 강의·강의유래 문항까지 함께 옮기고, commit 뒤
+    # 런타임 은행을 리로드해 연습 화면에 즉시 반영한다(빈 은행을 가리켜 깨지지 않게).
+    subject_changed = False
+    if req.subject is not None and req.subject != c.subject:
+        if req.subject not in ALLOWED_COURSE_SUBJECTS:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="지원하지 않는 과목입니다.")
+        _change_course_subject(db, c, req.subject)
+        subject_changed = True
     audit(
         db, action="course.update", actor_user_id=principal.id,
         target_type="course", target_id=c.id,
-        before=before, after={"title": c.title, "order_no": c.order_no, "status": c.status},
+        before=before,
+        after={"title": c.title, "subject": c.subject, "order_no": c.order_no, "status": c.status},
     )
     db.commit()
+    if subject_changed:
+        from app.services import subject_banks
+
+        subject_banks.refresh_from_db(db)
     return _course_row(db, c)
 
 
