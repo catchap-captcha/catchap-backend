@@ -22,7 +22,7 @@ def test_course_crud_and_subject_fixed(client, db, media_dir):
     # 지원하지 않는 과목 400
     assert client.post("/api/v1/ops/courses", json={"title": "x", "subject": "체육"}, headers=auth(ops)).status_code == 400
 
-    # 수정 — 제목/순서/상태. subject는 스키마에 없어 바뀌지 않는다(코스=과목 고정)
+    # 수정 — 제목/순서/상태. subject 미전송이면 그대로 유지된다.
     r = client.put(f"/api/v1/ops/courses/{c['id']}", json={"title": "수학 심화반", "order_no": 5}, headers=auth(ops))
     assert r.status_code == 200 and r.json()["title"] == "수학 심화반" and r.json()["subject"] == "수학"
 
@@ -271,6 +271,58 @@ def test_edit_lecture_into_general_subject_course(client, db, seed_org, media_di
     )
     assert r.status_code == 200, r.text
     assert r.json()["course_id"] == course["id"] and r.json()["subject"] == "일반"
+
+
+def test_course_subject_change_cascades(client, db, media_dir):
+    """과목(분류) 변경 — 코스=과목 고정이라 강의·강의유래 은행 문항까지 함께 옮기고,
+    런타임 은행이 새 과목으로 즉시 재편된다(연습이 빈 은행을 가리켜 깨지지 않게).
+    (사용자 결정: 강사 콘솔에서 과목을 실제 분류로 바꿀 수 있게 열되, 연쇄로 정합 유지.)"""
+    from app.models import Lecture, Question
+    from app.services import bank_mode, subject_banks
+
+    from tests.test_question_to_bank import _bank_state_guard
+
+    with _bank_state_guard():
+        ops = _instructor(client, db)
+        course = _create_course(client, ops, title="카카오 클라우드", subject="일반")
+        lec = _upload_lecture(client, ops, title="1강", subject="일반", course_id=course["id"]).json()
+
+        # 강의 유래 은행 문항 1개 직접 적재(payload.lecture_id로 코스 귀속)
+        qid = f"lec-{lec['id'][:8]}-t1"
+        db.add(
+            Question(
+                id=qid, subject="일반", type="single", order_no=1, playable=True,
+                payload={
+                    "id": qid, "type": "single", "topic": "1강", "lecture_id": lec["id"],
+                    "stage": 1, "prompt": "?", "hint": "",
+                    "options": [{"id": "o1", "text": "가"}, {"id": "o2", "text": "나"}],
+                    "answer": "o1", "explain": "", "playable": True,
+                },
+            )
+        )
+        db.commit()
+        subject_banks.refresh_from_db(db)  # '일반' 은행에 등록
+        assert qid in bank_mode.course_question_ids(db, "일반", course["id"])
+
+        # 과목 변경 일반 → IT (연쇄)
+        r = client.put(f"/api/v1/ops/courses/{course['id']}", json={"subject": "IT"}, headers=auth(ops))
+        assert r.status_code == 200, r.text
+        assert r.json()["subject"] == "IT"
+
+        db.expire_all()
+        assert db.get(Lecture, lec["id"]).subject == "IT"  # 강의도 이동
+        assert db.get(Question, qid).subject == "IT"  # 은행 문항도 이동
+        assert subject_banks.is_live("IT")  # 런타임 은행 재편
+        assert qid in bank_mode.course_question_ids(db, "IT", course["id"])
+        assert qid not in bank_mode.course_question_ids(db, "일반", course["id"])
+
+        # 지원하지 않는 과목은 400
+        assert (
+            client.put(
+                f"/api/v1/ops/courses/{course['id']}", json={"subject": "체육"}, headers=auth(ops)
+            ).status_code
+            == 400
+        )
 
 
 def test_enrollment_gates_lecture_watch(client, db, seed_org, media_dir):
