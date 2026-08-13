@@ -1,5 +1,6 @@
 from datetime import date
 
+from app.schemas.motion import MotionIn
 from pydantic import BaseModel, EmailStr, Field, field_validator
 
 
@@ -23,6 +24,10 @@ class LoginRequest(BaseModel):
     # session_id·purpose 와 대조하므로 토큰만으로는 검증이 실패한다.
     captcha_session_id: str | None = None
     captcha_purpose: str | None = None
+    # 이 화면에 머무는 동안의 포인터 움직임 요약(좌표 아님). 캡차는 캡차가 떠 있는
+    # 몇 초만 보는데, 그 앞뒤가 더 길다. 로그인은 인증 **전**이라 누구인지 모르므로
+    # 분포만 본다. 지금은 기록만 하고 판정에 쓰지 않는다.
+    motion: MotionIn | None = None
     # 공개 로그인 폼(/login)에서 온 요청이면 True — 운영자(ops)는 여기서 인증하지 않고
     # 강사(instructor)만 허용한다(운영자 분리, 2026-07-20). 운영자는 전용 /ops/login에서만
     # 로그인한다(고권한 내부 계정을 공개 로그인 공격면에 노출하지 않기 위함).
@@ -40,6 +45,10 @@ class StudentLoginRequest(BaseModel):
     # session_id·purpose 와 대조하므로 토큰만으로는 검증이 실패한다.
     captcha_session_id: str | None = None
     captcha_purpose: str | None = None
+    # 이 화면에 머무는 동안의 포인터 움직임 요약(좌표 아님). 캡차는 캡차가 떠 있는
+    # 몇 초만 보는데, 그 앞뒤가 더 길다. 로그인은 인증 **전**이라 누구인지 모르므로
+    # 분포만 본다. 지금은 기록만 하고 판정에 쓰지 않는다.
+    motion: MotionIn | None = None
 
 
 class RefreshRequest(BaseModel):
