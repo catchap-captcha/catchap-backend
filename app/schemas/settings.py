@@ -25,6 +25,7 @@ class ChangePasswordRequest(BaseModel):
 
 class AccountDeleteRequest(BaseModel):
     # 계정 탈퇴(비활성화)는 되돌리기 어려우므로 재확인한다.
-    # 비밀번호 있는 계정은 password로, 소셜 전용(비밀번호 없음) 계정은 confirm='탈퇴'로 확인.
+    # 비밀번호 있는 계정은 password로, 소셜 전용(비밀번호 없음)은 confirm='탈퇴처리에 동의합니다.'로 확인.
     password: str | None = None
     confirm: str | None = None
+    reason: str | None = None  # 탈퇴 사유(선택) — 감사 로그에 남긴다

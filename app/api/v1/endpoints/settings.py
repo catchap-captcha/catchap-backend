@@ -213,16 +213,20 @@ def delete_account(
     if target is None:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="계정을 찾을 수 없습니다.")
     # 되돌리기 어려운 파괴적 작업이라 재확인한다. 비밀번호 있는 계정은 비밀번호로,
-    # 소셜 전용(비밀번호 없음 = UNUSABLE_PASSWORD) 계정은 '탈퇴' 입력으로 확인한다.
+    # 소셜 전용(비밀번호 없음 = UNUSABLE_PASSWORD) 계정은 '탈퇴처리에 동의합니다.' 입력으로 확인한다.
     # (소셜 계정은 verify_password가 항상 실패해 종전엔 탈퇴 자체가 불가능했다 — 이미 JWT로 본인 인증됨.)
     from app.services.social_login_service import UNUSABLE_PASSWORD
 
+    CONFIRM_PHRASE = "탈퇴처리에 동의합니다."
     has_usable_pw = bool(target.password_hash) and target.password_hash != UNUSABLE_PASSWORD
     if has_usable_pw:
         if not verify_password(req.password or "", target.password_hash):
             raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="비밀번호가 일치하지 않습니다.")
-    elif (req.confirm or "").strip() != "탈퇴":
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="탈퇴하려면 '탈퇴'를 입력해 주세요.")
+    elif (req.confirm or "").strip() != CONFIRM_PHRASE:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            detail=f"탈퇴하려면 '{CONFIRM_PHRASE}'를 입력해 주세요.",
+        )
     # 탈퇴 = 식별 PII 익명화 + 로그인ID/이메일 해제(같은 이메일로 재가입 가능) + 비활성화.
     # (종전엔 status만 disabled로 둬서 탈퇴 계정이 이메일을 계속 점유해 재가입이 막혔다.)
     if principal.kind == "student":
@@ -248,7 +252,7 @@ def delete_account(
         organization_id=principal.organization_id,
         target_type=principal.kind,
         target_id=principal.id,
-        after={"status": "disabled"},
+        after={"status": "disabled", "reason": (req.reason or "").strip()[:200] or None},
     )
     db.commit()
     return {"ok": True, "status": "disabled"}
