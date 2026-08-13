@@ -5,7 +5,7 @@ from sqlalchemy.orm import Session
 from app.core.permissions import Principal, get_current_principal
 from app.db.session import get_db
 from app.schemas import auth as s
-from app.services import auth_service
+from app.services import auth_service, motion_service
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -53,6 +53,10 @@ def student_login(req: s.StudentLoginRequest, db: Session = Depends(get_db)):
 @router.post("/public-login", response_model=s.TokenPair)
 def public_login(req: s.StudentLoginRequest, db: Session = Depends(get_db)):
     """공개 로그인 폼(/login)의 단일 진입 — 서버가 학생·강사를 판별(운영자는 제외)."""
+    # 로그인 성공 여부와 무관하게 남긴다 — 실패한 시도야말로 봇일 확률이 높다.
+    # 인증 전이라 누구인지 모르므로 subject_id 는 비운다(motion_service 참고).
+    motion_service.record(db, req.motion, surface="login")
+    db.commit()
     return auth_service.public_login(db, req)
 
 

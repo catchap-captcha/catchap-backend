@@ -40,7 +40,8 @@ from app.models import (
     LectureQuestion,
     LectureTranscript,
 )
-from app.services import auth_service, bank_mode
+from app.services import auth_service, bank_mode, motion_service
+from app.schemas.motion import MotionIn
 from app.services.media_storage import get_media_storage, local_file, media_response
 from app.utils.helpers import audit
 
@@ -1375,6 +1376,10 @@ class _ExamSubmit(BaseModel):
     sitting_id: str
     answers: list[_ExamAnswer] = Field(default_factory=list)
     solve_time_ms: int = 0
+    # 푸는 동안의 포인터 움직임 요약(좌표 아님). "무엇을 아는가" 가 아니라 "누가
+    # 푸는가" 를 보는 값이다 — LLM 으로 답을 맞히는 봇은 정답률로는 안 걸린다.
+    # 지금은 기록만 한다.
+    motion: MotionIn | None = None
 
 
 @router.post("/courses/{course_id}/exam/submit")
@@ -1494,6 +1499,9 @@ def exam_submit(
         passed_this=passed_this, perfect_sitting=perfect_sitting,
     )
     passed = completion is not None
+    # 관측은 부수적인 일이다 — 실패해도 채점·제출을 막지 않는다(motion_service 참고).
+    motion_service.record(db, req.motion, surface="exam",
+                          subject_id=principal.id, context_id=req.sitting_id)
     db.commit()
     return {
         "total": graded_n,

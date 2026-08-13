@@ -78,7 +78,8 @@ from app.models import (
     StudentProfile,
     User,
 )
-from app.services import auth_service, lecture_service, notify_service
+from app.services import auth_service, lecture_service, motion_service, notify_service
+from app.schemas.motion import MotionIn
 from app.services.media_storage import get_media_storage, local_file, media_response
 from app.clients import main_captcha_client
 from app.services.captcha_service import EDU_SUBJECTS
@@ -960,6 +961,9 @@ def lecture_session_start(
 
 class _ProgressReq(BaseModel):
     position_sec: int
+    # 그 구간의 포인터 움직임 요약(좌표 아님). 지금은 기록만 하고 판정에 쓰지 않는다 —
+    # 정상 시청자의 분포를 먼저 알아야 기준을 정할 수 있다.
+    motion: MotionIn | None = None
     # (제거됨) interacted — 상호작용 자기신고. 캡차 면제에만 쓰였고 그 면제를 걷어냈다.
     # 구버전 플레이어가 계속 보내도 pydantic이 조용히 무시한다(extra 무시가 기본).
     # 이유는 lecture_service의 '상호작용 면제: 제거됨' 주석 참조 — 요약하면 집중해서 보는
@@ -992,6 +996,9 @@ def lecture_progress(
     progress = lecture_service.ensure_progress(db, principal.id, lec)
     lecture_service.claim_session(db, progress, session_id)  # 동시 세션이면 409
     state = lecture_service.advance(db, progress, lec, req.position_sec)
+    # 관측은 부수적인 일이다 — 실패해도 시청 진행을 막지 않는다(motion_service 참고).
+    motion_service.record(db, req.motion, surface="lecture",
+                          subject_id=principal.id, context_id=lecture_id)
     db.commit()
     return state
 

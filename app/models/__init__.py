@@ -2,6 +2,7 @@ from app.models.auth_token import EmailVerificationCode, PasswordResetToken, Ref
 from app.models.billing import Invoice, PaymentMethod, Plan, Subscription
 from app.models.class_room import ClassRoom
 from app.models.consent import Consent
+from app.models.motion import MotionSample
 from app.models.content import (
     Badge,
     Chapter,
@@ -162,6 +163,7 @@ __all__ = [
     "StudentQuestionState",
     "Subscription",
     "SystemHealthLog",
+    "MotionSample",
     "SystemSetting",
     "User",
     "UserSetting",
