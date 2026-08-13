@@ -60,6 +60,19 @@ class Settings(BaseSettings):
     BOT_ESCALATION_MODE: str = "off"
     # 임계값. record 모드로 관측한 뒤 정하는 값 — 아래 기본값은 근거 없는 출발점이다.
     BOT_SUSPICION_THRESHOLD: int = 10
+
+    # 포인터 움직임 요약 수집 (2026-08-13 신설) — 강의·로그인·시험 화면.
+    #
+    #   record  받아서 남긴다. 판정에는 쓰지 않는다.
+    #   off     받되 버린다. 프론트는 계속 보내지만 아무것도 안 남는다.
+    #
+    # ★off 를 둔 이유 — 강의를 보는 내내 관측하는 일이라 개인정보 처리방침·고지 여부를
+    #   정해야 한다. 그 결정이 나기 전에 멈춰야 할 수도 있는데, 그때 코드를 되돌리거나
+    #   이미지를 다시 굽는 것은 과하다. 설정 한 줄로 멈추고 다시 켤 수 있어야 한다.
+    #
+    # ⚠️좌표는 어느 모드에서도 받지 않는다. 표에 담을 칸이 아예 없다
+    #   (`models/motion.py` · 시험 test_table_has_no_coordinate_columns).
+    MOTION_COLLECT_MODE: str = "record"
     # 메인 캡차 호스트. 비우면 승급이 동작하지 않는다(빈 값이면 off 로 강등).
     MAIN_CAPTCHA_URL: str = ""
     # /api/verify-token 서버검증용. 절대 프런트로 노출하지 않는다.
