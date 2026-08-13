@@ -63,3 +63,20 @@ def test_table_has_no_coordinate_columns():
     names = {c.name for c in MotionSample.__table__.columns}
     forbidden = {"x", "y", "points", "events", "path", "trace", "coords", "raw"}
     assert not (names & forbidden), names
+
+
+def test_off_mode_records_nothing(client, db, seed_org, monkeypatch):
+    """설정으로 멈출 수 있어야 한다 — 프론트는 계속 보내되 아무것도 안 남는다.
+
+    강의를 보는 내내 관측하는 일이라, 개인정보 처리방침·고지 여부가 정해지기 전에
+    멈춰야 할 수도 있다. 그때 코드를 되돌리거나 이미지를 다시 굽는 것은 과하다.
+    """
+    from app.core.config import get_settings
+
+    settings = get_settings()
+    monkeypatch.setattr(settings, "MOTION_COLLECT_MODE", "off", raising=False)
+
+    res = _login(client, {"student_login_id": "stu01", "password": "1234", "motion": MOTION})
+    # 멈춘 상태에서도 로그인은 그대로 된다.
+    assert res.status_code == 200
+    assert db.query(MotionSample).count() == 0

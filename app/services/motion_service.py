@@ -15,6 +15,7 @@ import logging
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
+from app.core.config import get_settings
 from app.models import MotionSample
 from app.schemas.motion import MotionIn
 
@@ -35,6 +36,11 @@ def record(
     아직 끝나지 않은 작업을 함께 확정해버린다.
     """
     if motion is None:
+        return
+    # 설정으로 멈출 수 있어야 한다. 강의를 보는 내내 관측하는 일이라 개인정보
+    # 처리방침·고지 여부가 정해지기 전에 멈춰야 할 수도 있는데, 그때 코드를 되돌리는
+    # 것은 과하다. 프론트는 계속 보내되 여기서 버린다.
+    if get_settings().MOTION_COLLECT_MODE != "record":
         return
     # 움직임이 아예 없는 구간은 남기지 않는다. 강의를 집중해서 보는 사람이 대부분
     # 여기 해당해서, 남기면 표의 대부분이 0 으로 채워지고 분포를 볼 때 방해가 된다.
