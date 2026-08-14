@@ -95,6 +95,13 @@ EXPECTED_SERVERS: list[tuple[str, str]] = [
 # ⚠️DB(MySQL)는 여기 없다. 관리형이라 에이전트를 못 넣는다.
 #   ★대신 Grafana 가 카카오클라우드 Metric Export 로 본다(kc-mysql 데이터소스).
 #   여기에 넣어 두면 ★영영 "없음"으로 빨갛게 남아 진짜 고장과 구별이 안 된다.
+# 컷오버로 내린 옛 서버 — 화면에서 감춘다.
+# gpu-stt: 클러스터 밖 GPU VM. 2026-08-11 stt-worker(클러스터)로 옮기며 내렸다.
+#   EXPECTED_SERVERS 주석대로 "컷오버 뒤에 지우면 된다"는 그 대상이다. 남겨 두면 영영
+#   '오래됨'으로 붙어 있어 ★진짜 수집 중단과 구별이 안 된다(운영자가 매번 이 카드를 확인하게 됨).
+# ★행 자체는 지우지 않는다 — 지난 표본·롤업은 이력으로 남기고 현황판에서만 뺀다.
+RETIRED_SERVER_KEYS: frozenset[str] = frozenset({"gpu-stt"})
+
 STALE_AFTER_SEC = 120  # 이 시간 넘게 갱신 없으면 '오래됨'(수집 중단 의심)
 
 
@@ -357,7 +364,9 @@ def ops_monitoring(
     other_keys = sorted(
         k
         for k in rows
-        if k not in expected_keys and not k.startswith(cluster_metrics.NODE_KEY_PREFIX)
+        if k not in expected_keys
+        and k not in RETIRED_SERVER_KEYS
+        and not k.startswith(cluster_metrics.NODE_KEY_PREFIX)
     )
     servers = [_row_out(rows[k], k, rows[k].label) for k in node_keys]
     servers += [_row_out(rows.get(key), key, label) for key, label in EXPECTED_SERVERS]
