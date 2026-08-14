@@ -1121,6 +1121,77 @@ def logs(
     }
 
 
+@router.get("/withdrawals")
+def withdrawals(
+    role: str | None = None,  # 'student' | 'user'
+    date_from: str | None = None,  # 'YYYY-MM-DD'
+    date_to: str | None = None,  # 'YYYY-MM-DD'
+    page: int = 1,
+    page_size: int = 50,
+    principal: Principal = Depends(require_ops),
+    db: Session = Depends(get_db),
+):
+    """회원탈퇴 현황·사유 — settings.account_delete 감사로그를 탈퇴 리포트로 보여준다.
+
+    탈퇴 계정은 이미 익명화(PII 파기)되므로 남는 건 익명 식별(계정 id 앞자리)·역할·사유·
+    시각뿐이다. 사유는 탈퇴 모달의 드롭다운 선택 + 자유입력을 ' / '로 합친 값이라, 상단
+    요약은 첫 조각(드롭다운 사유)만 키로 묶어 집계한다.
+    """
+    from datetime import date as _date, datetime as _dt, time as _time, timedelta as _td
+
+    page = max(1, page)
+    page_size = max(1, min(200, page_size))
+
+    q = db.query(AuditLog).filter(AuditLog.action == "settings.account_delete")
+    if role in ("student", "user"):
+        q = q.filter(AuditLog.target_type == role)
+    try:
+        if date_from:
+            q = q.filter(AuditLog.created_at >= _dt.combine(_date.fromisoformat(date_from), _time.min))
+        if date_to:
+            q = q.filter(AuditLog.created_at < _dt.combine(_date.fromisoformat(date_to) + _td(days=1), _time.min))
+    except ValueError:
+        pass
+
+    total = q.count()
+    rows = (
+        q.order_by(AuditLog.created_at.desc())
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+        .all()
+    )
+    items = [
+        {
+            "id": log.id,
+            "role": log.target_type,  # 'student' | 'user'
+            "anon_code": (log.target_id or "")[:8] or None,  # 계정 id 앞자리(익명 식별)
+            "reason": (log.after_json or {}).get("reason"),
+            "created_at": log.created_at.isoformat() if log.created_at else None,
+        }
+        for log in rows
+    ]
+    # 사유별 집계(전체 기간, 필터 무시) — 상단 요약용. 드롭다운 사유(합본 첫 조각)만 키로.
+    counts: dict[str, int] = {}
+    for (aj,) in (
+        db.query(AuditLog.after_json).filter(AuditLog.action == "settings.account_delete").all()
+    ):
+        raw = (aj or {}).get("reason")
+        key = (raw.split(" / ")[0].strip() if raw else "") or "사유 미입력"
+        counts[key] = counts.get(key, 0) + 1
+    reason_summary = sorted(
+        [{"reason": k, "count": v} for k, v in counts.items()],
+        key=lambda x: x["count"],
+        reverse=True,
+    )
+    return {
+        "items": items,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "reason_summary": reason_summary,
+    }
+
+
 def _model_row(m: ModelVersion) -> dict:
     return {
         "id": m.id,
