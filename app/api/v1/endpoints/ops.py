@@ -630,6 +630,45 @@ def update_operator(
     return _operator_row(op)
 
 
+@router.delete("/operators/{op_id}")
+def ops_delete_operator(
+    op_id: str,
+    principal: Principal = Depends(require_ops),
+    db: Session = Depends(get_db),
+):
+    """운영자 계정 삭제(하드 삭제) — 되돌릴 수 없다.
+
+    가드: ① 중지(disabled) 상태여야만 삭제한다(실수로 활성 운영자를 날리는 것 방지 —
+    화면도 중지된 계정에만 삭제 버튼을 준다), ② 자기 계정은 삭제 불가.
+    감사 로그의 actor_user_id는 소프트 참조라 계정을 지워도 로그 자체는 남는다
+    (감사 로그 화면은 이름을 못 찾으면 '삭제된 계정 xxxx'로 표시한다).
+    """
+    op = db.get(User, op_id)
+    if op is None or op.role != "ops":
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="운영자 계정을 찾을 수 없습니다.")
+    if op_id == principal.id:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="자기 계정은 삭제할 수 없어요.")
+    if op.status != "disabled":
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            detail="먼저 계정을 중지한 뒤에 삭제할 수 있어요.",
+        )
+    snapshot = {"name": op.name, "email": op.email, "status": op.status}
+    auth_service.logout(db, op.id)  # 남은 세션/리프레시 토큰 폐기
+    db.delete(op)
+    db.add(
+        AuditLog(
+            actor_user_id=principal.id,
+            action="ops.operator_delete",
+            target_type="user",
+            target_id=op_id,
+            before_json=snapshot,
+        )
+    )
+    db.commit()
+    return {"ok": True, "deleted": op_id}
+
+
 @router.get("/inquiries")
 def inquiries(
     status_filter: str | None = None,
@@ -2955,6 +2994,55 @@ def update_instructor(
     )
     db.commit()
     return _instructor_row(inst)
+
+
+@router.delete("/instructors/{inst_id}")
+def delete_instructor(
+    inst_id: str,
+    principal: Principal = Depends(require_ops),
+    db: Session = Depends(get_db),
+):
+    """강사 계정 삭제(하드 삭제) — 되돌릴 수 없다.
+
+    가드: ① 중지(disabled) 상태여야만 삭제한다, ② 소유한 코스·강의가 남아 있으면 막는다.
+    Course/Lecture.instructor_id는 FK 없는 소프트 참조라 계정을 지워도 DB가 막아주지
+    않는다 — 그냥 지우면 주인 없는 강의가 조용히 남는다. 그래서 여기서 직접 센다.
+    (강의를 다른 강사에게 옮기거나 먼저 정리한 뒤 삭제하도록 안내한다.)
+    """
+    from app.models import Course, Lecture
+
+    inst = db.get(User, inst_id)
+    if inst is None or inst.role != "instructor":
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="강사 계정을 찾을 수 없습니다.")
+    if inst.status != "disabled":
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            detail="먼저 계정을 중지한 뒤에 삭제할 수 있어요.",
+        )
+    course_n = db.query(Course).filter(Course.instructor_id == inst_id).count()
+    lecture_n = db.query(Lecture).filter(Lecture.instructor_id == inst_id).count()
+    if course_n or lecture_n:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"이 강사에게 코스 {course_n}개·강의 {lecture_n}개가 남아 있어요. "
+                "다른 강사로 옮기거나 정리한 뒤 삭제해 주세요."
+            ),
+        )
+    snapshot = {"name": inst.name, "email": inst.email, "status": inst.status}
+    auth_service.logout(db, inst.id)  # 남은 세션/리프레시 토큰 폐기
+    db.delete(inst)
+    db.add(
+        AuditLog(
+            actor_user_id=principal.id,
+            action="ops.instructor_delete",
+            target_type="user",
+            target_id=inst_id,
+            before_json=snapshot,
+        )
+    )
+    db.commit()
+    return {"ok": True, "deleted": inst_id}
 
 
 # ---------------------------------------------------------------------------
