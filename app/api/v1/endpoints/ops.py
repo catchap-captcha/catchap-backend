@@ -1170,25 +1170,47 @@ def withdrawals(
         }
         for log in rows
     ]
-    # 사유별 집계(전체 기간, 필터 무시) — 상단 요약용. 드롭다운 사유(합본 첫 조각)만 키로.
-    counts: dict[str, int] = {}
-    for (aj,) in (
-        db.query(AuditLog.after_json).filter(AuditLog.action == "settings.account_delete").all()
-    ):
-        raw = (aj or {}).get("reason")
-        key = (raw.split(" / ")[0].strip() if raw else "") or "사유 미입력"
-        counts[key] = counts.get(key, 0) + 1
-    reason_summary = sorted(
-        [{"reason": k, "count": v} for k, v in counts.items()],
-        key=lambda x: x["count"],
-        reverse=True,
-    )
+    # 사유별 집계 — 상단 요약용. 드롭다운 사유(합본 첫 조각)만 키로 센다.
+    #
+    # ★감사로그는 계속 쌓이는 테이블이라 집계를 함부로 짜면 페이지를 넘길 때마다 탈퇴 행
+    #   전체를 읽게 된다(종전 구현이 그랬다). 세 가지로 막는다:
+    #   1) 목록과 같은 필터(q)를 그대로 재사용 — 역할·기간으로 좁히면 집계도 같이 좁아진다.
+    #   2) 1페이지에서만 계산 — 페이지네이션 클릭마다 다시 세지 않는다.
+    #   3) 최근 SUMMARY_SCAN_CAP건까지만 훑고, 잘렸으면 truncated=True로 알린다(조용한 절단 금지).
+    #   사유는 JSON 안의 합본 문자열이라 SQL GROUP BY가 DB별로 갈린다(MySQL/SQLite JSON 함수
+    #   차이) — 이식성을 위해 상한을 둔 채 파이썬에서 센다.
+    SUMMARY_SCAN_CAP = 5000
+    reason_summary: list[dict] = []
+    summary_scanned = 0
+    summary_truncated = False
+    if page == 1:
+        scan = (
+            q.with_entities(AuditLog.after_json)
+            .order_by(AuditLog.created_at.desc())
+            .limit(SUMMARY_SCAN_CAP + 1)  # +1 = 잘림 판정용
+            .all()
+        )
+        summary_truncated = len(scan) > SUMMARY_SCAN_CAP
+        scan = scan[:SUMMARY_SCAN_CAP]
+        summary_scanned = len(scan)
+        counts: dict[str, int] = {}
+        for (aj,) in scan:
+            raw = (aj or {}).get("reason")
+            key = (raw.split(" / ")[0].strip() if raw else "") or "사유 미입력"
+            counts[key] = counts.get(key, 0) + 1
+        reason_summary = sorted(
+            [{"reason": k, "count": v} for k, v in counts.items()],
+            key=lambda x: x["count"],
+            reverse=True,
+        )
     return {
         "items": items,
         "total": total,
         "page": page,
         "page_size": page_size,
-        "reason_summary": reason_summary,
+        "reason_summary": reason_summary,  # 1페이지에서만 채워진다(그 외 빈 배열)
+        "summary_scanned": summary_scanned,  # 집계에 실제로 쓴 건수
+        "summary_truncated": summary_truncated,  # 상한에 걸려 일부만 셌는지
     }
 
 
