@@ -384,3 +384,39 @@ def test_node_gpu_is_skipped_when_dcgm_is_missing(monkeypatch):
     got = {s["server_key"]: s for s in cluster_metrics.collect("http://x")}
     assert got["node:host-10-0-2-210"]["gpu_present"] is False
     assert got["node:host-10-0-2-210"]["cpu_cores"] > 0, "다른 지표는 그대로 살아 있어야 한다"
+
+
+def test_apps_by_node_groups_pods_by_display_name(monkeypatch):
+    """★"이 서버에서 무엇이 도는가" — 파드 이름 뒤 무작위를 떼고 표시 이름으로 묶는다."""
+    answers = {
+        cluster_metrics._Q_POD_NODE: [
+            {"labels": {"pod": "backend-api-677b65d757-vwvz2", "node": "n1"}, "value": 1.0},
+            {"labels": {"pod": "backend-api-677b65d757-abcde", "node": "n1"}, "value": 1.0},
+            {"labels": {"pod": "stt-worker-f9c74b456-9cd2p", "node": "n1"}, "value": 1.0},
+            {"labels": {"pod": "frontend-78c6478bf8-6k46s", "node": "n2"}, "value": 1.0},
+            {"labels": {"pod": "backend-migrate-xkgtw", "node": "n1"}, "value": 1.0},
+            {"labels": {"pod": "somebody-else", "node": "n2"}, "value": 1.0},
+            {"labels": {"pod": "frontend-78c6478bf8-zzzzz"}, "value": 1.0},  # 노드 없음
+        ],
+    }
+    monkeypatch.setattr(cluster_metrics, "instant_query", _fake_query(answers))
+    got = cluster_metrics.apps_by_node("http://x")
+
+    assert got["n1"] == ["백엔드 API", "STT 워커"], "POD_GROUPS 순서 그대로, 같은 앱은 한 번만"
+    assert got["n2"] == ["프론트"], "모르는 파드는 안 센다"
+    assert "backend-migrate" not in str(got), "일회성 작업 파드는 앱이 아니다"
+
+
+def test_node_card_lists_the_apps_on_it(monkeypatch):
+    """노드 카드가 그 서버 위의 앱을 들고 온다 — 서버와 앱이 이어져 보이게."""
+    a = _node_gpu_answers()
+    a[cluster_metrics._Q_POD_NODE] = [
+        {"labels": {"pod": "backend-api-1-a", "node": "host-10-0-2-210"}, "value": 1.0},
+        {"labels": {"pod": "stt-worker-1-a", "node": "host-10-0-2-210"}, "value": 1.0},
+        {"labels": {"pod": "frontend-1-a", "node": "host-10-0-2-128"}, "value": 1.0},
+    ]
+    monkeypatch.setattr(cluster_metrics, "instant_query", _fake_query(a))
+    got = {s["server_key"]: s for s in cluster_metrics.collect("http://x")}
+    assert got["node:host-10-0-2-210"]["apps"] == ["백엔드 API", "STT 워커"]
+    assert got["node:host-10-0-2-128"]["apps"] == ["프론트"]
+    assert got["node:host-10-0-6-202"]["apps"] == [], "아무것도 없으면 빈 목록"
