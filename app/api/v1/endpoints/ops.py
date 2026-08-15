@@ -3139,6 +3139,77 @@ def unlock_login_throttle(
     return {"ok": True, "identifier": row.identifier, "before": before}
 
 
+# '가입되지 않은 아이디' 기록을 지울 때 남겨 둘 최근 창(시간).
+# 뒤에 계정이 없는 기록이라 지워도 풀어줄 사람이 사라지지는 않는다. 다만 ★지금 두들기고
+# 있는 상대의 카운터까지 0으로 돌리면 캡차 요구가 풀려 공격자에게 새 판을 깔아 준다.
+ORPHAN_PURGE_MIN_AGE_HOURS = 24
+
+
+@router.post("/login-throttles/purge-orphans")
+def purge_orphan_login_throttles(
+    principal: Principal = Depends(require_ops),
+    db: Session = Depends(get_db),
+):
+    """'가입되지 않은 아이디' 실패 기록을 실제로 삭제한다 — 화면에서 감추는 것과 다르다.
+
+    이 목록의 대부분은 오타·탐색·자동화 흔적이라 쌓이기만 하고 운영자가 할 일이 없다.
+    쌓인 채로 두면 정작 봐야 할 '사람이 오타 낸 아이디'가 묻힌다.
+
+    ★두 가지는 지우지 않는다.
+      - 계정이 있는 식별자   : 실제 사용자의 기록이다(잠금 해제 대상).
+      - 최근 24시간 안의 기록: 진행 중인 시도의 카운터다(위 상수 주석 참조).
+    """
+    rows = db.query(LoginThrottle).all()
+    student_ids = [r.identifier[8:] for r in rows if r.identifier.startswith("student:")]
+    user_emails = [r.identifier[5:] for r in rows if r.identifier.startswith("user:")]
+    live_students = {
+        sid
+        for (sid,) in db.query(StudentProfile.student_login_id).filter(
+            StudentProfile.student_login_id.in_(student_ids or [""])
+        )
+    }
+    live_users = {
+        em for (em,) in db.query(User.email).filter(User.email.in_(user_emails or [""]))
+    }
+    cutoff = datetime.now() - timedelta(hours=ORPHAN_PURGE_MIN_AGE_HOURS)
+
+    doomed: list[LoginThrottle] = []
+    kept_recent = 0
+    for r in rows:
+        kind, _, rest = r.identifier.partition(":")
+        if (kind == "student" and rest in live_students) or (kind == "user" and rest in live_users):
+            continue  # 실제 계정 — 건드리지 않는다
+        if r.updated_at and r.updated_at > cutoff:
+            kept_recent += 1
+            continue
+        doomed.append(r)
+
+    doomed_ids = [r.identifier for r in doomed]  # 지우기 전에 뽑아 둔다(감사 로그용)
+    for r in doomed:
+        db.delete(r)
+    if doomed_ids:
+        audit(
+            db,
+            action="ops.login_throttle_purge_orphans",
+            actor_user_id=principal.id,
+            target_type="login_throttle",
+            # 전부 넣으면 감사 로그 한 줄이 비대해진다 — 개수는 정확히, 목록은 앞 50건만.
+            before={
+                "deleted": len(doomed_ids),
+                "identifiers": doomed_ids[:50],
+                "truncated": max(0, len(doomed_ids) - 50),
+            },
+            after={"kept_recent": kept_recent},
+        )
+    db.commit()
+    return {
+        "ok": True,
+        "deleted": len(doomed_ids),
+        "kept_recent": kept_recent,
+        "min_age_hours": ORPHAN_PURGE_MIN_AGE_HOURS,
+    }
+
+
 @router.post("/students/{student_id}/reset-password")
 def reset_student_password(
     student_id: str,
