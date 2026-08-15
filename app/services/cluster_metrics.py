@@ -66,6 +66,21 @@ _Q_POD_MEM_LIMIT = (
     f'sum by (pod) (kube_pod_container_resource_limits{{namespace="{NAMESPACE}",resource="memory"}})'
 )
 
+# ★GPU — DCGM exporter(catchap-infra k8s/81-dcgm-exporter.yaml)가 낸다.
+#   0815 이전에는 GPU 지표가 프로메테우스에 ★하나도 없었다. nvidia-device-plugin 은
+#   GPU 를 "할당"하는 것이지 "재는" 것이 아니라서, STT 워커 카드의 GPU 칸만 비어 있었다.
+#
+# 🚨★pod 가 아니라 exported_pod 로 물어야 한다.
+#   DCGM 이 붙인 pod 라벨이 프로메테우스가 붙이는 pod(스크레이프 대상 = exporter 자신)와
+#   충돌해서 ★exported_ 접두사가 붙는다. pod 로 물으면 dcgm-exporter 자신이 나온다.
+#
+# ⚠️DCGM 이 없는 환경(테스트·GPU 없는 클러스터)에서는 결과가 비어 온다 →
+#   gpu_present=False 로 남는다. ★가짜 0 을 만들지 않는다.
+_GPUSEL = f'exported_namespace="{NAMESPACE}"'
+_Q_POD_GPU_UTIL = f"DCGM_FI_DEV_GPU_UTIL{{{_GPUSEL}}}"
+_Q_POD_GPU_MEM_USED = f"DCGM_FI_DEV_FB_USED{{{_GPUSEL}}}"          # 단위 MiB
+_Q_POD_GPU_MEM_TOTAL = f"DCGM_FI_DEV_FB_USED{{{_GPUSEL}}} + DCGM_FI_DEV_FB_FREE{{{_GPUSEL}}}"
+
 _MB = 1024 * 1024
 _GB = 1024 * 1024 * 1024
 
@@ -125,6 +140,33 @@ def _node_snapshots(base_url: str) -> list[dict]:
     return out
 
 
+def _gpu_of(
+    pods: list[str],
+    util: dict[str, float],
+    used: dict[str, float],
+    total: dict[str, float],
+    names: dict[str, str],
+) -> dict:
+    """이 서비스의 파드들이 쓰는 GPU 를 하나로 묶는다.
+
+    ★사용률은 평균, VRAM 은 합계다. 파드마다 ★다른 GPU 를 하나씩 잡기 때문에
+    사용률을 더하면 200% 같은 값이 나오고, VRAM 은 더해야 "얼마나 남았나"가 맞다.
+    ★GPU 를 안 쓰는 서비스는 gpu_present=False 로 둔다 — 0% 로 채우면 화면에서
+    "GPU 가 한가하다"로 읽혀 GPU 서비스와 구별이 안 된다.
+    """
+    g = [p for p in pods if p in util]
+    if not g:
+        return {"gpu_present": False}
+    tot = sum(total.get(p, 0.0) for p in g)
+    return {
+        "gpu_present": True,
+        "gpu_name": (names.get(g[0]) or None) and names[g[0]][:80],
+        "gpu_util_pct": round(sum(util.get(p, 0.0) for p in g) / len(g), 1),
+        "gpu_mem_used_mb": int(sum(used.get(p, 0.0) for p in g)),
+        "gpu_mem_total_mb": int(tot) if tot else None,
+    }
+
+
 def _service_snapshots(base_url: str, cluster_cores: float) -> list[dict]:
     """서비스별 스냅샷 — 같은 배포의 파드들을 하나로 묶은 합계.
 
@@ -135,6 +177,18 @@ def _service_snapshots(base_url: str, cluster_cores: float) -> list[dict]:
     cpu = _by_label(instant_query(_Q_POD_CPU, base_url=base_url), "pod")
     mem = _by_label(instant_query(_Q_POD_MEM, base_url=base_url), "pod")
     limit = _by_label(instant_query(_Q_POD_MEM_LIMIT, base_url=base_url), "pod")
+
+    # ★GPU 는 exported_pod 로 묶는다(위 상수 주석 참조). DCGM 이 없으면 전부 빈 dict 가 된다.
+    gpu_rows = instant_query(_Q_POD_GPU_UTIL, base_url=base_url)
+    gpu_util = _by_label(gpu_rows, "exported_pod")
+    gpu_used = _by_label(instant_query(_Q_POD_GPU_MEM_USED, base_url=base_url), "exported_pod")
+    gpu_total = _by_label(instant_query(_Q_POD_GPU_MEM_TOTAL, base_url=base_url), "exported_pod")
+    # 모델 이름(Tesla T4 등) — 같은 파드가 여러 GPU 를 쓰면 첫 것만 쓴다(우리는 파드당 1개).
+    gpu_names = {
+        r["labels"].get("exported_pod", ""): r["labels"].get("modelName", "")
+        for r in gpu_rows
+        if r["labels"].get("exported_pod")
+    }
 
     out: list[dict] = []
     for key, label in POD_GROUPS:
@@ -161,7 +215,7 @@ def _service_snapshots(base_url: str, cluster_cores: float) -> list[dict]:
                 "disk_pct": 0.0,
                 "disk_used_gb": 0.0,
                 "disk_total_gb": 0.0,
-                "gpu_present": False,
+                **_gpu_of(pods, gpu_util, gpu_used, gpu_total, gpu_names),
             }
         )
     return out
