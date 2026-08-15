@@ -51,6 +51,21 @@ _Q_NODE_NAME = "node_uname_info"
 _Q_NODE_CPU = '100 * (1 - avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])))'
 _Q_NODE_CORES = 'count by (instance) (node_cpu_seconds_total{mode="idle"})'
 _Q_NODE_LOAD1 = "node_load1"
+# ★어느 노드가 GPU 를 가졌나 — 카드 이름에 역할을 밝히기 위해서다.
+#   "노드 (10.0.2.128)" 만 보면 ★운영자는 그게 무슨 서버인지 알 수 없다.
+_Q_NODE_GPU_CAP = 'kube_node_status_capacity{resource="nvidia_com_gpu"}'
+# ★영역은 서브넷 대역으로 읽는다. kube_node_labels 가 꺼져 있고(kube-state-metrics 기본),
+#   노드 읽기 RBAC 도 없다. 대역은 ★우리가 정한 값이라 노드 이름보다 안정적이다.
+#   ⚠️서브넷을 바꾸면 여기도 바꿔야 한다(95-최종상태/09-네트워크-VPC 참고).
+_ZONE_BY_PREFIX = {"10.0.1.": "2-a", "10.0.2.": "2-a", "10.0.5.": "2-b", "10.0.6.": "2-b"}
+
+
+def _zone_of(ip: str) -> str:
+    """사설 IP → 가용영역 꼬리표. 모르면 빈 문자열(억지로 붙이지 않는다)."""
+    for pre, z in _ZONE_BY_PREFIX.items():
+        if ip.startswith(pre):
+            return z
+    return ""
 _Q_NODE_MEM_TOTAL = "node_memory_MemTotal_bytes"
 _Q_NODE_MEM_AVAIL = "node_memory_MemAvailable_bytes"
 # 루트 파일시스템만. tmpfs·overlay를 빼지 않으면 컨테이너 계층까지 세어 값이 흐려진다.
@@ -98,6 +113,18 @@ def _by_label(rows: list[dict], label: str) -> dict[str, float]:
     return {r["labels"].get(label, ""): r["value"] for r in rows if r["labels"].get(label)}
 
 
+def _node_label(nodename: str, ip: str, gpu_nodes: set[str]) -> str:
+    """노드 카드 이름 — 운영자가 보고 무슨 서버인지 알 수 있게.
+
+    ★그전에는 "노드 (10.0.2.128)" 이었다. IP 만으로는 ★무슨 일을 하는 서버인지 알 수 없고,
+    쿠버네티스를 모르는 운영자에게 '노드'라는 말 자체가 뜻을 주지 못한다.
+    """
+    role = "GPU" if nodename in gpu_nodes else "일반"
+    zone = _zone_of(ip)
+    tail = f" · {zone}" if zone else ""
+    return f"서비스 서버 · {role}{tail} ({ip})"
+
+
 def _node_snapshots(base_url: str) -> list[dict]:
     """노드별 스냅샷 — node-exporter가 보는 실제 하드웨어."""
     names = {
@@ -107,6 +134,12 @@ def _node_snapshots(base_url: str) -> list[dict]:
     cpu = _by_label(instant_query(_Q_NODE_CPU, base_url=base_url), "instance")
     cores = _by_label(instant_query(_Q_NODE_CORES, base_url=base_url), "instance")
     load1 = _by_label(instant_query(_Q_NODE_LOAD1, base_url=base_url), "instance")
+    # GPU 를 가진 노드 이름 집합. 질의가 비어 와도(지표 없음) 이름만 덜 친절해질 뿐 동작한다.
+    gpu_nodes = {
+        r["labels"].get("node", "")
+        for r in instant_query(_Q_NODE_GPU_CAP, base_url=base_url)
+        if float(r.get("value", 0) or 0) > 0
+    }
     mem_total = _by_label(instant_query(_Q_NODE_MEM_TOTAL, base_url=base_url), "instance")
     mem_avail = _by_label(instant_query(_Q_NODE_MEM_AVAIL, base_url=base_url), "instance")
     fs_size = _by_label(instant_query(_Q_NODE_FS_SIZE, base_url=base_url), "instance")
@@ -123,7 +156,10 @@ def _node_snapshots(base_url: str) -> list[dict]:
         out.append(
             {
                 "server_key": f"{NODE_KEY_PREFIX}{nodename}"[:_KEY_MAX],  # 예: node:host-10-0-2-128
-                "label": f"노드 ({instance.split(':')[0]})"[:_LABEL_MAX],
+                # ★사람이 읽는 이름 — "무엇을 하는 서버인가"를 앞에 둔다.
+                #   예: "서비스 서버 · GPU · 2-a (10.0.2.210)"
+                #   IP 는 남긴다(같은 역할이 여러 대라 구분이 필요하다).
+                "label": _node_label(nodename, instance.split(":")[0], gpu_nodes)[:_LABEL_MAX],
                 "host": instance.split(":")[0],
                 "cpu_pct": round(cpu.get(instance, 0.0), 1),
                 "cpu_cores": int(cores.get(instance, 0)),

@@ -273,3 +273,40 @@ def test_stale_node_row_triggers_collection(db, monkeypatch):
     """노드 행이 주기를 넘겨 오래됐으면 걷는다."""
     _fresh_row(db, "node:host-10-0-2-128", seconds_ago=60)
     assert _run_once(db, monkeypatch) is True
+
+def test_node_card_says_what_the_server_does(monkeypatch):
+    """★노드 카드 이름은 "무엇을 하는 서버인가"를 말해야 한다.
+
+    그전에는 "노드 (10.0.2.128)" 이었다. IP 만으로는 운영자가 ★무슨 서버인지 알 수 없고,
+    쿠버네티스를 모르는 사람에게 '노드'라는 말 자체가 뜻을 주지 못한다.
+    """
+    a = dict(_node_answers())
+    a[cluster_metrics._Q_NODE_GPU_CAP] = [
+        {"labels": {"node": "host-10-0-2-210"}, "value": 1.0},
+    ]
+    a[cluster_metrics._Q_NODE_NAME] = [
+        {"labels": {"instance": "10.0.2.128:9100", "nodename": "host-10-0-2-128"}, "value": 1.0},
+        {"labels": {"instance": "10.0.2.210:9100", "nodename": "host-10-0-2-210"}, "value": 1.0},
+        {"labels": {"instance": "10.0.6.202:9100", "nodename": "host-10-0-6-202"}, "value": 1.0},
+    ]
+    monkeypatch.setattr(cluster_metrics, "instant_query", _fake_query(a))
+    labels = {r["server_key"]: r["label"] for r in cluster_metrics.collect("http://x")}
+    assert labels["node:host-10-0-2-128"] == "서비스 서버 · 일반 · 2-a (10.0.2.128)"
+    assert labels["node:host-10-0-2-210"] == "서비스 서버 · GPU · 2-a (10.0.2.210)"   # ★GPU 를 밝힌다
+    assert labels["node:host-10-0-6-202"] == "서비스 서버 · 일반 · 2-b (10.0.6.202)"  # ★영역도
+
+
+def test_node_label_survives_missing_gpu_metric(monkeypatch):
+    """★GPU 지표가 없어도 카드가 깨지지 않는다.
+
+    DCGM/kube-state-metrics 가 없는 환경도 있다. 이름이 덜 친절해질 뿐 수집은 계속돼야 한다.
+    """
+    monkeypatch.setattr(cluster_metrics, "instant_query", _fake_query(_node_answers()))
+    rows = [r for r in cluster_metrics.collect("http://x") if r["server_key"].startswith("node:")]
+    assert rows and all(r["label"].startswith("서비스 서버 · 일반") for r in rows)
+
+
+def test_unknown_subnet_gets_no_fake_zone():
+    """★모르는 대역에 억지로 영역을 붙이지 않는다 — 틀린 위치는 없는 것만 못하다."""
+    assert cluster_metrics._zone_of("172.16.0.9") == ""
+    assert cluster_metrics._zone_of("10.0.6.202") == "2-b"
