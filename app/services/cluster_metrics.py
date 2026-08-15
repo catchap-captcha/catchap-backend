@@ -238,7 +238,9 @@ def _service_snapshots(base_url: str, cluster_cores: float) -> list[dict]:
             {
                 "server_key": key,
                 "label": f"{label} (파드 {len(pods)})",
-                "host": f"{NAMESPACE} 네임스페이스",
+                # ★"catchap 네임스페이스" 는 쿠버네티스를 아는 사람에게만 뜻이 있다.
+                #   운영자에게 필요한 정보는 "이게 어디서 도는가" 이므로 그 말로 쓴다.
+                "host": "쿠버네티스 클러스터 안",
                 # 클러스터 전체 코어 대비 점유율(위 머리말 설명 참조)
                 "cpu_pct": round(used_cores / cluster_cores * 100, 1) if cluster_cores else 0.0,
                 "cpu_cores": len(pods),  # 이 자리는 '몇 벌인지'로 쓴다
