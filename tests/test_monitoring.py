@@ -275,3 +275,36 @@ def test_retired_servers_are_hidden_by_key_or_label(client, db):
     assert "gpu-stt" not in keys, "키로 지정한 옛 서버"
     assert {"NAT 2a", "NAT 2b"} & labels == set(), "이름으로 지정한 옛 서버"
     assert "vm-legacy" in keys, "내리지 않은 서버는 그대로 보여야 한다"
+
+def test_expected_servers_have_no_duplicate_keys():
+    """★서버마다 키가 달라야 한다 — 겹치면 카드 하나가 여러 서버 값으로 튄다.
+
+    0815 사고: 2-b 짝을 만들며 에이전트 설정을 그대로 복사해서 ★세 대(점프 2b·운영 2a·
+    운영 2b)가 같은 server_key("vm-ops")로 보내고 있었다. 같은 키는 최신값으로 덮어쓰므로
+    카드 하나가 30초마다 다른 서버 값을 보여줬고, ★점프 2b 가 "빌드·운영 VM"으로 보였다.
+    화면만 봐서는 알 수 없다 — 값이 그럴듯하게 나오기 때문이다.
+    """
+    from app.api.v1.endpoints.monitoring import EXPECTED_SERVERS
+
+    keys = [k for k, _ in EXPECTED_SERVERS]
+    labels = [l for _, l in EXPECTED_SERVERS]
+    assert len(keys) == len(set(keys)), f"server_key 가 겹칩니다: {keys}"
+    assert len(labels) == len(set(labels)), f"화면 이름이 겹칩니다: {labels}"
+
+
+def test_expected_servers_are_not_hidden_by_retired_list():
+    """★기대 목록에 넣은 서버가 RETIRED 명단에 걸려 감춰지면 안 된다.
+
+    0815 사고: 새로 세운 NAT 에 SERVER_KEY="nat-2a" 를 붙였는데, RETIRED_SERVERS 의
+    옛 "NAT 2a" 와 ★정규화 비교(대소문자·구분자 무시)에서 같아져 화면에서 감춰졌다.
+    에이전트는 정상이고 데이터도 들어오는데 ★카드만 안 보여서 원인 찾기가 어렵다.
+    """
+    from app.api.v1.endpoints.monitoring import (
+        EXPECTED_SERVERS,
+        _RETIRED_NORM,
+        _norm_server,
+    )
+
+    for key, label in EXPECTED_SERVERS:
+        assert _norm_server(key) not in _RETIRED_NORM, f"기대 서버인데 키가 은퇴 명단에 있습니다: {key}"
+        assert _norm_server(label) not in _RETIRED_NORM, f"기대 서버인데 이름이 은퇴 명단에 있습니다: {label}"
