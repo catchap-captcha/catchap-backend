@@ -468,6 +468,56 @@ def list_operators(principal: Principal = Depends(require_ops), db: Session = De
     return [_operator_row(u) for u in rows]
 
 
+def _deleted_account_rows(db: Session, action: str, limit: int) -> list[dict]:
+    """하드 삭제된 계정 이력 — 감사 로그의 삭제 직전 스냅샷을 화면용 행으로 편다.
+
+    ★출처가 감사 로그뿐인 이유: 운영자·강사 삭제는 하드 삭제라 users 행이 남지 않는다.
+    지우기 직전 스냅샷(이름·이메일·상태)을 before_json 에 남겨 두었고, 그것이 "누가
+    있었는지"를 복원할 수 있는 유일한 기록이다.
+
+    ⚠️삭제를 실행한 운영자도 나중에 삭제될 수 있다 — 그때는 이름을 찾을 수 없으므로
+    deleted_by 를 None 으로 둔다(화면이 '삭제된 계정'으로 표시한다). 없는 이름을 지어내지 않는다.
+    """
+    limit = max(1, min(200, limit))
+    logs = (
+        db.query(AuditLog)
+        .filter(AuditLog.action == action)
+        .order_by(AuditLog.created_at.desc())
+        .limit(limit)
+        .all()
+    )
+    actor_ids = {log.actor_user_id for log in logs if log.actor_user_id}
+    actors = {u.id: u.name for u in db.query(User).filter(User.id.in_(actor_ids or [""]))}
+
+    items = []
+    for log in logs:
+        snap = log.before_json or {}
+        items.append(
+            {
+                "id": log.target_id,
+                "name": snap.get("name"),
+                "email": snap.get("email"),
+                # 삭제 직전 상태 — 가드상 항상 'disabled'(중지 후에만 삭제 가능)지만,
+                # 규칙이 바뀔 수 있으니 화면에 지어내지 말고 기록된 값을 그대로 내린다.
+                "status_before": snap.get("status"),
+                "deleted_at": log.created_at.isoformat() if log.created_at else None,
+                "deleted_by": actors.get(log.actor_user_id),
+                "deleted_by_id": log.actor_user_id,
+            }
+        )
+    return items
+
+
+@router.get("/operators/deleted")
+def list_deleted_operators(
+    limit: int = 100,
+    principal: Principal = Depends(require_ops),
+    db: Session = Depends(get_db),
+):
+    """삭제된 운영자 계정 이력 — 자세한 것은 _deleted_account_rows 머리말."""
+    return {"items": _deleted_account_rows(db, "ops.operator_delete", limit)}
+
+
 @router.post("/operators")
 def create_operator(
     req: _OperatorCreateReq,
@@ -2838,6 +2888,16 @@ def list_instructors(
     return [_instructor_row(u) for u in rows]
 
 
+@router.get("/instructors/deleted")
+def list_deleted_instructors(
+    limit: int = 100,
+    principal: Principal = Depends(require_ops),
+    db: Session = Depends(get_db),
+):
+    """삭제된 강사 계정 이력 — 자세한 것은 _deleted_account_rows 머리말."""
+    return {"items": _deleted_account_rows(db, "ops.instructor_delete", limit)}
+
+
 @router.post("/instructors")
 def create_instructor(
     req: _OperatorCreateReq,  # {name, email} — 운영자 발급과 동일 형태
@@ -3020,7 +3080,12 @@ def delete_instructor(
             detail="먼저 계정을 중지한 뒤에 삭제할 수 있어요.",
         )
     course_n = db.query(Course).filter(Course.instructor_id == inst_id).count()
-    lecture_n = db.query(Lecture).filter(Lecture.instructor_id == inst_id).count()
+    # ★Lecture 에는 instructor_id 가 없다 — 강의는 코스를 통해 강사에게 매인다(course_id).
+    #   여기서 Lecture.instructor_id 를 보던 코드는 ★AttributeError 로 500 을 냈다.
+    #   즉 강사 삭제가 아예 동작하지 않았다(가드가 아니라 고장이었다).
+    #   업로더로 세는 이유: ① 코스가 없어도 미분류 강의(course_id IS NULL)가 남을 수 있고,
+    #   ② lectures.uploaded_by 는 users.id 를 가리키는 ★진짜 FK 라 그냥 지우면 DB가 막는다.
+    lecture_n = db.query(Lecture).filter(Lecture.uploaded_by == inst_id).count()
     if course_n or lecture_n:
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
