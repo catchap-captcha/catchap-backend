@@ -445,3 +445,74 @@ def test_one_failing_recipient_does_not_block_the_rest(client, db, monkeypatch):
     r = _post(client, _payload())
     assert r.status_code == 200
     assert r.json()["notified"] == 2  # ★셋 중 둘은 받았다
+
+
+# ── 경보 제목이 읽히는 말인가 (0815 화면 지적) ────────────────────────────
+# 그전에는 화면에 이렇게 떴다:
+#   [급함] CatchapServiceDown — monitoring-kube-state-metrics-6cb6769d69-przfr 외 1건
+# 규칙에 한글 summary 가 붙어 있는데도 ★메일 본문에만 쓰고 제목엔 규칙 이름을 찍었다.
+def _title_payload(alerts, status="firing"):
+    from app.api.v1.endpoints.alerts import AlertmanagerPayload
+
+    return AlertmanagerPayload(status=status, alerts=alerts)
+
+
+def test_title_uses_korean_summary_when_the_rule_has_one():
+    """우리가 만든 경보는 summary 가 한글이다 — 규칙 이름 대신 그것을 쓴다."""
+    from app.api.v1.endpoints.alerts import _title
+
+    t = _title(_title_payload([{
+        "labels": {"alertname": "CatchapMetricsCollectionStopped", "severity": "critical"},
+        "annotations": {"summary": "★catchap 지표가 10분째 안 들어옵니다"},
+    }]))
+    assert "catchap 지표가 10분째 안 들어옵니다" in t
+    assert "CatchapMetricsCollectionStopped" not in t, "규칙 이름이 그대로 새면 안 된다"
+    assert t.startswith("[급함]")
+
+
+def test_title_does_not_repeat_the_place_twice():
+    """summary 에 이미 파드 이름이 있으면 뒤에 또 붙이지 않는다."""
+    from app.api.v1.endpoints.alerts import _title
+
+    t = _title(_title_payload([{
+        "labels": {"alertname": "CatchapPodRestartingRepeatedly", "severity": "warning",
+                   "pod": "behavior-ai-5d5d995d64-bfzgd"},
+        "annotations": {"summary": "behavior-ai-5d5d995d64-bfzgd 가 한 시간에 6번 다시 떴습니다"},
+    }]))
+    assert t.count("behavior-ai-5d5d995d64-bfzgd") == 1
+
+
+def test_title_falls_back_to_korean_name_for_foreign_rules():
+    """남이 만든 규칙은 summary 가 영문이다 — 자주 뜨는 것은 한글 이름을 쓴다."""
+    from app.api.v1.endpoints.alerts import _title
+
+    # summary 가 아예 없는 경우 → 표의 한글 이름
+    t = _title(_title_payload([{
+        "labels": {"alertname": "CPUThrottlingHigh", "severity": "info",
+                   "pod": "monitoring-prometheus-node-exporter-cgs55"},
+        "annotations": {},
+    }]))
+    assert "CPU 가 한도에 걸려 느려지는 중" in t
+    assert "monitoring-prometheus-node-exporter-cgs55" in t, "어디서 났는지는 남아야 한다"
+
+
+def test_title_keeps_the_rule_name_when_nothing_else_is_known():
+    """표에도 없고 summary 도 없으면 규칙 이름 그대로 — 조용히 지우지 않는다."""
+    from app.api.v1.endpoints.alerts import _title
+
+    t = _title(_title_payload([{
+        "labels": {"alertname": "SomeBrandNewAlert", "severity": "warning"},
+        "annotations": {},
+    }]))
+    assert "SomeBrandNewAlert" in t
+
+
+def test_resolved_alert_says_so():
+    """해제된 경보는 등급 대신 '해제' 로 — 기존 동작이 유지되는지."""
+    from app.api.v1.endpoints.alerts import _title
+
+    t = _title(_title_payload([{
+        "labels": {"alertname": "CatchapServiceDown", "severity": "critical"},
+        "annotations": {"summary": "★backend-api 가 한 벌도 안 떠 있습니다"},
+    }], status="resolved"))
+    assert t.startswith("[해제]")
