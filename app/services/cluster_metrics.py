@@ -237,7 +237,9 @@ def _service_snapshots(base_url: str, cluster_cores: float) -> list[dict]:
         out.append(
             {
                 "server_key": key,
-                "label": f"{label} (파드 {len(pods)})",
+                # ★"(파드 2)" 는 쿠버네티스를 아는 사람에게만 뜻이 있고, 몇 벌 떠 있는지는
+                #   화면 부제가 "2벌 실행 중" 으로 이미 보여 준다(cpu_cores). 제목에서는 뺀다.
+                "label": label,
                 # ★"catchap 네임스페이스" 는 쿠버네티스를 아는 사람에게만 뜻이 있다.
                 #   운영자에게 필요한 정보는 "이게 어디서 도는가" 이므로 그 말로 쓴다.
                 "host": "쿠버네티스 클러스터 안",

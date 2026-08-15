@@ -113,7 +113,10 @@ def test_pod_memory_is_measured_against_its_limit(monkeypatch):
     assert captcha["cpu_cores"] == 2  # 이 자리는 '몇 벌인지'
     # CPU는 클러스터 전체 코어(8) 대비 — 0.4/8 = 5.0%
     assert captcha["cpu_pct"] == 5.0
-    assert captcha["label"] == "캡차 API (파드 2)"
+    # 제목에는 "(파드 2)" 를 붙이지 않는다 — 쿠버네티스 용어이고, 몇 벌인지는
+    # 화면 부제가 cpu_cores 로 "2벌 실행 중" 이라고 이미 보여 준다.
+    assert captcha["label"] == "캡차 API"
+    assert captcha["cpu_cores"] == 2, "몇 벌인지는 이 값이 진다"
 
 
 def test_service_with_no_pods_is_omitted_not_zeroed(monkeypatch):
