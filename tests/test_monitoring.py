@@ -243,3 +243,35 @@ def test_collect_cluster_does_not_hide_a_persistent_integrity_error(db, monkeypa
     monkeypatch.setattr(db, "commit", always_fails)
     with pytest.raises(IntegrityError):
         monitoring.collect_cluster(db)
+
+
+def test_retired_servers_are_hidden_by_key_or_label(client, db):
+    """컷오버로 내린 옛 서버는 현황판에서 뺀다 — ★영영 '오래됨'으로 남지 않게.
+
+    ★기준이 두 가지인 이유
+      클러스터 밖 VM 의 server_key 는 그 서버에 심은 에이전트의 SERVER_KEY 환경변수가
+      정하므로 코드에 남아 있지 않다(scripts/metrics_agent.py). 이미 내린 뒤에는 물어볼
+      곳도 없으니, 화면에 보이는 이름(label)으로도 지정할 수 있어야 정리가 된다.
+      NAT 인스턴스 두 대가 실제로 그런 경우였다.
+    """
+    from datetime import datetime
+
+    from app.models import ServerMetric
+
+    otok = _ops(client, db)
+    now = datetime.now()
+    db.add_all([
+        ServerMetric(server_key="gpu-stt", label="GPU STT 워커", collected_at=now),
+        ServerMetric(server_key="vm-nat-a-9f31", label="NAT 2a", collected_at=now),
+        ServerMetric(server_key="vm-nat-b-2c07", label="NAT 2b", collected_at=now),
+        # 내리지 않은 것까지 지우면 진짜 장애를 감추게 된다 — 이건 남아야 한다
+        ServerMetric(server_key="vm-legacy", label="옛 배치 VM", collected_at=now),
+    ])
+    db.commit()
+
+    body = client.get("/api/v1/ops/monitoring", headers=auth(otok)).json()
+    keys = {s["server_key"] for s in body["servers"]}
+    labels = {s["label"] for s in body["servers"]}
+    assert "gpu-stt" not in keys, "키로 지정한 옛 서버"
+    assert {"NAT 2a", "NAT 2b"} & labels == set(), "이름으로 지정한 옛 서버"
+    assert "vm-legacy" in keys, "내리지 않은 서버는 그대로 보여야 한다"

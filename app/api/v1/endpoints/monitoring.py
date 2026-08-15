@@ -96,11 +96,33 @@ EXPECTED_SERVERS: list[tuple[str, str]] = [
 #   ★대신 Grafana 가 카카오클라우드 Metric Export 로 본다(kc-mysql 데이터소스).
 #   여기에 넣어 두면 ★영영 "없음"으로 빨갛게 남아 진짜 고장과 구별이 안 된다.
 # 컷오버로 내린 옛 서버 — 화면에서 감춘다.
-# gpu-stt: 클러스터 밖 GPU VM. 2026-08-11 stt-worker(클러스터)로 옮기며 내렸다.
-#   EXPECTED_SERVERS 주석대로 "컷오버 뒤에 지우면 된다"는 그 대상이다. 남겨 두면 영영
-#   '오래됨'으로 붙어 있어 ★진짜 수집 중단과 구별이 안 된다(운영자가 매번 이 카드를 확인하게 됨).
+#   gpu-stt   : 클러스터 밖 GPU VM. 2026-08-11 stt-worker(클러스터)로 옮기며 내렸다.
+#   NAT 2a/2b : 사설망 아웃바운드용 NAT 인스턴스 두 대. 관리형 NAT Gateway 로 대체되며 내렸다.
+# EXPECTED_SERVERS 주석대로 "컷오버 뒤에 지우면 된다"는 그 대상들이다. 남겨 두면 영영
+# '오래됨'으로 붙어 있어 ★진짜 수집 중단과 구별이 안 된다(운영자가 매번 이 카드를 확인하게 됨).
 # ★행 자체는 지우지 않는다 — 지난 표본·롤업은 이력으로 남기고 현황판에서만 뺀다.
-RETIRED_SERVER_KEYS: frozenset[str] = frozenset({"gpu-stt"})
+#
+# ★key 가 아니라 화면 이름으로도 지정할 수 있게 한 이유
+#   클러스터 밖 VM 의 server_key 는 그 서버에 심은 에이전트의 SERVER_KEY 환경변수가 정한다
+#   (scripts/metrics_agent.py). 즉 그 값은 코드에 남아 있지 않고, 서버를 이미 내린 뒤에는
+#   물어볼 곳도 없다. 운영자가 화면에서 보는 이름(label)으로도 지울 수 있어야 정리가 된다.
+RETIRED_SERVERS: tuple[str, ...] = ("gpu-stt", "NAT 2a", "NAT 2b")
+
+
+def _norm_server(s: str) -> str:
+    """서버 키·이름 비교용 정규화 — 대소문자와 구분자(-, _, 공백) 차이를 무시한다."""
+    return " ".join(s.replace("-", " ").replace("_", " ").split()).casefold()
+
+
+_RETIRED_NORM: frozenset[str] = frozenset(_norm_server(s) for s in RETIRED_SERVERS)
+
+
+def _is_retired(row: ServerMetric) -> bool:
+    """내린 서버인가 — server_key 와 label 중 하나만 맞아도 현황판에서 뺀다."""
+    return (
+        _norm_server(row.server_key) in _RETIRED_NORM
+        or _norm_server(row.label or "") in _RETIRED_NORM
+    )
 
 STALE_AFTER_SEC = 120  # 이 시간 넘게 갱신 없으면 '오래됨'(수집 중단 의심)
 
@@ -363,9 +385,9 @@ def ops_monitoring(
     # 기대 목록에도 노드에도 없는 것(옛 VM 잔재 등)은 맨 뒤에(확장성 + 정직)
     other_keys = sorted(
         k
-        for k in rows
+        for k, row in rows.items()
         if k not in expected_keys
-        and k not in RETIRED_SERVER_KEYS
+        and not _is_retired(row)
         and not k.startswith(cluster_metrics.NODE_KEY_PREFIX)
     )
     servers = [_row_out(rows[k], k, rows[k].label) for k in node_keys]
