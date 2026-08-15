@@ -937,11 +937,11 @@ def system(principal: Principal = Depends(require_ops), db: Session = Depends(ge
         services.append({
             "name": "db", "status": "ok",
             "latency_ms": max(1, int((_time.perf_counter() - t0) * 1000)),
-            "detail": "SELECT 1 왕복",
+            "detail": "연결 확인 질의 왕복",
         })
     except Exception as e:  # noqa: BLE001 — 상태 보고가 목적, 어떤 예외든 error로
         services.append({"name": "db", "status": "error", "latency_ms": None,
-                         "detail": type(e).__name__})
+                         "detail": f"연결 실패 ({type(e).__name__})"})
 
     # 캡차 엔진 — 문제은행이 실제로 로드돼 출제 가능한지
     t0 = _time.perf_counter()
@@ -960,7 +960,7 @@ def system(principal: Principal = Depends(require_ops), db: Session = Depends(ge
         })
     except Exception as e:  # noqa: BLE001
         services.append({"name": "captcha-engine", "status": "error", "latency_ms": None,
-                         "detail": type(e).__name__})
+                         "detail": f"문제은행 로드 실패 ({type(e).__name__})"})
 
     # SMTP — 설정 여부 + 최근 24시간 발송 결과 실집계
     smtp_on = get_settings().smtp_enabled
