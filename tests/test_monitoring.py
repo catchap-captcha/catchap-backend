@@ -313,26 +313,38 @@ def test_expected_servers_are_not_hidden_by_retired_list():
 # ── 서버 tz 가 무엇이든 시각이 맞아야 한다 (0815) ─────────────────────────
 # 0815 에 새로 만든 VM 4대가 Etc/UTC 라 9시간 뒤처진 시각을 보냈고, 화면이 "수집 중단"
 # 이라고 했다. 서버 tz 를 맞추는 것만으로는 ★노드 재생성·VM 추가 때 또 난다.
-def test_utc_agent_time_is_converted_to_kst():
-    """UTC 로 잰 시각을 보내도 KST 로 맞춰 저장한다 (9시간 차이가 사라진다)."""
+#
+# ⚠️★이 시험들은 "돌리는 환경이 KST" 에 기대면 안 된다 — CI 러너는 UTC 다.
+#   (처음 쓴 시험이 그 함정에 빠져 로컬은 통과하고 CI 만 깨졌다. 고치려던 것과 같은 실수다.)
+def test_same_moment_in_different_tz_gives_same_stored_time():
+    """★같은 순간을 UTC 로 보내든 KST 로 보내든 저장값이 같아야 한다.
+
+    환경 tz 와 무관하게 항상 참이다 — 이 시험이 변환의 핵심을 잡는다.
+    """
     from datetime import datetime, timedelta, timezone
 
     from app.api.v1.endpoints.monitoring import _to_local_naive
 
-    utc_ts = datetime(2026, 8, 15, 7, 0, 0, tzinfo=timezone.utc)
-    got = _to_local_naive(utc_ts)
-    assert got == datetime(2026, 8, 15, 16, 0, 0), got
-    assert got.tzinfo is None, "앱 규약은 naive 다 — tz 가 붙으면 다른 시각과 못 뺀다"
+    utc = datetime(2026, 8, 15, 7, 0, 0, tzinfo=timezone.utc)
+    kst = datetime(2026, 8, 15, 16, 0, 0, tzinfo=timezone(timedelta(hours=9)))
+    assert utc == kst, "같은 순간을 두 가지로 적은 것"
+    assert _to_local_naive(utc) == _to_local_naive(kst)
+    assert _to_local_naive(utc).tzinfo is None, "앱 규약은 naive 다"
 
 
-def test_kst_agent_time_stays_the_same():
-    """KST 로 보내면 시각이 그대로여야 한다 (엉뚱하게 또 9시간 더하지 않는다)."""
-    from datetime import datetime, timedelta, timezone
+def test_converted_time_matches_the_frame_used_for_freshness():
+    """★신선도를 재는 datetime.now() 와 ★같은 프레임이어야 한다.
+
+    KST(+9)로 못박으면 앱 컨테이너가 KST 가 아닐 때 어긋난다 — 이 시험이 그것을 잡는다.
+    """
+    from datetime import datetime, timezone
 
     from app.api.v1.endpoints.monitoring import _to_local_naive
 
-    kst_ts = datetime(2026, 8, 15, 16, 0, 0, tzinfo=timezone(timedelta(hours=9)))
-    assert _to_local_naive(kst_ts) == datetime(2026, 8, 15, 16, 0, 0)
+    local_now = datetime.now()                       # 앱이 신선도를 잴 때 쓰는 '지금'
+    same_moment_utc = local_now.astimezone(timezone.utc)   # 같은 순간을 UTC 로 표현
+    got = _to_local_naive(same_moment_utc)
+    assert abs((got - local_now).total_seconds()) < 1, f"{got} vs {local_now}"
 
 
 def test_naive_agent_time_is_left_alone():
@@ -349,7 +361,6 @@ def test_naive_agent_time_is_left_alone():
 def test_agent_sends_timezone_aware_time():
     """에이전트가 ★tz 를 붙여 보내야 위 변환이 발동한다 (한쪽만 고치면 안 된다)."""
     import pathlib
-    import re
 
     src = pathlib.Path(__file__).resolve().parents[1] / "scripts" / "metrics_agent.py"
     line = [l for l in src.read_text(encoding="utf-8").splitlines() if '"collected_at"' in l]
@@ -357,13 +368,13 @@ def test_agent_sends_timezone_aware_time():
     assert "astimezone()" in line[0], f"tz 가 안 붙는다: {line[0].strip()}"
 
 
-def test_utc_server_report_is_stored_as_kst_end_to_end(client, db, monkeypatch):
-    """★실제 POST 경로로 UTC 시각을 보내면 DB 에 KST 로 들어가고 '오래됨'이 아니어야 한다.
+def test_utc_server_report_is_stored_in_app_frame_end_to_end(client, db, monkeypatch):
+    """★실제 POST 경로로 다른 tz 시각을 보내도 '오래됨'이 아니어야 한다.
 
     함수만 시험하면 _METRIC_FIELDS 루프가 raw 값을 그대로 setattr 하는 것을 못 잡는다 —
     0815 사고가 화면에 드러난 곳이 바로 이 경로다.
     """
-    from datetime import datetime, timedelta, timezone
+    from datetime import datetime, timezone
 
     from app.api.v1.endpoints import monitoring
     from app.models import ServerMetric, ServerMetricSample
@@ -373,12 +384,12 @@ def test_utc_server_report_is_stored_as_kst_end_to_end(client, db, monkeypatch):
 
     monkeypatch.setattr(monitoring, "get_settings", lambda: _S())
 
-    # UTC 서버가 "바로 지금" 잰 것 — 벽시계로는 9시간 전처럼 보인다
-    now_utc = datetime.now(timezone.utc).replace(microsecond=0)
+    # "바로 지금" 을 ★UTC 표기로 보낸다 — 보내는 서버가 UTC 인 상황
+    sent = datetime.now().astimezone(timezone.utc).replace(microsecond=0)
     client.post(
         "/api/v1/internal/metrics",
         json={"server_key": "vm-tz-utc", "label": "UTC 서버", "cpu_pct": 1.0,
-              "collected_at": now_utc.isoformat()},
+              "collected_at": sent.isoformat()},
         headers={"X-Metrics-Token": "sekret"},
     )
     row = db.query(ServerMetric).filter(ServerMetric.server_key == "vm-tz-utc").first()
@@ -387,9 +398,9 @@ def test_utc_server_report_is_stored_as_kst_end_to_end(client, db, monkeypatch):
 
     # 앱이 신선도를 재는 방식 그대로 — 9시간이 아니라 몇 초여야 한다
     age = abs((datetime.now() - row.collected_at).total_seconds())
-    assert age < 300, f"UTC 서버 보고가 {age / 3600:.1f}시간 뒤처져 저장됐다 (0815 사고 재발)"
+    assert age < 300, f"보고가 {age / 3600:.1f}시간 어긋나 저장됐다 (0815 사고 재발)"
 
-    # 표본 행도 같은 시각이어야 한다(그래프가 9시간 왼쪽으로 밀리지 않게)
+    # 표본 행도 같은 시각이어야 한다(그래프가 옆으로 밀리지 않게)
     sample = (db.query(ServerMetricSample)
               .filter(ServerMetricSample.server_key == "vm-tz-utc").first())
     assert sample is not None and abs((datetime.now() - sample.collected_at).total_seconds()) < 300

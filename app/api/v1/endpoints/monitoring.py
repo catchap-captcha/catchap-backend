@@ -19,7 +19,7 @@
 """
 
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
 from pydantic import BaseModel
@@ -168,25 +168,30 @@ _METRIC_FIELDS = (
 )
 
 
-# 앱 규약은 "로컬(KST) naive 하나"다(app/utils/helpers.py). 그런데 지표를 보내는 쪽은
+# 앱 규약은 "로컬 naive 하나"다(app/utils/helpers.py). 그런데 지표를 보내는 쪽은
 # ★앱 밖의 서버 10대라 그 규약을 코드로 강제할 수 없다 — 서버 tz 가 UTC 면 9시간 뒤처진
 # 시각이 그대로 들어와 "수집 중단"으로 보인다(0815 실제 사고: 0814 에 만든 2-b 짝과 NAT
 # 2대가 기본값 Etc/UTC 였다). 서버 tz 를 맞추는 것으로는 ★같은 일이 또 난다 — 노드가
 # 재생성되거나 VM 이 새로 생기면 다시 UTC 다.
-# 그래서 에이전트가 tz 를 붙여 보내고(scripts/metrics_agent.py), 여기서 KST 로 맞춘다.
-_KST = timezone(timedelta(hours=9))
+# 그래서 에이전트가 tz 를 붙여 보내고(scripts/metrics_agent.py), 여기서 맞춘다.
 
 
 def _to_local_naive(ts: datetime | None) -> datetime | None:
-    """에이전트가 보낸 시각을 앱 규약(로컬 KST naive)으로 맞춘다.
+    """에이전트가 보낸 시각을 앱 규약(로컬 naive)으로 맞춘다.
 
-    tz 가 붙어 있으면 ★서버 tz 가 무엇이든 정확히 맞는다.
+    tz 가 붙어 있으면 ★보내는 서버 tz 가 무엇이든 정확히 맞는다.
     tz 가 없으면(에이전트를 아직 안 바꾼 서버) 그대로 둔다 — 그 경우만 여전히
-    "보내는 서버가 KST" 라는 가정에 기댄다. 섞여 있어도 각각 옳게 처리된다.
+    "보내는 서버가 이 앱과 같은 tz" 라는 가정에 기댄다. 섞여 있어도 각각 옳게 처리된다.
+
+    ⚠️★KST(+9)로 못박지 않는다. 신선도를 재는 쪽이 datetime.now() — ★이 앱 컨테이너의
+      로컬 시각이라, 여기서 +9 로 고정하면 컨테이너가 KST 가 아닐 때 둘이 어긋난다.
+      그러면 고치려던 사고가 자리만 옮겨 다시 난다. 인자 없는 astimezone() 이
+      "이 앱의 로컬" 로 맞춰 주므로 ★항상 같은 프레임이 된다.
+      (배포는 TZ=Asia/Seoul 로 고정한다 — 그래서 실제 값은 KST 다.)
     """
     if ts is None or ts.tzinfo is None:
         return ts
-    return ts.astimezone(_KST).replace(tzinfo=None)
+    return ts.astimezone().replace(tzinfo=None)
 
 
 def _upsert(db: Session, snap: dict) -> ServerMetric:
