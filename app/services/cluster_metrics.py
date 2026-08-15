@@ -58,6 +58,10 @@ _Q_NODE_GPU_CAP = 'kube_node_status_capacity{resource="nvidia_com_gpu"}'
 #   그래서 "DCGM 파드 → 노드" 를 kube_pod_info 로 따로 받아 파이썬에서 잇는다.
 #   (PromQL 조인으로도 되지만 라벨 이름이 달라 label_replace 가 겹겹이 필요해 읽기 어렵다)
 _Q_DCGM_POD_NODE = 'kube_pod_info{pod=~"dcgm-exporter.*"}'
+# ★어느 앱이 어느 서버에 올라가 있나 — 노드 카드에 그걸 적어야 "서버와 앱" 이 이어져 보인다.
+#   그전에는 서버 카드와 앱 카드가 따로 놀아서, 보는 사람이 둘을 머리로 이어야 했다.
+_Q_POD_NODE = f'kube_pod_info{{namespace="{NAMESPACE}"}}'
+
 _Q_NODE_GPU_UTIL = "DCGM_FI_DEV_GPU_UTIL"
 _Q_NODE_GPU_MEM_USED = "DCGM_FI_DEV_FB_USED"
 _Q_NODE_GPU_MEM_FREE = "DCGM_FI_DEV_FB_FREE"
@@ -132,6 +136,29 @@ def _node_label(nodename: str, ip: str, gpu_nodes: set[str]) -> str:
     return f"서비스 서버 · {role}{tail} ({ip})"
 
 
+def apps_by_node(base_url: str) -> dict[str, list[str]]:
+    """서버(노드) 이름 → 그 위에 올라가 있는 앱들(사람이 읽는 이름).
+
+    ★서버 카드와 앱 카드가 따로 있으면 보는 사람이 둘을 머리로 이어야 한다.
+    노드 카드에 이 목록을 적어 "이 서버에서 무엇이 도는가" 를 바로 보이게 한다.
+
+    파드 이름은 "backend-api-677b65d757-vwvz2" 처럼 뒤에 무작위가 붙으므로
+    POD_GROUPS 의 키로 앞을 맞춰 가른다. 순서는 POD_GROUPS 그대로 — 화면과 같게.
+    """
+    order = [d for _, d in POD_GROUPS]
+    found: dict[str, set[str]] = {}
+    for r in instant_query(_Q_POD_NODE, base_url=base_url):
+        pod = r["labels"].get("pod", "")
+        node = r["labels"].get("node", "")
+        if not node:
+            continue
+        for key, disp in POD_GROUPS:
+            if pod.startswith(f"{key}-"):
+                found.setdefault(node, set()).add(disp)
+                break
+    return {n: [d for d in order if d in got] for n, got in found.items()}
+
+
 def _node_snapshots(base_url: str) -> list[dict]:
     """노드별 스냅샷 — node-exporter가 보는 실제 하드웨어."""
     names = {
@@ -147,6 +174,8 @@ def _node_snapshots(base_url: str) -> list[dict]:
         for r in instant_query(_Q_NODE_GPU_CAP, base_url=base_url)
         if float(r.get("value", 0) or 0) > 0
     }
+    node_apps = apps_by_node(base_url)
+
     # ★노드별 GPU 실측 — 이름에 "GPU" 라고 써 놓고 카드에는 "GPU 없음" 이라고 하던 것을 메운다.
     #   DCGM 파드가 어느 노드에 있는지(kube_pod_info)로 이어 붙인다.
     dcgm_node = {
@@ -212,6 +241,8 @@ def _node_snapshots(base_url: str) -> list[dict]:
                 "disk_pct": round((1 - free / size) * 100, 1) if size else 0.0,
                 "disk_used_gb": round((size - free) / _GB, 1),
                 "disk_total_gb": round(size / _GB, 1),
+                # 이 서버 위에서 도는 앱들(표시 이름). 없으면 빈 목록 — 화면이 알아서 감춘다.
+                "apps": node_apps.get(nodename, []),
                 # ★이름에 "GPU" 라고 써 놓고 여기서 False 를 보내면 카드가 "GPU 없음" 이라고
                 #   말한다 — 제목과 내용이 정면으로 어긋난다(0815 화면에서 확인). 실측을 넣는다.
                 **(

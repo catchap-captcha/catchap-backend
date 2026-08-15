@@ -440,6 +440,20 @@ def ops_monitoring(
         if not s.get("no_data"):
             s["history"] = _history(db, s["server_key"], range_key)
 
+    # ★"이 서버 위에 어떤 앱이 올라가 있나" — 서버 카드와 앱 카드가 따로 놀아서 보는 사람이
+    #   둘을 머리로 이어야 했다(사용자 지적: "서버랑 앱이 한눈에 안 들어와서 헷갈려").
+    #   ⚠️표에 담지 않는다 — 파드는 수시로 옮겨 다녀서 저장하면 금세 옛말이 된다.
+    #     조회할 때 프로메테우스에서 바로 읽고, 못 읽으면 이 정보만 빠진다(화면이 감춘다).
+    try:
+        placement = cluster_metrics.apps_by_node(get_settings().PROMETHEUS_URL)
+    except Exception:  # noqa: BLE001 — 배치 정보는 곁가지다. 없다고 화면 전체를 죽이지 않는다.
+        placement = {}
+    if placement:
+        for s in servers:
+            key = s.get("server_key", "")
+            if key.startswith(cluster_metrics.NODE_KEY_PREFIX):
+                s["apps"] = placement.get(key[len(cluster_metrics.NODE_KEY_PREFIX):], [])
+
     # LLM 사용량·비용 — 모델별 누적 토큰 × 공시 단가($/1M). 실비용 아닌 운영 참고 추정치.
     models = db.query(AiModelConfig).all()
     by_provider: dict[str, dict] = {}
