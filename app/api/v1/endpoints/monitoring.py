@@ -19,7 +19,7 @@
 """
 
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
 from pydantic import BaseModel
@@ -168,9 +168,33 @@ _METRIC_FIELDS = (
 )
 
 
+# 앱 규약은 "로컬(KST) naive 하나"다(app/utils/helpers.py). 그런데 지표를 보내는 쪽은
+# ★앱 밖의 서버 10대라 그 규약을 코드로 강제할 수 없다 — 서버 tz 가 UTC 면 9시간 뒤처진
+# 시각이 그대로 들어와 "수집 중단"으로 보인다(0815 실제 사고: 0814 에 만든 2-b 짝과 NAT
+# 2대가 기본값 Etc/UTC 였다). 서버 tz 를 맞추는 것으로는 ★같은 일이 또 난다 — 노드가
+# 재생성되거나 VM 이 새로 생기면 다시 UTC 다.
+# 그래서 에이전트가 tz 를 붙여 보내고(scripts/metrics_agent.py), 여기서 KST 로 맞춘다.
+_KST = timezone(timedelta(hours=9))
+
+
+def _to_local_naive(ts: datetime | None) -> datetime | None:
+    """에이전트가 보낸 시각을 앱 규약(로컬 KST naive)으로 맞춘다.
+
+    tz 가 붙어 있으면 ★서버 tz 가 무엇이든 정확히 맞는다.
+    tz 가 없으면(에이전트를 아직 안 바꾼 서버) 그대로 둔다 — 그 경우만 여전히
+    "보내는 서버가 KST" 라는 가정에 기댄다. 섞여 있어도 각각 옳게 처리된다.
+    """
+    if ts is None or ts.tzinfo is None:
+        return ts
+    return ts.astimezone(_KST).replace(tzinfo=None)
+
+
 def _upsert(db: Session, snap: dict) -> ServerMetric:
     """server_key 기준 upsert(최신 1행) + 시계열 표본 append(추이 그래프)."""
     key = snap["server_key"]
+    # 아래 _METRIC_FIELDS 루프가 collected_at 을 그대로 setattr 하므로 ★루프보다 먼저 맞춘다.
+    if isinstance(snap.get("collected_at"), datetime):
+        snap = {**snap, "collected_at": _to_local_naive(snap["collected_at"])}
     row = db.query(ServerMetric).filter(ServerMetric.server_key == key).first()
     if row is None:
         row = ServerMetric(server_key=key)
@@ -178,10 +202,10 @@ def _upsert(db: Session, snap: dict) -> ServerMetric:
     for f in _METRIC_FIELDS:
         if f in snap and snap[f] is not None:
             setattr(row, f, snap[f])
-    # collected_at은 각 서버가 측정한 시각을 그대로 쓴다(백엔드 시각으로 덮지 않는다) —
-    # 5대 VM이 전부 KST로 통일돼 있어 서버별 시각을 그대로 비교해도 신선도가 어긋나지 않는다.
-    # (과거 GPU만 어긋난 건 그 VM의 에이전트 프로세스가 OS tz 변경 전 UTC를 물고 있어서였고,
-    #  재부팅/재시작으로 KST 프로세스가 뜨면 자연히 정렬된다. 서버 tz 자체가 정본.)
+    # collected_at 은 각 서버가 잰 시각을 쓴다(백엔드 시각으로 덮지 않는다) — 덮으면 정말로
+    # 늦게 도착한 것과 제때 온 것을 구별할 수 없다. 대신 위에서 ★tz 를 맞춰 두었다.
+    # ⚠️예전 주석은 "VM 이 전부 KST 라 그냥 비교해도 된다"고 적혀 있었는데, 0815 에 그 전제가
+    #   깨졌다(새로 만든 VM 4대가 UTC). 서버 tz 에 기대지 않는 것이 이 코드의 요점이다.
     ts = snap.get("collected_at") or datetime.now()
     if snap.get("collected_at") is None:
         row.collected_at = ts

@@ -57,7 +57,9 @@ def snapshot(server_key: str, label: str) -> dict:
         "load1": load1, "mem_pct": float(vm.percent), "mem_used_mb": int(vm.used / 1048576),
         "mem_total_mb": int(vm.total / 1048576), "disk_pct": float(disk.percent),
         "disk_used_gb": round(disk.used / 1073741824, 1), "disk_total_gb": round(disk.total / 1073741824, 1),
-        "collected_at": datetime.now().isoformat(), **gpu(),
+        # ★astimezone() 으로 tz 를 붙인다 — 이 서버가 UTC 여도 받는 쪽이 KST 로 맞춘다.
+        #   (0815: 새로 만든 VM 4대가 Etc/UTC 라 9시간 뒤처진 시각을 보내 "수집 중단"으로 보였다)
+        "collected_at": datetime.now().astimezone().isoformat(), **gpu(),
     }
 
 
