@@ -54,6 +54,13 @@ _Q_NODE_LOAD1 = "node_load1"
 # ★어느 노드가 GPU 를 가졌나 — 카드 이름에 역할을 밝히기 위해서다.
 #   "노드 (10.0.2.128)" 만 보면 ★운영자는 그게 무슨 서버인지 알 수 없다.
 _Q_NODE_GPU_CAP = 'kube_node_status_capacity{resource="nvidia_com_gpu"}'
+# ★DCGM 지표에는 노드 이름이 없다 — Hostname 라벨이 DCGM 파드 이름이다(0815 실측).
+#   그래서 "DCGM 파드 → 노드" 를 kube_pod_info 로 따로 받아 파이썬에서 잇는다.
+#   (PromQL 조인으로도 되지만 라벨 이름이 달라 label_replace 가 겹겹이 필요해 읽기 어렵다)
+_Q_DCGM_POD_NODE = 'kube_pod_info{pod=~"dcgm-exporter.*"}'
+_Q_NODE_GPU_UTIL = "DCGM_FI_DEV_GPU_UTIL"
+_Q_NODE_GPU_MEM_USED = "DCGM_FI_DEV_FB_USED"
+_Q_NODE_GPU_MEM_FREE = "DCGM_FI_DEV_FB_FREE"
 # ★영역은 서브넷 대역으로 읽는다. kube_node_labels 가 꺼져 있고(kube-state-metrics 기본),
 #   노드 읽기 RBAC 도 없다. 대역은 ★우리가 정한 값이라 노드 이름보다 안정적이다.
 #   ⚠️서브넷을 바꾸면 여기도 바꿔야 한다(95-최종상태/09-네트워크-VPC 참고).
@@ -140,6 +147,41 @@ def _node_snapshots(base_url: str) -> list[dict]:
         for r in instant_query(_Q_NODE_GPU_CAP, base_url=base_url)
         if float(r.get("value", 0) or 0) > 0
     }
+    # ★노드별 GPU 실측 — 이름에 "GPU" 라고 써 놓고 카드에는 "GPU 없음" 이라고 하던 것을 메운다.
+    #   DCGM 파드가 어느 노드에 있는지(kube_pod_info)로 이어 붙인다.
+    dcgm_node = {
+        r["labels"].get("pod", ""): r["labels"].get("node", "")
+        for r in instant_query(_Q_DCGM_POD_NODE, base_url=base_url)
+    }
+
+    def _gpu_by_node(expr: str) -> dict[str, float]:
+        """DCGM 지표를 노드별 합계로. Hostname(=DCGM 파드) → 노드로 바꿔 더한다."""
+        acc: dict[str, float] = {}
+        for r in instant_query(expr, base_url=base_url):
+            node = dcgm_node.get(r["labels"].get("Hostname", ""), "")
+            if node:
+                acc[node] = acc.get(node, 0.0) + float(r.get("value", 0) or 0)
+        return acc
+
+    def _gpu_names_by_node() -> dict[str, str]:
+        out: dict[str, str] = {}
+        for r in instant_query(_Q_NODE_GPU_UTIL, base_url=base_url):
+            node = dcgm_node.get(r["labels"].get("Hostname", ""), "")
+            if node and node not in out:
+                out[node] = r["labels"].get("modelName", "")
+        return out
+
+    n_gpu_util = _gpu_by_node(_Q_NODE_GPU_UTIL)
+    n_gpu_used = _gpu_by_node(_Q_NODE_GPU_MEM_USED)
+    n_gpu_free = _gpu_by_node(_Q_NODE_GPU_MEM_FREE)
+    n_gpu_name = _gpu_names_by_node()
+    # 한 노드에 GPU 가 여러 장이면 사용률은 평균, VRAM 은 합계(앱 카드와 같은 규약)
+    n_gpu_cnt: dict[str, int] = {}
+    for r in instant_query(_Q_NODE_GPU_UTIL, base_url=base_url):
+        node = dcgm_node.get(r["labels"].get("Hostname", ""), "")
+        if node:
+            n_gpu_cnt[node] = n_gpu_cnt.get(node, 0) + 1
+
     mem_total = _by_label(instant_query(_Q_NODE_MEM_TOTAL, base_url=base_url), "instance")
     mem_avail = _by_label(instant_query(_Q_NODE_MEM_AVAIL, base_url=base_url), "instance")
     fs_size = _by_label(instant_query(_Q_NODE_FS_SIZE, base_url=base_url), "instance")
@@ -170,7 +212,22 @@ def _node_snapshots(base_url: str) -> list[dict]:
                 "disk_pct": round((1 - free / size) * 100, 1) if size else 0.0,
                 "disk_used_gb": round((size - free) / _GB, 1),
                 "disk_total_gb": round(size / _GB, 1),
-                "gpu_present": False,
+                # ★이름에 "GPU" 라고 써 놓고 여기서 False 를 보내면 카드가 "GPU 없음" 이라고
+                #   말한다 — 제목과 내용이 정면으로 어긋난다(0815 화면에서 확인). 실측을 넣는다.
+                **(
+                    {
+                        "gpu_present": True,
+                        "gpu_name": (n_gpu_name.get(nodename) or None) and n_gpu_name[nodename][:80],
+                        "gpu_util_pct": round(n_gpu_util[nodename] / max(1, n_gpu_cnt.get(nodename, 1)), 1),
+                        "gpu_mem_used_mb": int(n_gpu_used.get(nodename, 0.0)),
+                        "gpu_mem_total_mb": int(
+                            n_gpu_used.get(nodename, 0.0) + n_gpu_free.get(nodename, 0.0)
+                        )
+                        or None,
+                    }
+                    if nodename in n_gpu_util
+                    else {"gpu_present": False}
+                ),
             }
         )
     return out

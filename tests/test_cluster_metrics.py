@@ -313,3 +313,74 @@ def test_unknown_subnet_gets_no_fake_zone():
     """★모르는 대역에 억지로 영역을 붙이지 않는다 — 틀린 위치는 없는 것만 못하다."""
     assert cluster_metrics._zone_of("172.16.0.9") == ""
     assert cluster_metrics._zone_of("10.0.6.202") == "2-b"
+
+
+# ── 노드 카드의 GPU (0815) ─────────────────────────────────────────────────
+# 이름에 "GPU" 라고 써 놓고 카드에는 "GPU 없음" 이라고 하고 있었다(화면 실측).
+# DCGM 지표에는 노드 이름이 없어서(Hostname 이 DCGM 파드 이름) 그냥은 이어지지 않는다.
+def _node_gpu_answers():
+    """기존 노드 2대(일반)에 ★GPU 노드 1대를 더한다 — 실제 구성과 같은 모양."""
+    gib = 1024**3
+    a = _node_answers()
+    g = "10.0.2.210:9100"
+    a[cluster_metrics._Q_NODE_NAME].append(
+        {"labels": {"instance": g, "nodename": "host-10-0-2-210"}, "value": 1.0}
+    )
+    a[cluster_metrics._Q_NODE_CPU].append({"labels": {"instance": g}, "value": 3.0})
+    a[cluster_metrics._Q_NODE_CORES].append({"labels": {"instance": g}, "value": 16.0})
+    a[cluster_metrics._Q_NODE_MEM_TOTAL].append({"labels": {"instance": g}, "value": 62.0 * gib})
+    a[cluster_metrics._Q_NODE_MEM_AVAIL].append({"labels": {"instance": g}, "value": 58.0 * gib})
+    a[cluster_metrics._Q_NODE_FS_SIZE].append({"labels": {"instance": g}, "value": 100.0 * gib})
+    a[cluster_metrics._Q_NODE_FS_AVAIL].append({"labels": {"instance": g}, "value": 35.0 * gib})
+    # 이름표가 "GPU" 가 되려면 이 질의가 그 노드를 짚어 줘야 한다
+    a[cluster_metrics._Q_NODE_GPU_CAP] = [
+        {"labels": {"node": "host-10-0-2-210"}, "value": 1.0},
+    ]
+    a[cluster_metrics._Q_DCGM_POD_NODE] = [
+        {"labels": {"pod": "dcgm-exporter-aaa", "node": "host-10-0-2-210"}, "value": 1.0},
+    ]
+    a[cluster_metrics._Q_NODE_GPU_UTIL] = [
+        {"labels": {"Hostname": "dcgm-exporter-aaa", "modelName": "Tesla T4"}, "value": 40.0},
+    ]
+    a[cluster_metrics._Q_NODE_GPU_MEM_USED] = [
+        {"labels": {"Hostname": "dcgm-exporter-aaa"}, "value": 3000.0},
+    ]
+    a[cluster_metrics._Q_NODE_GPU_MEM_FREE] = [
+        {"labels": {"Hostname": "dcgm-exporter-aaa"}, "value": 11912.0},
+    ]
+    return a
+
+
+def test_gpu_node_card_reports_its_gpu(monkeypatch):
+    """★이름이 "GPU" 인 노드는 카드에서도 GPU 를 말해야 한다 (제목과 내용이 어긋나지 않게)."""
+    monkeypatch.setattr(cluster_metrics, "instant_query", _fake_query(_node_gpu_answers()))
+    got = {s["server_key"]: s for s in cluster_metrics.collect("http://x")}
+
+    gpu_a = got["node:host-10-0-2-210"]
+    assert "GPU" in gpu_a["label"], "이름에 GPU 가 들어가는 노드인지 먼저 확인"
+    assert gpu_a["gpu_present"] is True, "이름은 GPU 인데 카드가 'GPU 없음' 이면 안 된다"
+    assert gpu_a["gpu_name"] == "Tesla T4"
+    assert gpu_a["gpu_util_pct"] == 40.0
+    assert gpu_a["gpu_mem_used_mb"] == 3000
+    assert gpu_a["gpu_mem_total_mb"] == 14912, "쓴 것 + 남은 것"
+
+
+def test_plain_node_card_has_no_gpu(monkeypatch):
+    """일반 노드는 그대로 'GPU 없음' 이어야 한다 (다 붙여 버리면 그것도 거짓이다)."""
+    monkeypatch.setattr(cluster_metrics, "instant_query", _fake_query(_node_gpu_answers()))
+    got = {s["server_key"]: s for s in cluster_metrics.collect("http://x")}
+    plain = got["node:host-10-0-2-128"]
+    assert "일반" in plain["label"]
+    assert plain["gpu_present"] is False
+
+
+def test_node_gpu_is_skipped_when_dcgm_is_missing(monkeypatch):
+    """DCGM 이 없거나 죽어도 ★노드 카드 자체는 나와야 한다 (GPU 만 빠진다)."""
+    a = _node_gpu_answers()  # GPU 노드는 있는데
+    for q in (cluster_metrics._Q_DCGM_POD_NODE, cluster_metrics._Q_NODE_GPU_UTIL,
+              cluster_metrics._Q_NODE_GPU_MEM_USED, cluster_metrics._Q_NODE_GPU_MEM_FREE):
+        a.pop(q, None)  # ★DCGM 이 죽어 지표만 없는 상황
+    monkeypatch.setattr(cluster_metrics, "instant_query", _fake_query(a))
+    got = {s["server_key"]: s for s in cluster_metrics.collect("http://x")}
+    assert got["node:host-10-0-2-210"]["gpu_present"] is False
+    assert got["node:host-10-0-2-210"]["cpu_cores"] > 0, "다른 지표는 그대로 살아 있어야 한다"
