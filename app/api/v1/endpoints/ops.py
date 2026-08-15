@@ -952,11 +952,14 @@ def system(principal: Principal = Depends(require_ops), db: Session = Depends(ge
         total_playable = sum(counts.values())
         empty = [s for s, n in counts.items() if n == 0]
         services.append({
+            # 이름표는 프런트가 갖는다(systemServices.ts) — 여기선 키만.
             "name": "captcha-engine",
             "status": "ok" if not empty else "degraded",
             "latency_ms": max(1, int((_time.perf_counter() - t0) * 1000)),
+            # ★"6과목" 을 문자열로 박아 두고 있었다 — 실제로는 8과목인데(IT·안전이 늘었다)
+            #   화면이 계속 6이라고 말했다. 센 값을 그대로 쓴다.
             "detail": f"출제 가능 {total_playable}문항"
-                      + (f" · 빈 과목: {', '.join(empty)}" if empty else " · 6과목 정상"),
+                      + (f" · 빈 과목: {', '.join(empty)}" if empty else f" · {len(subjects)}과목 정상"),
         })
     except Exception as e:  # noqa: BLE001
         services.append({"name": "captcha-engine", "status": "error", "latency_ms": None,

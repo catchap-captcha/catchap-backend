@@ -107,3 +107,36 @@ def test_measured_cards_still_work(ops_client, db, monkeypatch):
     assert cards["db"]["status"] == "ok" and cards["db"]["latency_ms"] >= 1
     assert cards["captcha-engine"]["status"] in ("ok", "degraded")
     assert "disk" in cards and "smtp" in cards
+
+
+def test_subject_count_is_counted_not_hardcoded(ops_client, monkeypatch):
+    """★과목 수를 세서 말해야 한다 — "6과목" 을 문자열로 박아 두면 늘어나도 6이라고 한다.
+
+    0815 실측: 문제은행이 8과목(IT·안전이 늘었다)인데 화면은 계속 "6과목 정상" 이었다.
+    """
+    from app.services import subject_banks
+
+    cards = _cards(ops_client)
+    detail = cards["captcha-engine"]["detail"]
+    if "빈 과목" in detail:
+        return  # 빈 과목이 있으면 다른 문구가 나간다 — 이 시험의 대상이 아니다
+
+    real = len(subject_banks.LIVE_SUBJECTS)
+    assert f"{real}과목" in detail, f"실제 {real}과목인데 화면은 {detail!r}"
+
+
+def test_subject_count_follows_the_bank(ops_client, monkeypatch):
+    """과목이 늘면 화면 숫자도 따라 늘어야 한다 (하드코딩이면 안 따라온다)."""
+    from app.services import subject_banks
+
+    real = set(subject_banks.LIVE_SUBJECTS)
+    monkeypatch.setattr(subject_banks, "LIVE_SUBJECTS", frozenset(real | {"__시험과목__"}))
+    monkeypatch.setattr(
+        subject_banks,
+        "playable_pool",
+        lambda s: [1] if s == "__시험과목__" else subject_banks.BANKS.get(s, []),
+    )
+    detail = _cards(ops_client)["captcha-engine"]["detail"]
+    if "빈 과목" in detail:
+        return
+    assert f"{len(real) + 1}과목" in detail, f"과목을 하나 늘렸는데 화면은 {detail!r}"
