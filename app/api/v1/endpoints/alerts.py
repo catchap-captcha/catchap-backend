@@ -85,6 +85,45 @@ def _severity(alerts: list[AlertItem]) -> str:
     return "none"
 
 
+# 남이 만든(kube-prometheus-stack 기본) 경보 중 ★실제로 자주 뜨는 것만 이름을 옮긴다.
+# 141종을 다 옮기지는 않는다 — 대부분은 한 번도 안 뜨고, 아래 _title 이 규칙에 붙은
+# summary 를 먼저 쓰기 때문에 이름이 없어도 뜻은 전달된다.
+# ★우리가 만든 Catchap* 경보는 summary 자체가 한글이라 여기에 없어도 된다.
+ALERT_NAME_KO = {
+    "CPUThrottlingHigh": "CPU 가 한도에 걸려 느려지는 중",
+    "KubePodCrashLooping": "앱이 뜨자마자 죽기를 반복",
+    "KubePodNotReady": "앱이 준비 상태가 되지 못함",
+    "KubeContainerWaiting": "앱이 시작하지 못하고 대기 중",
+    "KubeDeploymentReplicasMismatch": "떠 있어야 할 벌 수를 못 채움",
+    "KubeNodeNotReady": "서버가 준비 상태가 아님",
+    "KubeNodeUnreachable": "서버에 연결되지 않음",
+    "KubeletDown": "서버 관리 프로그램이 응답하지 않음",
+    "TargetDown": "감시 대상이 응답하지 않음",
+    "NodeFilesystemAlmostOutOfSpace": "서버 저장공간이 거의 다 참",
+    "NodeFilesystemSpaceFillingUp": "서버 저장공간이 빠르게 차는 중",
+    "NodeMemoryHighUtilization": "서버 메모리 사용이 높음",
+    "NodeCPUHighUsage": "서버 CPU 사용이 높음",
+    "KubePersistentVolumeFillingUp": "디스크(볼륨)가 거의 다 참",
+    "Watchdog": "감시 장치 살아 있음 확인(늘 켜져 있는 신호)",
+}
+
+
+def _headline(first: "AlertItem", name: str) -> str:
+    """제목에 쓸 한 줄 — ★규칙 이름(CatchapServiceDown)보다 사람이 읽는 말을 먼저 쓴다.
+
+    경보 규칙에는 summary 어노테이션이 붙어 있고, 우리가 만든 Catchap* 는 그것이
+    한글이다("★catchap 지표가 10분째 안 들어옵니다"). 그런데 그전에는 이 값을
+    ★메일 본문에만 쓰고 화면 제목에는 규칙 이름을 그대로 찍어서,
+    운영자에게 "CatchapServiceDown — monitoring-kube-state-metrics-6cb…" 로 보였다.
+
+    summary 가 없거나 영문뿐이면 위 표의 한글 이름으로, 그것도 없으면 규칙 이름 그대로.
+    """
+    summary = (first.annotations.get("summary") or "").strip()
+    if summary:
+        return summary
+    return ALERT_NAME_KO.get(name, name)
+
+
 def _title(payload: AlertmanagerPayload) -> str:
     """콘솔 벨과 메일 제목에 쓸 한 줄. Notification.title은 String(150)이라 잘라 넣는다."""
     first = payload.alerts[0]
@@ -93,7 +132,11 @@ def _title(payload: AlertmanagerPayload) -> str:
     tag = SEVERITY_KO.get(_severity(payload.alerts), "안내")
     state = "해제" if payload.status == "resolved" else tag
     more = f" 외 {len(payload.alerts) - 1}건" if len(payload.alerts) > 1 else ""
-    return f"[{state}] {name}{f' — {where}' if where else ''}{more}"[:150]
+    head = _headline(first, name)
+    # 어디서 난 것인지가 이미 머리말에 들어 있으면(우리 경보는 summary 에 파드/배포 이름을
+    # 넣는다) 같은 말을 두 번 붙이지 않는다.
+    tail = f" — {where}" if where and where not in head else ""
+    return f"[{state}] {head}{tail}{more}"[:150]
 
 
 def _message(payload: AlertmanagerPayload) -> str:
