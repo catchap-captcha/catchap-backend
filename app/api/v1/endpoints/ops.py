@@ -155,7 +155,12 @@ def orgs(
         "page_size": page_size,
         # 헤더 요약용 전체 집계 — 검색과 무관한 전체 기준
         "total_all": db.query(func.count(Organization.id)).scalar() or 0,
-        "total_students": int(sum(counts.values())),
+        # ★기관에 소속된 학생만 센다. counts 에는 organization_id 가 None 인 묶음(공개 가입 학생)이
+        #   섞여 있어서, 그대로 sum 하면 화면이 "각 기관 0명인데 합계 14명" 이라고 말한다
+        #   (0816 화면에서 실제로 그렇게 보였다).
+        "total_students": int(sum(n for oid, n in counts.items() if oid)),
+        # 기관 없이 가입한 학생 — 위 합계에서 뺐으니 따로 알려 준다(정보를 잃지 않게).
+        "no_org_students": int(counts.get(None, 0)),
     }
 
 
