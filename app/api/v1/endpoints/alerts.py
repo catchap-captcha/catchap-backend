@@ -225,6 +225,37 @@ def _esc(s: str) -> str:
     )
 
 
+# 본문에 들어온 주소. 이스케이프한 뒤에 찾으므로 &amp; 같은 것이 섞여 있어도 그대로 잡힌다.
+_URL_RE = re.compile(r"https?://[^\s<]+")
+
+
+def _rich(text: str) -> str:
+    """설명글을 메일에 넣을 형태로 — ★줄바꿈을 살리고 주소를 누를 수 있게.
+
+    ★왜 필요한가 (0817)
+      description 을 _esc 만 해서 <div> 에 넣었더니 ★HTML 이 줄바꿈을 무시해
+      여러 줄로 쓴 안내가 한 줄짜리 덩어리가 됐다. 게다가 주소가 글자로만 나와서
+      새벽에 운영자가 손으로 옮겨 적어야 했다(NAT 자동 절체 경보의 '되돌리는 법').
+
+    ⚠️순서가 중요하다 — ★이스케이프를 먼저 한다. 링크를 먼저 만들면 우리가 넣은
+      <a> 태그까지 이스케이프되어 태그가 글자로 보인다.
+    """
+    out = _esc(text)
+
+    def _link(m: "re.Match[str]") -> str:
+        url = m.group(0)
+        tail = ""
+        # 문장 끝 마침표·괄호가 주소에 딸려 가지 않게 떼어 낸다
+        while url and url[-1] in ".,;:)]}":
+            tail = url[-1] + tail
+            url = url[:-1]
+        if not url:
+            return tail
+        return f'<a href="{url}" style="color:#2563eb">{url}</a>{tail}'
+
+    return _URL_RE.sub(_link, out).replace("\n", "<br>")
+
+
 def _email_html(payload: AlertmanagerPayload) -> str:
     """메일 본문 — ★훑어보고 바로 판단할 수 있게.
 
@@ -247,7 +278,7 @@ def _email_html(payload: AlertmanagerPayload) -> str:
     for a in payload.alerts:
         name = a.labels.get("alertname", "?")
         summary = _esc(a.annotations.get("summary") or name)
-        desc = _esc((a.annotations.get("description") or "").strip())
+        desc = _rich((a.annotations.get("description") or "").strip())
         chips = "".join(
             f'<span style="display:inline-block;background:#f3f4f6;color:#374151;'
             f'border-radius:5px;padding:2px 7px;margin:0 5px 5px 0;font-size:12px">'
