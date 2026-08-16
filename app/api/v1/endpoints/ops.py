@@ -31,7 +31,10 @@ from app.models import (
     BehaviorTrace,
     CaptchaSetting,
     ClassRoom,
+    Course,
     Inquiry,
+    Lecture,
+    LectureQuestion,
     InquiryReply,
     Invitation,
     Invoice,
@@ -910,6 +913,17 @@ def resolve_inquiry(
 # (backend-api 는 이 응답을 만드는 주체 자신이라 '정상'이 자명하고, 바로 위 디스크 카드가
 #  같은 컨테이너를 이미 말한다)
 # 표시 이름(라벨)은 프런트가 갖는다 — 다른 카드들과 같은 규약이라 여기선 키만 보낸다.
+# 역할 한글 — ★감사 로그의 실행자와 대상이 같은 말을 쓰게 한 곳에 둔다
+# (그전엔 _actor() 안에 인라인으로만 있어서 대상 쪽에서 쓸 수 없었다).
+_ROLE_KO = {
+    "ops": "운영자",
+    "instructor": "강사",
+    "org_admin": "기관 관리자",
+    "grade_head": "학년부장",
+    "teacher": "교사",
+    "parent": "학부모",
+}
+
 _CLUSTER_APPS = ("captcha-api", "behavior-ai", "frontend", "stt-worker")
 # monitoring.STALE_AFTER_SEC 와 같은 값. 수집 주기가 30초라 2분이면 두 번 이상 걸렀다는 뜻.
 _CLUSTER_STALE_SEC = 120
@@ -1171,8 +1185,7 @@ def logs(
             return None
         u = users.get(aid)
         if u is not None:
-            role = {"ops": "운영자", "org_admin": "기관 관리자", "grade_head": "학년부장", "teacher": "교사", "parent": "학부모"}.get(u.role, u.role)
-            return f"{u.name} ({role})"
+            return f"{u.name} ({_ROLE_KO.get(u.role, u.role)})"
         s = students.get(aid)
         if s is not None:
             # 학생은 익명(anon_code) — 운영자는 학생 식별정보(닉네임 포함)를 보지 않는다.
@@ -1204,6 +1217,93 @@ def logs(
             .all()
         ):
             replies_by_inquiry.setdefault(rep.inquiry_id, []).append(rep)
+
+    # ─────────────────────────────────────────────────────────────
+    # ★"말 그대로 로그인데" — 0816 지적.
+    #
+    # 그전에는 「누가·언제·무슨 종류」까지만 보여 줬다.
+    #
+    #   코스 수정   운영자 (운영자)   코스   2026-08-16 12:21
+    #
+    # ★어느 코스인지도, 무엇을 어떻게 바꿨는지도 없다. 그런데 둘 다 DB 에는 있다 —
+    #   target_id 로 이름을 찾을 수 있고, before_json/after_json 이 저장돼 있다.
+    #   ★응답에 안 실어 보내고 있었을 뿐이다(문의 답변 하나만 예외였다).
+    #
+    # ⚠️민감 정보는 실측으로 확인했다 — audit(before=/after=) 에 들어가는 칸 69종을
+    #   전수로 뽑아 보니 비밀번호·해시·토큰·실명은 ★하나도 없다. 전부 메타데이터다
+    #   (title·status·order_no·count·bytes …). 그래서 그대로 보여 준다.
+    # ─────────────────────────────────────────────────────────────
+
+    # 대상 이름 — 타입별로 ★한 번씩 묶어 조회한다(행마다 질의하면 50건에 50질의).
+    def _names_for(t_type: str, ids: set[str]) -> dict[str, str]:
+        if not ids:
+            return {}
+        if t_type == "course":
+            return {c.id: c.title for c in db.query(Course).filter(Course.id.in_(ids))}
+        if t_type == "lecture":
+            return {x.id: x.title for x in db.query(Lecture).filter(Lecture.id.in_(ids))}
+        if t_type == "lecture_question":
+            # 문항 자체엔 이름이 없다 — ★어느 강의의 문항인지가 운영자가 알고 싶은 것이다.
+            q_rows = (
+                db.query(LectureQuestion.id, Lecture.title)
+                .join(Lecture, Lecture.id == LectureQuestion.lecture_id)
+                .filter(LectureQuestion.id.in_(ids))
+                .all()
+            )
+            return {qid: f"{title} 의 문항" for qid, title in q_rows}
+        if t_type == "organization":
+            return {o.id: o.name for o in db.query(Organization).filter(Organization.id.in_(ids))}
+        if t_type == "user":
+            return {
+                u.id: f"{u.name} ({_ROLE_KO.get(u.role, u.role)})"
+                for u in db.query(User).filter(User.id.in_(ids))
+            }
+        if t_type == "api_key":
+            return {
+                k.id: (k.label or k.site_key or k.id)
+                for k in db.query(ApiKey).filter(ApiKey.id.in_(ids))
+            }
+        if t_type == "inquiry":
+            return {i.id: (i.title or i.content or "")[:40] for i in db.query(Inquiry).filter(Inquiry.id.in_(ids))}
+        if t_type in ("student", "student_profile"):
+            # ★학생은 실명을 쓰지 않는다 — 다른 화면과 같은 익명 코드 규약(감사 로그 목적엔 충분).
+            return {
+                sp.id: f"학생 {hashlib.sha256(f'{_salt}:{sp.id}'.encode()).hexdigest()[:6].upper()}"
+                for sp in db.query(StudentProfile).filter(StudentProfile.id.in_(ids))
+            }
+        return {}
+
+    by_type: dict[str, set[str]] = {}
+    for log in rows:
+        if log.target_type and log.target_id:
+            by_type.setdefault(log.target_type, set()).add(log.target_id)
+    target_names: dict[str, str] = {}
+    for t_type, ids in by_type.items():
+        target_names.update(_names_for(t_type, ids))
+
+    def _short(v) -> object:
+        """값이 길면 자른다 — 목록 응답이 통째로 커지지 않게."""
+        if isinstance(v, str) and len(v) > 120:
+            return v[:120] + "…"
+        if isinstance(v, list) and len(v) > 8:
+            return v[:8] + [f"… 외 {len(v) - 8}개"]
+        return v
+
+    def _changes(log: AuditLog) -> list[dict]:
+        """무엇이 어떻게 바뀌었나 — ★바뀐 칸만.
+
+        만들기(before 없음)·지우기(after 없음)도 같은 모양으로 낸다.
+        같은 값이면 뺀다 — 안 바뀐 것을 늘어놓으면 바뀐 것이 묻힌다.
+        """
+        b = log.before_json if isinstance(log.before_json, dict) else {}
+        a = log.after_json if isinstance(log.after_json, dict) else {}
+        out = []
+        for k in list(b.keys()) + [k for k in a.keys() if k not in b]:
+            bv, av = b.get(k), a.get(k)
+            if k in b and k in a and bv == av:
+                continue
+            out.append({"field": k, "before": _short(bv), "after": _short(av)})
+        return out
 
     def _detail(log: AuditLog) -> dict | None:
         if log.action != "inquiry.answer" or not log.target_id:
@@ -1241,6 +1341,10 @@ def logs(
             "org_name": orgs[log.organization_id].name if log.organization_id in orgs else None,
             "target_type": log.target_type,
             "target_id": log.target_id,
+            # ★UUID 만 보내고 있었다 — 운영자가 "어느 코스인지" 알 수 없었다
+            "target_name": target_names.get(log.target_id) if log.target_id else None,
+            # ★무엇을 어떻게 바꿨나 — DB 에는 있는데 응답에 안 싣고 있었다
+            "changes": _changes(log),
             "detail": _detail(log),  # 문의 답변 미리보기용 본문 (그 외 액션은 None)
             "created_at": log.created_at.isoformat() if log.created_at else None,
         }
