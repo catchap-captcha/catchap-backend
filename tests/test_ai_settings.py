@@ -425,3 +425,60 @@ def test_ai_verify_prompt_edit_roundtrip(client, db):
     assert r.status_code == 200, r.text
     assert r.json()["is_custom"] is False
     assert r.json()["rules"] == DEFAULT_VERIFY_RULES
+
+
+# ─────────────────────────────────────────────────────────────────────
+# 「사용 모델」 표기 (0816)
+#
+# 화면은 .env LLM_MODEL 을 "사용 모델" 이라고 찍고 있었다. 그런데 그건 ★슬롯이
+# 하나도 없을 때만 쓰는 폴백이고, 실제로는 슬롯에 배정된 모델로 돈다.
+# 실측: 화면 "사용 모델: claude-opus-4-8" ↔ 실제 생성 claude-opus-5
+# ─────────────────────────────────────────────────────────────────────
+
+
+def test_ai_settings_reports_model_actually_in_use(client, db, monkeypatch):
+    from app.core.config import get_settings
+    from app.models import AiModelConfig
+    from app.services import ai_models_service
+
+    ops_tok = _ops(client, db)
+    monkeypatch.setattr(get_settings(), "LLM_MODEL", "폴백-모델")
+
+    # 등록된 모델이 없으면 실제로 폴백을 쓴다 — 그때만 None 이다
+    r = client.get("/api/v1/ops/settings/ai", headers=auth(ops_tok))
+    assert r.status_code == 200, r.text
+    assert r.json()["llm_model"] == "폴백-모델"
+    assert r.json()["llm_model_in_use"] is None
+
+    m = AiModelConfig(provider="Anthropic", model_id="진짜-쓰는-모델", name="생성용", enabled=True)
+    db.add(m)
+    db.commit()
+    ai_models_service.set_slot(db, "generate", m.id, updated_by=None)
+    db.commit()
+
+    body = client.get("/api/v1/ops/settings/ai", headers=auth(ops_tok)).json()
+    # ★폴백 값은 그대로 두되(하위호환), 실제로 도는 모델을 따로 알려 준다
+    assert body["llm_model"] == "폴백-모델"
+    assert body["llm_model_in_use"] == "진짜-쓰는-모델"
+
+
+def test_model_in_use_follows_slot_not_env(client, db, monkeypatch):
+    """★슬롯 모델을 끄면 실제로 도는 것도 바뀐다 — 화면이 따라가야 한다."""
+    from app.core.config import get_settings
+    from app.models import AiModelConfig
+    from app.services import ai_models_service
+
+    ops_tok = _ops(client, db)
+    monkeypatch.setattr(get_settings(), "LLM_MODEL", "폴백-모델")
+
+    a = AiModelConfig(provider="Anthropic", model_id="A", name="A", enabled=True)
+    db.add(a)
+    db.commit()
+    ai_models_service.set_slot(db, "generate", a.id, updated_by=None)
+    db.commit()
+    assert client.get("/api/v1/ops/settings/ai", headers=auth(ops_tok)).json()["llm_model_in_use"] == "A"
+
+    a.enabled = False
+    db.commit()
+    # 자동 스왑도 없고 켜진 모델도 없으면 후보 0 → 그때는 폴백을 쓴다
+    assert client.get("/api/v1/ops/settings/ai", headers=auth(ops_tok)).json()["llm_model_in_use"] is None

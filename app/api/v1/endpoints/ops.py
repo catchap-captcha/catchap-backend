@@ -2438,6 +2438,19 @@ class _AiSettingsUpdate(BaseModel):
     openai_api_key: str | None = None
 
 
+def _model_in_use(db: Session) -> str | None:
+    """문항 생성이 ★실제로 부르는 모델. 후보가 없으면 None(그때만 .env 폴백을 쓴다).
+
+    resolve_candidates 가 호출자와 같은 규칙으로 고르므로, 여기서 첫 후보를 보면
+    지금 무엇으로 도는지가 나온다. ⚠️자동 스왑이 켜져 있으면 첫 후보가 실패했을 때
+    뒤엣것으로 넘어가므로, 화면은 "지금 이걸로 시도한다" 로 읽어야 맞다.
+    """
+    from app.services import ai_models_service
+
+    cands = ai_models_service.resolve_candidates(db, "generate")
+    return cands[0].model_id if cands else None
+
+
 def _ai_settings_payload(db: Session) -> dict:
     from app.services import settings_service
 
@@ -2446,7 +2459,12 @@ def _ai_settings_payload(db: Session) -> dict:
         # 원문 미반환 — 설정 여부·끝 4자리·출처(console|env)만. 콘솔 입력이 env보다 우선.
         "llm": settings_service.masked_status(db, "anthropic_api_key", s.ANTHROPIC_API_KEY),
         "stt": settings_service.masked_status(db, "openai_api_key", s.OPENAI_API_KEY),
+        # ★"사용 모델" 이라고 화면에 찍히던 값이다. 그런데 이건 ★슬롯이 하나도 없을 때만
+        #   쓰는 폴백(.env LLM_MODEL)이고, 실제로는 슬롯에 배정된 모델로 돈다.
+        #   0816 실측: 화면은 "사용 모델: claude-opus-4-8" 인데 생성은 claude-opus-5 였다.
+        #   이름은 그대로 두고(하위호환) ★실제로 쓰는 모델을 따로 보낸다.
         "llm_model": s.LLM_MODEL,
+        "llm_model_in_use": _model_in_use(db),
         # 자체 호스팅 STT 워커(faster-whisper/GPU) 설정 여부 — 켜져 있으면 STT는 무료로 이 워커가
         # 처리하고, OpenAI 키는 STT에 필요 없다(폴백·GPT 모델용). 화면 문구를 이 값으로 정확히 표기.
         "stt_worker": {"configured": bool(s.STT_WORKER_URL)},
