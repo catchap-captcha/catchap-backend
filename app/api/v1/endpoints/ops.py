@@ -1320,6 +1320,11 @@ def logs(
             bv, av = b.get(k), a.get(k)
             if k in b and k in a and bv == av:
                 continue
+            # ★둘 다 비었으면 뺀다 — 아무 정보가 없는 줄이다.
+            #   0816 실측: 설정을 ★처음 저장할 때 before 가 {"settings": None} 로 남아,
+            #   펴 놓으면 "settings" 키가 값 없이 홀로 남고 화면에 빈 줄이 생겼다.
+            if bv is None and av is None:
+                continue
             out.append({"field": k, "before": _short(bv), "after": _short(av)})
         return out
 

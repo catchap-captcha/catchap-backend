@@ -149,3 +149,19 @@ def test_lists_are_not_flattened(ops_client, db):
     ch = _logs(ops_client)[0]["changes"]
     assert len(ch) == 1 and ch[0]["field"] == "order"
     assert ch[0]["before"] == ["a", "b"] and ch[0]["after"] == ["b", "a"]
+
+
+def test_empty_change_is_dropped(ops_client, db):
+    """★둘 다 비었으면 뺀다 — 아무 정보가 없는 줄이다.
+
+    실측: 설정을 ★처음 저장할 때 before 가 {"settings": None} 로 남아,
+    펴 놓으면 "settings" 키가 값 없이 홀로 남고 화면에 빈 줄이 생겼다.
+    """
+    db.add(AuditLog(
+        action="settings.update", target_type="user_setting", target_id="u1",
+        before_json={"settings": None},
+        after_json={"settings": {"alerts": {"email": False}}},
+    ))
+    db.commit()
+    ch = _logs(ops_client)[0]["changes"]
+    assert ch == [{"field": "settings.alerts.email", "before": None, "after": False}], ch
