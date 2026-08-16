@@ -61,11 +61,16 @@ def social_signup(req: s.SocialSignupRequest, db: Session = Depends(get_db)):
 def authorize(
     provider: str,
     redirect_uri: str | None = Query(default=None, max_length=500),
+    reauth: bool = Query(default=False),
 ):
     """provider 동의 화면 URL 발급. 프론트는 이 URL로 이동시키기만 하면 된다.
 
-    redirect_uri는 서버 허용목록 안의 값만 받는다(오픈 리다이렉트 차단). 미지정 시 기본값."""
-    return social_login_service.authorize(provider, redirect_uri)
+    redirect_uri는 서버 허용목록 안의 값만 받는다(오픈 리다이렉트 차단). 미지정 시 기본값.
+
+    reauth=true면 '다른 계정으로 로그인' — provider 세션이 살아 있어도 로그인·계정선택
+    화면을 다시 띄운다. 우리가 로그아웃해도 provider 세션은 남아서 버튼을 누르는 즉시
+    같은 계정으로 되돌아오는데, 계정을 바꾸려면 이 경로가 필요하다."""
+    return social_login_service.authorize(provider, redirect_uri, reauth=reauth)
 
 
 @router.post("/{provider}/callback", response_model=s.SocialLoginResponse)
