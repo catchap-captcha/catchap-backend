@@ -1289,14 +1289,32 @@ def logs(
             return v[:8] + [f"… 외 {len(v) - 8}개"]
         return v
 
+    def _flat(d: dict, prefix: str = "") -> dict:
+        """중첩 dict 를 "바깥.안쪽" 한 겹으로 편다.
+
+        ★설정 변경(100건)이 {"settings": {"alerts": {"email": false}}} 처럼 중첩이라,
+          그대로 두면 화면에 JSON 이 통째로 찍힌다 — 운영자에게는 개발자 말이다.
+          펴 두면 ★바뀐 칸 하나만 짚어 줄 수 있다(settings.alerts.email  아니오 → 예).
+        ⚠️목록은 펴지 않는다 — 순서가 뜻을 갖는 값들이라(문항 차례 등) 칸으로 나누면
+          오히려 읽기 어렵다. 목록은 통째로 비교하고 길면 자른다.
+        """
+        out: dict = {}
+        for k, v in d.items():
+            key = f"{prefix}{k}"
+            if isinstance(v, dict) and v:
+                out.update(_flat(v, f"{key}."))
+            else:
+                out[key] = v
+        return out
+
     def _changes(log: AuditLog) -> list[dict]:
         """무엇이 어떻게 바뀌었나 — ★바뀐 칸만.
 
         만들기(before 없음)·지우기(after 없음)도 같은 모양으로 낸다.
         같은 값이면 뺀다 — 안 바뀐 것을 늘어놓으면 바뀐 것이 묻힌다.
         """
-        b = log.before_json if isinstance(log.before_json, dict) else {}
-        a = log.after_json if isinstance(log.after_json, dict) else {}
+        b = _flat(log.before_json) if isinstance(log.before_json, dict) else {}
+        a = _flat(log.after_json) if isinstance(log.after_json, dict) else {}
         out = []
         for k in list(b.keys()) + [k for k in a.keys() if k not in b]:
             bv, av = b.get(k), a.get(k)
