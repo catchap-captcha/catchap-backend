@@ -59,7 +59,13 @@ from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
-from app.core.permissions import Principal, require_content_author, require_lecture_manager, require_student
+from app.core.permissions import (
+    Principal,
+    require_content_author,
+    require_lecture_manager,
+    require_ops,
+    require_student,
+)
 from app.core.security import decode_token, new_uuid
 from app.db.session import SessionLocal, get_db
 from app.models import (
@@ -1781,6 +1787,127 @@ def ops_delete_course(
     )
     db.commit()
     return {"ok": True, "lectures_unassigned": int(freed)}
+
+
+@router.get("/ops/lecture-admin")
+def ops_lecture_admin(
+    q: str | None = None,            # 제목 검색
+    instructor: str | None = None,   # 강사 id
+    course: str | None = None,       # 코스 id ('none' = 미분류)
+    issue: str | None = None,        # noquestion|draftleft|hidden — 문제 있는 것만
+    page: int = 1,
+    page_size: int = 50,
+    principal: Principal = Depends(require_ops),
+    db: Session = Depends(get_db),
+):
+    """운영자용 강의 목록 — 강사·코스·문제 상태를 한 표로.
+
+    ★왜 따로 만드나 — 기존 /ops/lectures 는 강사가 자기 강의를 관리하는 화면이라
+    코스별 트리로 나온다. 강의가 몇 개일 때는 편하지만 ★수백 개가 되면 운영자가
+    "누가 올렸나 · 어디가 비었나" 를 찾을 수 없다(0816 지적).
+
+    운영자가 여기서 하는 일은 셋이다 — ①문제 있는 강의 찾기 ②강사별로 보기 ③내리기.
+    그래서 평평한 표 + 필터 + 요약으로 준다.
+
+    ⚠️문항 수는 강의당 COUNT 를 따로 날리지 않고 GROUP BY 한 번으로 모은다
+      (강의 500개면 질의가 1000번 나간다).
+    """
+    from app.models import Course, User
+
+    base = db.query(Lecture).filter(Lecture.status != "deleted")
+    if q:
+        base = base.filter(Lecture.title.contains(q.strip()))
+    if instructor:
+        base = base.filter(Lecture.uploaded_by == instructor)
+    if course == "none":
+        base = base.filter(Lecture.course_id.is_(None))
+    elif course:
+        base = base.filter(Lecture.course_id == course)
+
+    rows_all = base.all()
+    ids = [r.id for r in rows_all]
+
+    # 문항 수 — 전체/공개 두 벌을 한 번씩만
+    def _counts(only_active: bool) -> dict[str, int]:
+        qq = db.query(LectureQuestion.lecture_id, func.count(LectureQuestion.id)).filter(
+            LectureQuestion.lecture_id.in_(ids or [""]),
+            LectureQuestion.status != "deleted",
+        )
+        if only_active:
+            qq = qq.filter(LectureQuestion.status == "active")
+        return dict(qq.group_by(LectureQuestion.lecture_id).all())
+
+    total_q = _counts(False)
+    active_q = _counts(True)
+
+    # 강사·코스 이름 — 목록에 id 를 보여 줄 수는 없다
+    who = {
+        u.id: (u.name or u.email)
+        for u in db.query(User).filter(User.id.in_([r.uploaded_by for r in rows_all if r.uploaded_by] or [""]))
+    }
+    courses = {
+        c.id: c.title
+        for c in db.query(Course).filter(Course.id.in_([r.course_id for r in rows_all if r.course_id] or [""]))
+    }
+
+    def _issues(lec) -> list[str]:
+        """운영자가 손봐야 할 것 — 이름을 붙여야 필터도 걸고 화면도 설명할 수 있다."""
+        out = []
+        if active_q.get(lec.id, 0) == 0:
+            out.append("noquestion")  # 공개 문항 0 = 시청 검증이 조용히 꺼진 상태
+        if total_q.get(lec.id, 0) - active_q.get(lec.id, 0) > 0:
+            out.append("draftleft")   # 미공개 문항이 남아 방치
+        if lec.status == "hidden":
+            out.append("hidden")
+        return out
+
+    items = [
+        {
+            "id": lec.id,
+            "title": lec.title,
+            "status": lec.status,
+            "instructor_id": lec.uploaded_by,
+            "instructor_name": who.get(lec.uploaded_by or "", "(알 수 없음)"),
+            "course_id": lec.course_id,
+            "course_title": courses.get(lec.course_id or "", None),
+            "question_total": total_q.get(lec.id, 0),
+            "question_active": active_q.get(lec.id, 0),
+            "duration_sec": lec.duration_sec,
+            "created_at": lec.created_at,
+            "issues": _issues(lec),
+        }
+        for lec in rows_all
+    ]
+    if issue:
+        items = [it for it in items if issue in it["issues"]]
+
+    # 요약 — "지금 무엇이 문제인가" 를 먼저 보여 준다(필터를 걸기 전 전체 기준)
+    summary = {
+        "total": len(rows_all),
+        "noquestion": sum(1 for it in items if "noquestion" in it["issues"]),
+        "draftleft": sum(1 for it in items if "draftleft" in it["issues"]),
+        "hidden": sum(1 for it in items if "hidden" in it["issues"]),
+    }
+    # 문제 있는 것을 위로 — 운영자가 스크롤하지 않게. 그다음 최신순.
+    items.sort(key=lambda it: (-len(it["issues"]), -(it["created_at"].timestamp() if it["created_at"] else 0)))
+
+    page = max(1, page)
+    page_size = max(1, min(200, page_size))
+    start = (page - 1) * page_size
+    return {
+        "items": items[start : start + page_size],
+        "total": len(items),
+        "page": page,
+        "page_size": page_size,
+        "summary": summary,
+        # 필터 드롭다운 재료 — 화면이 따로 부르지 않게 같이 준다
+        "instructors": sorted(
+            ({"id": i, "name": n} for i, n in who.items()), key=lambda x: x["name"]
+        ),
+        "courses": sorted(
+            ({"id": i, "title": t} for i, t in courses.items()), key=lambda x: x["title"]
+        ),
+    }
 
 
 @router.get("/ops/lectures")
