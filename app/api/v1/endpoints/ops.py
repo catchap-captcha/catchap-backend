@@ -922,13 +922,14 @@ def system(principal: Principal = Depends(require_ops), db: Session = Depends(ge
     - db: SELECT 1 왕복 실측(ms)
     - captcha-engine: 인프로세스 문제은행 로드 확인 — 6과목 playable 문항 수
     - smtp: 설정 여부 + 최근 24시간 발송 성공/실패 실집계(email_logs)
-    - disk: 컨테이너 루트 사용률
+    - disk: 서버(노드)들 중 가장 많이 쓴 곳
     - ai-server: 배포 보류 상태를 정직하게 표시(설정 자체가 없음)
     """
-    import shutil
     import time as _time
 
     from sqlalchemy import text as _text
+
+    from app.services.cluster_metrics import NODE_KEY_PREFIX
 
     from app.models import EmailLog
     from app.services import subject_banks
@@ -941,7 +942,8 @@ def system(principal: Principal = Depends(require_ops), db: Session = Depends(ge
         db.execute(_text("SELECT 1"))
         services.append({
             "name": "db", "status": "ok",
-            "latency_ms": max(1, int((_time.perf_counter() - t0) * 1000)),
+            # ★max(1, int(...)) 이었다 — 0.3ms 도 "1ms" 로 찍혀 정확한 값처럼 보였다.
+            "latency_ms": round((_time.perf_counter() - t0) * 1000, 1),
             "detail": "연결 확인 질의 왕복",
         })
     except Exception as e:  # noqa: BLE001 — 상태 보고가 목적, 어떤 예외든 error로
@@ -960,7 +962,7 @@ def system(principal: Principal = Depends(require_ops), db: Session = Depends(ge
             # 이름표는 프런트가 갖는다(systemServices.ts) — 여기선 키만.
             "name": "captcha-engine",
             "status": "ok" if not empty else "degraded",
-            "latency_ms": max(1, int((_time.perf_counter() - t0) * 1000)),
+            "latency_ms": round((_time.perf_counter() - t0) * 1000, 1),
             # ★"6과목" 을 문자열로 박아 두고 있었다 — 실제로는 8과목인데(IT·안전이 늘었다)
             #   화면이 계속 6이라고 말했다. 센 값을 그대로 쓴다.
             "detail": f"출제 가능 {total_playable}문항"
@@ -996,18 +998,55 @@ def system(principal: Principal = Depends(require_ops), db: Session = Depends(ge
         ),
     })
 
-    # 디스크 — 컨테이너 루트 사용률
-    try:
-        du = shutil.disk_usage("/")
-        pct = round(du.used / du.total * 100, 1)
+    # 디스크·클러스터 앱은 둘 다 프로메테우스 수집분을 읽는다 — 설정을 한 번만 본다.
+    _cluster = get_settings().PROMETHEUS_URL.strip()
+
+    # 디스크 — ★서버들 중 가장 많이 쓴 곳
+    #
+    # ★그전엔 shutil.disk_usage("/") 였다. 세 가지가 틀렸다(0816 실측) —
+    #   ① 백엔드 파드에는 볼륨이 없어서 그 "/" 는 ★파드가 우연히 앉은 노드의 디스크다.
+    #      파드가 2벌이라 ★어느 파드가 응답했느냐에 따라 값이 바뀐다(요청마다 튄다).
+    #      cluster_metrics 머리말에 적힌 0805 사고와 ★똑같은 함정이다.
+    #   ② 그래서 "어느 서버인지"를 말할 수 없었다 — 파드는 자기 노드 이름을 모른다
+    #      (매니페스트에 downward API 가 없다).
+    #   ③ 화면 설명이 "영상·자막·이미지를 쌓는 곳" 이었는데 ★그건 오브젝트 스토리지다
+    #      (MEDIA_STORAGE_BACKEND=object). 여기서 재는 값과 아무 상관이 없다.
+    #
+    # ★실측(0816) — 같은 화면을 12번 연속 부르니 두 값이 번갈아 나왔다.
+    #     60.9% (59GB/98GB)  ↔  61.6% (60GB/98GB)
+    #   그리고 모니터링 화면이 보는 노드 넷은 30.6 · 65.3 · 66.0 · 28.2% 였다 —
+    #   ★두 화면이 같은 디스크를 다른 숫자로 말하고 있었다(shutil 은 f_bfree, node-exporter 는
+    #   f_bavail 기준이라 ext4 예약분 5%만큼 어긋난다). 게다가 ★일반 노드 2대는 시스템 상태에
+    #   아예 나오지 않아, 그 둘이 90%가 되어도 이 화면은 「정상」이라고 말했다.
+    #
+    # 노드 디스크는 이미 server_metrics 에 노드별로 들어와 있다(cluster_metrics).
+    # 있는 것을 읽어서 ★가장 많이 쓴 서버 하나를 말한다 — 한 대라도 차면 그 서버에
+    # 새 파드가 못 뜨기 때문에, 평균이 아니라 최댓값이 이 화면이 물어야 할 값이다.
+    _node_rows = [
+        r
+        for r in db.query(ServerMetric)
+        .filter(ServerMetric.server_key.like(f"{NODE_KEY_PREFIX}%"))
+        .all()
+        if r.disk_total_gb and int((datetime.now() - r.collected_at).total_seconds()) <= _CLUSTER_STALE_SEC
+    ]
+    if not _node_rows:
+        services.append({
+            "name": "disk", "status": "unknown", "latency_ms": None,
+            "detail": "서버 지표가 아직 없어요" if _cluster else "클러스터 지표 미설정 — PROMETHEUS_URL 없음",
+        })
+    else:
+        worst_node = max(_node_rows, key=lambda r: r.disk_pct or 0.0)
+        pct = round(worst_node.disk_pct or 0.0, 1)
         services.append({
             "name": "disk",
+            # 85% 는 kubelet 이 옛 이미지를 지우기 시작하는 선이자(imageGCHighThresholdPercent)
+            # 디스크 압박으로 파드를 쫓아내기 시작하는 선이다.
             "status": "ok" if pct < 85 else "degraded",
             "latency_ms": None,
-            "detail": f"사용 {pct}% ({du.used // 1024**3}GB / {du.total // 1024**3}GB)",
+            # ★몇 대인지 세어서 넣는다(문자열로 박지 않는다).
+            "detail": f"서버 {len(_node_rows)}대 중 가장 많이 쓴 곳 {pct}% "
+                      f"({worst_node.disk_used_gb:.0f}GB / {worst_node.disk_total_gb:.0f}GB) — {worst_node.label}",
         })
-    except OSError:
-        services.append({"name": "disk", "status": "error", "latency_ms": None, "detail": None})
 
     # 클러스터 앱 — 캡차 API·행동 AI·프론트·STT 워커
     #
@@ -1019,7 +1058,6 @@ def system(principal: Principal = Depends(require_ops), db: Session = Depends(ge
     # ★여기서 각 앱의 /health 를 직접 찌르지 않는 이유: 앱마다 파드가 2벌이라 한 번 찔러
     #   봐야 그중 ★하나만 확인된다(로드밸런서가 고른 것). k8s 는 이미 전부를 보고 있고,
     #   그 값이 cluster_metrics 수집기를 통해 server_metrics 에 들어와 있다. 있는 것을 읽는다.
-    _cluster = get_settings().PROMETHEUS_URL.strip()
     _rows = {
         r.server_key: r
         for r in db.query(ServerMetric).filter(ServerMetric.server_key.in_(_CLUSTER_APPS)).all()
@@ -1044,13 +1082,26 @@ def system(principal: Principal = Depends(require_ops), db: Session = Depends(ge
                              "detail": f"지표가 {age // 60}분째 갱신되지 않았어요 — 수집 중단 의심"})
             continue
         # 메모리는 ★제한 대비다. 넘으면 커널이 파드를 죽인다(OOMKill) — 그래서 85%가 경계.
-        bad = row.mem_pct >= 85
+        bad_mem = row.mem_pct >= 85
+        # ★몇 벌 떠 있나 — 앱 행의 cpu_cores 자리가 파드 수다(cluster_metrics._service_snapshots).
+        #   그전엔 이 화면이 벌 수를 아예 안 보여 줬다. 화면 안내문은 "각각 2벌씩이라 한 벌이
+        #   죽어도 이어집니다" 라고 말하는데, ★정작 한 벌만 남아도 카드는 초록 「정상」이었다.
+        #   이중화가 깨진 것을 이 화면에서 볼 수 없었다는 뜻이다.
+        #   ⚠️기대 벌 수(2)를 박지 않는다 — 늘리면 틀린다. 1벌이면 ★그 자체로 단일 장애점이다.
+        replicas = int(row.cpu_cores or 0)
+        alone = replicas == 1
+        # CPU 는 뺐다 — 파드엔 CPU 제한이 없어 ★판정에 쓰이지 않는 숫자였고(위험한 것은 노드
+        # 쪽이다), 실제로 네 카드가 전부 "CPU 0.0%" 였다. 추세는 모니터링 화면이 본다.
+        parts = [f"{replicas}벌 실행 중" if replicas else "벌 수 미상", f"메모리 {row.mem_pct:.0f}%"]
+        if alone:
+            parts.append("★한 벌뿐 — 이 벌이 죽으면 끊깁니다")
+        if bad_mem:
+            parts.append("제한 임박(OOM 위험)")
         services.append({
             "name": key,
-            "status": "degraded" if bad else "ok",
+            "status": "degraded" if (bad_mem or alone) else "ok",
             "latency_ms": None,
-            "detail": f"CPU {row.cpu_pct:.1f}% · 메모리 {row.mem_pct:.0f}%"
-                      + (" — 제한 임박(OOM 위험)" if bad else ""),
+            "detail": " · ".join(parts),
         })
 
     return {
