@@ -1851,12 +1851,17 @@ def ops_lecture_admin(
     }
 
     def _issues(lec) -> list[str]:
-        """운영자가 손봐야 할 것 — 이름을 붙여야 필터도 걸고 화면도 설명할 수 있다."""
+        """운영자가 손봐야 할 것 — 이름을 붙여야 필터도 걸고 화면도 설명할 수 있다.
+
+        ⚠️처음엔 "미공개 문항이 남음"(draftleft)도 넣었는데 ★뺐다.
+          실측하니 강의 17개 중 16개가 그 상태였다(공개 비율 중간값 11%).
+          강사가 AI 로 문항을 많이 만들어 두고 몇 개만 공개하는 것이 ★정상 흐름이라,
+          경고로 두면 전부에 배지가 붙어 정작 볼 것을 가린다.
+          미공개 수는 표의 "확인 문항 (공개 / 전체)" 칸이 이미 보여 준다.
+        """
         out = []
         if active_q.get(lec.id, 0) == 0:
             out.append("noquestion")  # 공개 문항 0 = 시청 검증이 조용히 꺼진 상태
-        if total_q.get(lec.id, 0) - active_q.get(lec.id, 0) > 0:
-            out.append("draftleft")   # 미공개 문항이 남아 방치
         if lec.status == "hidden":
             out.append("hidden")
         return out
@@ -1885,8 +1890,12 @@ def ops_lecture_admin(
     summary = {
         "total": len(rows_all),
         "noquestion": sum(1 for it in items if "noquestion" in it["issues"]),
-        "draftleft": sum(1 for it in items if "draftleft" in it["issues"]),
         "hidden": sum(1 for it in items if "hidden" in it["issues"]),
+        # 최근 7일 새 강의 — "그동안 뭐가 올라왔나" 가 훑을 때 첫 질문이다
+        "recent": sum(
+            1 for lec in rows_all
+            if lec.created_at and (datetime.now() - lec.created_at).days < 7
+        ),
     }
     # 문제 있는 것을 위로 — 운영자가 스크롤하지 않게. 그다음 최신순.
     items.sort(key=lambda it: (-len(it["issues"]), -(it["created_at"].timestamp() if it["created_at"] else 0)))
