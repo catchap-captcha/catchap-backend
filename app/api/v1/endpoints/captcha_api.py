@@ -7,6 +7,7 @@
 교육형도 같은 경로에 product='edu' 키를 쓰면 동작 (키에 과목이 박혀 있음).
 """
 
+import random
 import re
 from datetime import date
 from functools import lru_cache
@@ -522,6 +523,14 @@ def challenge(
             {"subj": eff_subject, "rp": bool(replay), "chapter": eff_chapter, "stage": stage, "bank": True},
         )
         return _emit_challenge(db, api, eff_subject, ch)
+    # ★고객사가 직접 넣은 문항 섞기 — 봇 차단 캡차에만. 학습 문제 캡차는 과목 문제은행이
+    #   정본이라 섞지 않는다(구독한 과목 문항이 나와야 한다).
+    #   문항이 없거나 전부 내려간 사이트는 그냥 기본 문제로 간다 — 자기 문항 때문에
+    #   캡차가 멈추는 일은 없다.
+    if api.product == "captcha" and random.random() < cs.SITE_QUESTION_RATIO:
+        row = cs.pick_site_question(db, api.site_id)
+        if row is not None:
+            return _emit_challenge(db, api, eff_subject, cs.wrap_site_question(row))
     ch = cs.make_challenge(
         api.product, eff_subject, day=day, replay=replay, learning=learning,
         chapter=chapter, stage=stage,

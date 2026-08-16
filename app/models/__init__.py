@@ -76,6 +76,7 @@ from app.models.site import (
     CaptchaConsumedToken,
     CaptchaSetting,
     Site,
+    SiteQuestion,
 )
 from app.models.social_account import SocialAccount
 from app.models.stat import StatBlob
@@ -155,6 +156,7 @@ __all__ = [
     "ReportDownloadLog",
     "ShopItem",
     "Site",
+    "SiteQuestion",
     "StatBlob",
     "StudentBadge",
     "StudentItem",

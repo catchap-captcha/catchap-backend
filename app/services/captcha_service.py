@@ -417,6 +417,43 @@ def _wrap(kind: str, answer, public: dict, meta: dict | None = None) -> dict:
     return {"challenge_token": token, **public}
 
 
+# 고객사가 직접 넣은 문항을 섞는 비율. 절반으로 두는 이유 —
+#   1.0 이면 몇 개 안 되는 자기 문항이 돌고 돌아 봇이 외운다.
+#   0 에 가까우면 넣은 보람이 없다. 문항이 없으면 이 값과 무관하게 기본 문제만 나온다.
+SITE_QUESTION_RATIO = 0.5
+
+
+def wrap_site_question(row) -> dict:
+    """고객사 문항(SiteQuestion) → 캡차 응답 모양.
+
+    ★정답은 토큰에만 서명해 넣는다(공개 응답에는 없다) — 기본 문제와 같은 규약이라
+    페이지를 뜯어봐도 답을 알 수 없다.
+    """
+    opts = row.options if isinstance(row.options, list) else []
+    return _wrap(
+        "single",
+        str(row.answer),
+        {
+            "type": "site_question",  # 화면이 "이 사이트가 낸 문제" 로 표시할 수 있게
+            "prompt": row.prompt,
+            # 보기 순서를 매번 섞는다 — 순서를 외워서 찍는 것을 막는다
+            "options": random.sample(opts, len(opts)) if opts else [],
+        },
+    )
+
+
+def pick_site_question(db, site_id: str):
+    """이 사이트의 살아 있는 문항 중 하나 — 없으면 None(기본 문제로 넘어간다)."""
+    from app.models import SiteQuestion
+
+    rows = (
+        db.query(SiteQuestion)
+        .filter(SiteQuestion.site_id == site_id, SiteQuestion.status == "active")
+        .all()
+    )
+    return random.choice(rows) if rows else None
+
+
 def _main_challenge() -> dict:
     if random.random() < 0.5:
         # 그림 다중 선택

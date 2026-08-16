@@ -40,6 +40,29 @@ class ApiKey(Base, UUIDPk, Timestamps):
     last_used_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
+class SiteQuestion(Base, UUIDPk, Timestamps):
+    """고객사가 직접 넣는 캡차 문항 — 그 사이트 키로 오는 캡차에만 섞여 나온다.
+
+    ★왜 '섞어서' 인가 — 자기 문항만 내면 몇 개 안 되는 문제가 돌고 돌아 봇이 외운다.
+      기본 문제(우리가 그때그때 만드는 그림·셈)와 섞어야 예측이 어렵다.
+      문항이 하나도 없거나 전부 내려간 사이트는 자동으로 기본 문제만 나온다 —
+      ★자기 문항 때문에 캡차가 멈추는 일은 없다.
+
+    정답(answer)은 이 표에만 있고 화면으로 내려가지 않는다. 채점은 우리 서버가 한다.
+    """
+
+    __tablename__ = "site_questions"
+
+    site_id: Mapped[str] = mapped_column(CHAR(36), ForeignKey("sites.id"), index=True)
+    # 조회·수정 권한 확인용(사이트를 한 번 더 타지 않게 비정규화) — api_keys 와 같은 방식
+    organization_id: Mapped[str] = mapped_column(CHAR(36), index=True)
+    prompt: Mapped[str] = mapped_column(String(300))  # 문제 (예: 우리 회사 로고 색은?)
+    # 보기 [{"id": "o1", "text": "파랑"}, …] — id 는 answer 와 맞춘다
+    options: Mapped[dict] = mapped_column(JSON, default=list)
+    answer: Mapped[str] = mapped_column(String(20))  # 정답 보기의 id
+    status: Mapped[str] = mapped_column(String(20), default="active")  # active|disabled
+
+
 class ApiUsageLog(Base, UUIDPk, Timestamps):
     __tablename__ = "api_usage_logs"
     # 기관 API 사용량 기간 집계 가속용 (migration ce50a1b2c3d4)

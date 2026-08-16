@@ -343,3 +343,174 @@ def test_verify_rejects_cross_subject_token(client, db, seed_org):
 
 
 # (기관 셀프서비스 API키 테스트는 기관 콘솔 은퇴로 제거 — 키 발급은 /ops/api-keys가 전담)
+
+
+# ── 고객사가 직접 넣은 문항 (0816) ────────────────────────────────────────
+def _site_key_for(client, db, seed_org, domain="example.kr"):
+    """봇 차단 캡차 키 하나 발급 → (site_key, api_key row, ops 토큰).
+
+    ★ops 토큰을 함께 돌려준다 — _ops() 를 두 번 부르면 같은 이메일로 운영자를 또 만들려다
+      UNIQUE 로 깨진다(실제로 한 번 겪었다).
+    """
+    from app.models import ApiKey, Subscription
+
+    org = seed_org["org"]
+    _, pro = _plans(db)
+    db.add(Subscription(organization_id=org.id, plan_id=pro.id, status="active"))
+    db.commit()
+    tok = _ops(client, db)
+    r = client.post(
+        "/api/v1/ops/api-keys",
+        json={"organization_id": org.id, "product": "captcha", "label": "t", "domain": domain},
+        headers=auth(tok),
+    )
+    assert r.status_code == 200, r.text
+    sk = r.json()["site_key"]
+    row = db.query(ApiKey).filter(ApiKey.site_key == sk).first()
+    return sk, row, tok
+
+
+def test_site_question_is_served_and_graded(client, db, seed_org, monkeypatch):
+    """★고객사 문항이 실제로 나오고, 그 정답으로 채점까지 통과해야 한다.
+
+    문항을 만드는 것만으로는 의미가 없다 — verify 가 맞다고 해야 캡차가 통과한다.
+    """
+    from app.models import SiteQuestion
+    from app.services import captcha_service as cs
+
+    site_key, api, _tok = _site_key_for(client, db, seed_org)
+    db.add(
+        SiteQuestion(
+            site_id=api.site_id,
+            organization_id=api.organization_id,
+            prompt="우리 회사 로고 색은?",
+            options=[{"id": "o1", "text": "파랑"}, {"id": "o2", "text": "빨강"}],
+            answer="o1",
+            status="active",
+        )
+    )
+    db.commit()
+
+    monkeypatch.setattr(cs, "SITE_QUESTION_RATIO", 1.0)  # 반드시 자기 문항이 나오게
+    hdr = {"X-Site-Key": site_key, "Origin": "https://www.example.kr"}
+    ch = client.post("/api/v1/captcha/v1/challenge", headers=hdr)
+    assert ch.status_code == 200, ch.text
+    body = ch.json()
+    assert body["prompt"] == "우리 회사 로고 색은?"
+    assert body.get("type") == "site_question"
+    assert "answer" not in body, "정답이 화면으로 내려가면 안 된다"
+    assert {o["id"] for o in body["options"]} == {"o1", "o2"}
+
+    v = client.post(
+        "/api/v1/captcha/v1/verify",
+        json={"challenge_token": body["challenge_token"], "answer": "o1"},
+        headers=hdr,
+    )
+    assert v.status_code == 200, v.text
+    assert v.json().get("success") is True, "★자기 문항 정답이 통과하지 못하면 쓸 수 없다"
+
+
+def test_site_question_wrong_answer_fails(client, db, seed_org, monkeypatch):
+    """틀린 답은 막혀야 한다 — 통과시키면 캡차가 아니다."""
+    from app.models import SiteQuestion
+    from app.services import captcha_service as cs
+
+    site_key, api, _tok = _site_key_for(client, db, seed_org)
+    db.add(SiteQuestion(site_id=api.site_id, organization_id=api.organization_id,
+                        prompt="q", options=[{"id": "o1", "text": "a"}, {"id": "o2", "text": "b"}],
+                        answer="o1", status="active"))
+    db.commit()
+    monkeypatch.setattr(cs, "SITE_QUESTION_RATIO", 1.0)
+    hdr = {"X-Site-Key": site_key, "Origin": "https://www.example.kr"}
+    body = client.post("/api/v1/captcha/v1/challenge", headers=hdr).json()
+    v = client.post("/api/v1/captcha/v1/verify",
+                    json={"challenge_token": body["challenge_token"], "answer": "o2"}, headers=hdr)
+    assert v.json().get("success") is not True
+
+
+def test_captcha_keeps_working_when_site_has_no_question(client, db, seed_org, monkeypatch):
+    """★문항이 하나도 없어도 캡차는 돌아야 한다 — 기본 문제로 넘어간다."""
+    from app.services import captcha_service as cs
+
+    site_key, _api, _tok = _site_key_for(client, db, seed_org)
+    monkeypatch.setattr(cs, "SITE_QUESTION_RATIO", 1.0)  # 자기 문항을 최우선으로 시도해도
+    ch = client.post(
+        "/api/v1/captcha/v1/challenge",
+        headers={"X-Site-Key": site_key, "Origin": "https://www.example.kr"},
+    )
+    assert ch.status_code == 200, "문항이 없다고 캡차가 멈추면 안 된다"
+    assert "challenge_token" in ch.json()
+
+
+def test_disabled_site_question_is_not_served(client, db, seed_org, monkeypatch):
+    """내린 문항은 나오지 않아야 한다."""
+    from app.models import SiteQuestion
+    from app.services import captcha_service as cs
+
+    site_key, api, _tok = _site_key_for(client, db, seed_org)
+    db.add(SiteQuestion(site_id=api.site_id, organization_id=api.organization_id,
+                        prompt="내린 문제", options=[{"id": "o1", "text": "a"}],
+                        answer="o1", status="disabled"))
+    db.commit()
+    monkeypatch.setattr(cs, "SITE_QUESTION_RATIO", 1.0)
+    body = client.post("/api/v1/captcha/v1/challenge",
+                       headers={"X-Site-Key": site_key, "Origin": "https://www.example.kr"}).json()
+    assert body.get("prompt") != "내린 문제"
+
+
+def test_ops_can_add_and_toggle_site_question(client, db, seed_org, monkeypatch):
+    """운영자가 화면에서 문항을 넣고 내릴 수 있어야 한다 — API 가 실제로 도는지."""
+    from app.services import captcha_service as cs
+
+    site_key, api, _t = _site_key_for(client, db, seed_org)
+    tok = auth(_t)
+
+    # 잘못된 입력은 막힌다 — 풀 수 없는 문제가 나가면 아무도 통과 못 한다
+    bad = client.post(f"/api/v1/ops/api-keys/{api.id}/questions", headers=tok,
+                      json={"prompt": "q", "options": [{"id": "o1", "text": "a"}], "answer": "o1"})
+    assert bad.status_code == 400, "보기가 하나뿐인데 통과하면 안 된다"
+    bad2 = client.post(f"/api/v1/ops/api-keys/{api.id}/questions", headers=tok,
+                       json={"prompt": "q", "options": [{"id": "o1", "text": "a"}, {"id": "o2", "text": "b"}],
+                             "answer": "o9"})
+    assert bad2.status_code == 400, "정답이 보기에 없는데 통과하면 안 된다"
+
+    r = client.post(f"/api/v1/ops/api-keys/{api.id}/questions", headers=tok,
+                    json={"prompt": "우리 대표 색은?",
+                          "options": [{"id": "o1", "text": "파랑"}, {"id": "o2", "text": "빨강"}],
+                          "answer": "o1"})
+    assert r.status_code == 200, r.text
+    qid = r.json()["id"]
+
+    lst = client.get(f"/api/v1/ops/api-keys/{api.id}/questions", headers=tok)
+    assert lst.status_code == 200 and len(lst.json()) == 1
+
+    # 내리면 캡차에 안 나온다
+    t = client.patch(f"/api/v1/ops/api-keys/{api.id}/questions/{qid}", headers=tok)
+    assert t.json()["status"] == "disabled"
+    monkeypatch.setattr(cs, "SITE_QUESTION_RATIO", 1.0)
+    body = client.post("/api/v1/captcha/v1/challenge",
+                       headers={"X-Site-Key": site_key, "Origin": "https://www.example.kr"}).json()
+    assert body.get("prompt") != "우리 대표 색은?"
+
+    assert client.delete(f"/api/v1/ops/api-keys/{api.id}/questions/{qid}", headers=tok).status_code == 200
+    assert client.get(f"/api/v1/ops/api-keys/{api.id}/questions", headers=tok).json() == []
+
+
+def test_edu_key_cannot_take_own_question(client, db, seed_org):
+    """학습 문제 캡차는 문제은행이 정본 — 직접 넣으면 과목 체계가 무너진다."""
+    from app.models import ApiKey, Subscription
+
+    org = seed_org["org"]
+    _, pro = _plans(db)
+    db.add(Subscription(organization_id=org.id, plan_id=pro.id, status="active"))
+    db.commit()
+    tok = auth(_ops(client, db))
+    r = client.post("/api/v1/ops/api-keys", headers=tok,
+                    json={"organization_id": org.id, "product": "edu", "subject": "국어",
+                          "label": "t", "domain": "example.kr"})
+    assert r.status_code == 200, r.text
+    row = db.query(ApiKey).filter(ApiKey.site_key == r.json()["site_key"]).first()
+    bad = client.post(f"/api/v1/ops/api-keys/{row.id}/questions", headers=tok,
+                      json={"prompt": "q", "options": [{"id": "o1", "text": "a"}, {"id": "o2", "text": "b"}],
+                            "answer": "o1"})
+    assert bad.status_code == 400

@@ -1711,6 +1711,114 @@ def ops_list_api_keys(
     }
 
 
+# ── 고객사가 직접 넣는 캡차 문항 ─────────────────────────────────────────
+class _SiteQuestionReq(BaseModel):
+    prompt: str
+    options: list[dict]  # [{"id": "o1", "text": "파랑"}, …]
+    answer: str          # 정답 보기의 id
+
+
+def _site_question_or_404(db: Session, question_id: str):
+    from app.models import SiteQuestion
+
+    row = db.get(SiteQuestion, question_id)
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="문항을 찾을 수 없습니다.")
+    return row
+
+
+@router.get("/api-keys/{key_id}/questions")
+def ops_list_site_questions(
+    key_id: str, principal: Principal = Depends(require_ops), db: Session = Depends(get_db)
+):
+    """이 키(사이트)에 등록된 캡차 문항 목록 — 정답도 함께(운영자 화면에서 확인용)."""
+    from app.models import SiteQuestion
+
+    api = db.get(ApiKey, key_id)
+    if api is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="키를 찾을 수 없습니다.")
+    rows = (
+        db.query(SiteQuestion)
+        .filter(SiteQuestion.site_id == api.site_id)
+        .order_by(SiteQuestion.created_at.desc())
+        .all()
+    )
+    return [
+        {"id": r.id, "prompt": r.prompt, "options": r.options, "answer": r.answer,
+         "status": r.status, "created_at": r.created_at}
+        for r in rows
+    ]
+
+
+@router.post("/api-keys/{key_id}/questions")
+def ops_add_site_question(
+    key_id: str, req: _SiteQuestionReq,
+    principal: Principal = Depends(require_ops), db: Session = Depends(get_db),
+):
+    """캡차 문항 추가 — 이 키로 오는 캡차에 기본 문제와 섞여 나온다.
+
+    ★보기가 둘 이상이어야 하고 정답이 그중 하나여야 한다. 아니면 사용자가 풀 수 없는
+    문제가 나가고, 그 캡차는 아무도 통과하지 못한다.
+    """
+    from app.models import SiteQuestion
+
+    api = db.get(ApiKey, key_id)
+    if api is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="키를 찾을 수 없습니다.")
+    if api.product != "captcha":
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            detail="학습 문제 캡차는 문제은행에서 내므로 직접 넣을 수 없어요. 봇 차단 캡차 키에 넣어 주세요.",
+        )
+    prompt = (req.prompt or "").strip()
+    if not prompt:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="문제를 입력해 주세요.")
+    ids = [str(o.get("id", "")).strip() for o in req.options if str(o.get("id", "")).strip()]
+    if len(ids) < 2 or len(set(ids)) != len(ids):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="보기를 서로 다른 id 로 2개 이상 넣어 주세요.")
+    if not all(str(o.get("text", "")).strip() for o in req.options):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="보기 내용을 모두 채워 주세요.")
+    if req.answer not in ids:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="정답이 보기 중에 없어요.")
+
+    row = SiteQuestion(
+        site_id=api.site_id, organization_id=api.organization_id,
+        prompt=prompt, options=req.options, answer=req.answer, status="active",
+    )
+    db.add(row)
+    audit(db, action="captcha.site_question_add", actor_user_id=principal.id,
+          target_type="api_key", target_id=key_id, after={"prompt": prompt[:80]})
+    db.commit()
+    return {"id": row.id}
+
+
+@router.patch("/api-keys/{key_id}/questions/{question_id}")
+def ops_toggle_site_question(
+    key_id: str, question_id: str,
+    principal: Principal = Depends(require_ops), db: Session = Depends(get_db),
+):
+    """문항 공개/숨김 — 지우지 않고 내린다(다시 올릴 수 있게)."""
+    row = _site_question_or_404(db, question_id)
+    row.status = "disabled" if row.status == "active" else "active"
+    audit(db, action="captcha.site_question_toggle", actor_user_id=principal.id,
+          target_type="api_key", target_id=key_id, after={"status": row.status})
+    db.commit()
+    return {"status": row.status}
+
+
+@router.delete("/api-keys/{key_id}/questions/{question_id}")
+def ops_delete_site_question(
+    key_id: str, question_id: str,
+    principal: Principal = Depends(require_ops), db: Session = Depends(get_db),
+):
+    row = _site_question_or_404(db, question_id)
+    db.delete(row)
+    audit(db, action="captcha.site_question_delete", actor_user_id=principal.id,
+          target_type="api_key", target_id=key_id)
+    db.commit()
+    return {"ok": True}
+
+
 @router.post("/api-keys")
 def ops_issue_api_key(
     req: _IssueKeyReq, principal: Principal = Depends(require_ops), db: Session = Depends(get_db)
