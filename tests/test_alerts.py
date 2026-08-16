@@ -568,3 +568,76 @@ def test_headline_ignores_english_summary():
     )
     # 한글 summary 는 표보다 구체적이라 그것을 쓴다
     assert _headline(ko, "CatchapServiceDown") == "★behavior-ai 가 한 벌도 안 떠 있습니다"
+
+
+def test_mail_keeps_the_line_breaks_of_the_description(client, db, monkeypatch):
+    """★여러 줄로 쓴 안내가 메일에서 한 덩어리가 되면 안 된다.
+
+    HTML 은 줄바꿈을 무시한다. description 을 _esc 만 해서 <div> 에 넣던 동안,
+    「되돌리는 법 — ① … ② …」처럼 줄을 나눠 쓴 안내가 통째로 이어붙어 나왔다(0817).
+    """
+    from app.api.v1.endpoints import alerts
+
+    html = alerts._email_html(
+        alerts.AlertmanagerPayload(
+            alerts=[
+                alerts.AlertItem(
+                    labels={"alertname": "X", "severity": "critical"},
+                    annotations={"summary": "가", "description": "첫 줄\n\n둘째 줄"},
+                )
+            ]
+        )
+    )
+    assert "첫 줄<br><br>둘째 줄" in html, html
+
+
+def test_mail_makes_the_address_clickable(client, db, monkeypatch):
+    """★경보가 「이 화면을 여세요」라고 하면 눌러서 갈 수 있어야 한다.
+
+    새벽에 콘솔 주소를 손으로 옮겨 적게 하면 안 된다.
+    """
+    from app.api.v1.endpoints import alerts
+
+    url = "https://console.kakaocloud.com/vpc/routing-tables/abc/detail?project_id=1&region=kr"
+    html = alerts._email_html(
+        alerts.AlertmanagerPayload(
+            alerts=[
+                alerts.AlertItem(
+                    labels={"alertname": "X", "severity": "critical"},
+                    # ★주소 바로 뒤에 마침표를 붙인다 — 그것까지 링크에 들어가면 404 로 간다.
+                    #   (0817: 처음엔 주소 뒤에 공백을 뒀더니 그 코드를 아예 안 지나가서
+                    #    변이 시험이 안 물었다 — 시험이 통과했는데 지키는 게 없었다)
+                    annotations={"summary": "가", "description": f"여세요: {url}. 그리고 끝."},
+                )
+            ]
+        )
+    )
+    # & 는 이스케이프된 채로 href 에 들어간다(브라우저가 되돌려 읽는다)
+    assert 'href="https://console.kakaocloud.com/vpc/routing-tables/abc/detail' in html
+    assert "&amp;region=kr" in html
+    # ★문장 끝 마침표가 주소에 딸려 가면 안 된다 (그러면 링크가 404 로 간다)
+    assert "&amp;region=kr</a>" in html, html
+    assert "그리고 끝." in html
+
+
+def test_mail_still_escapes_a_fake_link(client, db, monkeypatch):
+    """★주소를 누를 수 있게 만들면서 ★태그 주입 구멍을 열면 안 된다."""
+    from app.api.v1.endpoints import alerts
+
+    html = alerts._email_html(
+        alerts.AlertmanagerPayload(
+            alerts=[
+                alerts.AlertItem(
+                    labels={"alertname": "X", "severity": "critical"},
+                    annotations={
+                        "summary": "가",
+                        "description": '<a href="https://나쁜곳">눌러</a> <script>x</script>',
+                    },
+                )
+            ]
+        )
+    )
+    assert "<script>" not in html
+    assert "&lt;script&gt;" in html
+    # 원래 문장에 있던 <a> 는 글자로만 남아야 한다 — 우리가 만든 것만 진짜 링크다
+    assert '&lt;a href=&quot;' in html
