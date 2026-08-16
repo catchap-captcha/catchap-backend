@@ -37,7 +37,11 @@ from app.models import ApiKey, ApiUsageLog, CaptchaConsumedToken, Plan, Site, Su
 _log = logging.getLogger("catchap.captcha")
 
 # ── 제품 · 요금제 엔타이틀먼트 ─────────────────────────────────
-PRODUCTS = {"captcha": "메인 캡차 API", "edu": "교육형 API (행동데이터 수집)"}
+# 상품 이름 — 화면·문서·고객 안내가 전부 이 값을 쓴다.
+# ⚠️키(captcha/edu)는 DB 에 저장되는 값이라 바꾸지 않는다. 보이는 이름만 바꾼다.
+# ★0816 정정: "메인 캡차 API" 는 무엇을 하는지 안 알려 주고, "교육형 API (행동데이터 수집)"
+#   은 부산물을 주 목적처럼 적어 놓았다. 실제로 하는 일로 부른다.
+PRODUCTS = {"captcha": "봇 차단 캡차", "edu": "학습 문제 캡차"}
 EDU_SUBJECTS = ["국어", "영어", "수학", "과학", "사회", "생활"]
 
 # 요금제(key)별 사용 가능한 제품. Basic=메인만, Pro↑=교육형까지.
