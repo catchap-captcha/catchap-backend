@@ -129,11 +129,15 @@ def _node_label(nodename: str, ip: str, gpu_nodes: set[str]) -> str:
 
     ★그전에는 "노드 (10.0.2.128)" 이었다. IP 만으로는 ★무슨 일을 하는 서버인지 알 수 없고,
     쿠버네티스를 모르는 운영자에게 '노드'라는 말 자체가 뜻을 주지 못한다.
+
+    ⚠️그다음엔 "서비스 서버 · GPU · 2-a" 로 붙였는데, 화면 묶음 제목이 이미
+      "프로그램이 도는 서버" 라 ★"서버"가 두 번 나오고 "서비스"와도 헷갈렸다(0816 지적).
+      묶음이 이미 무엇인지 말하므로 여기서는 ★역할과 자리만 남긴다.
     """
     role = "GPU" if nodename in gpu_nodes else "일반"
     zone = _zone_of(ip)
     tail = f" · {zone}" if zone else ""
-    return f"서비스 서버 · {role}{tail} ({ip})"
+    return f"{role} 서버{tail} ({ip})"
 
 
 def apps_by_node(base_url: str) -> dict[str, list[str]]:

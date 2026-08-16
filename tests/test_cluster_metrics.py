@@ -294,9 +294,9 @@ def test_node_card_says_what_the_server_does(monkeypatch):
     ]
     monkeypatch.setattr(cluster_metrics, "instant_query", _fake_query(a))
     labels = {r["server_key"]: r["label"] for r in cluster_metrics.collect("http://x")}
-    assert labels["node:host-10-0-2-128"] == "서비스 서버 · 일반 · 2-a (10.0.2.128)"
-    assert labels["node:host-10-0-2-210"] == "서비스 서버 · GPU · 2-a (10.0.2.210)"   # ★GPU 를 밝힌다
-    assert labels["node:host-10-0-6-202"] == "서비스 서버 · 일반 · 2-b (10.0.6.202)"  # ★영역도
+    assert labels["node:host-10-0-2-128"] == "일반 서버 · 2-a (10.0.2.128)"
+    assert labels["node:host-10-0-2-210"] == "GPU 서버 · 2-a (10.0.2.210)"   # ★GPU 를 밝힌다
+    assert labels["node:host-10-0-6-202"] == "일반 서버 · 2-b (10.0.6.202)"  # ★영역도
 
 
 def test_node_label_survives_missing_gpu_metric(monkeypatch):
@@ -306,7 +306,7 @@ def test_node_label_survives_missing_gpu_metric(monkeypatch):
     """
     monkeypatch.setattr(cluster_metrics, "instant_query", _fake_query(_node_answers()))
     rows = [r for r in cluster_metrics.collect("http://x") if r["server_key"].startswith("node:")]
-    assert rows and all(r["label"].startswith("서비스 서버 · 일반") for r in rows)
+    assert rows and all(r["label"].startswith("일반 서버") for r in rows)
 
 
 def test_unknown_subnet_gets_no_fake_zone():
