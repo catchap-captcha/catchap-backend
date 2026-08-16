@@ -1282,11 +1282,17 @@ def logs(
         target_names.update(_names_for(t_type, ids))
 
     def _short(v) -> object:
-        """값이 길면 자른다 — 목록 응답이 통째로 커지지 않게."""
-        if isinstance(v, str) and len(v) > 120:
-            return v[:120] + "…"
-        if isinstance(v, list) and len(v) > 8:
-            return v[:8] + [f"… 외 {len(v) - 8}개"]
+        """긴 문자열만 자른다.
+
+        ★목록은 자르지 않는다(0816 지적 — "다 표시해야 하는 거 아니야? 감사 로그인데").
+          그전에는 8개만 보내고 "… 외 42개" 를 붙였는데, ★감사 로그에서 일부만 보여 주면
+          그건 기록이 아니다. 애초에 저장할 때 이미 한 번 잘려 있고(예: doomed_ids[:50])
+          몇 개가 생략됐는지는 truncated 로 따로 남는다 — 여기서 또 자를 이유가 없다.
+        ⚠️문자열은 여전히 자른다 — 프롬프트 규칙처럼 수천 자짜리가 있어서 목록 응답이
+          통째로 무거워진다. 대신 한도를 넉넉히 두고 잘렸다는 것을 「…」로 밝힌다.
+        """
+        if isinstance(v, str) and len(v) > 300:
+            return v[:300] + "…"
         return v
 
     def _flat(d: dict, prefix: str = "") -> dict:
