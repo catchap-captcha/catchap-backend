@@ -44,8 +44,11 @@ def test_admin_list_shows_instructor_and_issues(client, db, seed_org):
     assert by["문항 있는 강의"]["issues"] == []
     assert "noquestion" in by["문항 없는 강의"]["issues"]
     assert "noquestion" in by["미공개만 남은 강의"]["issues"]
-    assert "draftleft" in by["미공개만 남은 강의"]["issues"]
+    # ★"미공개가 남았다" 는 경고가 아니다 — 실측상 대부분의 강의가 그 상태다
+    #   (강사가 많이 만들어 두고 몇 개만 공개하는 것이 정상 흐름).
+    assert "draftleft" not in by["미공개만 남은 강의"]["issues"]
     assert d["summary"]["total"] == 3
+    assert d["summary"]["recent"] == 3, "방금 만든 것은 최근 7일에 들어간다"
     # ★문제 있는 것이 위로 — 운영자가 스크롤하지 않게
     assert d["items"][0]["issues"], "문제 있는 강의가 맨 위여야 한다"
 
