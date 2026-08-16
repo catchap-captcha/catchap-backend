@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 
 from app.core.permissions import Principal, get_current_principal
 from app.db.session import get_db
+from app.api.v1.endpoints.alerts import localize_stored_title
 from app.models import Notification
 
 router = APIRouter(prefix="/notifications", tags=["notifications"])
@@ -29,7 +30,9 @@ def list_notifications(
             "id": n.id,
             "type": n.type,
             "category": n.category,
-            "title": n.title,
+            # ★시스템 경보 제목은 ★받을 때 만들어 저장한 값이라, 규칙 이름을 한글로 옮기기
+            #   전(0816)에 쌓인 기록은 영문 그대로다. 저장된 값은 그대로 두고 ★보여 줄 때만 바꾼다.
+            "title": localize_stored_title(n.title) if n.type == "시스템경보" else n.title,
             "message": n.message,
             "child_id": n.child_id,
             "read_at": n.read_at.isoformat() if n.read_at else None,

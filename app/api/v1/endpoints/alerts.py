@@ -23,6 +23,7 @@
 """
 
 import logging
+import re
 from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends, Header, HTTPException, status
@@ -88,8 +89,16 @@ def _severity(alerts: list[AlertItem]) -> str:
 # 남이 만든(kube-prometheus-stack 기본) 경보 중 ★실제로 자주 뜨는 것만 이름을 옮긴다.
 # 141종을 다 옮기지는 않는다 — 대부분은 한 번도 안 뜨고, 아래 _title 이 규칙에 붙은
 # summary 를 먼저 쓰기 때문에 이름이 없어도 뜻은 전달된다.
-# ★우리가 만든 Catchap* 경보는 summary 자체가 한글이라 여기에 없어도 된다.
+# ★우리가 만든 Catchap* 도 넣는다 — 새 경보는 summary(한글)를 쓰지만, ★0816 전에 저장된
+#   기록에는 제목에 규칙 이름만 남아 있어서 표로만 되돌릴 수 있다(localize_stored_title).
+_HANGUL = re.compile(r"[가-힣]")
+# 저장된 제목 "[급함] CatchapServiceDown — …" 에서 ★맨 앞 ASCII 토큰이 규칙 이름이다.
+# (?![가-힣]) — 바로 뒤에 한글이 붙으면 우리가 붙인 이름이므로 손대지 않는다.
+_STORED_NAME_RE = re.compile(r"^(\[[^\]]*\]\s*)([A-Za-z][A-Za-z0-9_]*)(?![가-힣])")
+
 ALERT_NAME_KO = {
+    "CatchapServiceDown": "서비스가 한 벌도 안 떠 있음",
+    "CatchapPodRestartingRepeatedly": "앱이 자꾸 다시 뜨는 중",
     "CPUThrottlingHigh": "CPU 가 한도에 걸려 느려지는 중",
     "KubePodCrashLooping": "앱이 뜨자마자 죽기를 반복",
     "KubePodNotReady": "앱이 준비 상태가 되지 못함",
@@ -119,9 +128,32 @@ def _headline(first: "AlertItem", name: str) -> str:
     summary 가 없거나 영문뿐이면 위 표의 한글 이름으로, 그것도 없으면 규칙 이름 그대로.
     """
     summary = (first.annotations.get("summary") or "").strip()
-    if summary:
+    # ★주석은 "영문뿐이면 표를 쓴다" 였는데 코드가 그 검사를 안 했다(0816 실측) —
+    #   남이 만든 규칙(kube-prometheus-stack)은 summary 가 영문이라
+    #   "Processes experience elevated CPU throttling." 이 그대로 제목이 됐다.
+    if summary and _HANGUL.search(summary):
         return summary
     return ALERT_NAME_KO.get(name, name)
+
+
+def localize_stored_title(title: str) -> str:
+    """★이미 저장된 경보 제목을 ★보여 줄 때 사람 말로 바꾼다.
+
+    제목은 경보를 ★받을 때 만들어 저장한다(_title). 그래서 이 표를 넣기 전(0816)에
+    쌓인 기록은 규칙 이름이 영문 그대로다 — 화면의 15건이 전부 그랬다.
+
+        [급함] CatchapServiceDown — monitoring-kube-state-metrics-6cb6769d69-przfr 외 1건
+        [참고] CPUThrottlingHigh — monitoring-prometheus-node-exporter-cgs55
+
+    ★저장된 값은 건드리지 않는다 — 기록은 온 그대로 남아야 한다. 읽을 때만 바꾼다.
+    ⚠️규칙 이름 바로 뒤에 한글이 붙은 것(CatChap경보시험-0813)은 우리가 붙인 이름이라
+      건드리지 않는다.
+    """
+    m = _STORED_NAME_RE.match(title)
+    if not m:
+        return title
+    ko = ALERT_NAME_KO.get(m.group(2))
+    return f"{m.group(1)}{ko}{title[m.end():]}" if ko else title
 
 
 def _title(payload: AlertmanagerPayload) -> str:

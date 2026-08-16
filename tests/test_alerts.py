@@ -516,3 +516,55 @@ def test_resolved_alert_says_so():
         "annotations": {"summary": "★backend-api 가 한 벌도 안 떠 있습니다"},
     }], status="resolved"))
     assert t.startswith("[해제]")
+
+
+# ─────────────────────────────────────────────────────────────────────
+# 저장된 경보 제목을 ★읽을 때 사람 말로 (0816)
+#
+# 제목은 경보를 ★받을 때 만들어 저장한다. 그래서 이름 표를 넣기 전에 쌓인 기록은
+# 규칙 이름이 영문 그대로였다 — 화면의 15건이 전부 그랬다.
+# ─────────────────────────────────────────────────────────────────────
+
+
+def test_stored_title_is_localized_on_read():
+    from app.api.v1.endpoints.alerts import localize_stored_title as f
+
+    assert f("[급함] CatchapServiceDown — monitoring-kube-state-metrics-6cb 외 1건") == (
+        "[급함] 서비스가 한 벌도 안 떠 있음 — monitoring-kube-state-metrics-6cb 외 1건"
+    )
+    # ★남이 만든 규칙도 표에 있으면 바꾼다
+    assert f("[참고] CPUThrottlingHigh — node-exporter-cgs55").startswith("[참고] CPU 가 한도에")
+
+
+def test_stored_title_keeps_what_it_does_not_know():
+    """모르는 규칙 이름은 ★건드리지 않는다 — 지어내지 않는다."""
+    from app.api.v1.endpoints.alerts import localize_stored_title as f
+
+    assert f("[급함] SomeUnknownRule — x") == "[급함] SomeUnknownRule — x"
+    # 규칙 이름 바로 뒤에 한글이 붙은 것은 우리가 붙인 이름이라 그대로 둔다
+    assert f("[급함] CatChap경보시험-0813 — 시험용") == "[급함] CatChap경보시험-0813 — 시험용"
+    assert f("[급함] 알 수 없는 규칙 — 어딘가") == "[급함] 알 수 없는 규칙 — 어딘가"
+
+
+def test_headline_ignores_english_summary():
+    """★주석은 "영문뿐이면 표를 쓴다" 였는데 코드가 그 검사를 안 했다.
+
+    남이 만든 규칙은 summary 가 영문이라 그대로 제목이 됐다 —
+    "Processes experience elevated CPU throttling."
+    """
+    from app.api.v1.endpoints.alerts import AlertItem, _headline
+
+    en = AlertItem(
+        status="firing",
+        labels={"alertname": "CPUThrottlingHigh"},
+        annotations={"summary": "Processes experience elevated CPU throttling."},
+    )
+    assert _headline(en, "CPUThrottlingHigh") == "CPU 가 한도에 걸려 느려지는 중"
+
+    ko = AlertItem(
+        status="firing",
+        labels={"alertname": "CatchapServiceDown"},
+        annotations={"summary": "★behavior-ai 가 한 벌도 안 떠 있습니다"},
+    )
+    # 한글 summary 는 표보다 구체적이라 그것을 쓴다
+    assert _headline(ko, "CatchapServiceDown") == "★behavior-ai 가 한 벌도 안 떠 있습니다"
