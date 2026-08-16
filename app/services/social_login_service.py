@@ -164,12 +164,22 @@ def _sign_signup_token(profile: SocialProfile) -> str:
 
 
 # ---------------------------------------------------------------- 1단계: authorize
-def authorize(provider: str, redirect_uri: str | None) -> dict:
+def authorize(provider: str, redirect_uri: str | None, *, reauth: bool = False) -> dict:
+    """동의 화면 URL 발급.
+
+    reauth=True면 provider 에게 '이미 로그인돼 있어도 다시 물어보라'고 요청한다
+    ('다른 계정으로 로그인'). 기본값은 False — 평소엔 간편 로그인이어야 하므로
+    provider 세션을 그대로 쓴다.
+    """
     _assert_supported(provider)
     uri = _resolve_redirect_uri(redirect_uri)
     state = sign_state(provider, uri)
     adapter = _adapter(provider)
-    return {"provider": provider, "authorize_url": adapter.authorize_url(uri, state), "state": state}
+    return {
+        "provider": provider,
+        "authorize_url": adapter.authorize_url(uri, state, reauth=reauth),
+        "state": state,
+    }
 
 
 def _assert_supported(provider: str) -> None:

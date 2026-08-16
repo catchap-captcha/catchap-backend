@@ -81,6 +81,15 @@ class SocialProvider:
     token_endpoint = ""
     profile_endpoint = ""
     scope = ""
+    # ★'다른 계정으로 로그인' — provider 세션이 살아 있으면 동의 화면을 건너뛰고 즉시
+    # 돌아온다(OAuth 표준 동작). 우리가 로그아웃해도 provider 세션은 우리 것이 아니라
+    # 그대로 남기 때문이다. 계정을 바꾸려면 provider 에게 '다시 물어보라'고 해야 하는데,
+    # 그 파라미터 이름이 provider 마다 다르다. 여기에 선언하고 authorize_url 이 붙인다.
+    # ⚠️평소 로그인에는 붙이지 않는다 — 매번 다시 로그인하게 되어 간편 로그인이 아니게 된다.
+    reauth_params: dict[str, str] = {}
+    # provider 고유 고정 파라미터(항상 붙는다). authorize_url 을 오버라이드하면 상위 시그니처와
+    # 갈라져 새 인자가 늘 때 조용히 깨진다 — 실제로 reauth 를 넣을 때 구글에서 그랬다.
+    extra_authorize_params: dict[str, str] = {}
     # 이 provider의 이메일을 '소유가 검증된 것'으로 볼 수 있는가.
     # 응답에 검증 필드가 있는 provider는 그 값을 그대로 쓰고, 없는 provider만 이 값을 쓴다.
     email_verified_default = False
@@ -131,7 +140,7 @@ class SocialProvider:
         return body
 
     # ---------------------------------------------------------------- 단계별
-    def authorize_url(self, redirect_uri: str, state: str) -> str:
+    def authorize_url(self, redirect_uri: str, state: str, *, reauth: bool = False) -> str:
         params = {
             "client_id": self._client_id,
             "redirect_uri": redirect_uri,
@@ -140,6 +149,9 @@ class SocialProvider:
         }
         if self.scope:
             params["scope"] = self.scope
+        params.update(self.extra_authorize_params)
+        if reauth:
+            params.update(self.reauth_params)
         return f"{self.authorize_endpoint}?{urlencode(params)}"
 
     def exchange_code(self, code: str, redirect_uri: str, state: str) -> str:
@@ -189,6 +201,7 @@ class KakaoProvider(SocialProvider):
     authorize_endpoint = "https://kauth.kakao.com/oauth/authorize"
     token_endpoint = "https://kauth.kakao.com/oauth/token"
     profile_endpoint = "https://kapi.kakao.com/v2/user/me"
+    reauth_params = {"prompt": "login"}  # 카카오 — 로그인 화면을 다시 띄운다
     # ★기본값은 닉네임만이다. 카카오는 이메일(account_email) 동의항목을 **비즈 앱**에만
     # 열어 주고, 권한 없는 항목을 요청하면 로그인 자체가 거절된다(KOE205). 비즈 앱 전환 후
     # settings.KAKAO_SCOPES 에 "profile_nickname account_email" 로 넣으면 이메일도 받는다.
@@ -240,6 +253,7 @@ class NaverProvider(SocialProvider):
     authorize_endpoint = "https://nid.naver.com/oauth2.0/authorize"
     token_endpoint = "https://nid.naver.com/oauth2.0/token"
     profile_endpoint = "https://openapi.naver.com/v1/nid/me"
+    reauth_params = {"auth_type": "reprompt"}  # 네이버 — 재인증(동의 화면 재노출)
     # 네이버 프로필 응답에는 이메일 검증 필드가 없다. 네이버 계정은 가입 시 이메일 본인확인을
     # 거치므로 검증된 것으로 본다(자동 연결 허용). 정책을 조이려면 이 값을 False로 두면
     # 되고, 그러면 네이버 사용자는 항상 신규 가입 또는 로그인 후 수동 연결을 거친다.
@@ -303,15 +317,11 @@ class GoogleProvider(SocialProvider):
     token_endpoint = "https://oauth2.googleapis.com/token"
     profile_endpoint = "https://openidconnect.googleapis.com/v1/userinfo"
     scope = "openid email profile"
-
-    def authorize_url(self, redirect_uri: str, state: str) -> str:
-        # prompt=select_account — 한 기기에서 계정을 바꿔 로그인할 수 있어야 한다.
-        # access_type=online — refresh token을 받지 않는다(우리는 저장하지 않으므로 불필요).
-        return (
-            super().authorize_url(redirect_uri, state)
-            + "&"
-            + urlencode({"access_type": "online", "prompt": "select_account"})
-        )
+    # prompt=select_account — 구글은 ★항상 계정 선택 화면을 띄운다. 한 기기에서 계정을 바꿔
+    #   로그인할 수 있어야 하고, 구글은 다중 로그인이 흔해서 기본값으로 두는 편이 맞다.
+    #   (그래서 구글엔 reauth_params 가 따로 필요 없다 — 이미 매번 물어본다)
+    # access_type=online — refresh token 을 받지 않는다(우리는 저장하지 않으므로 불필요).
+    extra_authorize_params = {"access_type": "online", "prompt": "select_account"}
 
     def fetch_profile(self, access_token: str) -> SocialProfile:
         body = self._profile_body(access_token)

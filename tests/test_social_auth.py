@@ -64,7 +64,7 @@ def _stub(monkeypatch, profile: SocialProfile):
     """provider 왕복을 스텁으로 — 이 프로필을 돌려주는 어댑터를 쓴다."""
 
     class _Adapter:
-        def authorize_url(self, redirect_uri, state):
+        def authorize_url(self, redirect_uri, state, *, reauth=False):
             return f"https://stub.test/authorize?redirect_uri={redirect_uri}&state={state}"
 
         def login(self, code, redirect_uri, state):
@@ -612,3 +612,34 @@ def test_disabled_console_account_cannot_login_via_social(client, db, social_env
 
     _stub(monkeypatch, _profile(provider_user_id="kakao-c4"))
     assert _callback(client, state=_state(client)).status_code == 403
+
+
+# ---------------------------------------------------------------- 다른 계정으로 로그인
+def test_reauth_adds_provider_specific_prompt(client, db, social_env):
+    """★provider 세션이 살아 있으면 동의 화면을 건너뛴다(OAuth 표준). 계정을 바꾸려면
+    provider 에게 '다시 물어보라'고 해야 하는데, 그 파라미터 이름이 저마다 다르다."""
+    from urllib.parse import parse_qs, urlparse
+
+    def q(provider: str, **params):
+        r = client.get(f"/api/v1/auth/social/{provider}/authorize", params=params)
+        assert r.status_code == 200, r.text
+        return parse_qs(urlparse(r.json()["authorize_url"]).query)
+
+    # 카카오는 평소 로그인엔 붙지 않는다 — 붙으면 매번 다시 로그인하게 되어
+    # '간편' 로그인이 아니게 된다.
+    assert "prompt" not in q("kakao")
+    assert q("kakao", reauth=True)["prompt"] == ["login"]
+
+    # ★구글은 예외 — 다중 로그인이 흔해 ★항상 계정 선택을 띄운다(reauth 여부와 무관).
+    assert q("google")["prompt"] == ["select_account"]
+    assert q("google", reauth=True)["prompt"] == ["select_account"]
+
+
+def test_reauth_keeps_state_and_redirect_intact():
+    """재확인 파라미터가 state·redirect_uri 를 덮어쓰지 않는다 — 덮으면 콜백이 통째로 깨진다."""
+    from urllib.parse import parse_qs, urlparse
+
+    p = NaverProvider("cid", "sec")
+    got = parse_qs(urlparse(p.authorize_url(REDIRECT, "st-1", reauth=True)).query)
+    assert got["auth_type"] == ["reprompt"]  # 네이버만 이름이 다르다
+    assert got["state"] == ["st-1"] and got["redirect_uri"] == [REDIRECT]
