@@ -122,3 +122,30 @@ def test_unknown_target_type_does_not_break(ops_client, db):
     row = _logs(ops_client)[0]
     assert row["target_name"] is None
     assert row["changes"] == []
+
+
+def test_nested_settings_are_flattened(ops_client, db):
+    """★설정 변경(100건)은 중첩 dict 라 그대로 두면 JSON 이 통째로 찍힌다.
+
+    운영자에게는 개발자 말이다 — 펴서 ★바뀐 칸 하나만 짚어 준다.
+    """
+    db.add(AuditLog(
+        action="settings.update", target_type="user_setting", target_id="u1",
+        before_json={"settings": {"alerts": {"email": False, "push": True}, "theme": "light"}},
+        after_json={"settings": {"alerts": {"email": True, "push": True}, "theme": "light"}},
+    ))
+    db.commit()
+    ch = _logs(ops_client)[0]["changes"]
+    assert ch == [{"field": "settings.alerts.email", "before": False, "after": True}], ch
+
+
+def test_lists_are_not_flattened(ops_client, db):
+    """⚠️목록은 펴지 않는다 — 순서가 뜻을 갖는 값이라 칸으로 나누면 오히려 읽기 어렵다."""
+    db.add(AuditLog(
+        action="lecture.reorder", target_type="lecture", target_id="l1",
+        before_json={"order": ["a", "b"]}, after_json={"order": ["b", "a"]},
+    ))
+    db.commit()
+    ch = _logs(ops_client)[0]["changes"]
+    assert len(ch) == 1 and ch[0]["field"] == "order"
+    assert ch[0]["before"] == ["a", "b"] and ch[0]["after"] == ["b", "a"]
