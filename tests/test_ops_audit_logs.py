@@ -106,13 +106,28 @@ def test_student_target_is_anonymous(ops_client, db, seed_org):
     assert (sp.nickname or "") not in name
 
 
-def test_long_values_are_trimmed(ops_client, db):
-    """값이 길면 자른다 — 목록 응답이 통째로 커지지 않게."""
+def test_long_strings_are_trimmed(ops_client, db):
+    """긴 문자열은 자른다 — 프롬프트 규칙처럼 수천 자짜리가 있다."""
     db.add(AuditLog(action="system.settings.ai_prompt", target_type="system_setting",
-                    target_id="p", before_json={"rules": "가" * 500}, after_json={"rules": "나" * 500}))
+                    target_id="p", before_json={"rules": "가" * 900}, after_json={"rules": "나" * 900}))
     db.commit()
     ch = _logs(ops_client)[0]["changes"][0]
-    assert len(ch["before"]) <= 121 and ch["before"].endswith("…")
+    assert len(ch["before"]) <= 301 and ch["before"].endswith("…")
+
+
+def test_lists_are_shown_in_full(ops_client, db):
+    """★목록은 자르지 않는다 — 감사 로그에서 일부만 보여 주면 그건 기록이 아니다.
+
+    저장할 때 이미 한 번 잘려 있고(doomed_ids[:50]) 몇 개가 생략됐는지는
+    truncated 로 따로 남는다 — 여기서 또 자를 이유가 없다.
+    """
+    ids = [f"user:x{i}@example.com" for i in range(50)]
+    db.add(AuditLog(action="ops.login_throttle_purge_orphans", target_type="login_throttle",
+                    target_id="t", before_json={"identifiers": ids, "truncated": 220}))
+    db.commit()
+    ch = {c["field"]: c for c in _logs(ops_client)[0]["changes"]}
+    assert ch["identifiers"]["before"] == ids  # 50개 전부
+    assert ch["truncated"]["before"] == 220
 
 
 def test_unknown_target_type_does_not_break(ops_client, db):
