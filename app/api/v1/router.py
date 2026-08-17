@@ -49,3 +49,7 @@ for _mod in (
     deployments,
 ):
     api_router.include_router(_mod.router)
+
+
+from app.api.v1.endpoints import ops_exports
+api_router.include_router(ops_exports.router)
