@@ -16,6 +16,7 @@ from app.api.v1.endpoints import (
     misc,
     monitoring,
     notifications,
+    ops_exports,
     ops,
     payments,
     settings as settings_ep,
@@ -36,6 +37,7 @@ for _mod in (
     notifications,
     settings_ep,
     misc,
+    ops_exports,
     ops,
     payments,
     captcha_api,
@@ -49,7 +51,3 @@ for _mod in (
     deployments,
 ):
     api_router.include_router(_mod.router)
-
-
-from app.api.v1.endpoints import ops_exports
-api_router.include_router(ops_exports.router)
