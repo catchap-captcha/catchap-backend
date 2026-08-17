@@ -477,7 +477,7 @@ def expire_old_exports(db: Session) -> int:
 
 def job_to_dict(job: BehaviorExportJob) -> dict:
     return {
-        "job_id": job.id,
+        "id": job.id,
         "requested_by": job.requested_by,
         "mode": job.mode,
         "status": job.status,
