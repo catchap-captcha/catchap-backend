@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import hmac
 import logging
 import tempfile
 from datetime import date, datetime, time, timedelta
@@ -98,8 +99,8 @@ def _apply_filters(q, filters: dict, snapshot_at: datetime):
 
 
 def _anon(student_id: str) -> str:
-    salt = get_settings().JWT_SECRET_KEY
-    return hashlib.sha256(f"{salt}:{student_id}".encode()).hexdigest()[:6].upper()
+    secret = get_settings().JWT_SECRET_KEY.encode()
+    return hmac.new(secret, student_id.encode(), hashlib.sha256).hexdigest()[:12].upper()
 
 
 def _safe(value):
