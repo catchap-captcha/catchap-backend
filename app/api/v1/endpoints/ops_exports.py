@@ -280,3 +280,33 @@ def create_behavior_export_download_link(
         "file_name": job.file_name,
         "sha256": job.sha256,
     }
+
+
+@router.get("/behavior/export", include_in_schema=False)
+def legacy_behavior_export(
+    fmt: str = "json",
+    mode: Mode = "aggregate",
+    dataset: Dataset = "included",
+    source_type: str | None = None,
+    risk: Risk | None = None,
+    result_filter: ResultFilter | None = None,
+    date_from: date | None = None,
+    date_to: date | None = None,
+    principal: Principal = Depends(require_ops),
+    db: Session = Depends(get_db),
+):
+    """구 UI 호환: JSON 미리보기만 허용하고 장시간 동기 CSV 응답은 중단한다."""
+    if fmt != "json":
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail="CSV는 비동기 내보내기 작업으로 생성해 주세요.",
+        )
+    filters = _filters(
+        dataset=dataset,
+        source_type=source_type,
+        risk=risk,
+        result_filter=result_filter,
+        date_from=date_from,
+        date_to=date_to,
+    )
+    return build_preview(db, actor_id=principal.id, mode=mode, filters=filters)
