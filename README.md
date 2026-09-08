@@ -107,3 +107,32 @@ catchap-behavior-ai   행동 기반 봇 판별 AI
 catchap-infra         쿠버네티스 매니페스트·인프라 문서
 catchap-legacy        지난 작업 보관 (읽기용)
 ```
+
+---
+
+## 전체 지도 — CatChap 저장소
+
+이 프로젝트는 저장소 여러 개로 나뉘어 있습니다. **찾는 것이 여기 없으면 아래를 보십시오.**
+
+| 저장소 | 무엇 |
+|---|---|
+| [`catchap-backend`](https://github.com/catchap-captcha/catchap-backend) | 백엔드 API · DB 마이그레이션(alembic) |
+| [`catchap-frontend`](https://github.com/catchap-captcha/catchap-frontend) | 학생·강사·운영자 화면 |
+| [`catchap-captcha`](https://github.com/catchap-captcha/catchap-captcha) | 캡차 서비스 · ★Release 에 이미지 자산 2.05GB + 문제은행 |
+| [`catchap-behavior-ai`](https://github.com/catchap-captcha/catchap-behavior-ai) | 행동 기반 봇 판별 |
+| [`catchap-stt-worker`](https://github.com/catchap-captcha/catchap-stt-worker) | 강의 음성 → 자막 |
+| [`catchap-infra`](https://github.com/catchap-captcha/catchap-infra) | ★쿠버네티스 매니페스트 · Argo CD 설정 |
+| [`catchap-legacy`](https://github.com/catchap-captcha/catchap-legacy) | 옛 브랜치 35개 (커밋 이력 보존용) |
+| ★[`catchap-archive`](https://github.com/catchap-captcha/catchap-archive) | **비공개** — 인프라 문서·캡처·DB 덤프 전부 |
+
+### ★`catchap-archive` 부터 여십시오 (팀 구성원만)
+
+클라우드를 반납해서 **서버는 더 이상 없습니다.** 어떻게 만들었고 왜 그렇게 했는지는
+전부 그 저장소에 있습니다. 개인정보가 들어 있어 비공개입니다.
+
+```
+인프라-캡처/95-최종상태/          서비스 12종 실측 정본 + 복원 순서
+인프라-캡처/95-최종상태/06-배포가-어떻게-돌아갔나.md    배포 7단계 전체
+DB-복원/                          표 130개 · 칼럼 1,547개 + 복원 절차
+Releases                          DB 덤프 · 옛 서버 백업
+```
